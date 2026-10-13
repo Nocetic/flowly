@@ -490,6 +490,7 @@ class ProfileHost:
                 "profiles.manager.claim",
                 "profiles.rpc",
                 "profiles.cron.notify",
+                "profiles.agenda.notify",
                 *self._rooms.methods,
             ],
             "profileRpcMethods": sorted(PROFILE_RPC_TIMEOUTS),
@@ -631,6 +632,14 @@ class ProfileHost:
             return self.claim_management(params.get("ttlMs") if isinstance(params, dict) else None)
         if method == "profiles.stop":
             return await self.stop(_required_string(params, "name").strip(), by_user=True)
+        if method == "profiles.agenda.notify":
+            from flowly.push.profile_agenda_push import notify_profile_agenda
+
+            return await notify_profile_agenda(
+                self.host_id,
+                _required_string(params, "name").strip(),
+                _required_string(params, "itemId"),
+            )
         if method == "profiles.cron.notify":
             from flowly.push.profile_cron_push import notify_profile_cron
 
@@ -2270,6 +2279,13 @@ class ProfileHost:
                 }),
                 name=f"profile-cron-push:{profile}:{run_id}",
             )
+        if event == "agenda.delivered" and profile != "default":
+            # A message the agent wrote first: the phone rings from here, the
+            # primary host, which holds the device registrations.
+            self._spawn_background(
+                self._notify_agenda_delivery({"name": profile, "itemId": payload.get("itemId")}),
+                name=f"profile-agenda-push:{profile}:{payload.get('itemId')}",
+            )
         internal_turn = bool(self._broker_sessions.get((profile, session_key)))
         if internal_turn or (profile, session_key) in self._interactive_task_sessions:
             self._capture_task_audit_event(profile, session_key, event, payload)
@@ -2393,6 +2409,13 @@ class ProfileHost:
         entry["status"] = "ok" if payload.get("success") else "error"
         duration = payload.get("durationMs")
         entry["duration_ms"] = duration if isinstance(duration, int) else None
+
+    async def _notify_agenda_delivery(self, params: dict[str, Any]) -> None:
+        try:
+            await self.dispatch("profiles.agenda.notify", params)
+        except Exception:
+            # Notification failures must not break the runtime event reader.
+            logger.warning("Profile agenda push could not be dispatched for {}", params.get("name"))
 
     async def _notify_cron_completion(self, params: dict[str, Any]) -> None:
         try:

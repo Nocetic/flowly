@@ -43,10 +43,15 @@ from flowly.objectives.store import ObjectiveStore, get_objective_store
 AGENDA_SENDER = "agenda"
 #: Inbound metadata naming the wake-up a system turn belongs to.
 AGENDA_ITEM_KEY = "agenda_item"
+#: Inbound metadata naming the goal a check-in is about, for the card under it.
+AGENDA_GOAL_KEY = "agenda_goal"
 REVIEW_SESSION = "agenda:review"
 TICK_SECONDS = 30.0
 #: How long one wake-up's turn may take before it counts as failed.
-TURN_TIMEOUT_SECONDS = 15 * 60
+TURN_TIMEOUT_SECONDS = 10 * 60
+#: Wake-ups running at once, never two in one conversation. One that
+#: researches for minutes does not hold up another conversation's.
+MAX_CONCURRENT_WAKES = 2
 REVIEW_TIMEOUT_SECONDS = 10 * 60
 #: Without goals, a review runs only while the owner has written this recently.
 REVIEW_RECENCY_MS = 7 * 24 * 60 * 60 * 1000
@@ -92,6 +97,8 @@ class AgendaService:
         self._task: asyncio.Task | None = None
         self._turns: dict[str, asyncio.Future] = {}
         self._tick_lock = asyncio.Lock()
+        #: Running wake-ups: item id -> (its task, its conversation).
+        self._running: dict[str, tuple[asyncio.Task, str]] = {}
 
     # ── lifecycle ────────────────────────────────────────────────────
 
@@ -118,6 +125,14 @@ class AgendaService:
             if not future.done():
                 future.cancel()
         self._turns.clear()
+        for task, _session in self._running.values():
+            task.cancel()
+        self._running.clear()
+
+    async def settle(self) -> None:
+        """Wait for the wake-ups that are running now (tests, shutdown)."""
+        while self._running:
+            await asyncio.gather(*(task for task, _session in list(self._running.values())), return_exceptions=True)
 
     async def _loop(self) -> None:
         while True:
@@ -175,9 +190,14 @@ class AgendaService:
                 await self._maybe_review(now)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"[agenda] review failed: {exc}")
+            busy_sessions = {session for _task, session in self._running.values()}
             for item in self.store.due(now):
+                if len(self._running) >= MAX_CONCURRENT_WAKES:
+                    break  # the next pass picks up the rest
+                if item["sessionKey"] in busy_sessions or item["id"] in self._running:
+                    continue  # one wake-up per conversation at a time
                 if await self._consider(item, now):
-                    break  # one wake-up per pass; the next pass picks up the rest
+                    busy_sessions.add(item["sessionKey"])
 
     def _facts(self, item: dict[str, Any], now: int) -> tuple[policy.Facts, dict[str, Any], dt.tzinfo]:
         settings = self.store.settings()
@@ -205,7 +225,7 @@ class AgendaService:
         return facts, settings, zone
 
     async def _consider(self, item: dict[str, Any], now: int) -> bool:
-        """Act on one due wake-up. True when a turn ran."""
+        """Act on one due wake-up. True when its turn was started."""
         facts, settings, zone = self._facts(item, now)
         decision = policy.decide(facts)
         if decision.action == "drop":
@@ -228,7 +248,9 @@ class AgendaService:
         if started is None:
             self.budget.release(token)
             return False
-        await self._wake(started, token, now, zone)
+        task = asyncio.create_task(self._wake(started, token, now, zone))
+        self._running[started["id"]] = (task, started["sessionKey"])
+        task.add_done_callback(lambda _t, item_id=started["id"]: self._running.pop(item_id, None))
         return True
 
     async def _wake(self, item: dict[str, Any], token: str, now: int, zone: dt.tzinfo) -> None:

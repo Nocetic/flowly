@@ -254,6 +254,7 @@ _PROFILE_HOST_LONG_RUNNING_METHODS = frozenset({
     "profiles.delete.commit",
     "profiles.rpc",
     "profiles.cron.notify",
+    "profiles.agenda.notify",
     "profiles.stop",
 })
 _PROFILE_CLIENT_SUBSCRIPTION_LIMIT = 128
@@ -5101,6 +5102,10 @@ class GatewayServer:
         }
         if isinstance(goal_snapshot, dict):
             data["goal"] = goal_snapshot
+        # A check-in the agent wrote first about a goal: its card, the same
+        # shape a reply's goalCards have (flowly/objectives/cards.py).
+        if isinstance(metadata.get("goalCards"), list) and metadata["goalCards"]:
+            final_message["goalCards"] = metadata["goalCards"]
         if metadata.get("goal_run") is True:
             data["goalRun"] = True
         if metadata.get("goalTerminal") is True:

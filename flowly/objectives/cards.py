@@ -89,18 +89,30 @@ def goal_cards_from_turn(
     cards = []
     for goal_id, event in list(events.items())[-MAX_CARDS:]:
         goal = goals.get(goal_id)
-        if goal is None:
-            continue
-        cards.append({
-            "id": goal["id"],
-            "event": event,
-            "title": goal["title"],
-            "category": goal["category"],
-            "status": goal["status"],
-            "createdAt": goal["createdAt"],
-            "endsAt": goal.get("endsAt"),
-            "progress": goal.get("progress") or {},
-            "steps": len(goal.get("plan") or []),
-            "stepsDone": sum(1 for step in goal.get("plan") or [] if step.get("done")),
-        })
+        if goal is not None:
+            cards.append(goal_card(goal, event))
     return cards
+
+
+def goal_card(goal: Mapping[str, Any], event: str) -> dict[str, Any]:
+    """The card for ``goal``: ``created``, ``done``, ``dropped``, or ``checkin``
+    (a message the agent wrote first about it)."""
+    plan = goal.get("plan") or []
+    return {
+        "id": goal["id"],
+        "event": event,
+        "title": goal["title"],
+        "category": goal["category"],
+        "status": goal["status"],
+        "createdAt": goal["createdAt"],
+        "endsAt": goal.get("endsAt"),
+        "progress": goal.get("progress") or {},
+        "steps": len(plan),
+        "stepsDone": sum(1 for step in plan if step.get("done")),
+    }
+
+
+def checkin_card(goal_id: str, store: ObjectiveStore | None = None) -> dict[str, Any] | None:
+    """The card under a check-in message about ``goal_id``, as the goal is now."""
+    goal = (store or get_objective_store()).get(goal_id)
+    return goal_card(goal, "checkin") if goal else None

@@ -27,7 +27,7 @@ _DEFERRED_CALL_PROTOCOL_NAME = "tool_call"
 #: the agent tells the owner itself when it starts tracking something, and
 #: what it remembers shows in what it says (and in the Memory view).
 INTERNAL_TOOLS = frozenset({
-    "objective", "follow_up",
+    "objective", "follow_up", "proactivity",
     "memory_search", "memory_get", "memory_recall", "memory_feedback",
     "memory_append", "memory_consolidate", "memory_import", "knowledge_graph",
 })

@@ -1577,9 +1577,10 @@ def gateway(
     # goals it tracks, and the limits on writing first. Every runtime runs its
     # own, named agents included; the daily budget is shared through the
     # canonical home. See docs/engineering/agent-goals.md.
-    from flowly.agenda.service import AGENDA_ITEM_KEY, AGENDA_SENDER, REVIEW_SESSION, AgendaService
+    from flowly.agenda.service import AGENDA_GOAL_KEY, AGENDA_ITEM_KEY, AGENDA_SENDER, REVIEW_SESSION, AgendaService
     from flowly.agent.tools.follow_up import FollowUpTool
     from flowly.agent.tools.objective import ObjectiveTool
+    from flowly.agent.tools.proactivity import ProactivityTool
     from flowly.bus.events import InboundMessage as _AgendaInbound
     from flowly.profile import current_profile_display_name, current_profile_name
 
@@ -1591,7 +1592,10 @@ def gateway(
             sender_id=AGENDA_SENDER,
             chat_id=item["sessionKey"],
             content=prompt,
-            metadata={AGENDA_ITEM_KEY: item["id"]},
+            metadata={
+                AGENDA_ITEM_KEY: item["id"],
+                **({AGENDA_GOAL_KEY: item["objectiveId"]} if item.get("objectiveId") else {}),
+            },
         ))
 
     async def _run_agenda_review(prompt: str) -> None:
@@ -1610,6 +1614,12 @@ def gateway(
             except Exception as exc:  # noqa: BLE001
                 logger.debug(f"[agenda] review session cleanup skipped: {exc}")
 
+    async def _announce_agenda_delivery(session_key: str, _text: str, item_id: str) -> None:
+        # A named agent's runtime holds no device registrations: it says which
+        # wake-up spoke, and the primary host (or Desktop, managing it) has
+        # the phone ring from that agent's own record (profiles.agenda.notify).
+        await gateway_server.broadcast_event("agenda.delivered", {"itemId": item_id, "sessionKey": session_key})
+
     agenda = AgendaService(
         profile=current_profile_name(),
         agent_name=current_profile_display_name(),
@@ -1617,9 +1627,11 @@ def gateway(
         is_busy=agent.subagents.is_busy,
         run_review=_run_agenda_review,
         list_conversations=agent.sessions.list_sessions,
+        notify=_announce_agenda_delivery if local_runtime else None,
     )
     agent.tools.register(ObjectiveTool())
     agent.tools.register(FollowUpTool())
+    agent.tools.register(ProactivityTool())
     agent.agenda = agenda
 
     # A managed profile backend is a local RPC process, never a second copy of

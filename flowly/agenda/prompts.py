@@ -19,6 +19,22 @@ from typing import Any
 from flowly.agenda.timeparse import describe
 from flowly.cron.service import SILENT_MARKER
 
+#: A wake-up's reply reaches the owner only when it starts with this. Anything
+#: else — [SILENT], nothing, or a remark about there being nothing to say —
+#: stays silent: a missed check-in costs less than a message that only nags.
+SEND_MARKER = "[SEND]"
+
+
+def wake_decision(reply: str | None) -> tuple[bool, str]:
+    """(send, the message without its marker) for a wake-up turn's reply."""
+    text = (reply or "").strip()
+    if not text.upper().startswith(SEND_MARKER):
+        return False, ""
+    message = text[len(SEND_MARKER):].strip()
+    if not message or SILENT_MARKER in message.upper():
+        return False, ""
+    return True, message
+
 _LOG_LINES = 5
 
 
@@ -97,9 +113,10 @@ def wake_prompt(
         "First, if it makes the message worth reading, do the work with your tools "
         "(look something up, check the calendar, compare options).\n"
         "Then decide:\n"
-        f"- If there is something genuinely useful to tell the owner now, as {agent_name}, "
-        "reply with the message itself: one short message in the owner's language, written the way you "
-        "write in this conversation. It is sent as your message, with a notification on their phone.\n"
+        f"- If there is something genuinely useful to tell the owner now, as {agent_name}, reply with "
+        f"{SEND_MARKER} followed by the message itself: one short message in the owner's language, written "
+        "the way you write in this conversation. It is sent as your message, with a notification on their "
+        "phone. Only a reply that starts with " + SEND_MARKER + " is sent.\n"
         f"- If not (nothing new, they already handled it, it would only nag), reply with exactly {SILENT_MARKER}. "
         "Nothing is sent.\n"
         "Bring something concrete; never ask where they have been or make them feel behind. Do not ask a "

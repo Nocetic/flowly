@@ -80,7 +80,7 @@ def harness(tmp_path):
 @pytest.mark.asyncio
 async def test_a_due_follow_up_wakes_the_agent_in_its_conversation_and_reaches_the_owner(harness):
     item = harness.follow_up()
-    await harness.service.tick()
+    await harness.service.tick(); await harness.service.settle()
 
     assert len(harness.wakes) == 1
     woke, prompt = harness.wakes[0]
@@ -98,7 +98,7 @@ async def test_a_due_follow_up_wakes_the_agent_in_its_conversation_and_reaches_t
 async def test_a_silent_turn_reaches_nobody_and_gives_its_slot_back(tmp_path):
     h = Harness(tmp_path / "home", tmp_path / "budget.json", reply="[SILENT]")
     h.follow_up()
-    await h.service.tick()
+    await h.service.tick(); await h.service.settle()
     assert h.notified == []
     assert h.service.store.snapshot()["history"][-1]["outcome"] == "silent"
     assert h.service.store.conversation(CHAT).get("unanswered", 0) == 0
@@ -109,7 +109,7 @@ async def test_a_silent_turn_reaches_nobody_and_gives_its_slot_back(tmp_path):
 async def test_a_turn_that_never_reports_back_is_retried_later(tmp_path):
     h = Harness(tmp_path / "home", tmp_path / "budget.json", fail=True)
     h.follow_up()
-    await h.service.tick()
+    await h.service.tick(); await h.service.settle()
     pending = h.service.store.pending()
     assert len(pending) == 1 and pending[0]["attempts"] == 1 and pending[0]["dueAt"] > h.now
     assert h.service.budget.counts("default", zone=IST, now_ms=h.now) == (0, 0)
@@ -119,7 +119,7 @@ async def test_a_turn_that_never_reports_back_is_retried_later(tmp_path):
 async def test_quiet_hours_move_the_wake_up_to_the_morning_without_a_turn(harness):
     harness.now = _ms(13, 23)
     item = harness.follow_up()
-    await harness.service.tick()
+    await harness.service.tick(); await harness.service.settle()
     assert harness.wakes == []
     pending = harness.service.store.pending()[0]
     assert pending["id"] == item["id"] and pending["dueAt"] == _ms(14, 9)
@@ -130,7 +130,7 @@ async def test_quiet_hours_move_the_wake_up_to_the_morning_without_a_turn(harnes
 async def test_a_busy_conversation_is_not_interrupted(harness):
     harness.busy.add(CHAT)
     harness.follow_up()
-    await harness.service.tick()
+    await harness.service.tick(); await harness.service.settle()
     assert harness.wakes == []
     assert harness.service.store.pending()[0]["deferredReason"] == "conversation_busy"
 
@@ -140,7 +140,7 @@ async def test_the_daily_limit_holds_across_wake_ups(harness):
     for _ in range(3):
         harness.follow_up(key=f"desktop:chat-{_}")
     for _ in range(3):
-        await harness.service.tick()
+        await harness.service.tick(); await harness.service.settle()
     assert len(harness.wakes) == 2  # normal: two a day
     left = harness.service.store.pending()
     assert len(left) == 1 and left[0]["deferredReason"] == "agent_daily_limit"
@@ -149,10 +149,10 @@ async def test_the_daily_limit_holds_across_wake_ups(harness):
 @pytest.mark.asyncio
 async def test_unanswered_messages_hold_the_next_one_back(harness):
     harness.follow_up()
-    await harness.service.tick()
+    await harness.service.tick(); await harness.service.settle()
     harness.now += 60 * 60 * 1000
     harness.follow_up()
-    await harness.service.tick()
+    await harness.service.tick(); await harness.service.settle()
     assert len(harness.wakes) == 1
     assert harness.service.store.pending()[0]["deferredReason"] == "waiting_for_reply"
 
@@ -168,14 +168,14 @@ async def test_a_goal_check_in_carries_the_goal_and_stops_once_it_is_closed(harn
                         plan=["Run 30 min"], cadence="every evening")
     harness.service.store.schedule(kind="objective", due_at=harness.now - 1, note="Day 1",
                                    session_key=CHAT, objective_id=goal["id"])
-    await harness.service.tick()
+    await harness.service.tick(); await harness.service.settle()
     assert "Work out every day this week" in harness.wakes[0][1]
     assert "objective(action=\"log\")" in harness.wakes[0][1]
 
     harness.service.store.schedule(kind="objective", due_at=harness.now - 1, note="Day 2",
                                    session_key=CHAT, objective_id=goal["id"])
     goals.set_status(goal["id"], "paused")
-    await harness.service.tick()
+    await harness.service.tick(); await harness.service.settle()
     assert len(harness.wakes) == 1
     assert harness.service.store.snapshot()["history"][-1]["reason"] == "goal_not_active"
 
@@ -184,7 +184,7 @@ async def test_a_goal_check_in_carries_the_goal_and_stops_once_it_is_closed(harn
 async def test_off_drops_every_wake_up(harness):
     harness.service.store.update_settings({"level": "off"})
     harness.follow_up()
-    await harness.service.tick()
+    await harness.service.tick(); await harness.service.settle()
     assert harness.wakes == []
     assert harness.service.store.snapshot()["history"][-1]["reason"] == "proactivity_off"
 
@@ -194,18 +194,18 @@ async def test_the_daily_review_runs_once_after_its_time_and_only_when_there_is_
     h = Harness(tmp_path / "home", tmp_path / "budget.json")
     h.service.store._transaction(lambda data: data.pop("lastReviewDay", None))
     h.now = _ms(13, 8)
-    await h.service.tick()
+    await h.service.tick(); await h.service.settle()
     assert h.reviews == []  # before the review time
 
     h.now = _ms(13, 9)
-    await h.service.tick()
+    await h.service.tick(); await h.service.settle()
     assert h.reviews == []  # nothing to review: no goals, the owner never wrote
     assert h.service.store.snapshot()["lastReviewDay"] == "2026-10-13"
 
     h.service.owner_wrote(CHAT)
     h.now = _ms(14, 9)
-    await h.service.tick()
-    await h.service.tick()
+    await h.service.tick(); await h.service.settle()
+    await h.service.tick(); await h.service.settle()
     assert len(h.reviews) == 1
     prompt = h.reviews[0]
     assert "[Daily review]" in prompt and CHAT in prompt and "You may still write first 2 time(s)" in prompt
@@ -217,3 +217,39 @@ async def test_a_turn_finishing_after_the_wait_still_counts(harness):
     harness.service.turn_finished(item["id"], delivered=True, text="Late hello", session_key=CHAT)
     assert harness.service.store.conversation(CHAT)["unanswered"] == 1
     assert harness.service.store.snapshot()["history"][-1]["outcome"] == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_wake_ups_in_different_conversations_run_together_but_never_two_in_one(tmp_path):
+    h = Harness(tmp_path / "home", tmp_path / "budget.json")
+    h.service.store.update_settings({"level": "high"})
+    release = asyncio.Event()
+    started: list[str] = []
+
+    async def slow_publish(item, prompt):
+        started.append(item["sessionKey"])
+
+        async def finish():
+            await release.wait()
+            h.service.turn_finished(item["id"], delivered=False, text="", session_key=item["sessionKey"])
+
+        asyncio.ensure_future(finish())
+
+    h.service._publish_wake = slow_publish
+    h.follow_up(key="desktop:chat-1")
+    h.follow_up(key="desktop:chat-1")
+    h.follow_up(key="desktop:chat-2")
+    h.follow_up(key="desktop:chat-3")
+    await h.service.tick()
+    await asyncio.sleep(0.05)
+    # Two at once, from two different conversations; the rest wait their turn.
+    assert sorted(started) == ["desktop:chat-1", "desktop:chat-2"]
+    await h.service.tick()
+    await asyncio.sleep(0.05)
+    assert len(started) == 2  # still at the limit, and chat-1 is busy
+    release.set()
+    await h.service.settle()
+    await h.service.tick()
+    await asyncio.sleep(0.05)
+    assert sorted(started[2:]) == ["desktop:chat-1", "desktop:chat-3"]
+    await h.service.settle()

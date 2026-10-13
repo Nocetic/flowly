@@ -139,3 +139,23 @@ async def test_a_reopened_conversation_shows_the_same_card(tmp_path):
     await server._ws_rpc_chat_history(None, "h", {"sessionKey": "desktop:chat-1", "limit": 50})
     rows = server._ws_rpc_reply.await_args.args[2]["messages"]
     assert [row.get("goalCards") for row in rows] == [None, cards]
+
+
+@pytest.mark.asyncio
+async def test_a_message_the_agent_wrote_first_carries_its_goal_card_to_clients():
+    from flowly.gateway.server import GatewayServer
+
+    sent: list[dict] = []
+    server = object.__new__(GatewayServer)
+    server._ws_clients = {"desktop": object()}
+    server._scoped_event = lambda payload: payload
+
+    async def ws_send(ws, payload):
+        sent.append(payload)
+
+    server._ws_send = ws_send
+    card = {"id": "obj_aaaaaaaaaaaa", "event": "checkin", "title": "Physics"}
+    await server.push_session_message("desktop:chat-1", "How did it go?", metadata={"goalCards": [card]})
+    [event] = sent
+    assert event["data"]["message"]["goalCards"] == [card]
+    assert event["data"]["proactive"] is True

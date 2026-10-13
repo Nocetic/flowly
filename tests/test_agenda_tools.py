@@ -116,3 +116,17 @@ async def test_unknown_goals_and_actions_are_errors():
     assert (await _call(ObjectiveTool(), CHAT, action="log", id="obj_nope", note="x")).startswith("Error:")
     assert (await _call(ObjectiveTool(), CHAT, action="close")).startswith("Error:")
     assert (await _call(ObjectiveTool(), CHAT, action="create", title="x", category="astrology")).startswith("Error:")
+
+
+@pytest.mark.asyncio
+async def test_the_owner_says_write_less_and_the_agent_sets_it():
+    from flowly.agent.tools.proactivity import ProactivityTool
+    from flowly.tool_activity import INTERNAL_TOOLS
+
+    tool = ProactivityTool()
+    assert "proactivity" in INTERNAL_TOOLS
+    saved = await _call(tool, CHAT, action="set", level="low", quiet_start="22:30")
+    assert saved.startswith("Saved: level low, quiet hours 22:30–09:00")
+    assert json.loads(await _call(tool, CHAT, action="get")) == {"level": "low", "quietStart": "22:30", "quietEnd": "09:00"}
+    assert (await _call(tool, CHAT, action="set", level="loud")).startswith("Error:")
+    assert (await _call(tool, CHAT, action="set")).startswith("Error:")

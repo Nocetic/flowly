@@ -62,7 +62,7 @@ from flowly.session.archive import (
     EVENT_SEQ_KEY,
     SUMMARY_COVERS_KEY,
 )
-from flowly.cron.service import CronService, is_silent_response
+from flowly.cron.service import CronService
 from flowly.compaction.service import CompactionService
 from flowly.compaction.request_guard import (
     ProviderRequestCoordinator,
@@ -3670,7 +3670,10 @@ class AgentLoop:
             await self._record_group_observation(msg)
             return
 
-        if msg.channel == "web":
+        if msg.channel == "web" or (msg.channel == "system" and msg.metadata.get(_AGENDA_ITEM)):
+            # An agenda wake-up may research for minutes; it must not hold up
+            # other conversations' system turns (finished tasks reporting back).
+            # The agenda never wakes a conversation while a turn runs there.
             self._spawn_concurrent_turn(msg)
         else:
             await self._process_turn(msg)
@@ -9604,8 +9607,14 @@ class AgentLoop:
         # announce turn is delivered on the parent's origin channel,
         # so the channel hint must match origin_channel rather than
         # the announce message's transport channel.
+        # A wake-up of the agent's own agenda runs with nobody watching: its
+        # tools are the "agenda" route's (look things up, memory, past
+        # conversations, goals and follow-ups — nothing that acts), and nothing
+        # of it streams to a client before it decides to say something.
+        agenda_item = str(msg.metadata.get(_AGENDA_ITEM) or "")
+        tool_route = "agenda" if agenda_item else origin_channel
         system_disclosure = self._routed_tool_disclosure(
-            origin_channel,
+            tool_route,
             intent_text=msg.content,
         )
         system_available_tools = {
@@ -9660,9 +9669,9 @@ class AgentLoop:
             live_call_turn=live_call_turn,
             turn_content=msg.content,
             session_key=f"{origin_channel}:{origin_chat_id}",
-            tool_platform=origin_channel,
-            outbound_channel=origin_channel,
-            outbound_chat_id=origin_chat_id,
+            tool_platform=tool_route,
+            outbound_channel="" if agenda_item else origin_channel,
+            outbound_chat_id="" if agenda_item else origin_chat_id,
             outbound_run_id=msg.metadata.get("run_id") or "",
             reply_media=reply_media,
             reply_media_assets=reply_media_assets,
@@ -9671,19 +9680,33 @@ class AgentLoop:
             provider_state_out=provider_state_out,
         )
 
-        # An agenda wake-up may decide there is nothing worth saying. Then
-        # nothing of it stays in the conversation: no hidden trigger, no
-        # reply, no push. What its tools recorded (a goal's log) stays.
-        agenda_item = str(msg.metadata.get(_AGENDA_ITEM) or "")
-        if agenda_item and (
-            not (final_content or "").strip()
-            or is_silent_response(final_content)
-            or self.compaction.is_silent_reply(final_content)
-        ):
-            if getattr(self, "agenda", None) is not None:
-                self.agenda.turn_finished(agenda_item, delivered=False, text="", session_key=session_key)
-            logger.info(f"[agenda] {agenda_item} stayed silent in {session_key}")
-            return None
+        # An agenda wake-up speaks only when its reply starts with [SEND]
+        # (flowly/agenda/prompts.py). Otherwise nothing of it stays in the
+        # conversation: no hidden trigger, no reply, no push. What its tools
+        # recorded (a goal's log) stays.
+        agenda_cards: list[dict[str, Any]] = []
+        if agenda_item:
+            from flowly.agenda.prompts import wake_decision
+
+            send, message = wake_decision(final_content)
+            if not send:
+                if getattr(self, "agenda", None) is not None:
+                    self.agenda.turn_finished(agenda_item, delivered=False, text="", session_key=session_key)
+                logger.info(f"[agenda] {agenda_item} stayed silent in {session_key}")
+                return None
+            final_content = message
+            # A check-in about a goal carries the goal's card, so the message
+            # leads to it (flowly/objectives/cards.py).
+            agenda_goal = str(msg.metadata.get("agenda_goal") or "")
+            if agenda_goal:
+                try:
+                    from flowly.objectives.cards import checkin_card
+
+                    card = checkin_card(agenda_goal)
+                    if card is not None:
+                        agenda_cards = [card]
+                except Exception as exc:  # noqa: BLE001 — a card never fails a turn
+                    logger.debug(f"[agenda] check-in card skipped: {exc}")
 
         # No pending-action-lock bookkeeping here: a system/announce turn is a
         # delivery turn (action_turn is always False above), so it neither sets
@@ -9695,6 +9718,7 @@ class AgentLoop:
         # visible to the parent agent on the next turn.
         turn_start_index = len(session.messages)
         session.extend_with_turn_messages(
+            goal_cards=agenda_cards or None,
             user_content=f"[System: {msg.sender_id}] {msg.content}",
             new_messages=turn_messages,
             final_content=final_content,
@@ -9729,7 +9753,8 @@ class AgentLoop:
             if gw is not None and hasattr(gw, "push_session_message"):
                 try:
                     await gw.push_session_message(
-                        f"{origin_channel}:{origin_chat_id}", final_content
+                        f"{origin_channel}:{origin_chat_id}", final_content,
+                        **({"metadata": {"goalCards": agenda_cards}} if agenda_cards else {}),
                     )
                 except Exception as exc:
                     logger.warning(f"[board] local push failed: {exc}")
@@ -9744,11 +9769,10 @@ class AgentLoop:
             chat_id=origin_chat_id,
             content=final_content,
             media=reply_media,
-            metadata=(
-                {ASSETS_META_KEY: assets_to_meta(reply_media_assets)}
-                if reply_media_assets
-                else {}
-            ),
+            metadata={
+                **({ASSETS_META_KEY: assets_to_meta(reply_media_assets)} if reply_media_assets else {}),
+                **({"goalCards": agenda_cards} if agenda_cards else {}),
+            },
         )
 
     @staticmethod
