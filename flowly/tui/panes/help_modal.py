@@ -20,7 +20,6 @@ HELP_BODY = """
 | `↑` / `↓`      | History prev/next; `↓` on an empty draft selects this chat's artifacts |
 | `Ctrl+E`       | Open draft in `$EDITOR` (vim/nvim/nano) |
 | `Ctrl+S`       | Open sessions picker |
-| `Ctrl+M`       | Open assistants / persona picker |
 | `Ctrl+A`       | Toggle subagent tree sidebar |
 | `F1`           | This help panel |
 | `F2`           | Activity / audit log |
@@ -41,7 +40,6 @@ HELP_BODY = """
 | `/undo`              | Pop last user+assistant turn · pre-fills composer for edit-and-resubmit |
 | `/compact [hint]`    | Summarize history to save tokens |
 | `/sessions`          | Switch saved session |
-| `/assistants` `/model` | Pick a persona / assistant |
 | `/integrations`      | Connect external services like Home Assistant, Linear, Trello, Google Workspace |
 | `/channels`          | Configure messaging channels like Telegram, Slack, Discord, iMessage, Email, iOS/Web |
 | `/provider`          | Pick LLM provider (arrow-key picker) · `/provider <key>` direct switch · `/provider off` clear |
@@ -66,7 +64,6 @@ HELP_BODY = """
 | `/memory` `/review`  | Review new memories inline — keep / discard the bot's pending candidates (also pops on open) |
 | `/board` `/kanban`   | Show the task board inline (status groups) |
 | `/subagents` `/subs` | Toggle subagent sidebar |
-| `/subagents models`  | Set which model each specialist runs on |
 | `/subagents <task>`  | Launch a manual background subagent |
 | `/abort`             | Cancel the current turn |
 | `/quit`              | Exit |

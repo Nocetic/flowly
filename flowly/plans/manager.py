@@ -117,7 +117,6 @@ SIDE_EFFECT_TOOLS: frozenset[str] = frozenset(
         # spawning work = a side effect
         "spawn",
         "delegate",
-        "builtin_agent",
     }
 )
 

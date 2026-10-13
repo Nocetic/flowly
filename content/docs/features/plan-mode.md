@@ -97,7 +97,7 @@ every tool with a real side effect:
 - **Reaching people** — `email`, `message`, `voice_call`
 - **External services** — Google Workspace, Linear, GitHub, Sentry, Trello, Home Assistant
 - **Durable state** — `board`, `cron`, `flowlet`, `artifact`, `image_generate`, `knowledge_graph`
-- **Spawning work** — `spawn`, `delegate`, `builtin_agent`
+- **Spawning work** — `spawn`, `delegate`
 
 Read-only tools stay open on purpose: `read_file`, `list_dir`, search, memory
 recall, `web_fetch`, screenshots, and the `plan` tool itself. The agent can

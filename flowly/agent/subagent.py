@@ -15,12 +15,6 @@ from loguru import logger
 from flowly.bus.events import InboundMessage
 from flowly.bus.queue import MessageBus
 from flowly.providers.base import LLMProvider
-from flowly.artifacts.context import (
-    INTERNAL_CONTEXT_TAGS,
-    build_persisted_output_message,
-    generate_preview,
-    internal_context_metadata,
-)
 from flowly.agent.tools.base import Tool
 from flowly.agent.tools.discovery import (
     annotate_search_repetition,
@@ -67,11 +61,10 @@ from flowly.agent.subagent_announce_queue import AnnounceItem, get_or_create_que
 #                          users' conversations; privacy boundary.
 #   * unbounded system   — `system` / `docker` are wide-open admin shims.
 #
-# Flowly uses an explicit allowlist in _do_run (computed from the
-# assistant's ``allowed_tools`` field) AND this blocklist as a
-# defense-in-depth backstop. If the allowlist ever expands to cover a
-# dangerous tool by accident, the blocklist still refuses the
-# obviously-dangerous names regardless.
+# Flowly builds a child's tools from an explicit allowlist in _do_run AND
+# keeps this blocklist as a defense-in-depth backstop. If the allowlist ever
+# expands to cover a dangerous tool by accident, the blocklist still refuses
+# the obviously-dangerous names regardless.
 _BLOCKED_SUBAGENT_TOOLS: frozenset[str] = frozenset({
     # recursion / privilege escalation
     "spawn", "builtin_agent", "delegate_to",
@@ -100,15 +93,13 @@ _BLOCKED_SUBAGENT_TOOLS: frozenset[str] = frozenset({
 })
 
 
-# System-wide wall-clock cap for every subagent run. Not per-assistant
+# System-wide wall-clock cap for every subagent run. Not per-run
 # configurable — keeping the user-facing config minimal is worth more
 # than letting operators tune this. 15 min is generous: normal runs
 # finish in 7-15 minutes (15 iterations × 30-60s average); anything
 # over this ceiling is almost always a genuine hang that the per-tool
 # (120s) / per-LLM-call (300s) / heartbeat guards failed to catch.
 _SUBAGENT_WALL_CLOCK_TIMEOUT = 900
-
-_SUBAGENT_OUTPUT_CONTEXT_LIMIT_CHARS = 6_000
 
 
 class SubagentToolRegistry(ToolRegistry):
@@ -329,22 +320,6 @@ class SubagentManager:
         # (other sessions / other cron jobs keep running).
         self._children_by_parent: dict[str, set[str]] = {}
         self._busy_sessions: set[str] = set()
-        # Per-session history of successful dispatches with associated
-        # artifacts. Used by two consumers:
-        #   - BuiltinAgentTool duplicate-dispatch guard: "did a run with
-        #     this label finish in the last 10 min? refuse the second
-        #     call, redirect to the existing artifact."
-        #   - AgentLoop recent-artifacts hint injection: "list up to the
-        #     last 5 artifacts in this session so the parent LLM can
-        #     reference them correctly — but only the ones that really
-        #     exist, never a blanket 'you may have artifacts' rule."
-        # Stored as list (newest appended) so multiple artifacts for
-        # the same label coexist (FRESH: bypass produces art_B alongside
-        # art_A; both remain queryable). Capped at 20 per session to
-        # prevent unbounded growth during marathon chats. In-memory
-        # only — best-effort across restarts.
-        self._recent_completed_dispatches: dict[str, list[dict[str, Any]]] = {}
-        self._dispatch_history_cap_per_session = 20
         self._on_event = on_event  # async callback(event_name, data)
         self._events = TaskEvents(self._deliver_event)
         self._cancel_outcomes: dict[str, str] = {}
@@ -382,97 +357,6 @@ class SubagentManager:
 
     def is_busy(self, session_key: str) -> bool:
         return session_key in self._busy_sessions
-
-    # ------------------------------------------------------------------
-    # Duplicate-dispatch guard (builtin_agent mutex)
-    # ------------------------------------------------------------------
-
-    def recent_completed_dispatches(
-        self,
-        parent_session_key: str,
-        max_age_seconds: float = 600.0,
-    ) -> list[dict[str, Any]]:
-        """Return every successful dispatch for this session within the
-        age window, newest first.
-
-        Multi-artifact aware: if the parent ran researcher twice (via
-        FRESH: on the second call), both art_A and art_B appear here.
-        Callers should NOT hint about artifacts when this list is
-        empty, otherwise the LLM starts offering files that were never
-        created.
-        """
-        records = self._recent_completed_dispatches.get(parent_session_key, [])
-        if not records:
-            return []
-        now = time.time()
-        fresh = [r for r in records if now - r["completed_at"] <= max_age_seconds]
-        # Newest first — callers can truncate to a display cap.
-        fresh.sort(key=lambda r: r["completed_at"], reverse=True)
-        return fresh
-
-    def last_completed_dispatch(
-        self,
-        parent_session_key: str,
-        label: str,
-        max_age_seconds: float = 600.0,
-    ) -> dict[str, Any] | None:
-        """Return the most recent successful dispatch for this parent
-        session + label, or None if none within the window.
-
-        Used by BuiltinAgentTool to refuse a same-label re-dispatch and
-        redirect the parent LLM to the existing artifact. Falsely missing
-        records (after a process restart, before any dispatch completes)
-        are safe — the worst case is one extra dispatch. Falsely stale
-        records are bounded by ``max_age_seconds``.
-        """
-        records = self._recent_completed_dispatches.get(parent_session_key, [])
-        if not records:
-            return None
-        now = time.time()
-        # Walk newest → oldest. First match within window is the answer.
-        for r in reversed(records):
-            if r["label"] != label:
-                continue
-            if now - r["completed_at"] > max_age_seconds:
-                # Older than this is only going to be older still.
-                return None
-            return r
-        return None
-
-    def _record_completed_dispatch(
-        self,
-        parent_session_key: str,
-        label: str,
-        artifact_id: str,
-        title: str,
-    ) -> None:
-        """Register a successful dispatch with an associated artifact.
-
-        Appends to a per-session list so multiple dispatches (same or
-        different labels) all stay queryable. Older entries age out
-        naturally via the window check in the read APIs; the per-session
-        cap prevents unbounded growth during very long chats.
-
-        Failed or interrupted runs are deliberately NOT recorded so the
-        LLM can retry them without tripping the guard.
-        """
-        records = self._recent_completed_dispatches.setdefault(
-            parent_session_key, [],
-        )
-        records.append({
-            "artifact_id": artifact_id,
-            "title": title,
-            "label": label,
-            "completed_at": time.time(),
-        })
-        if len(records) > self._dispatch_history_cap_per_session:
-            # Drop oldest. Guard/hint only care about recent entries
-            # anyway, so this is pure memory hygiene.
-            del records[0: len(records) - self._dispatch_history_cap_per_session]
-
-    # ------------------------------------------------------------------
-    # Crash recovery
-    # ------------------------------------------------------------------
 
     def resume_pending(self) -> None:
         """Called on startup: announce any tasks that were running when process crashed."""
@@ -512,7 +396,6 @@ class SubagentManager:
         timeout_seconds: int | None = None,
         is_subagent_caller: bool = False,
         wait: bool = False,
-        assistant: Any = None,  # Assistant | None — avoids circular import
         silent: bool = False,
         display_name: str | None = None,
     ) -> str:
@@ -592,7 +475,7 @@ class SubagentManager:
         await self._emit_event("subagent.started", run_id, resolved_display, "running")
         bg_task = asyncio.create_task(
             self._run_subagent(run_id, task, display_label, origin_channel, origin_chat_id,
-                               resolved_model, timeout_seconds, assistant=assistant,
+                               resolved_model, timeout_seconds,
                                skip_announce=wait or silent)
         )
         self._running_tasks[run_id] = bg_task
@@ -671,7 +554,6 @@ class SubagentManager:
         model: str,
         timeout_seconds: int | None,
         skip_announce: bool = False,
-        assistant: Any = None,  # Assistant | None
     ) -> str:
         """Execute the subagent task and optionally announce the result.
 
@@ -687,10 +569,10 @@ class SubagentManager:
 
         async def _do_run() -> tuple[str, bool, list[dict[str, Any]]]:
             nonlocal status, error_str, error_code
-            # Subagent tool registry — factory lookup + assistant-level
-            # allowlist. SubagentToolRegistry still refuses blocked names
-            # (spawn, delegate_to, cron, message, …) on register so a
-            # broken allowlist can't smuggle a dangerous tool in either.
+            # Subagent tool registry — factory lookup over a fixed allowlist.
+            # SubagentToolRegistry still refuses blocked names (spawn,
+            # delegate_to, cron, message, …) on register so a broken
+            # allowlist can't smuggle a dangerous tool in either.
             # When the parent has governance enabled, fire its post_tool_call
             # hook from the subagent's registry too, so self-review's memory/KG
             # writes are governed like the main agent's.
@@ -720,8 +602,7 @@ class SubagentManager:
 
             from flowly.agent.tools.skill_manage import SkillManageTool
 
-            # Factory map: name → builder. Used so assistant.allowed_tools
-            # can turn off tools without having to import each class here.
+            # Factory map: name → builder; the keys are the child's allowlist.
             _TOOL_FACTORIES: dict[str, Any] = {
                 "read_file": lambda: ReadFileTool(workspace=self.workspace),
                 "write_file": lambda: WriteFileTool(workspace=self.workspace),
@@ -744,14 +625,7 @@ class SubagentManager:
                 "artifact": _build_artifact_tool,
             }
 
-            # Default = every safe tool. Explicit allowed_tools on the
-            # assistant narrows the set (artifact stays in the set —
-            # it's the canonical output channel for auto_save_artifact
-            # assistants and the only way to surface non-text outputs).
-            if assistant is not None and assistant.allowed_tools is not None:
-                requested = set(assistant.allowed_tools) | {"artifact"}
-            else:
-                requested = set(_TOOL_FACTORIES.keys())
+            requested = set(_TOOL_FACTORIES.keys())
             if label == "self-review":
                 # Self-review is only for memory/KG evolution. Replace the
                 # default tool set so it cannot create skills indirectly via
@@ -761,21 +635,13 @@ class SubagentManager:
             for tool_name in requested:
                 factory = _TOOL_FACTORIES.get(tool_name)
                 if factory is None:
-                    logger.warning(
-                        f"[SubagentManager] [{run_id[:8]}] assistant "
-                        f"'{getattr(assistant, 'name', '?')}' listed "
-                        f"unknown tool '{tool_name}', skipping"
-                    )
                     continue
                 try:
                     tools.register(factory())
                 except ValueError as blocked:
-                    # Blocked tool in allowed_tools → log + skip (the
-                    # blocklist guard is authoritative; assistant file
-                    # doesn't get to escalate privilege).
+                    # The blocklist guard is authoritative.
                     logger.warning(
-                        f"[SubagentManager] [{run_id[:8]}] allowed_tools "
-                        f"contains blocked tool: {blocked}"
+                        f"[SubagentManager] [{run_id[:8]}] refused blocked tool: {blocked}"
                     )
                 except Exception as e:
                     # Optional tools (KG, artifact) may fail to build on
@@ -786,9 +652,7 @@ class SubagentManager:
                     )
 
             # Build messages with subagent-specific prompt
-            system_prompt = self._build_subagent_prompt(
-                task, label=label, assistant=assistant,
-            )
+            system_prompt = self._build_subagent_prompt(task, label=label)
             if build_tool_disclosure(
                 tools.get_definitions(),
                 toolsets=tools.get_toolsets(),
@@ -1281,18 +1145,6 @@ class SubagentManager:
         error_code: str | None = None
         tool_trace: list[dict[str, Any]] = []
 
-        # Artifact save is OPT-IN. Driven solely by
-        # ``assistant.auto_save_artifact``; there is no longer a
-        # label-based fallback (used to be ``builtin:writer`` /
-        # ``builtin:researcher`` always saving regardless of the
-        # assistant config — removed 2026-04-23 because users kept
-        # getting artifacts they didn't ask for). The output cap
-        # below still routes oversize results to the artifact store
-        # for context protection, but that's a context-management
-        # mechanism, not a "save this report" decision.
-        _auto_save = bool(getattr(assistant, "auto_save_artifact", False))
-        _art_type = getattr(assistant, "artifact_type", "markdown") or "markdown"
-
         try:
             # Wall-clock guard is opt-in: positive timeout_seconds enforces
             # a hard cap; 0 / None runs unbounded (rely on max_iter +
@@ -1305,87 +1157,6 @@ class SubagentManager:
                 final_result, model_used_artifact, tool_trace = await _do_run()
 
             durable_result = final_result
-
-            # Assistant-opt-in auto-save. Skip if the model already used
-            # the artifact tool itself (prevents duplicates) or if the
-            # result is an error message.
-            if (
-                _auto_save
-                and final_result
-                and not final_result.startswith("Error")
-                and not model_used_artifact
-            ):
-                artifact_id = await self._save_result_as_artifact(
-                    run_id, label, task, final_result, art_type=_art_type,
-                    session_key=f"{origin_channel}:{origin_chat_id}",
-                )
-                if artifact_id:
-                    self._link_artifact(run_id, artifact_id)
-                    final_result = (
-                        f"{final_result}\n\n"
-                        f"[Result saved as artifact: {artifact_id}]"
-                    )
-
-            # Opt-in context persistence for subagents whose output is
-            # structurally long (researcher, writer, user assistants with
-            # ``cap_to_artifact: true`` in their frontmatter). For terse
-            # specialists (coder, reviewer) and unconfigured callers, the
-            # final_result is returned verbatim — no artifact bloat for a
-            # "LGTM, 2 nits" review or a short patch.
-            #
-            # When a parking opts in and fires, the parent gets a
-            # <persisted-output> envelope with preview + artifact id, and
-            # an existing auto-save artifact (writer/researcher emitted
-            # during its run) is reused instead of duplicated.
-            _cap_opt_in = bool(getattr(assistant, "cap_to_artifact", False))
-            artifact_id_for_cap: str | None = None
-            if (
-                _cap_opt_in
-                and len(final_result) > _SUBAGENT_OUTPUT_CONTEXT_LIMIT_CHARS
-                and not final_result.startswith("Error")
-            ):
-                _embed_marker = "[Result saved as artifact: "
-                _embed_idx = final_result.rfind(_embed_marker)
-                if _embed_idx >= 0:
-                    _end = final_result.find("]", _embed_idx)
-                    if _end > _embed_idx:
-                        artifact_id_for_cap = final_result[
-                            _embed_idx + len(_embed_marker):_end
-                        ].strip()
-                if artifact_id_for_cap is None:
-                    # User-visible by default (Claude Code pattern): the
-                    # research output IS the persistence — no separate
-                    # "promote to make it visible" step. The artifact
-                    # lands in the desktop list immediately and the
-                    # user can see/open it. The parent LLM still sees
-                    # only the <persisted-output> preview so its
-                    # context stays lean; the two concerns
-                    # (user visibility vs parent context size) are
-                    # independent.
-                    artifact_id_for_cap = await self._save_result_as_artifact(
-                        run_id,
-                        label,
-                        task,
-                        final_result,
-                        source="subagent_result",
-                        session_key=f"{origin_channel}:{origin_chat_id}",
-                    )
-                if artifact_id_for_cap:
-                    self._link_artifact(run_id, artifact_id_for_cap)
-                    _total = len(final_result)
-                    _preview, _has_more = generate_preview(final_result)
-                    final_result = build_persisted_output_message(
-                        artifact_id=artifact_id_for_cap,
-                        original_size=_total,
-                        preview=_preview,
-                        has_more=_has_more,
-                        source="subagent result",
-                    )
-                    logger.info(
-                        f"[SubagentManager] [{run_id[:8]}] output persisted "
-                        f"({_total:,} → ~{len(final_result):,} chars, "
-                        f"artifact={artifact_id_for_cap})"
-                    )
 
             # Classify the outcome. `_do_run` signals LLM-error exhaustion
             # by returning final_result starting with "Error: Task failed"
@@ -1400,19 +1171,6 @@ class SubagentManager:
                 )
             else:
                 logger.info(f"[SubagentManager] [{run_id[:8]}] completed successfully")
-                # Register for the duplicate-dispatch guard. Only successful
-                # runs that produced a persisted artifact are recorded —
-                # failed/interrupted runs stay invisible so the parent LLM
-                # can retry them without being blocked. Short sync runs that
-                # never triggered the cap are also invisible (they return
-                # inline text; re-dispatching a coder one-liner is cheap).
-                if artifact_id_for_cap:
-                    self._record_completed_dispatch(
-                        parent_session_key=f"{origin_channel}:{origin_chat_id}",
-                        label=label,
-                        artifact_id=artifact_id_for_cap,
-                        title=(task or label)[:200],
-                    )
             self._registry.finish(run_id, status, result=durable_result,
                                   error=error_str, error_code=error_code)
 
@@ -1554,18 +1312,8 @@ class SubagentManager:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _build_subagent_prompt(
-        self, task: str, label: str = "", assistant: Any = None,
-    ) -> str:
-        """Build a focused system prompt for the subagent.
-
-        If ``assistant`` is supplied, its ``system_prompt`` body is
-        appended verbatim — this is how user-defined personas
-        (``~/.flowly/assistants/*.md``) and migrated builtins both
-        deliver their instructions. The legacy hardcoded writer /
-        researcher / coder blocks are now seeds in
-        ``flowly.agent.assistants._BUILTIN_ASSISTANTS``.
-        """
+    def _build_subagent_prompt(self, task: str, label: str = "") -> str:
+        """Build a focused system prompt for the subagent."""
         base = f"""# Subagent
 
 Complete ONLY the assigned task. Stay focused, be concise, do not initiate side tasks.
@@ -1604,16 +1352,15 @@ If nothing new to save, reply 'Nothing to save.'
 Do not create, patch, install, or manage skills. Do not edit project files or run commands.
 """
 
-        # Built-in agents: inject user context (memory + KG), but only
-        # after a prompt-injection scan. Matches Faz 5.2's hardening on
+        # Children working for the owner get their context (memory + KG),
+        # but only after a prompt-injection scan. Matches Faz 5.2's hardening on
         # the main agent: memory and KG are treated like bootstrap
         # context files, so a poisoned entry (e.g. a stray
         # "ignore previous instructions" snippet written by an earlier
         # turn) surfaces as a [BLOCKED: …] placeholder instead of being
         # silently relayed into the child's system prompt.
-        # P2.8 — inject for any assistant-driven run (registry or
-        # legacy builtin: label), not self-review or one-off spawns.
-        if assistant is not None or label.startswith("builtin:"):
+        # Self-review reads the conversation it reviews instead.
+        if label != "self-review":
             from flowly.cron.guard import scan_context_file
             try:
                 memory_path = self.workspace / "memory" / "MEMORY.md"
@@ -1640,96 +1387,7 @@ Do not create, patch, install, or manage skills. Do not edit project files or ru
             except Exception:
                 pass
 
-        # P2.8 — assistant persona injection. Replaces the hardcoded
-        # writer/researcher/coder blocks; those are now seeded in
-        # _BUILTIN_ASSISTANTS and reach us via the assistant argument
-        # along with any user-defined ones from ~/.flowly/assistants/.
-        if assistant is not None and assistant.system_prompt:
-            base += "\n" + assistant.system_prompt.strip() + "\n"
-
         return base
-
-    async def _save_result_as_artifact(
-        self,
-        run_id: str,
-        label: str,
-        task: str,
-        result: str,
-        art_type: str | None = None,
-        internal: bool = False,
-        source: str = "assistant_output",
-        session_key: str | None = None,
-    ) -> str | None:
-        """Auto-save assistant output as an artifact. Returns artifact ID or None.
-
-        ``art_type`` is supplied by the assistant registry
-        (``Assistant.artifact_type``). Falls back to the legacy heuristic
-        (coder → code, everything else → markdown) when callers don't
-        pass it — e.g. the P2.5 output-cap path which doesn't know about
-        the assistant object.
-        """
-        try:
-            from flowly.artifacts.store import get_store
-            store = get_store(self._state_dir)
-
-            title = task[:100].strip()
-            if len(task) > 100:
-                title += "..."
-
-            # Strip either 'builtin:' or 'assistant:' prefix so tags stay
-            # readable. Legacy suffix heuristic fills in art_type when
-            # the caller doesn't supply one.
-            clean_label = label.split(":", 1)[1] if ":" in label else label
-            if art_type is None:
-                art_type = "code" if clean_label == "coder" else "markdown"
-
-            # Always record provenance metadata so the store can tell
-            # subagent_result from user-typed artifacts later (useful
-            # for cleanup / filtering / TTL). Internal flag now only
-            # hides the artifact from list views — it does not change
-            # what we remember about where the artifact came from.
-            metadata: dict[str, Any] = {
-                "source": source,
-                "run_id": run_id,
-                "label": label,
-                "original_chars": len(result),
-            }
-            if task:
-                metadata["task"] = task[:400]
-            tags = [f"assistant:{clean_label}"]
-            if internal:
-                metadata.update(internal_context_metadata(
-                    source=source,
-                    original_chars=len(result),
-                    run_id=run_id,
-                    label=label,
-                    task=task,
-                ))
-                tags.extend(sorted(INTERNAL_CONTEXT_TAGS))
-
-            artifact = store.create(
-                type=art_type,
-                title=title,
-                content=result,
-                metadata=metadata,
-                tags=tags,
-                session_key=session_key,
-            )
-            artifact_id = artifact["id"]
-            if self._artifact_on_change and not internal:
-                try:
-                    await self._artifact_on_change("artifact.created", artifact)
-                except Exception as exc:
-                    logger.debug(
-                        "[SubagentManager] artifact broadcast failed: {}", exc
-                    )
-            logger.info(
-                f"[SubagentManager] [{run_id[:8]}] result saved as artifact {artifact_id}"
-            )
-            return artifact_id
-        except Exception as e:
-            logger.warning(f"[SubagentManager] [{run_id[:8]}] artifact save failed: {e}")
-            return None
 
     def cancel_all(self) -> int:
         """Cascade-cancel EVERY running subagent, regardless of parent.

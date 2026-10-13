@@ -19,14 +19,12 @@ COMMON_COMMANDS = [
     ("/clear",      "wipe current session"),
     ("/compact",    "summarize history"),
     ("/sessions",   "switch saved session"),
-    ("/assistants", "pick a persona"),
     ("/abort",      "cancel turn"),
     ("/quit",       "exit"),
 ]
 
 HOTKEYS = [
     ("Ctrl+S",   "sessions picker"),
-    ("Ctrl+M",   "assistants picker"),
     ("Ctrl+A",   "toggle subagents (/subs)"),
     ("Ctrl+E",   "edit draft in $EDITOR"),
     ("F1..F4",   "help · activity · approvals · artifacts"),

@@ -23,7 +23,7 @@ written outside it without your involvement.
 | `audit/` | Command + decision [audit log](/docs/features/audit-log). |
 | `sessions/` | Session routing index and transcripts. |
 | `goals/` | Durable [standing goal](/docs/features/goals) state — one lock + JSON record per conversation. |
-| `assistants/` | Saved assistant / multi-agent definitions. |
+| `assistants/` | Assistant definitions from earlier versions; no longer read. |
 | `desktop-client-id` | Stable id Flowly Desktop reconnects with. |
 
 Two more files appear only in certain states, and both are safe to delete:

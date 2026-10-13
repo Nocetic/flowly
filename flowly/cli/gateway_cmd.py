@@ -520,10 +520,8 @@ def gateway(
         # gateway's job). Keeping these blocked is non-negotiable.
         "cron",
         "message",
-        # Lower-level fire-and-forget spawners are hidden so the cron agent
-        # reaches for `builtin_agent` (sync in cron context) instead. If
-        # cron called `spawn`, it would get "accepted" back and spin waiting
-        # for an async announcement that never arrives inline.
+        # A scheduled run does its work itself. Background spawners report
+        # back on a later turn, which a cron tick never has.
         "spawn",
         "delegate_to",
         "message_profile",
@@ -1214,32 +1212,14 @@ def gateway(
                     "unless the task ABOVE explicitly asks for it. The user reads your "
                     "text reply — that's the whole deliverable.\n"
                     "\n"
-                    "# Specialist dispatch — ONE call, then STOP\n"
-                    "`builtin_agent` delegates focused work to a specialist:\n"
-                    "- `researcher` — researches AND writes a final markdown report "
-                    "(auto-saved as artifact). Use for ANY 'research X and write it up' "
-                    "task. It is SELF-CONTAINED.\n"
-                    "- `writer` — only when you already have the raw material and just "
-                    "need it reshaped.\n"
-                    "- `coder` — code review / refactor / debug.\n"
+                    "# How to work\n"
+                    "Do the task yourself with the tools it needs, then reply. Stop "
+                    "as soon as you have what the task asks for: if one `web_search` "
+                    "or `web_fetch` answers it, that is enough.\n"
                     "\n"
-                    "STRICT EXECUTION PLAN (follow in order, stop when the condition is met):\n"
-                    "1. If a single `web_search`/`web_fetch` answers the task, do that, "
-                    "then STOP and reply.\n"
-                    "2. Otherwise call ONE specialist (researcher for research+write, "
-                    "writer for reshape-only, coder for code).\n"
-                    "3. When the specialist returns: your NEXT turn MUST be the final "
-                    "reply. No more tool calls. Do NOT look up the artifact you just "
-                    "got back (you already have its text). Do NOT 'also save to Drive' "
-                    "or 'also send an email'. Just output the report to the user and end.\n"
-                    "\n"
-                    "Forbidden patterns — these waste 3-5 minutes and deliver nothing "
-                    "the user asked for:\n"
-                    "  ✗ researcher → writer (chain)\n"
-                    "  ✗ specialist → artifact(list) → artifact(get) (you already have "
-                    "the content)\n"
-                    "  ✗ specialist → google_drive(create) (user didn't ask for Drive)\n"
-                    "  ✗ specialist → email(send) (user didn't ask to email anyone)\n"
+                    "Don't add deliverables nobody asked for — no 'also saving to "
+                    "Drive', no email, no looking up an artifact you just wrote. Your "
+                    "final text reply is the deliverable.\n"
                     "\n"
                     "If any tool fails, include a one-sentence error note in your reply. "
                     "Then STOP."
@@ -2428,7 +2408,6 @@ Respond to the user now:"""
 
     # P2.8 — expose the assistant registry so the desktop UI's "Your
     # agents" section can list / reload user-defined assistants.
-    gateway_server._assistant_registry = getattr(agent, "_assistant_registry", None)
 
     # Wire Meeting Coach (continuous listening + real-time coaching).
     # STT runs client-side (desktop → web-app /api/stt/transcribe); the

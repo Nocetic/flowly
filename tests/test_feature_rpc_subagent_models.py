@@ -1,12 +1,8 @@
-"""Tests for the subagent specialist-model + manual-spawn feature RPCs.
+"""Tests for the retired specialist RPCs and the manual-spawn feature RPC.
 
-Pins the contract the desktop Settings editor and the TUI ``/subagents``
-command depend on:
-
-  * ``subagents.assistants`` lists specialists with their default model,
-    override, and resolved effective model;
-  * ``subagents.set_model`` persists/clears ``agents.assistant_models`` and
-    resolves the three-tier policy (override id > inherit > default);
+  * The stored specialists and owner-made assistants are gone. An older
+    client still asks for them: reads answer "none, retired" and writes say
+    plainly that the feature is gone, instead of failing as unknown methods.
   * ``subagents.spawn`` launches a manual background subagent through the
     wired SubagentManager and splits the session key into the origin
     channel/chat so the async result re-enters the right chat.
@@ -29,56 +25,36 @@ def home(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_assistants_lists_builtins_with_default_models(home) -> None:
-    result, _ = await dispatch("subagents.assistants", {})
-    names = {a["name"] for a in result["assistants"]}
-    assert {"researcher", "writer", "coder"} <= names
-    for a in result["assistants"]:
-        # Unset → no override, effective == default.
-        assert a["override"] == ""
-        assert a["effectiveModel"] == a["defaultModel"]
-        assert a["builtin"] is True
+@pytest.mark.parametrize("method", ["subagents.assistants", "assistants.list", "assistants.reload"])
+async def test_retired_reads_answer_an_empty_list(home, method) -> None:
+    result, _ = await dispatch(method, {})
+    assert result == {"assistants": [], "retired": True}
 
 
 @pytest.mark.asyncio
-async def test_set_model_concrete_inherit_and_clear(home) -> None:
-    # Concrete override.
-    res, _ = await dispatch(
-        "subagents.set_model", {"name": "writer", "model": "openrouter/x/y"}
-    )
-    assert res["override"] == "openrouter/x/y"
-    assert res["effectiveModel"] == "openrouter/x/y"
-
-    # Inherit → effective resolves to the bot model.
-    res, _ = await dispatch("subagents.set_model", {"name": "researcher", "model": "inherit"})
-    assert res["override"] == "inherit"
-    assert res["effectiveModel"] == res["botModel"]
-
-    # Persisted across reads.
-    listing, _ = await dispatch("subagents.assistants", {})
-    by_name = {a["name"]: a for a in listing["assistants"]}
-    assert by_name["writer"]["override"] == "openrouter/x/y"
-    assert by_name["researcher"]["override"] == "inherit"
-
-    # Clear → back to default.
-    res, _ = await dispatch("subagents.set_model", {"name": "writer", "model": ""})
-    assert res["override"] == ""
-    listing, _ = await dispatch("subagents.assistants", {})
-    by_name = {a["name"]: a for a in listing["assistants"]}
-    assert by_name["writer"]["override"] == ""
-    assert by_name["writer"]["effectiveModel"] == by_name["writer"]["defaultModel"]
+@pytest.mark.parametrize(
+    ("method", "params"),
+    [
+        ("subagents.set_model", {"name": "writer", "model": "openrouter/x/y"}),
+        ("assistants.write", {"name": "helper", "systemPrompt": "x"}),
+        ("assistants.delete", {"name": "helper"}),
+    ],
+)
+async def test_retired_writes_say_the_feature_is_gone(home, method, params) -> None:
+    with pytest.raises(FeatureRpcError) as caught:
+        await dispatch(method, params)
+    assert caught.value.code == "FEATURE_RETIRED"
 
 
 @pytest.mark.asyncio
-async def test_set_model_rejects_unknown_specialist(home) -> None:
+async def test_an_owner_made_assistant_file_is_left_on_disk(home) -> None:
+    folder = home / "assistants"
+    folder.mkdir()
+    made = folder / "helper.md"
+    made.write_text("---\nname: helper\n---\nbody\n")
     with pytest.raises(FeatureRpcError):
-        await dispatch("subagents.set_model", {"name": "nope", "model": "x"})
-
-
-@pytest.mark.asyncio
-async def test_set_model_requires_name(home) -> None:
-    with pytest.raises(FeatureRpcError):
-        await dispatch("subagents.set_model", {"name": "  ", "model": "x"})
+        await dispatch("assistants.delete", {"name": "helper"})
+    assert made.read_text() == "---\nname: helper\n---\nbody\n"
 
 
 class _FakeManager:

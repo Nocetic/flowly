@@ -4264,82 +4264,29 @@ def audit_clear() -> dict:
     return {"success": True}
 
 
-# ── Assistants (Agents tab) ─────────────────────────────────────────────────
+# ── Retired: user-defined assistants and specialist models ──────────────────
+#
+# The main agent writes each subagent's brief itself; there are no stored
+# researcher/writer/coder specialists or owner-made assistants any more. An
+# older client still asks for them, so the reads answer "none" and the writes
+# say plainly that the feature is gone instead of failing as unknown methods.
+# Assistant files an owner made earlier stay on disk untouched.
+
+_RETIRED_AGENTS_MESSAGE = (
+    "Custom agents were retired: the agent now creates a subagent for a task itself."
+)
 
 
-def _assistants_dir() -> Path:
-    return get_flowly_home() / "assistants"
+def assistants_list_retired() -> dict:
+    return {"assistants": [], "retired": True}
 
 
-def assistants_list() -> dict:
-    """User-defined + builtin assistants in the desktop Agents-tab shape."""
-    from flowly.agent.assistants import AssistantRegistry
-
-    reg = AssistantRegistry(_assistants_dir())
-    try:
-        reg.reload()
-    except Exception:
-        pass
-    out = []
-    for a in reg.all():
-        out.append(
-            {
-                "name": a.name,
-                "description": a.description,
-                "model": a.model,
-                "allowedTools": sorted(a.allowed_tools) if a.allowed_tools else None,
-                "autoSaveArtifact": getattr(a, "auto_save_artifact", False),
-                "artifactType": getattr(a, "artifact_type", None),
-                "systemPrompt": getattr(a, "system_prompt", ""),
-                "builtin": a.builtin,
-                "sourcePath": str(a.source_path) if a.source_path else None,
-            }
-        )
-    return {"assistants": out}
+def subagents_assistants_retired(params: dict) -> dict:
+    return {"assistants": [], "retired": True}
 
 
-def assistants_write(params: dict) -> dict:
-    """Create/edit a user assistant by writing ~/.flowly/assistants/{name}.md —
-    same YAML-fronted format the desktop writes locally. Returns
-    ``{"success": bool, "error"?: str}``."""
-    name = str(params.get("name", ""))
-    if not re.match(r"^[a-z0-9][a-z0-9_-]*$", name):
-        return {
-            "success": False,
-            "error": (
-                f"Invalid assistant name '{name}'. Use lowercase letters, digits, - and _ only."
-            ),
-        }
-    lines = [
-        "---",
-        f"name: {name}",
-        f"description: {params.get('description', '')}",
-        f"model: {params.get('model', '')}",
-    ]
-    tools = params.get("allowedTools")
-    if tools:
-        lines.append("allowed_tools: [" + ", ".join(f'"{t}"' for t in tools) + "]")
-    if params.get("autoSaveArtifact") is True:
-        lines.append("auto_save_artifact: true")
-    at = params.get("artifactType")
-    if at and at != "markdown":
-        lines.append(f"artifact_type: {at}")
-    lines += ["---", "", (params.get("systemPrompt") or "").strip(), ""]
-    d = _assistants_dir()
-    d.mkdir(parents=True, exist_ok=True)
-    (d / f"{name}.md").write_text("\n".join(lines), encoding="utf-8")
-    return {"success": True}
-
-
-def assistants_delete(params: dict) -> dict:
-    """Delete a user assistant (.md). Returns ``{"deleted": bool, "ok": bool}``."""
-    name = str(params.get("name", ""))
-    deleted = False
-    target = _assistants_dir() / f"{name}.md"
-    if target.exists():
-        target.unlink()
-        deleted = True
-    return {"deleted": deleted, "ok": deleted}
+def agents_feature_retired(params: dict) -> dict:
+    raise FeatureRpcError("FEATURE_RETIRED", _RETIRED_AGENTS_MESSAGE)
 
 
 # ── Pairing (Telegram / WhatsApp device approval) ───────────────────────────
@@ -4512,138 +4459,18 @@ def set_subagent_delegate_provider(provider) -> None:
     _subagent_delegate_provider = provider
 
 
-def subagents_assistants(params: dict) -> dict:
-    """Specialists the user can run as subagents, with their model settings —
-    for the desktop/TUI "subagent models" editor.
-
-    Each entry resolves the three-tier model policy (see ``builtin_agent``):
-      * ``override`` — what ``agents.assistant_models[name]`` holds:
-        ``""`` (unset → use the specialist's own default), ``"inherit"``
-        (run on the bot's selected model), or a concrete model id.
-      * ``effectiveModel`` — the model a spawn would actually use right now.
-      * ``defaultModel`` — the specialist's built-in default.
-
-    Returns ``{"assistants": [{name, description, defaultModel, override,
-    effectiveModel, builtin}], "botModel": <agents.defaults.model>}``.
-    """
-    from flowly.agent.assistants import AssistantRegistry
-    from flowly.config.loader import load_config
-
-    cfg = load_config()
-    overrides = cfg.agents.assistant_models or {}
-    bot_model = cfg.agents.defaults.model or ""
-
-    reg = AssistantRegistry(_assistants_dir())
-    try:
-        reg.reload()
-    except Exception:
-        pass
-
-    out = []
-    for a in reg.all():
-        override = overrides.get(a.name, "") or ""
-        if override == "inherit":
-            effective = bot_model
-        elif override:
-            effective = override
-        else:
-            effective = a.model
-        out.append(
-            {
-                "name": a.name,
-                "description": a.description,
-                "defaultModel": a.model,
-                "override": override,
-                "effectiveModel": effective,
-                "builtin": a.builtin,
-            }
-        )
-    return {"assistants": out, "botModel": bot_model}
-
-
-def subagents_set_model(params: dict) -> dict:
-    """Set (or clear) the per-specialist model override.
-
-    Params: ``{"name": <specialist>, "model": <id>|"inherit"|""}``.
-      * a model id  — run that specialist on this model
-      * ``"inherit"`` — run it on the bot's selected model
-      * ``""`` / null — clear the override (use the specialist's default)
-
-    Writes ``agents.assistant_models`` in config. No restart needed: the next
-    ``builtin_agent`` dispatch reads the fresh config when it spawns.
-    Returns ``{"ok": True, "name", "override", "effectiveModel", "botModel"}``.
-    """
-    name = params.get("name")
-    if not isinstance(name, str) or not name.strip():
-        raise FeatureRpcError("INVALID", "name must be a non-empty string")
-    name = name.strip()
-
-    raw = params.get("model")
-    model = (raw or "").strip() if isinstance(raw, str) else ""
-
-    from flowly.agent.assistants import AssistantRegistry
-    from flowly.config.loader import get_config_path, load_config
-    from flowly.integrations.config_io import (
-        _atomic_write_json,
-        _load_raw,
-        _set_path,
-    )
-
-    reg = AssistantRegistry(_assistants_dir())
-    try:
-        reg.reload()
-    except Exception:
-        pass
-    asst = reg.get(name)
-    if asst is None:
-        raise FeatureRpcError("INVALID", f"unknown specialist '{name}'. Available: {reg.names()}")
-
-    cfg = load_config()
-    overrides = dict(cfg.agents.assistant_models or {})
-    if model:
-        overrides[name] = model
-    else:
-        overrides.pop(name, None)
-
-    # Write the whole map at once via the raw path (merge=False replaces the
-    # leaf). save_config()'s deep-merge can ADD/overwrite keys but never DELETE
-    # one, so clearing an override (pop) would silently survive on disk — the
-    # raw replace makes "reset to default" actually stick. Atomic + backed up,
-    # same convention as the /model picker's _set_default_model.
-    raw = _load_raw()
-    _set_path(raw, "agents.assistant_models", overrides, merge=False)
-    _atomic_write_json(get_config_path(), raw)
-
-    bot_model = cfg.agents.defaults.model or ""
-    if model == "inherit":
-        effective = bot_model
-    elif model:
-        effective = model
-    else:
-        effective = asst.model
-    return {
-        "ok": True,
-        "name": name,
-        "override": model,
-        "effectiveModel": effective,
-        "botModel": bot_model,
-    }
-
-
 async def subagents_spawn(params: dict) -> dict:
     """Manually launch a background subagent for an ad-hoc task.
 
-    Unlike ``builtin_agent`` (which the LLM calls and picks a specialist), this
-    is a user-initiated spawn from a client UI (TUI ``/subagents <task>``). It
-    runs a generic subagent on the bot's model and announces the result back to
-    the origin session asynchronously — the same delivery path async specialists
-    use — so the chat the user spawned from receives the answer when it's ready.
+    A user-initiated spawn from a client UI (TUI ``/subagents <task>``). It
+    runs a subagent on the bot's model and announces the result back to the
+    origin session asynchronously, so the chat the user spawned from receives
+    the answer when it's ready.
 
     Params:
       ``task`` (required) — what the subagent should do.
       ``sessionKey`` — origin session ("channel:chat_id"); the result is
         announced here. Defaults to ``cli:direct``.
-      ``assistant`` — optional specialist name to run as (else generic).
 
     Returns ``{"ok": True, "runId": <id>, "displayName": <name>}``.
     """
@@ -4666,23 +4493,6 @@ async def subagents_spawn(params: dict) -> dict:
     else:
         origin_channel, origin_chat_id = "cli", session_key
 
-    # Optional specialist. Unknown name ⇒ generic subagent (don't fail the
-    # spawn over a bad assistant; the task still runs).
-    assistant = None
-    asst_name = params.get("assistant")
-    if isinstance(asst_name, str) and asst_name.strip():
-        try:
-            from flowly.agent.assistants import AssistantRegistry
-
-            reg = AssistantRegistry(_assistants_dir())
-            try:
-                reg.reload()
-            except Exception:
-                pass
-            assistant = reg.get(asst_name.strip())
-        except Exception:
-            assistant = None
-
     raw = await manager.spawn(
         task=task,
         label="manual",
@@ -4690,7 +4500,6 @@ async def subagents_spawn(params: dict) -> dict:
         origin_chat_id=origin_chat_id,
         cleanup="keep",
         wait=False,
-        assistant=assistant,
     )
     # An async (wait=False) spawn always returns a JSON envelope: on success
     # ``{"status": "dispatched", "run_id": ..., "label": ...}``, on refusal
@@ -5559,8 +5368,8 @@ _DISPATCH: dict[str, tuple] = {
     "subagents.get": (subagents_get, True, False),
     "subagents.result": (subagents_result, True, False),
     "subagents.cancel": (subagents_cancel, True, False),
-    "subagents.assistants": (subagents_assistants, True, False),
-    "subagents.set_model": (subagents_set_model, True, False),
+    "subagents.assistants": (subagents_assistants_retired, True, False),
+    "subagents.set_model": (agents_feature_retired, True, False),
     "subagents.spawn": (subagents_spawn, True, False),
     "board.card": (board_card, True, False),
     "cron.list": (cron_list, True, False),
@@ -5682,9 +5491,10 @@ _DISPATCH: dict[str, tuple] = {
     "flowlets.createFromTemplate": (flowlets_create_from_template, True, False),
     "model.list": (model_list, True, False),
     "model.set": (model_set, True, True),
-    "assistants.list": (assistants_list, False, False),
-    "assistants.write": (assistants_write, True, False),
-    "assistants.delete": (assistants_delete, True, False),
+    "assistants.list": (assistants_list_retired, False, False),
+    "assistants.reload": (subagents_assistants_retired, True, False),
+    "assistants.write": (agents_feature_retired, True, False),
+    "assistants.delete": (agents_feature_retired, True, False),
     "skills.list": (skills_list, False, False),
     "skills.install": (skills_install, True, True),
     "skills.remove": (skills_remove, True, True),

@@ -58,7 +58,7 @@ The full list — session, model, tools, permissions, account, and the keybindin
 
 ## Personas
 
-Switch the agent's persona (its voice and default behavior) with `/assistants` (alias `/persona`), or press **`Ctrl+M`** for the picker. See [Personas](./personas.md).
+The agent's persona (its voice and default behavior) is set in its configuration. See [Personas](./personas.md).
 
 ## Sessions & history
 
@@ -121,7 +121,7 @@ This is for *your* quick checks; the agent has its own sandboxed shell tool gove
 | `Shift+Tab` | Cycle permission level: 🔒 Ask → ⚖️ Auto → 🚀 YOLO → ▣ [Plan](../features/plan-mode.md) |
 | `↑` / `↓` | Input history prev / next; `↓` on an empty draft opens this chat's [artifacts](../features/artifacts.md) (`↑/↓` select · `Enter` open · `←/→` switch in the viewer) |
 | `Ctrl+E` | Edit draft in `$EDITOR` |
-| `Ctrl+S` / `Ctrl+M` | Sessions / personas picker |
+| `Ctrl+S` | Sessions picker |
 | `Ctrl+A` | Toggle subagent sidebar |
 | `F1`–`F4` | Help · Activity · Approvals · Artifacts |
 | `Ctrl+C` | Abort the run, or quit when idle |

@@ -75,7 +75,7 @@ See [Image generation](../features/image-generation.md) for the full image_gener
 | `board_add` / `board_list` / `board_get` / `board_update` | Capture and manage cards on the [task board](/docs/features/board). | — |
 | `board_run` | Run a card, or split a goal into parallel sub-cards. | — |
 | `delegate_to` | Hand a task to a CLI-subprocess agent or team. | `flowly setup agents` |
-| `spawn` / `builtin_agent` | Run an in-process subagent (writer / researcher / coder). | — |
+| `spawn` | Run an in-process subagent for a task the agent describes. | — |
 | `skill_view` / `skill_manage` | Read / author skills. | — |
 
 ## Integrations

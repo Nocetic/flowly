@@ -369,9 +369,9 @@ class AgentsConfig(BaseModel):
     agents: dict[str, MultiAgentConfig] = Field(default_factory=dict)
     teams: dict[str, MultiAgentTeamConfig] = Field(default_factory=dict)
     max_concurrent_cli_agents: int = Field(default=5, ge=1, le=64)
-    # Per-specialist model override: assistant name → model id. Empty/absent
-    # means the specialist inherits the bot's selected model. Lets a user run,
-    # say, the researcher on a cheap fast model and the writer on a strong one.
+    # Retired with the stored specialists: a subagent runs on the model of the
+    # agent that spawns it, or on one the owner names for that task. Kept only
+    # so configs written by earlier versions still load; nothing reads it.
     assistant_models: dict[str, str] = Field(default_factory=dict)
 
 

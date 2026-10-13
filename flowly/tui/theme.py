@@ -562,8 +562,6 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     ApprovalsModal .title,
     ArtifactsPanel .title,
     ArtifactsModal .title,
-    AssistantPickerPanel .title,
-    AssistantPicker .title,
     BrowserPanel .title,
     BrowserModal .title,
     ConfirmPanel .title,
@@ -586,12 +584,8 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     ProviderPicker .title,
     SessionPickerPanel .title,
     SessionPicker .title,
-    SubagentModelsPanel .title,
-    SubagentModelsModal .title,
     ThemePickerPanel .title,
-    ThemePicker .title,
-    SpecialistModelPickerPanel .title,
-    _SpecialistModelPicker .title {{
+    ThemePicker .title {{
         color: {palette.accent};
     }}
 
@@ -609,10 +603,6 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
         color: {palette.text};
     }}
 
-    AssistantPickerPanel .hint,
-    AssistantPickerPanel .footnote,
-    AssistantPicker .hint,
-    AssistantPicker .footnote,
     BrowserPanel .description,
     BrowserPanel #status-line,
     BrowserModal .description,
@@ -636,14 +626,6 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     ProviderPicker .footer,
     SessionPickerPanel .hint,
     SessionPicker .hint,
-    SubagentModelsPanel .hint,
-    SubagentModelsPanel .footer,
-    SubagentModelsModal .hint,
-    SubagentModelsModal .footer,
-    SpecialistModelPickerPanel .hint,
-    SpecialistModelPickerPanel .footer,
-    _SpecialistModelPicker .hint,
-    _SpecialistModelPicker .footer,
     IntegrationSetupModal .field-row > Label,
     IntegrationSetupModal .field-help,
     IntegrationSetupModal #status-line,
@@ -675,8 +657,6 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
         color: {palette.text};
     }}
 
-    AssistantPickerPanel OptionList,
-    AssistantPicker OptionList,
     ArtifactsModal ListView,
     IntegrationSetupModal VerticalScroll,
     IntegrationsPanel OptionList,
@@ -689,12 +669,8 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     ProviderPicker OptionList,
     SessionPickerPanel OptionList,
     SessionPicker OptionList,
-    SubagentModelsPanel OptionList,
-    SubagentModelsModal OptionList,
     ThemePickerPanel OptionList,
     ThemePicker OptionList,
-    SpecialistModelPickerPanel OptionList,
-    _SpecialistModelPicker OptionList,
     HelpPanel VerticalScroll,
     HelpPanel Markdown,
     HelpModal VerticalScroll,

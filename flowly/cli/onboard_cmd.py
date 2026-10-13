@@ -27,7 +27,6 @@ def onboard():
 
     Runs the same unified first-run flow: seed the workspace, then choose a
     Flowly account or your own API key, and offer to start the gateway.
-    Persona switching lives in the TUI (``/assistants`` / Ctrl+M).
     """
     run_onboarding()
 

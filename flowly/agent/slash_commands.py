@@ -147,7 +147,6 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True),
     # TUI modal launchers (Ctrl/F-key shortcuts) — handled by _on_slash but were
     # missing from the palette, so they worked when typed yet never autocompleted.
-    CommandDef("assistants", "Pick a persona / assistant", "Configuration", cli_only=True),
     CommandDef("subagents", "Toggle the subagent sidebar", "Tools & Skills",
                cli_only=True, aliases=("subs",)),
     CommandDef("activity", "Activity / audit log", "Info", cli_only=True),

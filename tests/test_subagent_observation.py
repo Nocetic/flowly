@@ -87,17 +87,13 @@ async def test_provider_terminal_errors_are_never_success(tmp_path, code, status
     await mgr._events.flush()
 
 
-async def test_full_unicode_result_survives_context_cap_and_restart(tmp_path):
-    from flowly.agent.assistants import AssistantRegistry
-    assistants = AssistantRegistry(tmp_path / "assistants")
-    assistants.reload()
+async def test_full_unicode_result_survives_restart(tmp_path):
     full = "Kanıt ve sonuç 🌱.\n" * 2500
     mgr = manager(tmp_path, Provider(LLMResponse(content=full)))
-    inline = await mgr.spawn("Read report", wait=True, assistant=assistants.get("researcher"))
-    assert len(inline) < len(full)
+    inline = await mgr.spawn("Read report", wait=True)
+    assert inline == full
     restarted = SubagentRegistry(tmp_path / "runs.json")
     rec = restarted.all()[0]
-    assert rec.artifact_ids
     assert len(run_view(rec)["resultPreview"]) == 1200
     offset, chunks = 0, []
     while True:
@@ -142,7 +138,7 @@ async def test_trace_survives_cancellation_inside_tool(tmp_path, monkeypatch):
     async def capture(name, data):
         events.append((name, data))
     mgr = manager(tmp_path, Provider(response), on_event=capture)
-    await mgr.spawn("Check folder", label="builtin:researcher", silent=True)
+    await mgr.spawn("Check folder", silent=True)
     await asyncio.wait_for(entered.wait(), 2)
     rec = mgr.registry.all()[0]
     disk = SubagentRegistry(tmp_path / "runs.json").get(rec.run_id)

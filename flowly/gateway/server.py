@@ -1641,13 +1641,6 @@ class GatewayServer:
             elif method == "subagents.cancel":
                 await self._ws_rpc_subagents_cancel(ws, rpc_id, params)
 
-            # P2.8 — Assistant registry (Desktop Agents tab "Your agents" section)
-            elif method == "assistants.list":
-                await self._ws_rpc_assistants_list(ws, rpc_id, params)
-
-            elif method == "assistants.reload":
-                await self._ws_rpc_assistants_reload(ws, rpc_id, params)
-
             elif method == "exec.approval.resolve":
                 await self._ws_rpc_exec_approval_resolve(ws, rpc_id, params)
 
@@ -2385,62 +2378,6 @@ class GatewayServer:
 
         result = _json.loads(result_json)
         await self._ws_rpc_reply(ws, rpc_id, result)
-
-    # --- RPC: assistants.list / assistants.reload (P2.8) ---
-    # Desktop UI's "Agents" tab reads these to populate the "Your agents"
-    # section. Desktop writes the .md files directly via Node fs; when
-    # it's done it calls assistants.reload so Python picks up the new
-    # file without a gateway restart.
-
-    async def _ws_rpc_assistants_list(
-        self,
-        ws: web.WebSocketResponse,
-        rpc_id: str,
-        params: dict,
-    ) -> None:
-        registry = getattr(self, "_assistant_registry", None)
-        if registry is None:
-            await self._ws_rpc_error(
-                ws,
-                rpc_id,
-                "NOT_AVAILABLE",
-                "Assistant registry not wired",
-            )
-            return
-        assistants = []
-        for a in registry.all():
-            assistants.append(
-                {
-                    "name": a.name,
-                    "description": a.description,
-                    "model": a.model,
-                    "allowedTools": sorted(a.allowed_tools) if a.allowed_tools else None,
-                    "autoSaveArtifact": a.auto_save_artifact,
-                    "artifactType": a.artifact_type,
-                    "systemPrompt": a.system_prompt,
-                    "builtin": a.builtin,
-                    "sourcePath": str(a.source_path) if a.source_path else None,
-                }
-            )
-        await self._ws_rpc_reply(ws, rpc_id, {"assistants": assistants})
-
-    async def _ws_rpc_assistants_reload(
-        self,
-        ws: web.WebSocketResponse,
-        rpc_id: str,
-        params: dict,
-    ) -> None:
-        registry = getattr(self, "_assistant_registry", None)
-        if registry is None:
-            await self._ws_rpc_error(
-                ws,
-                rpc_id,
-                "NOT_AVAILABLE",
-                "Assistant registry not wired",
-            )
-            return
-        report = registry.reload()
-        await self._ws_rpc_reply(ws, rpc_id, report.to_dict())
 
     # --- RPC: coaching.* (meeting coach) ---
 

@@ -68,7 +68,6 @@ from flowly.tui.media_upload import AttachmentPreparationError, prepare_media_at
 from flowly.tui.panes.activity_modal import ActivityPanel
 from flowly.tui.panes.approvals_modal import ApprovalsPanel
 from flowly.tui.panes.artifacts_modal import ArtifactsPanel
-from flowly.tui.panes.assistant_picker import AssistantPickerPanel
 from flowly.tui.panes.browser_modal import BrowserPanel
 from flowly.tui.panes.composer import (
     ApprovalPrompt,
@@ -97,7 +96,6 @@ from flowly.tui.panes.provider_picker import ProviderPickerPanel
 from flowly.tui.panes.session_picker import SessionPickerPanel
 from flowly.tui.panes.status import ContextHeader, StatusBar
 from flowly.tui.panes.status_panel import SessionStatusPanel
-from flowly.tui.panes.subagent_models import SubagentModelsPanel
 from flowly.tui.panes.subagents import SubagentPane
 from flowly.tui.panes.theme_picker import ThemePickerPanel
 from flowly.tui.panes.transcript import Bubble, TranscriptPane
@@ -260,7 +258,6 @@ class FlowlyTUI(App[None]):
         Binding("ctrl+l", "clear_session", "Clear", priority=True),
         Binding("ctrl+d", "quit", "Quit", priority=True),
         Binding("ctrl+s", "open_sessions", "Sessions", priority=True),
-        Binding("ctrl+m", "open_assistants", "Assistants", priority=True),
         Binding("ctrl+a", "toggle_subagents", "Subagents", priority=True),
         Binding("f1", "open_help", "Help", priority=True),
         Binding("f2", "open_activity", "Activity", priority=True),
@@ -1952,11 +1949,6 @@ class FlowlyTUI(App[None]):
         event.stop()
         self._finish_composer_picker(None)
 
-    @on(AssistantPickerPanel.Dismissed)
-    def _on_assistant_picker_dismissed(self, event: AssistantPickerPanel.Dismissed) -> None:
-        event.stop()
-        self._finish_composer_picker(event.result)
-
     @on(SessionPickerPanel.Dismissed)
     def _on_session_picker_dismissed(self, event: SessionPickerPanel.Dismissed) -> None:
         event.stop()
@@ -1964,11 +1956,6 @@ class FlowlyTUI(App[None]):
 
     @on(HelpPanel.Dismissed)
     def _on_help_panel_dismissed(self, event: HelpPanel.Dismissed) -> None:
-        event.stop()
-        self._finish_composer_picker(None)
-
-    @on(SubagentModelsPanel.Dismissed)
-    def _on_subagent_models_dismissed(self, event: SubagentModelsPanel.Dismissed) -> None:
         event.stop()
         self._finish_composer_picker(None)
 
@@ -2287,13 +2274,6 @@ class FlowlyTUI(App[None]):
         if head == "/sessions":
             self.action_open_sessions()
             return
-        if head in ("/assistants", "/persona"):
-            # ``/model`` used to alias here (assistant picker), but it's
-            # now bound to the LLM-model picker (see below). Persona /
-            # assistant switching lives under ``/assistants`` and
-            # ``/persona`` so the two pickers don't collide.
-            self.action_open_assistants()
-            return
         if head == "/login":
             self.action_login()
             return
@@ -2361,9 +2341,6 @@ class FlowlyTUI(App[None]):
             if not sub:
                 # bare → toggle the running-tasks panel (unchanged).
                 self.action_toggle_subagents()
-            elif sub.lower() == "models":
-                # `/subagents models` → per-specialist model editor.
-                self.action_subagent_models()
             else:
                 # `/subagents <task>` → launch a manual background subagent.
                 self.action_spawn_subagent(sub)
@@ -2759,14 +2736,6 @@ class FlowlyTUI(App[None]):
 
     def action_toggle_subagents(self) -> None:
         self.query_one(SubagentPane).toggle()
-
-    @work
-    async def action_subagent_models(self) -> None:
-        """``/subagents models`` — open the per-specialist model editor."""
-        await self._show_composer_picker(
-            SubagentModelsPanel(self._client),
-            inline=True,
-        )
 
     @work
     async def action_spawn_subagent(self, task: str) -> None:
@@ -4172,36 +4141,6 @@ class FlowlyTUI(App[None]):
         await self._show_composer_picker(
             ArtifactsPanel(arts, fetcher=self._client.artifacts_get),
             inline=True,
-        )
-
-    @work
-    async def action_open_assistants(self) -> None:
-        transcript = self.query_one(TranscriptPane)
-        try:
-            assistants = await self._client.assistants_list()
-        except Exception as exc:
-            transcript.add_error(f"assistants.list failed: {exc}")
-            return
-        if not assistants:
-            transcript.add_system(
-                "no assistants registered (registry not wired or empty)"
-            )
-            return
-        picked = await self._show_composer_picker(
-            AssistantPickerPanel(assistants),
-            inline=True,
-        )
-        if not picked:
-            return
-        name = picked["name"]
-        new_key = f"tui:{name}"
-        await self._switch_session(new_key)
-        status = self.query_one(StatusBar)
-        if picked.get("model"):
-            status.model = picked["model"]
-        transcript.add_system(
-            f"switched to assistant [b]{name}[/b]"
-            + (f" · model {picked['model']}" if picked.get("model") else "")
         )
 
     @work

@@ -43,7 +43,6 @@ Pausing or ending a goal also stops the goal turn that is streaming at that mome
 |---|---|
 | `/provider` | Pick the LLM provider (arrow-key picker). `/provider <key>` switches directly; `/provider off` clears. |
 | `/model` | Pick a model from the active provider's catalog (live for OpenRouter). |
-| `/assistants` (`/persona`) | Pick a persona / assistant. |
 | `/theme` | Switch the TUI theme. `/theme mono` switches directly. |
 
 ## Tools & integrations
@@ -157,7 +156,6 @@ behaves like `/plan status`.
 | `↑` / `↓` | History prev / next (single-line draft) |
 | `Ctrl+E` | Open the draft in `$EDITOR` |
 | `Ctrl+S` | Open the sessions picker |
-| `Ctrl+M` | Open the assistants / persona picker |
 | `Ctrl+A` | Toggle the subagent sidebar |
 | `F1` … `F4` | Help · Activity · Approvals · Artifacts |
 | `Ctrl+C` | Abort the current run, or quit if idle |

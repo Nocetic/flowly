@@ -348,40 +348,6 @@ class _AgentGoalDelivery(GoalDelivery):
         )
 
 
-# ── Built-in agent keyword routing ──────────────────────────────────────────
-
-_WRITING_KW = frozenset({
-    "rapor", "report", "essay", "makale", "article", "doküman", "document",
-    "yaz", "write", "hazırla", "prepare", "oluştur", "çalışma kağıdı",
-    "study guide", "özet", "summary", "mektup", "letter", "döküman",
-    "composition", "draft", "taslak",
-})
-_RESEARCH_KW = frozenset({
-    "araştır", "research", "analiz", "analysis", "karşılaştır", "compare",
-    "incele", "investigate", "kaynak", "source", "bul ve özetle",
-})
-_CODE_KW = frozenset({
-    "code review", "refactor", "debug", "test yaz", "write test",
-    "kod incele", "hata bul", "fix bug", "kod review",
-})
-
-
-def _detect_builtin_agent_type(task_text: str) -> str | None:
-    """Detect if a spawn task should be routed to a built-in specialist agent.
-
-    Returns agent type ('writer', 'researcher', 'coder') or None.
-    Uses keyword scoring to pick the best-matching specialist.
-    """
-    t = task_text.lower()
-    scores = {
-        "writer": sum(1 for kw in _WRITING_KW if kw in t),
-        "researcher": sum(1 for kw in _RESEARCH_KW if kw in t),
-        "coder": sum(1 for kw in _CODE_KW if kw in t),
-    }
-    best = max(scores, key=scores.get)  # type: ignore[arg-type]
-    return best if scores[best] > 0 else None
-
-
 def _maybe_extract_image_for_vision(raw_result: str, tool_name: str) -> str | None:
     """If the raw tool result asks the loop to render an image content block,
     return the image data URL. Otherwise return None.
@@ -2658,24 +2624,6 @@ class AgentLoop:
         spawn_tool = SpawnTool(manager=self.subagents)
         self.tools.register(spawn_tool)
 
-        # Built-in agent tool (internal specialist agents)
-        # P2.8 — the `builtin_agent` tool is now registry-backed: its
-        # enum and description are derived from AssistantRegistry at
-        # schema time, so dropping a new ~/.flowly/assistants/{name}.md
-        # exposes a new specialist without a code change. Tool name and
-        # parameter shape are unchanged vs the pre-P2.8 API so LLM
-        # trajectories keep working.
-        from flowly.agent.assistants import AssistantRegistry
-        from flowly.agent.tools.builtin_agent import BuiltinAgentTool
-        from flowly.profile import get_flowly_home
-        self._assistant_registry = AssistantRegistry(
-            get_flowly_home() / "assistants"
-        )
-        builtin_agent_tool = BuiltinAgentTool(
-            manager=self.subagents, registry=self._assistant_registry,
-        )
-        self.tools.register(builtin_agent_tool)
-
         # Sessions list tool (with cancel capability)
         from flowly.agent.tools.sessions_list import SessionsListTool
         self.tools.register(SessionsListTool(
@@ -4880,27 +4828,8 @@ class AgentLoop:
         self,
         tool_defs: list[dict[str, Any]],
         live_call_turn: bool,
-        builtin_agent_dispatched: bool = False,
     ) -> tuple[list[dict[str, Any]], list[str]]:
         """Apply per-turn tool constraints for safety and predictability."""
-        # After an ASYNC (background) subagent was dispatched this turn, hide
-        # ALL tools. There is nothing more for the parent to DO in this turn —
-        # the work is now running in the background — so the next model step
-        # should be a short text acknowledgement ("started, I'll report back"),
-        # after which the loop ends naturally (no tool calls → break). This is
-        # what frees the parent to go idle promptly and answer each subagent's
-        # result INCREMENTALLY as it finishes, instead of marathoning on its own
-        # tool calls while completions pile up undelivered.
-        #
-        # All parallel dispatches in the SAME batch still run: the policy is
-        # applied at the START of an iteration, so the dispatch batch executes
-        # first and only the NEXT iteration is tool-less. Sync delegations don't
-        # set this flag (their result is returned inline, no "dispatched"
-        # envelope), so a synthesise-the-result turn keeps its full toolset.
-        if builtin_agent_dispatched:
-            hidden = [td.get("function", {}).get("name", "") for td in tool_defs]
-            return [], hidden
-
         if not live_call_turn:
             return tool_defs, []
 
@@ -5898,8 +5827,6 @@ class AgentLoop:
         if live_call_turn and not enforce_action_tools:
             max_turn_iterations = min(max_turn_iterations, 3)
 
-        # Built-in agent dispatch tracking (enterprise pattern: tool hiding)
-        _builtin_agent_dispatched = False
         # One-shot soft warning state — see soft_warn_at_iteration. We don't
         # hard-stop on iteration count; we trust the model
         # to decide when it's done via stop_reason="end_turn". The warning
@@ -6053,7 +5980,6 @@ class AgentLoop:
                     disabled_tools=disabled_tools,
                 ),
                 live_call_turn=live_call_turn,
-                builtin_agent_dispatched=_builtin_agent_dispatched,
             )
             if policy_blocked_tools:
                 blocked_tools.extend(policy_blocked_tools)
@@ -6868,19 +6794,6 @@ class AgentLoop:
                         ):
                             call_args["session_key"] = _current_session_key
 
-                        # Spawn interception: redirect spawn → builtin_agent
-                        # when task matches a specialist keyword (enterprise pattern)
-                        if _effective_tool_name == "spawn" and not _builtin_agent_dispatched:
-                            _task_text = str(call_args.get("task", ""))
-                            _detected_agent = _detect_builtin_agent_type(_task_text)
-                            if _detected_agent:
-                                logger.info(
-                                    f"Spawn intercepted → builtin:{_detected_agent} "
-                                    f"(keywords matched in task)"
-                                )
-                                call_args = {"agent": _detected_agent, "task": _task_text}
-                                _effective_tool_name = "builtin_agent"
-
                         _enabled_toolsets, _disabled_toolsets = self._resolve_toolset_route(
                             tool_platform or outbound_channel
                         )
@@ -6964,21 +6877,6 @@ class AgentLoop:
                             logger.debug(
                                 f"Tool success: {_effective_tool_name} result={result[:180]}"
                             )
-                            # Track ASYNC (background) subagent dispatch so the
-                            # next iteration hides tools and the turn ends with a
-                            # plain acknowledgement — letting each subagent's
-                            # result be delivered and answered incrementally as it
-                            # finishes, instead of the parent marathoning on its
-                            # own tool calls (staying "busy") and forcing every
-                            # announce to queue up until the turn finally ends.
-                            # The async envelope reports status "dispatched"; the
-                            # older/spawn paths used "accepted" — match both. (The
-                            # previous "accepted"-only check never fired for an
-                            # async builtin_agent, so the turn never ended early.)
-                            if _effective_tool_name == "builtin_agent" and (
-                                '"dispatched"' in result or '"accepted"' in result
-                            ):
-                                _builtin_agent_dispatched = True
                         else:
                             logger.warning(
                                 f"Tool failed: {_effective_tool_name} result={result[:220]}"
@@ -7031,8 +6929,6 @@ class AgentLoop:
                     # awkward to promote; parent already has per-tool
                     # caps (_TOOL_MAX_CHARS) and can re-call the tool
                     # with a narrower query when it needs more detail.
-                    # Context persistence now exists only on the
-                    # subagent boundary (Assistant.cap_to_artifact).
                     sanitized_result = _sanitize_tool_result(result, _effective_tool_name)
 
                     # If the tool flagged its result as an image-bearing
@@ -8519,9 +8415,6 @@ class AgentLoop:
         if isinstance(spawn_tool, SpawnTool):
             spawn_tool.set_context(tool_channel, tool_chat_id, is_subagent=False)
 
-        builtin_agent_tool = self.tools.get("builtin_agent")
-        if builtin_agent_tool and hasattr(builtin_agent_tool, "set_context"):
-            builtin_agent_tool.set_context(tool_channel, tool_chat_id)
 
         cron_tool = self.tools.get("cron")
         if isinstance(cron_tool, CronTool):
@@ -8934,9 +8827,6 @@ class AgentLoop:
             available_tools=turn_available_tools,
             reachable_tools=turn_reachable_tools,
         )
-        self._inject_recent_artifacts_hint(
-            messages, session_key=msg.session_key,
-        )
         from flowly.agent_home import begin_turn
         try:
             # Classifies this turn (introduction, tapped choice, typed message)
@@ -9302,9 +9192,6 @@ class AgentLoop:
         if isinstance(spawn_tool, SpawnTool):
             spawn_tool.set_context(origin_channel, origin_chat_id)
 
-        builtin_agent_tool = self.tools.get("builtin_agent")
-        if builtin_agent_tool and hasattr(builtin_agent_tool, "set_context"):
-            builtin_agent_tool.set_context(origin_channel, origin_chat_id)
 
         cron_tool = self.tools.get("cron")
         if isinstance(cron_tool, CronTool):
@@ -9317,7 +9204,7 @@ class AgentLoop:
 
         # Build messages with the announce content. This path is the
         # subagent-completion-announce turn — the parent wakes back up
-        # to deliver the specialist's result, so it runs on the parent
+        # to deliver the subagent's result, so it runs on the parent
         # agent's primary model (self.model), not on any per-cron
         # override (subagent runs are out-of-band by then). The
         # announce turn is delivered on the parent's origin channel,
@@ -9345,10 +9232,6 @@ class AgentLoop:
             available_tools=system_available_tools,
             reachable_tools=set(system_disclosure.all_names),
         )
-        self._inject_recent_artifacts_hint(
-            messages, session_key=f"{origin_channel}:{origin_chat_id}",
-        )
-
         live_call_turn = self._is_live_call_turn(msg.content)
         turn_messages: list[dict[str, Any]] = []
         reply_media: list[str] = []
@@ -9520,72 +9403,6 @@ class AgentLoop:
             "max_iterations": self.max_iterations,
         }
 
-    def _inject_recent_artifacts_hint(
-        self,
-        messages: list[dict[str, Any]],
-        session_key: str,
-    ) -> None:
-        """Prepend an ephemeral system note listing recent subagent
-        artifacts for this session, if any exist.
-
-        Conditional on the tracker actually having entries — when no
-        subagent has produced an artifact in this session, nothing is
-        injected. That's the entire point: the LLM only learns about
-        artifacts that were really created, so proactive offers like
-        'Tam raporu göstereyim mi?' never promise a file that doesn't
-        exist (the risk with a blanket prompt rule).
-
-        The hint lands AFTER the cached system prompt — it's a fresh
-        ephemeral message each turn, so prompt-cache hits on the big
-        static prompt still work. ~100-200 tokens per turn when there
-        ARE artifacts; zero cost otherwise.
-        """
-        try:
-            recent = self.subagents.recent_completed_dispatches(
-                parent_session_key=session_key,
-                max_age_seconds=600.0,  # 10 min — matches the guard window
-            )
-        except Exception:
-            # Tracker unavailable — fail silent. Hint is best-effort.
-            return
-        if not recent:
-            return
-        # Cap to top 5 most recent. More than that just bloats tokens
-        # without helping — the user rarely cares about a research from
-        # 9 minutes ago when they're talking about something 1 minute old.
-        recent = recent[:5]
-        lines = [
-            "[Session context — persisted artifacts produced earlier in this session]",
-        ]
-        for r in recent:
-            import time as _time
-            mins_ago = max(0, int((_time.time() - r["completed_at"]) / 60))
-            when = f"{mins_ago} min ago" if mins_ago > 0 else "just now"
-            lines.append(
-                f"- {r['artifact_id']} — \"{r['title'][:80]}\" "
-                f"(from {r['label']}, completed {when})"
-            )
-        lines.append(
-            "\nIf the user asks to view, save, reference, or follow up "
-            "on one of these — in any language — use "
-            "artifact(action='get', artifact_id=..., offset=0, limit=6000) "
-            "to read it, or just reference the artifact_id in your reply "
-            "(the client renders it as a preview card). Do NOT re-dispatch "
-            "the specialist and do NOT invent artifact IDs outside this "
-            "list. When delivering a summary derived from one of these, "
-            "you MAY proactively offer the full artifact (in the user's "
-            "language, one short sentence) — but only because the "
-            "artifact above actually exists."
-        )
-        hint = "\n".join(lines)
-        # Insert AFTER the cached system prompt (messages[0]) so the
-        # big prompt can still hit the cache. Skip if messages is
-        # unexpectedly empty or first message is not system.
-        if messages and messages[0].get("role") == "system":
-            messages.insert(1, {"role": "system", "content": hint})
-        else:
-            messages.insert(0, {"role": "system", "content": hint})
-
     @staticmethod
     def _inject_render_capability_hint(
         messages: list[dict[str, Any]],
@@ -9728,7 +9545,7 @@ class AgentLoop:
             metadata["render_capabilities"] = normalized_render_capabilities
         # Real (user-facing) delivery coordinates. When session_key is
         # "cron:{job_id}" the derived channel/chat_id aren't deliverable —
-        # tools that capture context (spawn, cron, builtin_agent, message,
+        # tools that capture context (spawn, cron, message,
         # voice_call) must use these instead so they never persist the
         # literal "cron" channel into jobs.json / announcements.
         if origin_channel:

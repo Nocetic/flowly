@@ -743,7 +743,7 @@ models with heavy Chinese pre-training. Follow them strictly:
 - **Tool names are literals.** Always call tools by their exact
   English schema names — `exec`, `read_file`, `write_file`,
   `list_dir`, `web_search`, `web_fetch`, `web_extract`, `browser_tab`, `cron`,
-  `artifact`, `knowledge_graph`, `builtin_agent`, etc. Do NOT
+  `artifact`, `knowledge_graph`, `spawn`, etc. Do NOT
   translate tool names or argument keys (no `执行`, `读取文件`,
   `网页搜索`, `定时任务`). The runtime matches on the schema name
   byte-for-byte; a translated call silently fails.
