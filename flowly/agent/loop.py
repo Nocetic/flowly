@@ -487,6 +487,54 @@ _XML_INVOKE_RE = re.compile(r"<\s*invoke\b[^>]*>.*?</\s*invoke\s*>", re.DOTALL |
 _CODE_FENCE_RE = re.compile(r"(```.*?```|~~~.*?~~~)", re.DOTALL)
 
 
+# A plugin's pre_llm_call hook must not hold the owner's reply. Past this the
+# model is called without that iteration's plugin context.
+_PRE_LLM_HOOK_TIMEOUT_SECONDS = 5.0
+_PLUGIN_CONTEXT_OPEN = "<plugin_context>\n"
+_PLUGIN_CONTEXT_CLOSE = "\n</plugin_context>\n\n"
+
+
+def _without_plugin_context(content: Any) -> Any:
+    """Remove a plugin block this loop prepended earlier, if any."""
+    if not isinstance(content, str) or not content.startswith(_PLUGIN_CONTEXT_OPEN):
+        return content
+    end = content.find(_PLUGIN_CONTEXT_CLOSE)
+    return content if end == -1 else content[end + len(_PLUGIN_CONTEXT_CLOSE):]
+
+
+def _with_plugin_context(messages: list[dict[str, Any]], injected: str) -> list[dict[str, Any]]:
+    """Return ``messages`` carrying exactly one plugin block, ``injected``.
+
+    The loop calls the hooks before every model call and feeds the result
+    back in, so an earlier block is removed first instead of being wrapped
+    again. The block belongs to the owner's message of this turn, never to a
+    loop nudge; an empty refresh leaves no block at all.
+    """
+    result = list(messages)
+    changed = False
+    for i, message in enumerate(result):
+        if message.get("role") != "user":
+            continue
+        stripped = _without_plugin_context(message.get("content"))
+        if stripped is not message.get("content"):
+            result[i] = {**message, "content": stripped}
+            changed = True
+    if injected:
+        for i in range(len(result) - 1, -1, -1):
+            message = result[i]
+            if message.get("role") != "user" or message.get(_EPHEMERAL_NUDGE):
+                continue
+            content = message.get("content", "")
+            if isinstance(content, str):  # multimodal user msgs (rare) — skip injection
+                result[i] = {
+                    **message,
+                    "content": f"{_PLUGIN_CONTEXT_OPEN}{injected}{_PLUGIN_CONTEXT_CLOSE}{content}",
+                }
+                changed = True
+            break
+    return result if changed else messages
+
+
 def _announces_untaken_step(text: str | None) -> bool:
     """True when a tool-less reply ends by announcing its next step.
 
@@ -5079,35 +5127,22 @@ class AgentLoop:
         )
 
         try:
-            contexts = await self.hooks.fire_pre_llm_call(ctx)
+            contexts = await asyncio.wait_for(
+                self.hooks.fire_pre_llm_call(ctx),
+                timeout=_PRE_LLM_HOOK_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"pre_llm_call hooks took over {_PRE_LLM_HOOK_TIMEOUT_SECONDS}s; "
+                "calling the model without plugin context"
+            )
+            contexts = []
         except Exception:
             logger.debug("pre_llm_call fire failed", exc_info=True)
             return messages
 
-        if not contexts:
-            return messages
-
-        injected = "\n\n".join(c for c in contexts if c)
-        if not injected:
-            return messages
-
-        # Prepend to the last user message inside <plugin_context> tags.
-        # Walk from the end so we hit the most recent user turn even if
-        # there are tool/assistant messages after it.
-        new_messages = list(messages)
-        for i in range(len(new_messages) - 1, -1, -1):
-            if new_messages[i].get("role") != "user":
-                continue
-            original = new_messages[i].get("content", "")
-            wrapped = (
-                f"<plugin_context>\n{injected}\n</plugin_context>\n\n{original}"
-                if isinstance(original, str)
-                else original  # multimodal user msgs (rare) — skip injection
-            )
-            new_messages[i] = {**new_messages[i], "content": wrapped}
-            break
-
-        return new_messages
+        injected = "\n\n".join(c for c in (contexts or []) if c)
+        return _with_plugin_context(messages, injected)
 
     async def _chat_with_stream(
         self,
