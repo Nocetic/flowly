@@ -215,7 +215,9 @@ def test_retention_uses_completion_time_and_prunes_result_files(tmp_path, monkey
     reg.update("run-1", announced=True)
     assert len(reg.all()) == 1  # a long-running task is still recent
     now = time.time()
-    monkeypatch.setattr("flowly.agent.subagent_registry.time.time", lambda: now + 86401)
+    monkeypatch.setattr("flowly.agent.subagent_registry.time.time", lambda: now + 7 * 86400)
+    assert len(reg.all()) == 1  # a finished run is kept for weeks, not a day
+    monkeypatch.setattr("flowly.agent.subagent_registry.time.time", lambda: now + 30 * 86400 + 1)
     assert reg.all() == []
     assert SubagentRegistry(tmp_path / "runs.json").all() == []
     reg.register(record("new"))

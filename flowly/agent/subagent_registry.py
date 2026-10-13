@@ -8,6 +8,7 @@ import math
 import os
 import re
 import secrets
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -22,7 +23,9 @@ def _default_registry_path() -> Path:
     return get_flowly_home() / "subagents" / "runs.json"
 
 _REGISTRY_PATH = None  # resolved lazily
-_PRUNE_AFTER_SECONDS = 86_400  # 24 hours
+# A finished run, its result and its transcript are kept this long: long
+# enough to reopen a conversation days later and still open its subagents.
+_PRUNE_AFTER_SECONDS = 30 * 86_400
 
 
 @dataclass
@@ -78,6 +81,8 @@ class SubagentRegistry:
 
     def __init__(self, path: Path | None = None) -> None:
         self._path = path or _default_registry_path()
+        self._transcript_lock = threading.Lock()
+        self._transcript_seq: dict[str, int] = {}
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = FileLock(str(self._path) + ".lock", timeout=5)
         self._runs: dict[str, SubagentRunRecord] = {}
@@ -184,6 +189,14 @@ class SubagentRegistry:
                         path.unlink()
                     except OSError:
                         logger.warning("Could not prune an expired subagent result")
+        keep_transcripts = {self._transcript_path(r.run_id).name for r in self._runs.values()}
+        if self._transcript_dir.exists():
+            for path in self._transcript_dir.glob("*.jsonl"):
+                if re.fullmatch(r"[0-9a-f]{64}\.jsonl", path.name) and path.name not in keep_transcripts:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        logger.warning("Could not prune an expired subagent transcript")
 
     @property
     def _result_dir(self) -> Path:
@@ -191,6 +204,67 @@ class SubagentRegistry:
 
     def _result_path(self, run_id: str) -> Path:
         return self._result_dir / (hashlib.sha256(run_id.encode()).hexdigest() + ".txt")
+
+    @property
+    def _transcript_dir(self) -> Path:
+        return self._path.with_name(self._path.stem + "-transcripts")
+
+    def _transcript_path(self, run_id: str) -> Path:
+        return self._transcript_dir / (hashlib.sha256(run_id.encode()).hexdigest() + ".jsonl")
+
+    def append_transcript(self, run_id: str, item: dict[str, Any]) -> int:
+        """Append one step of a run's transcript; returns its sequence number.
+
+        The transcript is what a client shows when the owner opens a
+        subagent: its brief, what it said, the tools it called, messages
+        exchanged with the main agent and its result. Only the run's own
+        task writes it, so a process-local lock is enough.
+        """
+        with self._transcript_lock:
+            if run_id not in self._runs:
+                raise KeyError(run_id)
+            seq = self._transcript_seq.get(run_id)
+            path = self._transcript_path(run_id)
+            if seq is None:
+                seq = 0
+                if path.exists():
+                    with path.open(encoding="utf-8") as stream:
+                        seq = sum(1 for _ in stream)
+            seq += 1
+            entry = {"seq": seq, "ts": time.time(), **item}
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                stream.flush()
+            self._transcript_seq[run_id] = seq
+            return seq
+
+    def read_transcript(self, run_id: str, after: int = 0, limit: int = 200) -> dict[str, Any]:
+        """Transcript steps with ``seq > after``, oldest first, at most ``limit``."""
+        if type(after) is not int or after < 0 or type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("Invalid transcript range")
+        record = next((r for r in self.all() if r.run_id == run_id), None)
+        if record is None:
+            raise FileNotFoundError("No such run")
+        items: list[dict[str, Any]] = []
+        path = self._transcript_path(run_id)
+        more = False
+        if path.exists():
+            with path.open(encoding="utf-8") as stream:
+                for line in stream:
+                    try:
+                        entry = json.loads(line)
+                    except ValueError:
+                        continue  # a torn last line from a crash
+                    if not isinstance(entry, dict) or int(entry.get("seq", 0)) <= after:
+                        continue
+                    if len(items) >= limit:
+                        more = True
+                        break
+                    items.append(entry)
+        last = items[-1]["seq"] if items else after
+        return {"runId": run_id, "items": items, "nextSeq": last,
+                "more": more, "done": record.ended_at is not None}
 
     def register(self, record: SubagentRunRecord) -> None:
         with self._lock:

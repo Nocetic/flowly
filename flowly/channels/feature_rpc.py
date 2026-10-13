@@ -4436,6 +4436,28 @@ def subagents_result(params: dict) -> dict:
         raise FeatureRpcError("UNAVAILABLE", "The task result could not be read") from exc
 
 
+def subagents_transcript(params: dict) -> dict:
+    """A run's transcript, for the owner opening a subagent from the chat.
+
+    Params: ``runId``; ``after`` (default 0) — return steps after this
+    sequence number, so a client polls with the ``nextSeq`` it last got;
+    ``limit`` (default 200, max 1000). ``done`` tells whether the run ended.
+    """
+    registry, record = _subagent_record(params)
+    after = params.get("after", 0)
+    limit = params.get("limit", 200)
+    try:
+        page = registry.read_transcript(record.run_id, after, limit)
+    except ValueError as exc:
+        raise FeatureRpcError("INVALID", str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise FeatureRpcError("NOT_FOUND", "No such task") from exc
+    except OSError as exc:
+        raise FeatureRpcError("UNAVAILABLE", "The task transcript could not be read") from exc
+    from flowly.agent.subagent_observation import run_view
+    return {"schemaVersion": 2, "task": run_view(record), **page}
+
+
 async def subagents_cancel(params: dict) -> dict:
     _, record = _subagent_record(params, allow_prefix=True)
     if record.ended_at is not None:
@@ -5369,6 +5391,7 @@ _DISPATCH: dict[str, tuple] = {
     "subagents.list": (subagents_list, True, False),
     "subagents.get": (subagents_get, True, False),
     "subagents.result": (subagents_result, True, False),
+    "subagents.transcript": (subagents_transcript, True, False),
     "subagents.cancel": (subagents_cancel, True, False),
     "subagents.assistants": (subagents_assistants_retired, True, False),
     "subagents.set_model": (agents_feature_retired, True, False),

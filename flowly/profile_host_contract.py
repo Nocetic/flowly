@@ -50,6 +50,7 @@ PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     "subagents.list": 15_000,
     "subagents.get": 15_000,
     "subagents.result": 15_000,
+    "subagents.transcript": 15_000,
     "memory.editor.list": 30_000,
     "memory.editor.document": 30_000,
     "memory.editor.save": 30_000,

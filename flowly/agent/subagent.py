@@ -128,6 +128,10 @@ class SubagentToolRegistry(ToolRegistry):
         super().register(tool)
 
 
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit] + f" […{len(text) - limit} more]"
+
+
 def _looks_like_code(s: str) -> bool:
     """True for internal/code-ish labels that must NEVER be shown to a user —
     ``builtin:researcher``, ``subagent:<uuid>``, ``self-review``, bare UUIDs."""
@@ -696,6 +700,9 @@ class SubagentManager:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": first_message},
             ]
+            self._transcribe(run_id, {
+                "kind": "brief", "content": task, "withConversation": bool(context),
+            })
 
             # Run agent loop (limited iterations)
             max_iterations = _SUBAGENT_MAX_ITERATIONS
@@ -816,6 +823,18 @@ class SubagentManager:
                         "role": "assistant",
                         "content": response.content or "",
                         "tool_calls": tool_call_dicts,
+                    })
+                    self._transcribe(run_id, {
+                        "kind": "assistant",
+                        "content": response.content or "",
+                        "toolCalls": [
+                            {
+                                "id": tc.id,
+                                "name": tc.name,
+                                "arguments": _clip(json.dumps(tc.arguments, ensure_ascii=False), 1_500),
+                            }
+                            for tc in response.tool_calls
+                        ],
                     })
 
                     # Execute tools
@@ -964,6 +983,13 @@ class SubagentManager:
                             "tool_call_id": tool_call.id,
                             "name": protocol_tool_name,
                             "content": result,
+                        })
+                        self._transcribe(run_id, {
+                            "kind": "tool",
+                            "toolCallId": tool_call.id,
+                            "name": effective_tool_name,
+                            "status": _tool_status,
+                            "content": _clip(result, 2_000),
                         })
                 else:
                     # Error response (timeout, provider error)
@@ -1216,6 +1242,7 @@ class SubagentManager:
             logger.info(f"[SubagentManager] [{run_id[:8]}] cancelled")
             outcome = self._cancel_outcomes.get(run_id, "interrupted")
             self._registry.finish(run_id, outcome, error="Task interrupted", error_code="cancelled")
+            self._transcribe(run_id, {"kind": "result", "status": outcome, "content": ""})
             if not skip_announce:
                 try:
                     await self._announce(run_id, "(task was interrupted)", outcome)
@@ -1234,12 +1261,22 @@ class SubagentManager:
             status = "error"
             error_str = final_result
 
+        self._transcribe(run_id, {
+            "kind": "result", "status": status, "content": _clip(final_result or "", 8_000),
+        })
         try:
             if not skip_announce:
                 await self._announce(run_id, final_result, status)
         finally:
             await self._emit_event("subagent.completed", run_id, label, status, error_str)
         return final_result
+
+    def _transcribe(self, run_id: str, item: dict[str, Any]) -> None:
+        """Record one step for the owner to read; never fails the run."""
+        try:
+            self._registry.append_transcript(run_id, item)
+        except Exception:
+            logger.warning(f"[SubagentManager] [{run_id[:8]}] could not record a transcript step")
 
     async def _deliver_event(self, event: str, data: dict) -> None:
         if self._on_event:
