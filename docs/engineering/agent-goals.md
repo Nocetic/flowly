@@ -82,7 +82,7 @@ owner-only permissions). Each JSON file carries `version` and a monotonic `revis
 {
   "id": "obj_3f9c2a1b7d4e",
   "title": "Work out every day this week",
-  "category": "health",            // health|relationships|finance|career|interests|productivity|other
+  "category": "health",            // health|relationships|finance|career|learning|interests|productivity|other
   "why": "Feel stronger",
   "plan": [{"text": "30 min run", "done": true}, {"text": "Gym", "done": false}],
   "stage": "Day 3 of 7",
@@ -93,9 +93,17 @@ owner-only permissions). Each JSON file carries `version` and a monotonic `revis
   "sessionKey": "desktop:8c1…",    // the conversation the goal was set in
   "createdBy": "agent",            // agent|owner
   "createdAt": 0, "updatedAt": 0, "closedAt": null,
-  "log": [{"at": 0, "kind": "checkin", "text": "Ran 30 minutes"}]   // last 50
+  "log": [{"at": 0, "kind": "checkin", "text": "Ran 30 minutes"},
+          {"at": 0, "kind": "owner", "event": "step_done", "text": "Gym"}]   // last 50
 }
 ```
+
+Log kinds: `note`, `checkin`, `plan` (the agent), `status` (the agent closed
+or paused it), `owner` (the owner did it in the app). An `owner` or `status`
+entry carries an `event` (`step_done`, `step_undone`, `renamed`, `active`,
+`paused`, `done`, `dropped`) and its text is then only the step or the new
+title, so clients say it in their own language ("You completed “Gym”") and the
+agent reads it on its next check-in.
 
 Limits: 20 open goals per agent, 200 stored (oldest closed pruned), title 120,
 why 1000, 20 steps of 300, stage 200, cadence 120, log entry 500. Every text
@@ -258,11 +266,15 @@ tools, ids or agenda, and plan nothing when nothing is worth it.
 
 ### Hidden from every product surface
 
-`objective` and `follow_up` are bookkeeping; showing their calls would expose
-the machinery ("Tracking goal obj_…", "Follow-up wk_… planned") instead of the
-result, and the agent already tells the owner in words. They are listed in
-`flowly.tool_activity.INTERNAL_TOOLS` and dropped at the one projection
-boundary every surface uses:
+`objective` and `follow_up` are bookkeeping, and the memory tools
+(`memory_search`, `memory_get`, `memory_recall`, `memory_feedback`,
+`memory_append`, `memory_consolidate`, `memory_import`, `knowledge_graph`)
+are the agent recalling and tidying what it knows. Showing their calls would
+expose the machinery ("Tracking goal obj_…", "Follow-up wk_… planned", a
+memory search) instead of the result; the agent tells the owner in words, and
+what it remembers shows in what it says and in the Memory view. They are
+listed in `flowly.tool_activity.INTERNAL_TOOLS` and dropped at the one
+projection boundary every surface uses:
 
 - `project_tool_messages_for_ui` removes their calls and results (an assistant
   step that only called them and said nothing disappears) — this covers the
@@ -275,6 +287,33 @@ boundary every surface uses:
 The canonical session/provider history is untouched: the model still sees its
 own calls.
 
+### The goal card under a reply (`flowly/objectives/cards.py`)
+
+Because the tool calls are hidden, a client cannot tell from them that a goal
+was created. When a user turn ends, the loop asks `goal_cards_from_turn(turn
+messages)` which goals the turn **created** or **closed** (successful
+`objective` create / close results; updates add no card) and stores up to 3
+cards on the closing assistant record (`goal_cards`, display-only, projected
+away for the model, like `usage`). They go out as `goalCards`:
+
+- on the direct gateway's final chat event (`message.goalCards`);
+- in `chat.history` rows (`goalCards` on that assistant row), so a reopened
+  conversation shows the same card;
+- in the relay's final data block (`goalCards`) — **the relay does not persist
+  it yet** (it stores a whitelist of fields, and an encrypted conversation
+  must not store a goal title in clear), so a relay chat shows the card live
+  only until the relay learns to store it encrypted.
+
+```json
+{"id": "obj_…", "event": "created", "title": "A month of physics", "category": "learning",
+ "status": "active", "createdAt": 0, "endsAt": 0, "progress": {"current": null, "target": null, "unit": ""},
+ "steps": 4, "stepsDone": 0}
+```
+
+A card is a snapshot; clients compute time progress from `createdAt`/`endsAt`
+when drawing and open the goal for anything current. Wake-up turns carry no
+card.
+
 ## Owner-facing RPCs (`flowly/agenda/rpc.py`)
 
 Registered in `feature_rpc._DISPATCH` and allowed through the profile host
@@ -283,7 +322,7 @@ Registered in `feature_rpc._DISPATCH` and allowed through the profile host
 | Method | Params | Result |
 | --- | --- | --- |
 | `objectives.list` | `includeClosed?` (default true) | `{objectives: [goal + nextCheckAt], settings}` |
-| `objectives.update` | `id`, `action`: `pause` / `resume` / `done` / `drop` / `delete` | `{ok, objective}` or `{ok, deleted}`; anything but resume cancels the check-in |
+| `objectives.update` | `id`, `action`: `pause` / `resume` / `done` / `drop` / `delete`; `step` with `step` (1-based) and `done`; `rename` with `title` | `{ok, objective}` or `{ok, deleted}`; pause/done/drop/delete cancel the check-in; a tick or rename is logged as kind `owner` for the agent's next check-in |
 | `agenda.list` | `historyLimit?` (0–100, default 20) | `{pending, history, settings}` (public fields only) |
 | `agenda.settings.get` | — | `{settings, levels, dailyCaps, globalDailyCap}` |
 | `agenda.settings.set` | any of `level`, `quietStart`, `quietEnd`, `timezone`, `reviewTime` | `{settings}`; unknown keys rejected |
