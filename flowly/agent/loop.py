@@ -5739,6 +5739,18 @@ class AgentLoop:
                 metadata={"tool_progress_event": event},
             ))
 
+    def _internal_tool_calls(self, run_id: str) -> set[str]:
+        """Ids of this run's calls to internal tools (flowly.tool_activity),
+        so their results, which arrive as separate iteration events, are left
+        out too. Bounded: only recent runs are remembered."""
+        runs = self.__dict__.setdefault("_internal_tool_call_ids", {})
+        ids = runs.get(run_id)
+        if ids is None:
+            if len(runs) >= 64:
+                runs.pop(next(iter(runs)))
+            ids = runs[run_id] = set()
+        return ids
+
     async def _emit_iteration_event(
         self,
         *,
@@ -5777,7 +5789,12 @@ class AgentLoop:
         from flowly.tool_activity import project_tool_messages_for_ui
 
         self._steering().observe_iteration(outbound_run_id, iteration_idx, message)
-        ui_message = project_tool_messages_for_ui([message])[0]
+        projected = project_tool_messages_for_ui(
+            [message], internal_call_ids=self._internal_tool_calls(outbound_run_id),
+        )
+        if not projected:
+            return  # the agent's own bookkeeping (a goal, a follow-up): no step
+        ui_message = projected[0]
         role = ui_message.get("role") or ""
         if role not in ("assistant", "tool"):
             return
