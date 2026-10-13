@@ -1226,6 +1226,12 @@ class WebChannel(BaseChannel):
         if isinstance(tool_messages, list) and tool_messages:
             data_block["toolMessages"] = tool_messages
 
+        # Goals the turn started tracking or finished: a card under the reply
+        # (flowly/objectives/cards.py). Omitted when there are none.
+        goal_cards = msg.metadata.get("goalCards")
+        if isinstance(goal_cards, list) and goal_cards:
+            data_block["goalCards"] = goal_cards
+
         # ``aborted`` propagates through to the relay → Firestore →
         # client UI so a turn that was stopped mid-flight can be
         # rendered with an [Aborted] marker instead of looking like

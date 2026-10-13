@@ -43,7 +43,9 @@ class ObjectiveTool(Tool):
     def description(self) -> str:
         return (
             "Track the owner's own goals over days or weeks (health, relationships, finance, career, "
-            "interests, productivity, other): a plan, a stage, progress, and check-ins on a rhythm. "
+            "learning, interests, productivity, other): a plan, a stage, progress, and check-ins on a "
+            "rhythm. When the owner gives a timeframe (a week, a month, by December), set ends so the "
+            "goal shows how far along it is. "
             "Create one when the owner sets out to do something over time and a plan comes together "
             "(\"a week of daily workouts\", \"save 500 by December\", \"find a laptop\") — even if they "
             "did not say 'goal' — and tell them in your reply that you will keep track of it. Then plan "
@@ -79,7 +81,10 @@ class ObjectiveTool(Tool):
                 "current": {"type": "number", "description": "Progress so far, when it is measurable."},
                 "target": {"type": "number", "description": "The measurable target, if any."},
                 "unit": {"type": "string", "description": "Unit of current/target, e.g. 'days', 'TRY'."},
-                "ends": {"type": "string", "description": "When the goal ends, if it has an end ('+7d', ISO date)."},
+                "ends": {
+                    "type": "string",
+                    "description": "When the goal ends: '+7d' for a week, '+30d' for a month, or an ISO date. Set it whenever a timeframe was said.",
+                },
                 "next_check": {
                     "type": "string",
                     "description": "When to check in next: '20:00', 'tomorrow 20:00', '+1d', ISO. Replaces the planned one.",

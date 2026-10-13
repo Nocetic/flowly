@@ -9305,8 +9305,20 @@ class AgentLoop:
         introduction_failed = introduction_turn and (
             bool(provider_error) or turn_aborted or not str(final_content or "").strip()
         )
+        # Goals this turn started tracking or finished: their cards ride the
+        # closing reply (live and in history), since the objective tool's own
+        # calls never show (flowly/objectives/cards.py).
+        goal_cards: list[dict[str, Any]] = []
+        if not provider_error and not turn_aborted:
+            try:
+                from flowly.objectives.cards import goal_cards_from_turn
+
+                goal_cards = goal_cards_from_turn(turn_messages)
+            except Exception as exc:  # noqa: BLE001 — a card never fails a turn
+                logger.debug(f"[goals] card skipped: {exc}")
         if not introduction_failed:
             session.extend_with_turn_messages(
+                goal_cards=goal_cards or None,
                 user_content=display_content,
                 new_messages=turn_messages,
                 final_content=final_content,
@@ -9434,6 +9446,7 @@ class AgentLoop:
                    if reply_media_assets else {}),
                 "tool_results": tool_results,
                 "executed_tools": _executed_tools,
+                **({"goalCards": goal_cards} if goal_cards else {}),
                 "toolPolicy": "auto" if tools_allowed else "none",
                 # Failed/aborted turns may contain usage from an earlier
                 # successful iteration, not the terminal request. Keep that

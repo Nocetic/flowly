@@ -28,10 +28,12 @@ from flowly.profile import _atomic_write_json, get_flowly_home
 
 SCHEMA_VERSION = 1
 
-CATEGORIES = ("health", "relationships", "finance", "career", "interests", "productivity", "other")
+CATEGORIES = ("health", "relationships", "finance", "career", "learning", "interests", "productivity", "other")
 STATUSES = ("active", "paused", "done", "dropped")
 OPEN_STATUSES = frozenset({"active", "paused"})
-LOG_KINDS = ("note", "checkin", "plan", "status")
+#: ``owner`` marks what the owner did themselves (ticked a step, renamed it),
+#: so the agent reads it on its next check-in and the timeline can say so.
+LOG_KINDS = ("note", "checkin", "plan", "status", "owner")
 
 #: Open goals one agent may track at once; more is a list, not a focus.
 MAX_ACTIVE_OBJECTIVES = 20
@@ -302,18 +304,38 @@ class ObjectiveStore:
 
         return self._transaction(mutate)
 
-    def log(self, objective_id: str, text: Any, *, kind: str = "note") -> dict[str, Any]:
+    def log(self, objective_id: str, text: Any, *, kind: str = "note", event: str | None = None) -> dict[str, Any]:
         entry_text = clean_text(text, limit=MAX_LOG_TEXT, field="note", required=True, multiline=True)
         entry_kind = kind if kind in LOG_KINDS else "note"
 
         def mutate(data: dict[str, Any]) -> dict[str, Any]:
             record = _require(data["objectives"], objective_id)
-            _append_log(record, entry_kind, entry_text)
+            _append_log(record, entry_kind, entry_text, event)
             return copy.deepcopy(record)
 
         return self._transaction(mutate)
 
-    def set_status(self, objective_id: str, status: str, *, note: Any = "") -> dict[str, Any]:
+    def set_step(self, objective_id: str, number: Any, done: Any, *, by_owner: bool = True) -> dict[str, Any]:
+        """Tick or untick plan step ``number`` (1-based)."""
+        if isinstance(number, bool) or not isinstance(number, int):
+            raise ObjectiveError("INVALID", "step must be a step number")
+        if not isinstance(done, bool):
+            raise ObjectiveError("INVALID", "done must be true or false")
+
+        def mutate(data: dict[str, Any]) -> dict[str, Any]:
+            record = _require(data["objectives"], objective_id)
+            if not 1 <= number <= len(record["plan"]):
+                raise ObjectiveError("INVALID", f"There is no step {number}")
+            step = record["plan"][number - 1]
+            if step["done"] != done:
+                step["done"] = done
+                _append_log(record, "owner" if by_owner else "plan", step["text"],
+                            "step_done" if done else "step_undone")
+            return copy.deepcopy(record)
+
+        return self._transaction(mutate)
+
+    def set_status(self, objective_id: str, status: str, *, note: Any = "", by_owner: bool = False) -> dict[str, Any]:
         if status not in STATUSES:
             raise ObjectiveError("INVALID", f"status must be one of {', '.join(STATUSES)}")
         note_text = clean_text(note, limit=MAX_LOG_TEXT, field="note", multiline=True)
@@ -327,7 +349,7 @@ class ObjectiveStore:
                     raise ObjectiveError("LIMIT", f"Already tracking {MAX_ACTIVE_OBJECTIVES} goals.")
             record["status"] = status
             record["closedAt"] = None if status in OPEN_STATUSES else _now_ms()
-            _append_log(record, "status", note_text or status)
+            _append_log(record, "owner" if by_owner else "status", note_text or status, status)
             return copy.deepcopy(record)
 
         return self._transaction(mutate)
@@ -352,10 +374,18 @@ def _require(items: list[dict[str, Any]], objective_id: str) -> dict[str, Any]:
     return record
 
 
-def _append_log(record: dict[str, Any], kind: str, text: str) -> None:
+#: What an ``owner`` (or ``status``) log entry records, for clients to say in
+#: their own language; the entry's text is then the step or the new title.
+LOG_EVENTS = ("step_done", "step_undone", "renamed", "active", "paused", "done", "dropped")
+
+
+def _append_log(record: dict[str, Any], kind: str, text: str, event: str | None = None) -> None:
     now = _now_ms()
     entries = list(record.get("log") or [])
-    entries.append({"at": now, "kind": kind, "text": text})
+    entry: dict[str, Any] = {"at": now, "kind": kind, "text": text}
+    if event in LOG_EVENTS:
+        entry["event"] = event
+    entries.append(entry)
     record["log"] = entries[-MAX_LOG_ENTRIES:]
     record["updatedAt"] = now
 

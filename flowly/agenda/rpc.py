@@ -6,7 +6,9 @@ phone apps share:
 
 - ``objectives.list`` — the goals, each with its next planned check-in.
 - ``objectives.update`` — the owner pauses, resumes, finishes, drops or
-  deletes a goal. Anything that ends or pauses a goal cancels its check-in.
+  deletes a goal, ticks a plan step (``step``, ``done``) or renames it
+  (``title``). Anything that ends or pauses a goal cancels its check-in;
+  a tick or a rename is logged so the agent reads it on its next check-in.
 - ``agenda.list`` — what the agent plans to look at again, and what came of
   its recent wake-ups.
 - ``agenda.settings.get`` / ``agenda.settings.set`` — how often the agent may
@@ -59,10 +61,20 @@ def objectives_update(params: dict[str, Any]) -> dict[str, Any]:
             raise ObjectiveError("NOT_FOUND", "No such goal")
         agenda.cancel_for_objective(goal_id, reason="owner_deleted")
         return {"ok": True, "deleted": goal_id}
+    if action == "step":
+        goal = goals.set_step(goal_id, params.get("step"), params.get("done"))
+        goal["nextCheckAt"] = (agenda.next_for_objective(goal_id) or {}).get("dueAt")
+        return {"ok": True, "objective": goal}
+    if action == "rename":
+        goal = goals.update(goal_id, {"title": params.get("title")})
+        goals.log(goal_id, goal["title"], kind="owner", event="renamed")
+        goal = goals.get(goal_id) or goal
+        goal["nextCheckAt"] = (agenda.next_for_objective(goal_id) or {}).get("dueAt")
+        return {"ok": True, "objective": goal}
     status = _OWNER_ACTIONS.get(action)
     if status is None:
-        raise ObjectiveError("INVALID", "action must be pause, resume, done, drop or delete")
-    goal = goals.set_status(goal_id, status, note=f"owner: {action}")
+        raise ObjectiveError("INVALID", "action must be pause, resume, done, drop, delete, step or rename")
+    goal = goals.set_status(goal_id, status, by_owner=True)
     if status != "active":
         agenda.cancel_for_objective(goal_id, reason=f"owner_{action}")
     goal["nextCheckAt"] = None if status != "active" else (

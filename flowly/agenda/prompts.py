@@ -58,7 +58,11 @@ def goal_block(goal: dict[str, Any], zone: dt.tzinfo, *, next_check: int | None 
     log = (goal.get("log") or [])[-_LOG_LINES:]
     if log:
         lines.append("Recent log:")
-        lines.extend(f"  - {describe(int(entry['at']), zone)} ({entry.get('kind')}): {entry.get('text')}" for entry in log)
+        lines.extend(
+            f"  - {describe(int(entry['at']), zone)} ({entry.get('kind')}"
+            f"{', ' + entry['event'] if entry.get('event') else ''}): {entry.get('text')}"
+            for entry in log
+        )
     return "\n".join(lines)
 
 

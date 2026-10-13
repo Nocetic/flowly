@@ -2945,6 +2945,8 @@ class GatewayServer:
                 msg["voice"] = m["voice"]
             if m.get("kind") == "agent_setup_card" and isinstance(m.get("setupCard"), dict):
                 msg["setupCard"] = m["setupCard"]
+            if isinstance(m.get("goal_cards"), list) and m["goal_cards"]:
+                msg["goalCards"] = m["goal_cards"]
             if m.get("boundaryKind"):
                 msg["boundaryKind"] = m["boundaryKind"]
             if m.get("compactionId"):
@@ -3721,6 +3723,11 @@ class GatewayServer:
                 )
                 if atts:
                     final_message["attachments"] = atts
+            # Goals the turn started tracking or finished: a card under the
+            # reply, the same shape chat.history returns (flowly/objectives/cards.py).
+            goal_cards = (metadata or {}).get("goalCards")
+            if isinstance(goal_cards, list) and goal_cards:
+                final_message["goalCards"] = goal_cards
 
             final_data: dict[str, Any] = {
                 "state": "final",
