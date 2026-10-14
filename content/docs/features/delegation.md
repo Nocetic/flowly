@@ -14,12 +14,9 @@ The desktop UI unifies both under one "Agents" tab, but the implementations are 
 
 ## In-process subagents
 
-The agent does its work itself — a long or detailed task is still its own. It starts a subagent with the `spawn` tool only when:
+The agent starts a subagent with the `spawn` tool when you ask for one ("give this to Luna", "let two agents look at it"), or when it judges one worth it. Flowly never pushes it either way: each subagent is a separate model run with its own cost, and most work the agent simply does itself.
 
-- **you ask for one** ("give this to Luna", "let two agents look at it"). The agent quotes your words in the call and Flowly checks that you really wrote them in that message, so nothing a tool returned or the agent assumed can stand in for you; or
-- **the work splits into independent parts** — say, researching three companies — and the agent starts one subagent per part in the same reply while it keeps the part its next step depends on.
-
-A single subagent the agent starts on its own initiative is refused and the agent does the task itself. At most **3** subagents run per conversation at once (8 across the whole agent).
+When you ask, the agent quotes your words in the call and Flowly checks that you really wrote them in that message, so nothing a tool returned or the agent assumed can stand in for you; the subagent is then shown as started at your request. At most **3** subagents run per conversation at once (8 across the whole agent) — a budget guard, not a rule about when to delegate.
 
 When it starts one, the agent writes the subagent's brief itself: the goal, what it already knows, the sources to use, what is out of scope and what to return. The subagent:
 

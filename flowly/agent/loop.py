@@ -100,7 +100,6 @@ from flowly.agent.run_abort import RunAbortedError, RunAbortController
 from flowly.agent.run_steering import ProviderSteeredError, RunSteeringController, SteeringError
 from flowly.agent.delegation import (
     DelegationTurn,
-    begin_spawn_batch,
     conversation_from_history,
     delegation_turn_scope,
 )
@@ -6616,7 +6615,6 @@ class AgentLoop:
                 turn_tools: list[str] = []
                 terminal_action_executed = False
                 turn_success_count = 0
-                begin_spawn_batch(response.tool_calls)
                 # Independent reads in one response run at the same time; the
                 # loop below still takes every call in order, through every
                 # gate, and only swaps its execution for the finished read.
@@ -9538,7 +9536,7 @@ class AgentLoop:
         provider_state = self._provider_continuity_state(session)
         provider_state_out: dict[str, Any] = {}
         # A system wake-up (a subagent's result, a notice) is not the owner
-        # speaking: nothing in it can authorise a new subagent.
+        # speaking: nothing in it counts as the owner asking for a subagent.
         # The owner's next message waits behind this turn rather than
         # entering it, so this turn stops waiting as soon as one arrives.
         owner_epoch = self.goal_user_epoch(session_key)

@@ -5,12 +5,7 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any
 
-from flowly.agent.delegation import (
-    current_batch_size,
-    current_turn,
-    decide,
-    render_conversation,
-)
+from flowly.agent.delegation import current_turn, render_conversation, spawn_origin
 from flowly.agent.tools.base import Tool
 
 if TYPE_CHECKING:
@@ -44,14 +39,12 @@ class SpawnTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Start a subagent that works on a task in the background and reports "
-            "back to you. Do the work yourself unless (a) the owner asked for a "
-            "subagent — pass their exact words as owner_request — or (b) the work "
-            "splits into independent parts: then call spawn once per part in the "
-            "same response. A long or detailed task alone is not a reason. Don't "
-            "hand off the step your next action depends on. While subagents run, "
-            "keep working on what doesn't depend on them; their results reach you "
-            "as messages."
+            "Start a subagent: a separate model run that works on a task in the "
+            "background and reports back to you. Each one costs a full run of its "
+            "own. Whether to use one is your call, or the owner's when they ask "
+            "for it — then pass their exact words as owner_request. Subagents "
+            "started in the same turn report back together, once all have "
+            "finished."
         )
 
     @property
@@ -115,11 +108,8 @@ class SpawnTool(Tool):
         label: str | None = None,
         **kwargs: Any,
     ) -> str:
-        """Start a subagent, or explain why not."""
+        """Start a subagent."""
         turn = current_turn()
-        decision = decide(owner_request, batch_size=current_batch_size(), turn=turn)
-        if not decision.allowed:
-            return json.dumps({"status": "refused", "error": decision.reason})
 
         chosen_model = (model or "").strip() or (turn.model if turn else None)
         transcript = None
@@ -137,7 +127,7 @@ class SpawnTool(Tool):
             origin_chat_id=chat_id,
             model=chosen_model,
             is_subagent_caller=self._is_subagent,
-            origin=decision.origin,
+            origin=spawn_origin(owner_request, turn),
             context=transcript,
             batch_id=turn.turn_id if turn else "",
         )

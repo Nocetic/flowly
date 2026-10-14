@@ -11,9 +11,11 @@ and checks what the agent *did*, not how its prose reads:
 
 * an explanation is answered, not turned into a tool call;
 * "don't search" is respected;
-* a long or detailed task is done by the agent itself;
+* a long or detailed task is done by the agent itself (its own judgment —
+  nothing in the runtime pushes it either way);
 * an explicit "give this to an agent" starts exactly one subagent;
-* independent parts may be split, but never into a lone unrequested spawn;
+* independent parts the owner did not ask to delegate are reported, so a
+  change that makes the agent start subagents more often shows up;
 * after starting subagents the agent does the part that is still its own,
   then ends its turn — it does not wait for them, re-read them or poll a
   task list. ``FLOWLY_EVAL_ONLY=a,b`` runs only the named scenarios.
@@ -119,9 +121,7 @@ def _three_and_its_own_part(o: Observed) -> str | None:
     return _ends_turn_after_starting(o)
 
 
-def _split_or_self(o: Observed) -> str | None:
-    if o.spawn_started == 1:
-        return "started a lone unrequested subagent"
+def _self_or_ends_turn(o: Observed) -> str | None:
     return _answered(o) if not o.spawn_started else _ends_turn_after_starting(o)
 
 
@@ -137,7 +137,7 @@ SCENARIOS = [
              _one_on_request),
     Scenario("independent-parts",
              "Şu üç şirketin kuruluş yıllarını ayrı ayrı araştır: Anthropic, Mistral AI, Cohere.",
-             _split_or_self),
+             _self_or_ends_turn),
     Scenario("one-agent-each",
              "Şu üç şirketin kuruluş yıllarını ve hikayelerini ayrı ayrı araştır: Anthropic, "
              "Mistral AI, Cohere. agent çalıştır her biri için.",

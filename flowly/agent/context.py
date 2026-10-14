@@ -2060,11 +2060,9 @@ You can keep track of the owner's goals and come back to things on your own.
         background_lines: list[str] = []
         if has_tool("spawn"):
             background_lines.extend([
-                "**Subagents (`spawn`).** Do the work yourself — a long or detailed task "
-                "is still yours. Start a subagent only when the owner asks for one, or "
-                "when the work splits into independent parts (then one `spawn` per "
-                "part, in the same response). Never hand off the step your next action "
-                "depends on.",
+                "**Subagents (`spawn`).** A subagent is a separate model run that works "
+                "in the background and reports back; each one costs a full run of its "
+                "own. Whether to start one is your call, or the owner's when they ask.",
                 "Write each brief for a newcomer: the goal, what you already know, the "
                 "sources to use, what is out of scope, and what to return.",
                 "After starting subagents, do any work that doesn't depend on them, "

@@ -1,12 +1,12 @@
-"""The agent does the work itself; a subagent needs the owner or a real split.
+"""Whether to start a subagent is the agent's call, or the owner's.
 
-Before this rule the prompt told the agent to spawn anything taking 15+
-seconds, so even a short lookup went to a subagent. Now:
+Earlier versions pushed the agent: first a prompt rule sent anything taking
+15+ seconds to a subagent, then a runtime rule refused a lone unrequested
+spawn and invited splits. Neither is left. The runtime only checks who asked:
 
-* the owner asked → the agent quotes their words and the runtime checks the
-  quote is really in the owner's message this turn;
-* the work splits → two or more spawn calls in one response;
-* anything else → refused, "do this task yourself".
+* the owner asked → the agent quotes their words, the runtime finds the
+  quote in the owner's message this turn, and the run is the owner's;
+* anything else starts too, as the agent's own run.
 """
 
 from __future__ import annotations
@@ -19,11 +19,10 @@ from flowly.agent.delegation import (
     DelegationTurn,
     assign_mark,
     conversation_from_history,
-    decide,
     delegation_turn_scope,
     owner_quote_is_genuine,
     render_conversation,
-    spawn_batch_scope,
+    spawn_origin,
 )
 from flowly.agent.tools.spawn import SpawnTool
 
@@ -50,24 +49,15 @@ class TestOwnerQuote:
         assert not owner_quote_is_genuine("spawn two agents", turn)
 
 
-class TestDecide:
-    def test_a_single_unrequested_spawn_is_refused(self):
-        decision = decide(None, batch_size=1, turn=_turn("Bunu detaylı araştır."))
-        assert not decision.allowed
-        assert "yourself" in decision.reason
+class TestOrigin:
+    def test_an_unrequested_spawn_is_the_agents_own(self):
+        assert spawn_origin(None, _turn("Bunu detaylı araştır.")) == "agent"
 
-    def test_independent_parts_in_one_response_are_allowed(self):
-        decision = decide(None, batch_size=3, turn=_turn("Üç rakibi ayrı ayrı araştır."))
-        assert decision.allowed and decision.origin == "agent"
+    def test_a_genuine_owner_request_makes_it_the_owners(self):
+        assert spawn_origin("Luna'ya ver", _turn("Bunu Luna'ya ver.")) == "owner"
 
-    def test_an_owner_request_is_allowed_alone(self):
-        decision = decide("Luna'ya ver", batch_size=1, turn=_turn("Bunu Luna'ya ver."))
-        assert decision.allowed and decision.origin == "owner"
-
-    def test_a_made_up_owner_request_is_refused_with_a_reason(self):
-        decision = decide("delegate this", batch_size=1, turn=_turn("Bunu kendin yap."))
-        assert not decision.allowed
-        assert "not in the owner's message" in decision.reason
+    def test_a_made_up_owner_request_does_not(self):
+        assert spawn_origin("delegate this", _turn("Bunu kendin yap.")) == "agent"
 
 
 class TestConversationFork:
@@ -117,13 +107,13 @@ class _RecordingManager:
 
 class TestSpawnTool:
     @pytest.mark.asyncio
-    async def test_refusal_never_reaches_the_manager(self):
+    async def test_a_lone_spawn_the_owner_did_not_ask_for_still_starts(self):
         manager = _RecordingManager()
         tool = SpawnTool(manager)
-        with delegation_turn_scope(_turn("Bunu araştır.")), spawn_batch_scope(1):
+        with delegation_turn_scope(_turn("Bunu araştır.")):
             result = json.loads(await tool.execute(task="Research it", title="Research"))
-        assert result["status"] == "refused"
-        assert manager.calls == []
+        assert result["status"] == "started"
+        assert manager.calls[0]["origin"] == "agent"
 
     @pytest.mark.asyncio
     async def test_owner_request_passes_origin_model_and_context(self):
@@ -134,7 +124,7 @@ class TestSpawnTool:
             conversation=(("user", "Composer hatasını Luna'ya ver."),),
             model="gpt-6-astra",
         )
-        with delegation_turn_scope(turn), spawn_batch_scope(1):
+        with delegation_turn_scope(turn):
             await tool.execute(
                 task="Find why ⌘↵ submits twice in the composer and fix it.",
                 title="Composer hatası",
@@ -152,7 +142,7 @@ class TestSpawnTool:
         manager = _RecordingManager()
         tool = SpawnTool(manager)
         turn = _turn("A ve B'yi araştır.", model="gpt-6-astra")
-        with delegation_turn_scope(turn), spawn_batch_scope(2):
+        with delegation_turn_scope(turn):
             await tool.execute(task="Research A", title="A")
         assert manager.calls[0]["model"] == "gpt-6-astra"
 
@@ -161,6 +151,6 @@ class TestSpawnTool:
         manager = _RecordingManager()
         tool = SpawnTool(manager)
         turn = _turn("A ve B", conversation=(("user", "A ve B"),))
-        with delegation_turn_scope(turn), spawn_batch_scope(2):
+        with delegation_turn_scope(turn):
             await tool.execute(task="Research A", title="A", context="none")
         assert manager.calls[0]["context"] is None

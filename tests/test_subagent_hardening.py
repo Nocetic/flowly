@@ -19,9 +19,7 @@ import pytest
 from flowly.agent.delegation import (
     DelegationTurn,
     conversation_from_history,
-    count_spawn_calls,
     delegation_turn_scope,
-    spawn_batch_scope,
 )
 from flowly.agent.loop import AgentLoop, _GOAL_CONTINUATION_ID
 from flowly.agent.subagent import SubagentManager
@@ -74,15 +72,10 @@ async def test_a_concurrent_turn_cannot_redirect_another_turns_child():
     tool = SpawnTool(manager)
     tool.set_context("web", "turn-B")  # the shared tool was last set by turn B
     turn_a = DelegationTurn(owner_text="A ve B'yi araştır", origin_channel="web", origin_chat_id="turn-A")
-    with delegation_turn_scope(turn_a), spawn_batch_scope(2):
+    with delegation_turn_scope(turn_a):
         await tool.execute(task="Research A", title="A")
     assert manager.calls[0]["origin_channel"] == "web"
     assert manager.calls[0]["origin_chat_id"] == "turn-A"
-
-
-def test_identical_spawn_calls_are_one_part_not_a_split():
-    calls = [SimpleNamespace(name="spawn", arguments={"task": "Research X", "title": "X"})] * 2
-    assert count_spawn_calls(calls) == 1
 
 
 # ── Only the owner's own words can ask for a subagent ───────────────────────

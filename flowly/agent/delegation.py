@@ -1,16 +1,12 @@
-"""When the agent may hand work to a subagent, and what the child is told.
+"""Who started a subagent, and what the child is told.
 
-The agent does its work itself. It starts a subagent only when
-
-* the owner asked for one — the agent quotes the owner's own words and the
-  runtime checks the quote against what the owner actually wrote this turn, so
-  a tool result or a guess can never stand in for the owner; or
-* the work splits into independent parts — two or more ``spawn`` calls in the
-  same response, one per part.
-
-A single unrequested ``spawn`` is refused with a message telling the agent to
-do the task itself. There is no word list: the model decides what the owner
-means, the runtime only checks evidence it can verify.
+The agent decides for itself whether a subagent is worth it; the runtime
+never pushes it either way. What the runtime does check is who asked: a
+subagent counts as the owner's when the agent quotes the owner's own words
+and the quote is found in what the owner actually wrote this turn — so a
+tool result or a guess can never stand in for the owner. Every other
+subagent is the agent's own. Limits on how many may run at once are budget
+guards (see ``subagent.py``), not a rule about when to delegate.
 
 The turn facts live in context variables bound by the runtime around a turn,
 never in tool arguments the model controls, and never on shared tool objects
@@ -78,27 +74,13 @@ class DelegationTurn:
     waited: list[float] = field(default_factory=lambda: [0.0], compare=False)
 
 
-@dataclass(frozen=True)
-class DelegationDecision:
-    allowed: bool
-    origin: Origin = "agent"
-    reason: str = ""
-
-
 _turn: contextvars.ContextVar[DelegationTurn | None] = contextvars.ContextVar(
     "flowly_delegation_turn", default=None,
-)
-_batch: contextvars.ContextVar[int] = contextvars.ContextVar(
-    "flowly_spawn_batch", default=0,
 )
 
 
 def current_turn() -> DelegationTurn | None:
     return _turn.get()
-
-
-def current_batch_size() -> int:
-    return _batch.get()
 
 
 @contextmanager
@@ -108,39 +90,6 @@ def delegation_turn_scope(turn: DelegationTurn) -> Iterator[None]:
         yield
     finally:
         _turn.reset(token)
-
-
-@contextmanager
-def spawn_batch_scope(size: int) -> Iterator[None]:
-    """Bind how many ``spawn`` calls the current model response holds."""
-    token = _batch.set(max(0, int(size)))
-    try:
-        yield
-    finally:
-        _batch.reset(token)
-
-
-def count_spawn_calls(tool_calls: Any) -> int:
-    """Distinct pieces of work the response asks subagents for.
-
-    Two identical spawn calls are one part asked twice, not a split.
-    """
-    tasks = set()
-    for call in tool_calls or ():
-        if getattr(call, "name", "") != "spawn":
-            continue
-        arguments = getattr(call, "arguments", None) or {}
-        tasks.add(_normalize(str(arguments.get("task") or arguments.get("title") or "")))
-    return len(tasks)
-
-
-def begin_spawn_batch(tool_calls: Any) -> None:
-    """Record how many ``spawn`` calls the response being executed holds.
-
-    Called by the loop before it runs a response's tool calls; each response
-    overwrites the previous value, so it never leaks into the next one.
-    """
-    _batch.set(count_spawn_calls(tool_calls))
 
 
 def _normalize(text: str) -> str:
@@ -164,25 +113,9 @@ def owner_quote_is_genuine(quote: str | None, turn: DelegationTurn | None) -> bo
     return needle in _normalize(turn.owner_text)
 
 
-def decide(owner_request: str | None, *, batch_size: int, turn: DelegationTurn | None) -> DelegationDecision:
-    """Apply the delegation rule to one ``spawn`` call."""
-    if owner_quote_is_genuine(owner_request, turn):
-        return DelegationDecision(True, "owner")
-    if batch_size >= 2:
-        return DelegationDecision(True, "agent")
-    if owner_request:
-        reason = (
-            "Not started: the owner_request you gave is not in the owner's message "
-            "this turn. Quote their words exactly, or do the task yourself."
-        )
-    else:
-        reason = (
-            "Not started — do this task yourself. Start a subagent only when the "
-            "owner asked for one (pass their exact words as owner_request), or for "
-            "two or more independent parts of the work, one spawn call each in the "
-            "same response."
-        )
-    return DelegationDecision(False, reason=reason)
+def spawn_origin(owner_request: str | None, turn: DelegationTurn | None) -> Origin:
+    """"owner" when the quoted request is the owner's own words this turn."""
+    return "owner" if owner_quote_is_genuine(owner_request, turn) else "agent"
 
 
 def conversation_from_history(

@@ -1,7 +1,7 @@
 """A subagent's whole life as the agent sees it: start, context, result, read.
 
-* the loop tells the spawn tool how many spawn calls a response holds, so a
-  lone unrequested spawn is refused while a split into parts starts;
+* the agent decides for itself: a lone spawn it chose to make starts, as its
+  own run;
 * a started run carries its full id, origin and mark, and the child reads
   the conversation before its brief;
 * the completion message names the run and hands over a readable result,
@@ -102,19 +102,19 @@ async def _settle(loop: AgentLoop) -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_lone_unrequested_spawn_is_refused_in_the_loop(tmp_path):
+async def test_a_lone_spawn_the_agent_chose_starts_as_its_own(tmp_path):
     parent = _ParentProvider([
         LLMResponse(content=None, tool_calls=[_spawn_call("s1", title="Araştırma", task="Research X")]),
-        LLMResponse(content="Kendim araştırdım."),
+        LLMResponse(content="Bir agent araştırıyor."),
     ])
     loop = _loop(tmp_path, parent, _ChildProvider())
     try:
         await _turn(loop, "X'i detaylı araştır.")
-    finally:
         await _settle(loop)
+    finally:
         loop.stop()
-    assert json.loads(parent.tool_messages[0])["status"] == "refused"
-    assert loop.subagents.registry.all() == []
+    assert json.loads(parent.tool_messages[0])["status"] == "started"
+    assert [r.origin for r in loop.subagents.registry.all()] == ["agent"]
 
 
 @pytest.mark.asyncio
