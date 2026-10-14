@@ -13,7 +13,9 @@ and checks what the agent *did*, not how its prose reads:
 * "don't search" is respected;
 * a long or detailed task is done by the agent itself;
 * an explicit "give this to an agent" starts exactly one subagent;
-* independent parts may be split, but never into a lone unrequested spawn.
+* independent parts may be split, but never into a lone unrequested spawn;
+* after starting subagents the agent ends its turn — it does not wait for
+  them, re-read them or poll a task list.
 
 Subagents are recorded, not run, so a scenario costs one conversation turn.
 Each run writes ``agent-behavior-report.json`` (path in ``FLOWLY_EVAL_OUT``,
@@ -86,16 +88,32 @@ def _did_it_itself(o: Observed) -> str | None:
     return _answered(o)
 
 
+_WAITING_TOOLS = ("agent_wait", "agent_read", "sessions_list", "exec")
+
+
+def _ends_turn_after_starting(o: Observed) -> str | None:
+    waited = [t for t in o.tools if t in _WAITING_TOOLS]
+    if o.spawn_started and waited:
+        return f"waited on its subagents instead of ending the turn: {waited}"
+    return _answered(o)
+
+
 def _one_on_request(o: Observed) -> str | None:
     if o.spawn_started != 1:
         return f"expected exactly one subagent on request, got {o.spawn_started}"
-    return None
+    return _ends_turn_after_starting(o)
+
+
+def _one_each_on_request(o: Observed) -> str | None:
+    if o.spawn_started != 3:
+        return f"expected one subagent per company on request, got {o.spawn_started}"
+    return _ends_turn_after_starting(o)
 
 
 def _split_or_self(o: Observed) -> str | None:
     if o.spawn_started == 1:
         return "started a lone unrequested subagent"
-    return _answered(o) if not o.spawn_started else None
+    return _answered(o) if not o.spawn_started else _ends_turn_after_starting(o)
 
 
 SCENARIOS = [
@@ -111,6 +129,10 @@ SCENARIOS = [
     Scenario("independent-parts",
              "Şu üç şirketin kuruluş yıllarını ayrı ayrı araştır: Anthropic, Mistral AI, Cohere.",
              _split_or_self),
+    Scenario("one-agent-each",
+             "Şu üç şirketin kuruluş yıllarını ve hikayelerini ayrı ayrı araştır: Anthropic, "
+             "Mistral AI, Cohere. agent çalıştır her biri için.",
+             _one_each_on_request),
 ]
 
 
