@@ -34,6 +34,7 @@ from flowly.agent.error_classifier import (
     present_provider_error,
 )
 from flowly.agent.context import ContextBuilder
+from flowly.agent.repetition import ANSWER_NOW, RepetitionGuard, mark_repeated
 from flowly.agent.tools.registry import ToolRegistry
 from flowly.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool, MemoryAppendTool
 from flowly.agent.tools.web import WebSearchTool, WebFetchTool, WebExtractTool
@@ -5869,6 +5870,7 @@ class AgentLoop:
             _record_turn_message(message)
 
         final_content: str | None = None
+        repetition = RepetitionGuard()
         accumulated_tool_results: list[dict[str, Any]] = []
         executed_tool_names: list[str] = []
         blocked_tools: list[str] = []
@@ -6130,7 +6132,20 @@ class AgentLoop:
             # A no-tools turn advertises no schema at all. This reduces model
             # confusion and request size, but it is only the first layer: the
             # executor gate below still rejects hallucinated structured calls.
-            if not tools_allowed:
+            # A turn going round in circles answers with what it has.
+            answer_without_tools = tools_allowed and repetition.stalled
+            if answer_without_tools:
+                logger.warning(
+                    "[loop] {} tool results in a row repeated earlier ones; "
+                    "next call answers without tools",
+                    repetition.repeats_in_a_row,
+                )
+                messages.append({
+                    "role": "user",
+                    "content": ANSWER_NOW.format(count=repetition.repeats_in_a_row),
+                    _EPHEMERAL_NUDGE: True,
+                })
+            if not tools_allowed or answer_without_tools:
                 tool_defs = []
 
             # Caller-supplied hard block list — used by cron jobs to hide
@@ -6187,7 +6202,7 @@ class AgentLoop:
             # while the tool executes. On subsequent iterations (iteration > 1),
             # if the model hasn't called any tools yet, escalate to "required"
             # to force tool use and prevent infinite text-only loops.
-            if not tools_allowed:
+            if not tools_allowed or answer_without_tools:
                 tool_choice = "none"
             elif iteration == 1:
                 tool_choice = "auto"
@@ -7101,6 +7116,8 @@ class AgentLoop:
                     # caps (_TOOL_MAX_CHARS) and can re-call the tool
                     # with a narrower query when it needs more detail.
                     sanitized_result = _sanitize_tool_result(result, _effective_tool_name)
+                    if repetition.observe(_effective_tool_name, sanitized_result):
+                        sanitized_result = mark_repeated(_effective_tool_name, sanitized_result)
 
                     # If the tool flagged its result as an image-bearing
                     # screenshot, extract the data URL from the RAW
