@@ -694,9 +694,9 @@ class SubagentManager:
                 f"'{resolved_display}' is running in the background. When everything "
                 "you started in this turn has finished, the results reach you "
                 "together as a new message and you continue from there. Don't wait "
-                "for them, don't redo their tasks and don't guess their results. Do "
-                "the part that is still yours, if any (no extra checks to fill the "
-                "time), then tell the owner briefly what is running and end your turn."
+                "for them, don't redo their tasks and don't guess their results: do "
+                "any work that does not depend on them, then tell the owner briefly "
+                "what is running and end your turn."
             ),
         })
 

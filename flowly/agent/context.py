@@ -2067,10 +2067,8 @@ You can keep track of the owner's goals and come back to things on your own.
                 "depends on.",
                 "Write each brief for a newcomer: the goal, what you already know, the "
                 "sources to use, what is out of scope, and what to return.",
-                "After starting subagents, do the part that is still yours — one the "
-                "owner asked you to do, or one you didn't hand to a subagent — and "
-                "nothing else: no extra checks or lookups to fill the time. Then tell "
-                "the owner briefly what is running and end your turn. Don't "
+                "After starting subagents, do any work that doesn't depend on them, "
+                "tell the owner briefly what is running, and end your turn. Don't "
                 "wait for them: when all the subagents you started in a turn have "
                 "finished, their results reach you together as one new message, and "
                 "you answer the owner's request from there. Treat a result as the "
