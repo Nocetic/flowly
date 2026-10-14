@@ -58,6 +58,15 @@ _PROFILE_RUN_BINDING_LIMIT = 2048
 #: OutboundMessage metadata: the conversation a message the agent wrote first
 #: belongs to; the relay opens a session for it (``_agent_first_session``).
 AGENT_FIRST_CONVERSATION_KEY = "agent_first_conversation"
+#: A relay session that read or changed this agent's goals hears
+#: ``objectives.changed`` for this long after its last such call; a screen that
+#: stays open renews it with its fallback read (every 5 minutes).
+_OBJECTIVES_WATCH_SECONDS = 15 * 60
+_OBJECTIVES_WATCH_LIMIT = 64
+_OBJECTIVES_WATCH_METHODS = frozenset({
+    "objectives.list", "objectives.update",
+    "agenda.list", "agenda.settings.get", "agenda.settings.set",
+})
 _AGENT_FIRST_OPEN_ATTEMPTS = 6
 _AGENT_FIRST_OPEN_TIMEOUT = 10.0
 _AGENT_FIRST_OPEN_RETRY_SECONDS = 10.0
@@ -323,6 +332,8 @@ class WebChannel(BaseChannel):
         self._pending: dict[str, asyncio.Queue] = {}
         self._subagent_observers: dict[str, float] = {}
         self._subagent_event_versions: dict[str, int] = {}
+        # Relay sessions showing this agent's goals → when their watch ends.
+        self._objectives_watchers: dict[str, float] = {}
         self._profile_subagent_observers: dict[tuple[str, str], tuple[int, float]] = {}
         self._profile_subagent_reads: dict[object, str] = {}
         # Map session_key (e.g. "web:FirestoreId") → relay session_id (browser UUID)
@@ -689,7 +700,8 @@ class WebChannel(BaseChannel):
         # have the full tool events already.
         if event_type in ("directory", "tool.activity"):
             targets.update(self._profile_directory_sessions)
-        elif event_type in {"connection", "error", "needsInput"}:
+        # Whatever shows this agent hears that it changed, or that its goals did.
+        elif event_type in {"connection", "error", "needsInput", "objectives.changed"}:
             targets.update(self._profile_directory_sessions)
             for (candidate_profile, _session_key), subscribers in (
                 self._profile_conversation_sessions.items()
@@ -919,6 +931,7 @@ class WebChannel(BaseChannel):
         self._clear_profile_subscriptions()
         self._subagent_observers.clear()
         self._subagent_event_versions.clear()
+        self._objectives_watchers.clear()
         self._relay_principals.clear()
         self._relay_recipients.clear()
         self._relay_authority = None
@@ -1754,6 +1767,7 @@ class WebChannel(BaseChannel):
         ) as ws:
             self._subagent_observers.clear()
             self._subagent_event_versions.clear()
+            self._objectives_watchers.clear()
             self._clear_profile_subagent_observers()
             self._ws = ws
             self._relay_authority = None
@@ -1819,6 +1833,7 @@ class WebChannel(BaseChannel):
                     self._clear_profile_subscriptions()
                     self._subagent_observers.clear()
                     self._subagent_event_versions.clear()
+                    self._objectives_watchers.clear()
                     self._relay_principals.clear()
                     self._relay_recipients.clear()
                     self._relay_authority = None
@@ -1974,6 +1989,7 @@ class WebChannel(BaseChannel):
             self._pending.pop(session_id, None)
             self._subagent_observers.pop(session_id, None)
             self._subagent_event_versions.pop(session_id, None)
+            self._objectives_watchers.pop(session_id, None)
             self._clear_profile_subagent_observers(session_id)
             self._remove_profile_relay_session(session_id)
 
@@ -2501,6 +2517,8 @@ class WebChannel(BaseChannel):
                 self._subagent_observers[session_id] = now + 120
                 if "eventVersion" in params:
                     self._subagent_event_versions[session_id] = event_version(params)
+        if method in _OBJECTIVES_WATCH_METHODS and session_id:
+            self._watch_objectives(session_id)
         if method == "system.capabilities" and self._profile_host is not None:
             result = {**result, "profileHost": self._profile_host.capabilities()}
         await ws.send(
@@ -2547,6 +2565,52 @@ class WebChannel(BaseChannel):
         self._profile_subagent_observers[key] = (version, now + 120)
         if previous is None and profile == "default" and self._profile_host is not None:
             self._profile_host.retain_default_events(self._profile_lease_owner(session_id) + ":subagents")
+
+    def _watch_objectives(self, session_id: str) -> None:
+        """Let a relay session that just read the goals hear when they change.
+
+        Only an authenticated call reaches here, so a session hears about goals
+        exactly when it has shown them. At the limit the watch closest to its
+        end makes room: a screen opened now always hears.
+        """
+        if len(session_id) > 256:
+            return
+        now = time.monotonic()
+        self._objectives_watchers = {
+            key: expiry for key, expiry in self._objectives_watchers.items() if expiry > now
+        }
+        if session_id not in self._objectives_watchers:
+            while len(self._objectives_watchers) >= _OBJECTIVES_WATCH_LIMIT:
+                self._objectives_watchers.pop(
+                    min(self._objectives_watchers, key=self._objectives_watchers.__getitem__)
+                )
+        self._objectives_watchers[session_id] = now + _OBJECTIVES_WATCH_SECONDS
+
+    async def send_objectives_event(self, data: dict) -> None:
+        """Tell the relay sessions showing this agent's goals that they changed.
+
+        The event carries no goal content (``flowly/objectives/events.py``):
+        each reads the goals again through its own authorized RPC. A missed
+        event is caught by the screen's fallback read, so nothing is queued.
+        """
+        if not self._ws:
+            return
+        now = time.monotonic()
+        self._objectives_watchers = {
+            key: expiry for key, expiry in self._objectives_watchers.items() if expiry > now
+        }
+
+        async def send(session_id: str) -> None:
+            frame = json.dumps({
+                "type": "event", "event": "objectives.changed",
+                "data": data, "sessionId": session_id,
+            })
+            pending = RelayOutbound(frame, self._outbound_event_access(frame))
+            await asyncio.wait_for(self._deliver_relay_outbound(pending), timeout=1)
+
+        await asyncio.gather(
+            *(send(key) for key in tuple(self._objectives_watchers)), return_exceptions=True
+        )
 
     def _prune_subagent_observers(self, now: float) -> None:
         self._subagent_observers = {key: expiry for key, expiry in self._subagent_observers.items() if expiry > now}

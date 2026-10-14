@@ -185,7 +185,11 @@ class ObjectiveStore:
             data["revision"] = int(data.get("revision") or 0) + 1
             _prune(data["objectives"])
             _atomic_write_json(self.path, data)
-            return result
+        # After the lock: clients hearing it read the committed goals.
+        from flowly.objectives import events
+
+        events.changed()
+        return result
 
     # ── reads ────────────────────────────────────────────────────────
 

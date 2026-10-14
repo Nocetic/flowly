@@ -26,6 +26,10 @@ from flowly.agenda import policy
 from flowly.agenda.store import get_agenda_store
 from flowly.objectives.store import ObjectiveError, get_objective_store
 
+#: What the agent reads when a resumed goal never had a check-in to restore.
+RESUMED_CHECK_IN_NOTE = (
+    "The owner resumed this goal. Ask how it is going now, and plan its check-ins again."
+)
 _OWNER_ACTIONS = {"pause": "paused", "resume": "active", "done": "done", "drop": "dropped"}
 _PUBLIC_ITEM_FIELDS = (
     "id", "kind", "dueAt", "note", "sessionKey", "objectiveId", "createdAt",
@@ -77,6 +81,13 @@ def objectives_update(params: dict[str, Any]) -> dict[str, Any]:
     goal = goals.set_status(goal_id, status, by_owner=True)
     if status != "active":
         agenda.cancel_for_objective(goal_id, reason=f"owner_{action}")
+    else:
+        # Resumed (or Undo): the check-in the pause or finish took away comes back.
+        agenda.restore_for_objective(
+            goal_id,
+            session_key=str(goal.get("sessionKey") or ""),
+            fallback_note=RESUMED_CHECK_IN_NOTE,
+        )
     goal["nextCheckAt"] = None if status != "active" else (
         (agenda.next_for_objective(goal_id) or {}).get("dueAt")
     )

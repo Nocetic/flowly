@@ -2236,10 +2236,22 @@ class ProfileHost:
         with request_owner_scope(owner), event_access_scope(access):
             await self._handle_primary_frame_event(frame)
 
+    async def announce_primary_objectives(self, data: dict[str, Any]) -> None:
+        """The main agent's goals changed: tell every app showing this host.
+
+        Unlike the main agent's other events this needs no lease: it carries
+        no content, and a remote goals panel that reads them only through
+        ``profiles.rpc`` holds none (``flowly/objectives/events.py``).
+        """
+        await self._emit("default", "objectives.changed", data)
+
     async def _handle_primary_frame_event(self, frame: dict[str, Any]) -> None:
         if frame.get("type") == "event":
             payload = frame.get("data")
             if not isinstance(payload, dict):
+                return
+            if frame.get("event") == "objectives.changed":
+                # Announced once by the runtime (announce_primary_objectives).
                 return
             session_key = str(payload.get("sessionKey") or "")
             run_id = str(payload.get("runId") or "")

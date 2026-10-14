@@ -406,14 +406,83 @@ Registered in `feature_rpc._DISPATCH` and allowed through the profile host
 | Method | Params | Result |
 | --- | --- | --- |
 | `objectives.list` | `includeClosed?` (default true) | `{objectives: [goal + nextCheckAt], settings}` |
-| `objectives.update` | `id`, `action`: `pause` / `resume` / `done` / `drop` / `delete`; `step` with `step` (1-based) and `done`; `rename` with `title` | `{ok, objective}` or `{ok, deleted}`; pause/done/drop/delete cancel the check-in; a tick or rename is logged as kind `owner` for the agent's next check-in |
+| `objectives.update` | `id`, `action`: `pause` / `resume` / `done` / `drop` / `delete`; `step` with `step` (1-based) and `done`; `rename` with `title` | `{ok, objective}` or `{ok, deleted}`; pause/done/drop/delete cancel the check-in, resume restores it (below); a tick or rename is logged as kind `owner` for the agent's next check-in |
 | `agenda.list` | `historyLimit?` (0–100, default 20) | `{pending, history, settings}` (public fields only) |
 | `agenda.settings.get` | — | `{settings, levels, dailyCaps, globalDailyCap}` |
 | `agenda.settings.set` | any of `level`, `quietStart`, `quietEnd`, `timezone`, `reviewTime` | `{settings}`; unknown keys rejected |
 
 Errors map `ObjectiveError.code` to the RPC code: `INVALID`, `NOT_FOUND`,
-`LIMIT`, `BUSY`, `CORRUPT`. A resumed goal gets no check-in until the agent
-plans one (next turn in that conversation or the next daily review).
+`LIMIT`, `BUSY`, `CORRUPT`.
+
+**Resume and Undo** (`AgendaStore.restore_for_objective`). Pausing, finishing
+or dropping a goal cancels its check-in into the agenda history with reason
+`owner_<action>`. Resuming it (the Resume item, or Undo after "done") brings
+that check-in back: as it was when its time is still ahead (an Undo a moment
+later restores it exactly), otherwise `RESUME_CHECK_IN_DELAY_MS` (2 h) from
+now with its old note. A goal that never had one gets one in 2 h whose note
+asks the agent to ask how it is going and plan again (`RESUMED_CHECK_IN_NOTE`).
+A check-in the goal already has is kept; a goal outside an owner conversation
+gets none; a full agenda (`MAX_PENDING`) resumes the goal without one. The
+limits still decide when it may reach the owner.
+
+**The daily review time** (`reviewTime`, default 08:30, the owner's zone): once
+a day at or after it the agent reads its goals and recent conversations and
+plans the day's check-ins and follow-ups (below, "The daily review"). Every
+client shows it as "Daily planning: 08:30 · Change" with that explanation,
+under the quiet hours, and hides it when the agent never writes first.
+
+## When the goals change (`flowly/objectives/events.py`)
+
+A goals screen reads `objectives.list` again when the agent says its goals
+changed, and polls only as a fallback. Every committed write to
+`objectives.json` (`ObjectiveStore._transaction`), and every agenda write that
+changes what a goals screen shows (a goal's planned check-in, the settings:
+`agenda/store.py` `_what_clients_show`), calls `events.changed()`. Changes
+within `COALESCE_SECONDS` (0.15 s) are announced once as
+`objectives.changed {at}`: **no goal content**, so each client reads again
+through its own authorized RPC.
+
+- `changed()` is safe from any thread (`call_soon_threadsafe` onto the loop
+  the runtime registered), never raises, never blocks the writer.
+- The announcement runs in an **empty context**: inside one account's request
+  it would otherwise be scoped to that account (`EventAccess.capture`), and the
+  agent's goals are shown to every screen that reads them.
+- The runtime registers the broadcaster after `agenda.start()` and clears it
+  on shutdown (`cli/gateway_cmd.py` `_announce_objectives`). It sends:
+  1. `gateway_server.broadcast_event` — this runtime's own WS clients (Desktop
+     on this Mac; a direct-gateway phone). A named agent's host observes it
+     (`ProfileHost._handle_runtime_event`) and carries it on as a profile event.
+  2. On the host process, `ProfileHost.announce_primary_objectives` — the main
+     agent's change as a `profile.event` for `default`, **without** the default
+     event lease (a remote goals panel reads it only through `profiles.rpc`
+     and holds none). The same frame arriving through the leased primary feed
+     is dropped, so it is announced once.
+  3. `WebChannel.send_objectives_event` — relay sessions that called
+     `objectives.*` / `agenda.*` directly (the phones' main agent). A
+     successful call watches for `_OBJECTIVES_WATCH_SECONDS` (15 min), renewed
+     by the screens' fallback read; at most 64, the watch nearest its end makes
+     room; dropped on `browser-disconnected` and on relay reconnect.
+- Profile events route like `connection`: the directory and whoever reads that
+  agent (`web.py _forward_profile_event`, `server.py _ProfileClientSubscription`).
+- `system.capabilities.objectivesEventsVersion` is 1 when the runtime
+  announces; clients then poll every 5 minutes instead of every minute.
+  Desktop, which reaches agents through `profiles.rpc` (no capabilities),
+  slows down after the first event it hears from that agent instead.
+
+## Remote agents (relay and self-hosted gateway)
+
+Every goal RPC is a `feature_rpc` method, so it is served the same on this
+Mac, through the relay and on a self-hosted gateway, and named agents are
+allowed through the profile host (`PROFILE_RPC_TIMEOUTS`). Desktop reaches a
+remote host's agents with `profiles.rpc` (main agent = `default`), pinned to
+the host and bot ids; the phones call the main agent directly and named
+agents through `profiles.rpc`. Goal cards travel on the final chat event and
+history on every transport. A message the agent writes first goes out over
+the gateway's `push_session_message` or the relay's `conversation.open`, and
+rings the phone through the gateway-registered anonymous relay push. The
+clients send the owner's timezone once, since a VPS clock is usually UTC.
+Tested in code on every transport (above); live proof was on the owner's Mac
+over the relay, not yet on a VPS gateway.
 
 ## Named agents
 
@@ -471,21 +540,16 @@ agent's phone push through the primary, the phones' goals screens on a device.
   (a VPS and a Mac) each count their own; it needs a ledger both reach (the
   account).
 - **One combined morning message** across agents instead of each writing on
-  its own.
+  its own. Kept on purpose: Muse writes per event, and the daily briefs of
+  other products are scheduled by the owner; here that is a routine.
 - **Learning from outcomes** beyond back-off (which kinds of message the owner
   answers), and **event-driven wake-ups** (new email, calendar, flowlet data).
-- **A server event when goals change.** Clients poll: Desktop after every
-  settled turn and each minute, the phones each minute while the page shows.
-- **Editing the review time** in any client (`agenda.settings.set reviewTime`
-  works; no control).
-- **A resumed goal** (Undo after "done", or Resume) has no check-in until the
-  agent plans one: its next turn in that conversation or the next daily review.
 - **Subgoals with their own schedule.** A goal has a plan of steps the owner
   ticks and the agent reads; a step is not a goal of its own with a timeframe
-  or check-ins.
+  or check-ins. Kept on purpose: Muse's goals hold a plan of steps too, with
+  no sign of dated subgoals.
 - **Delivery retry after the relay was unreachable** (see Failure modes).
-- **Desktop's step tick** waits for the agent's answer; the phones show it at
-  once (`AgentGoalsModel` / `AgentGoalsState.setStep`).
+- **Live proof on a VPS gateway** of check-ins, cards and the change event.
 
 ## Tests
 
@@ -500,5 +564,9 @@ every surface; fails without the fix), `test_feature_rpc_agenda.py` (RPCs,
 profile host allowlist), `test_goal_cards.py` (cards on replies, history and
 proactive pushes; owner step/rename), `test_profile_agenda_push.py` (named
 agents' pushes through the primary host, once), `test_web_channel_agent_first.py`
-(a relay session opened for an agent-first message; refusal, silence, retries).
+(a relay session opened for an agent-first message; refusal, silence, retries),
+`test_objectives_events.py` (one event per burst, from threads, only what a
+screen shows, never in the writer's context, relay watches and their end,
+routing on relay and gateway, the main agent's change without a lease, once).
+`test_feature_rpc_agenda.py` covers Resume/Undo restoring the check-in.
 Every fix from the live test has a test that fails without it.

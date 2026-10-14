@@ -58,6 +58,22 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+#: A resumed goal whose old check-in time has passed is checked on this
+#: long after it is resumed.
+RESUME_CHECK_IN_DELAY_MS = 2 * 60 * 60 * 1000
+
+
+def _what_clients_show(data: dict[str, Any]) -> tuple[Any, ...]:
+    """The part of the agenda a goals list shows: each goal's planned check-in
+    and the settings."""
+    checks = sorted(
+        (str(item.get("objectiveId")), int(item.get("dueAt") or 0))
+        for item in data.get("items") or []
+        if item.get("objectiveId")
+    )
+    return tuple(checks), tuple(sorted((data.get("settings") or {}).items()))
+
+
 def is_owner_conversation(session_key: str) -> bool:
     return bool(session_key) and session_key.startswith(OWNER_CONVERSATION_PREFIXES) and len(session_key.split(":", 1)[1]) > 0
 
@@ -120,6 +136,7 @@ class AgendaStore:
     def _transaction(self, mutate: Callable[[dict[str, Any]], T]) -> T:
         with self._locked():
             data = self._read()
+            shown_before = _what_clients_show(data)
             result = mutate(data)
             data["version"] = SCHEMA_VERSION
             data["revision"] = int(data.get("revision") or 0) + 1
@@ -131,7 +148,15 @@ class AgendaStore:
                 )
                 data["conversations"] = dict(ordered[-MAX_CONVERSATIONS:])
             _atomic_write_json(self.path, data)
-            return result
+            shown_changed = _what_clients_show(data) != shown_before
+        # Only what a goals list shows (a goal's next check-in, the settings)
+        # is announced: the owner writing, a wake-up starting or a follow-up
+        # with no goal changes nothing there.
+        if shown_changed:
+            from flowly.objectives import events
+
+            events.changed()
+        return result
 
     def snapshot(self) -> dict[str, Any]:
         with self._locked():
@@ -259,6 +284,71 @@ class AgendaStore:
                 data["items"].remove(item)
                 data["history"].append({**item, "outcome": "cancelled", "reason": reason, "settledAt": now})
             return len(gone)
+
+        return self._transaction(mutate)
+
+    def restore_for_objective(
+        self,
+        objective_id: str,
+        *,
+        session_key: str,
+        fallback_note: str,
+        now_ms: int | None = None,
+        delay_ms: int = RESUME_CHECK_IN_DELAY_MS,
+    ) -> dict[str, Any] | None:
+        """A resumed goal gets its check-in back.
+
+        Pausing, finishing or dropping a goal cancels its check-in; resuming
+        it (or Undo) used to leave it with none until the agent happened to
+        plan one. The check-in the owner's action took away comes back as it
+        was when its time is still ahead (an Undo a moment later restores it
+        exactly); otherwise one comes ``delay_ms`` from now with its note, or
+        ``fallback_note`` when it never had one. The limits still decide when
+        it may reach the owner. A goal that already has a check-in keeps it.
+        None when the goal's conversation is not the owner's, or the agenda is
+        full.
+        """
+        now = now_ms if now_ms is not None else _now_ms()
+        key = clean_session_key(session_key)
+        if not is_owner_conversation(key):
+            return None
+
+        def mutate(data: dict[str, Any]) -> dict[str, Any] | None:
+            existing = next(
+                (i for i in data["items"] if i.get("objectiveId") == objective_id and i.get("state") == "pending"),
+                None,
+            )
+            if existing is not None:
+                return copy.deepcopy(existing)
+            taken = next(
+                (
+                    h for h in reversed(data["history"])
+                    if h.get("objectiveId") == objective_id
+                    and h.get("outcome") == "cancelled"
+                    and str(h.get("reason") or "").startswith("owner_")
+                ),
+                None,
+            )
+            due = int(taken["dueAt"]) if taken and int(taken.get("dueAt") or 0) > now else now + delay_ms
+            note = (taken or {}).get("note") or fallback_note
+            if len(data["items"]) >= MAX_PENDING:
+                # The goal is resumed all the same; the agent plans its
+                # check-in once there is room.
+                return None
+            item = {
+                "id": f"wk_{secrets.token_hex(6)}",
+                "kind": "objective",
+                "dueAt": due,
+                "note": clean_text(note, limit=MAX_NOTE, field="note", required=True, multiline=True),
+                "sessionKey": key,
+                "objectiveId": objective_id,
+                "cancelOnReply": False,
+                "createdAt": now,
+                "attempts": 0,
+                "state": "pending",
+            }
+            data["items"].append(item)
+            return copy.deepcopy(item)
 
         return self._transaction(mutate)
 
