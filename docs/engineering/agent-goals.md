@@ -434,7 +434,11 @@ reach (the account), which this change does not add.
 
 ## Not done yet
 
-- iOS / Android surfaces (goals list, goal page, cards, settings).
+- The phones have what Desktop has except the daily review time: goal cards
+  (live, history and the relay's copy, sealed or plain), "Goals and routines"
+  for the main agent (sidebar) and each named agent (its details), a goal's
+  page with its actions, quiet hours, and goal steps in Activity (their
+  `docs/engineering/goals-ios.md` / `goals-android.md`).
 - One owner-wide budget across machines (above).
 - One combined morning message across agents instead of separate ones.
 - Learning from outcomes beyond backoff (which kinds of message the owner
