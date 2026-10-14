@@ -1,6 +1,5 @@
 """sessions_list tool — list, cancel, and retry background tasks."""
 
-import json
 import time
 from typing import Any, TYPE_CHECKING
 
@@ -42,8 +41,9 @@ class SessionsListTool(Tool):
         return (
             "Manage this conversation's background tasks. Actions: "
             "list (show running/completed/failed tasks), "
-            "cancel (stop a running task by run_id). To wait for subagents use "
-            "agent_wait instead of listing repeatedly."
+            "cancel (stop a running task by run_id, or run_id=\"all\" to stop "
+            "every task this conversation has running, in one call). Results "
+            "reach you as a message; don't list repeatedly to wait for them."
         )
 
     @property
@@ -63,7 +63,9 @@ class SessionsListTool(Tool):
                 },
                 "run_id": {
                     "type": "string",
-                    "description": "Task ID to cancel (first 8 chars sufficient).",
+                    "description": (
+                        "Task ID to cancel (first 8 chars sufficient), or \"all\"."
+                    ),
                 },
             },
             "required": [],
@@ -154,6 +156,17 @@ class SessionsListTool(Tool):
 
         if not self._manager:
             return "Error: Task cancellation not available."
+
+        if run_id.strip().lower() == "all":
+            running = [r for r in self._registry.all()
+                       if r.ended_at is None and r.origin != "system" and self._is_own(r)]
+            if not running:
+                return "No task of this conversation is running."
+            stopped = []
+            for record in running:
+                await self._manager.cancel(record.run_id)
+                stopped.append(record.display_name or record.label)
+            return f"Stopped {len(stopped)} task(s): " + ", ".join(stopped)
 
         matches = [r for r in self._registry.all() if r.run_id.startswith(run_id.strip())]
         if matches and not any(self._is_own(r) for r in matches):

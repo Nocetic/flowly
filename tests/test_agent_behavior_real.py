@@ -14,8 +14,9 @@ and checks what the agent *did*, not how its prose reads:
 * a long or detailed task is done by the agent itself;
 * an explicit "give this to an agent" starts exactly one subagent;
 * independent parts may be split, but never into a lone unrequested spawn;
-* after starting subagents the agent ends its turn — it does not wait for
-  them, re-read them or poll a task list.
+* after starting subagents the agent does the part that is still its own,
+  then ends its turn — it does not wait for them, re-read them or poll a
+  task list. ``FLOWLY_EVAL_ONLY=a,b`` runs only the named scenarios.
 
 Subagents are recorded, not run, so a scenario costs one conversation turn.
 Each run writes ``agent-behavior-report.json`` (path in ``FLOWLY_EVAL_OUT``,
@@ -110,6 +111,14 @@ def _one_each_on_request(o: Observed) -> str | None:
     return _ends_turn_after_starting(o)
 
 
+def _three_and_its_own_part(o: Observed) -> str | None:
+    if o.spawn_started != 3:
+        return f"expected three subagents, got {o.spawn_started}"
+    if not any(t in ("web_search", "web_fetch", "web_extract") for t in o.tools):
+        return "left its own part undone"
+    return _ends_turn_after_starting(o)
+
+
 def _split_or_self(o: Observed) -> str | None:
     if o.spawn_started == 1:
         return "started a lone unrequested subagent"
@@ -133,6 +142,10 @@ SCENARIOS = [
              "Şu üç şirketin kuruluş yıllarını ve hikayelerini ayrı ayrı araştır: Anthropic, "
              "Mistral AI, Cohere. agent çalıştır her biri için.",
              _one_each_on_request),
+    Scenario("agents-plus-own-part",
+             "Anthropic, Mistral AI ve Cohere'in kuruluş yıllarını birer agent'la araştır; "
+             "OpenAI'ın kuruluş yılını da sen kendin araştır.",
+             _three_and_its_own_part),
 ]
 
 
@@ -214,7 +227,8 @@ async def test_agent_behaviour_on_owner_conversations(agent_factory, monkeypatch
 
     report: list[dict[str, Any]] = []
     failures: list[str] = []
-    for scenario in SCENARIOS:
+    only = {n for n in os.environ.get("FLOWLY_EVAL_ONLY", "").split(",") if n}
+    for scenario in (s for s in SCENARIOS if not only or s.name in only):
         observed = await _observe(config, provider, scenario, home)
         problem = scenario.check(observed)
         report.append({"scenario": scenario.name, "ok": problem is None, "problem": problem,

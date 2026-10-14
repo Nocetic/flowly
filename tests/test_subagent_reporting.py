@@ -397,3 +397,42 @@ def test_a_search_backend_without_its_sdk_is_not_available(monkeypatch):
         assert provider.is_available() is False
         monkeypatch.setattr(module, "_sdk_installed", lambda: True)
         assert provider.is_available() is True
+
+
+# ── Stopping on request ─────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_stopping_every_agent_takes_one_call_and_reports_nothing_back(tmp_path):
+    from flowly.agent.tools.sessions_list import SessionsListTool
+
+    bus, children = MessageBus(), _Children()
+    children.gates = {name: asyncio.Event() for name in ("A", "B", "C", "other")}
+    manager = _manager(tmp_path, children, bus)
+    for name in "ABC":
+        await _start(manager, name, "turn-1")
+    other = json.loads(await manager.spawn(
+        task="task other", origin_channel="web", origin_chat_id="x",
+        parent_session_key="web:other-chat", origin="agent", display_name="Other",
+    ))["run_id"]
+    tool = SessionsListTool(registry=manager.registry, manager=manager)
+    with tool_execution_scope(CHAT):
+        result = await tool.execute(action="cancel", run_id="all")
+    assert result.startswith("Stopped 3 task(s)")
+    assert {r.outcome for r in manager.registry.all() if r.parent_session_key == CHAT} == {"cancelled"}
+    assert manager.registry.get(other).ended_at is None  # another chat's work is untouched
+    await _no_notice(bus)  # whoever stopped them already knows
+    await manager.cancel(other)
+
+
+@pytest.mark.asyncio
+async def test_a_run_stopped_on_request_is_left_out_of_its_batchs_report(tmp_path):
+    bus, children = MessageBus(), _Children()
+    children.gates = {"A": asyncio.Event(), "B": asyncio.Event()}
+    manager = _manager(tmp_path, children, bus)
+    await _start(manager, "A", "turn-1")
+    b = await _start(manager, "B", "turn-1")
+    await manager.cancel(b)
+    await _no_notice(bus)
+    children.gates["A"].set()
+    notice = await asyncio.wait_for(bus.consume_inbound(), 3)
+    assert "Result of A." in notice.content and f"run_id={b}" not in notice.content
