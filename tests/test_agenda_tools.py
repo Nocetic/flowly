@@ -142,3 +142,16 @@ async def test_the_owner_says_write_less_and_the_agent_sets_it():
     assert json.loads(await _call(tool, CHAT, action="get")) == {"level": "low", "quietStart": "22:30", "quietEnd": "09:00"}
     assert (await _call(tool, CHAT, action="set", level="loud")).startswith("Error:")
     assert (await _call(tool, CHAT, action="set")).startswith("Error:")
+
+
+@pytest.mark.asyncio
+async def test_a_measured_goal_starts_at_nothing_done_not_at_an_unknown():
+    """The phones showed "? / 12 workouts": the store dropped the agent's
+    current and left it unknown. A target starts at 0; a given current stays."""
+    await _call(ObjectiveTool(), CHAT, action="create", title="Train 12 times", target=12, unit="workouts")
+    await _call(ObjectiveTool(), CHAT, action="create", title="Read 5 books", target=5, current=2, unit="books")
+    await _call(ObjectiveTool(), CHAT, action="create", title="Feel calmer")
+    progress = {goal["title"]: goal["progress"] for goal in get_objective_store().list()}
+    assert progress["Train 12 times"] == {"current": 0, "target": 12, "unit": "workouts"}
+    assert progress["Read 5 books"] == {"current": 2, "target": 5, "unit": "books"}
+    assert progress["Feel calmer"]["current"] is None and progress["Feel calmer"]["target"] is None

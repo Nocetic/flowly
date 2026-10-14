@@ -217,12 +217,19 @@ class ObjectiveStore:
         stage: Any = "",
         cadence: Any = "",
         target: Any = None,
+        current: Any = None,
         unit: Any = "",
         ends_at: Any = None,
         session_key: Any = "",
         created_by: str = "agent",
     ) -> dict[str, Any]:
         now = _now_ms()
+        clean_target = _clean_number(target, "target")
+        clean_current = _clean_number(current, "current")
+        # A goal measured against a target starts at nothing done, not at an
+        # unknown: "0 / 12 workouts", never "? / 12".
+        if clean_current is None and clean_target is not None:
+            clean_current = 0
         record = {
             "id": f"obj_{secrets.token_hex(6)}",
             "title": clean_text(title, limit=MAX_TITLE, field="title", required=True),
@@ -232,8 +239,8 @@ class ObjectiveStore:
             "stage": clean_text(stage, limit=MAX_STAGE, field="stage"),
             "cadence": clean_text(cadence, limit=MAX_CADENCE, field="cadence"),
             "progress": {
-                "current": None,
-                "target": _clean_number(target, "target"),
+                "current": clean_current,
+                "target": clean_target,
                 "unit": clean_text(unit, limit=MAX_UNIT, field="unit"),
             },
             "status": "active",
