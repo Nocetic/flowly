@@ -434,7 +434,10 @@ reach (the account), which this change does not add.
 
 ## Not done yet
 
-- iOS / Android surfaces (goals list, goal page, cards, settings).
+- iOS / Android: a goals list and settings. The phones draw goal cards
+  (live, history and the relay's copy, sealed or plain), open a goal read-only
+  from `objectives.list`, and name goal steps in Activity (their
+  `docs/engineering/goals-ios.md` / `goals-android.md`).
 - One owner-wide budget across machines (above).
 - One combined morning message across agents instead of separate ones.
 - Learning from outcomes beyond backoff (which kinds of message the owner
