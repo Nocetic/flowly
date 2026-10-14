@@ -1,7 +1,12 @@
 # Tracked goals and the agent's agenda
 
-Status: Core phase 1 implemented on branch `feat/agent-goals` (2026-10-13), not
-merged. Desktop UI on the same branch name in `flowly-desktop`. iOS not started.
+Status (2026-10-14): merged to `main` locally, **not pushed** (a Core push is a
+release). Clients: Desktop (`flowly-desktop`, `docs/engineering/agent-goals.md`),
+iOS (`Flowly`, `docs/engineering/goals-ios.md`), Android (`flowly-android`,
+`docs/engineering/goals-android.md`). The relay parts (goal cards stored with a
+reply, `conversation.open`) are merged to the relay's `main` and deployed by
+the maintainer. What was proven live is under "Verified live"; what is left is
+under "Not done yet".
 
 ## What it is for
 
@@ -48,8 +53,9 @@ owner conversation ──(agent decides)──▶ objective tool ─▶ objectiv
         │                                                     sender_id="agenda"
         ▼                                                     metadata.agenda_item
 AgentLoop._process_agenda_wake ─▶ _process_system_message (hidden turn in the conversation)
-   ├─ reply "[SILENT]"/empty ─▶ nothing saved, nothing sent ─▶ turn_finished(delivered=False)
-   └─ reply text ─▶ saved (trigger hidden), delivered like any proactive reply
+   ├─ reply without "[SEND]" ─▶ nothing saved, nothing sent ─▶ turn_finished(delivered=False)
+   └─ "[SEND] message" ─▶ saved (trigger hidden), delivered like any proactive reply
+                    │     (relay: the web channel first opens a relay session)
                     ─▶ turn_finished(delivered=True) ─▶ budget.confirm, unanswered+1,
                                                          phone notification
 daily, after reviewTime:
@@ -104,6 +110,12 @@ entry carries an `event` (`step_done`, `step_undone`, `renamed`, `active`,
 `paused`, `done`, `dropped`) and its text is then only the step or the new
 title, so clients say it in their own language ("You completed “Gym”") and the
 agent reads it on its next check-in.
+
+`progress.current` is what the agent passed when it created the goal; a goal
+with a `target` and no `current` starts at `0` (before 2026-10-14 the store
+dropped the agent's `current` and left it `null`, which the phones showed as
+"? / 12 workouts"; goals from then keep `null`, and clients read it as 0). The
+agent updates it on check-ins (`objective update current=…`).
 
 Limits: 20 open goals per agent, 200 stored (oldest closed pruned), title 120,
 why 1000, 20 steps of 300, stage 200, cadence 120, log entry 500. Every text
@@ -266,7 +278,9 @@ there is something to review (an active goal, or the owner wrote within 7
 days). The day is marked first, so a crashing review is not retried every tick.
 
 It runs `agent.process_direct(prompt, session_key="agenda:review")` in a fresh
-session, deleted again when the review ends (what it planned lives in the
+session (never auto-titled: `agenda:` is in `AgentLoop._NO_TITLE_PREFIXES`,
+since titling it cost a model call every morning), deleted again when the
+review ends (what it planned lives in the
 agenda; no client should ever list it as a conversation — Desktop's named-agent
 list also skips the `agenda:` prefix, and the dreamer never mines `agenda:`
 sessions into memory). Channel `agenda` is in `_NON_USER_CHANNELS` (not owner
@@ -321,7 +335,7 @@ tools, ids or agenda, and plan nothing when nothing is worth it.
 
 ### Hidden from every product surface
 
-`objective` and `follow_up` are bookkeeping, and the memory tools
+`objective`, `follow_up` and `proactivity` are bookkeeping, and the memory tools
 (`memory_search`, `memory_get`, `memory_recall`, `memory_feedback`,
 `memory_append`, `memory_consolidate`, `memory_import`, `knowledge_graph`)
 are the agent recalling and tidying what it knows. Showing their calls would
@@ -347,6 +361,10 @@ check-in (`follow_up`) or changing how often to write first (`proactivity`)
 is part of talking, like recalling memory: shown as steps of a task, never a
 task on its own.
 
+A wake-up or the daily review is never an Activity task of its own (their
+channels are not owner activity): what the agent wrote first shows in the
+conversation, and its outcome in `agenda.list`'s history.
+
 The canonical session/provider history is untouched: the model still sees its
 own calls.
 
@@ -362,12 +380,11 @@ away for the model, like `usage`). They go out as `goalCards`:
 - on the direct gateway's final chat event (`message.goalCards`);
 - in `chat.history` rows (`goalCards` on that assistant row), so a reopened
   conversation shows the same card;
-- in the relay's final data block (`goalCards`). The relay (branch
-  `feat/agent-goals` in `flowly-relay-service`, `goal-cards.ts`) stores it with
-  the message through an allowlist of fields and bounds; in an encrypted
-  conversation it is sealed with the conversation key (`encryptedGoalCards` +
-  `goalCardsIv`), never stored in clear. Until that relay is deployed, a relay
-  chat shows the card live only.
+- in the relay's final data block (`goalCards`). The relay
+  (`flowly-relay-service`, `goal-cards.ts`) stores it with the message through
+  an allowlist of fields and bounds; in an encrypted conversation it is sealed
+  with the conversation key (`encryptedGoalCards` + `goalCardsIv`), never
+  stored in clear. A relay that predates it shows the card live only.
 
 ```json
 {"id": "obj_…", "event": "created", "title": "A month of physics", "category": "learning",
@@ -431,20 +448,44 @@ reach (the account), which this change does not add.
 | Two agents race for the last slot | `reserve` is atomic under the lock; the loser defers to tomorrow |
 | Corrupt JSON | the store raises `CORRUPT`; the service logs and skips that tick; the file is never overwritten blindly |
 | Local agent and the Mac is off | nothing runs until it is on again: proactivity needs an always-on agent (VPS / cloud) |
+| Relay unreachable when a message is delivered | the web channel tries to open a relay session 6 times, 10 s apart; then the message stays only in the agent's history (not retried later) |
+| A client has the relay conversation open | the relay forwards the message live and does not push the phone (the same rule as any reply) |
+
+## Verified live (2026-10-14, the owner's Mac, relay conversations)
+
+- A check-in asked for "in 3 minutes" at night went out on time (the owner was
+  up) with its card and the Muse-style first check-in ("every evening around
+  21:00 I'll ask"), after `[SEND]`, the awake rule, the wake prompt and
+  `conversation.open` were fixed (each found by that test: silence, a
+  self-imposed quiet-hours delay, and the relay dropping the message).
+- The 08:30 daily review ran, kept the goal's pending check-in, and planned a
+  follow-up on an unfinished thread for 11:00, which researched and delivered.
+- The phone was not pushed while Desktop had the conversation open (expected).
+
+Not proven live: a check-in in a direct (local gateway) conversation, a named
+agent's phone push through the primary, the phones' goals screens on a device.
 
 ## Not done yet
 
-- The phones have what Desktop has except the daily review time: goal cards
-  (live, history and the relay's copy, sealed or plain), "Goals and routines"
-  for the main agent (sidebar) and each named agent (its details), a goal's
-  page with its actions, quiet hours, and goal steps in Activity (their
-  `docs/engineering/goals-ios.md` / `goals-android.md`).
-- One owner-wide budget across machines (above).
-- One combined morning message across agents instead of separate ones.
-- Learning from outcomes beyond backoff (which kinds of message the owner
-  answers), event-driven wake-ups (new email, calendar, flowlet data), and a
-  server event when goals change (Desktop re-reads after each settled turn).
-- The relay change is not deployed.
+- **One owner-wide budget across machines.** Agents on different machines
+  (a VPS and a Mac) each count their own; it needs a ledger both reach (the
+  account).
+- **One combined morning message** across agents instead of each writing on
+  its own.
+- **Learning from outcomes** beyond back-off (which kinds of message the owner
+  answers), and **event-driven wake-ups** (new email, calendar, flowlet data).
+- **A server event when goals change.** Clients poll: Desktop after every
+  settled turn and each minute, the phones each minute while the page shows.
+- **Editing the review time** in any client (`agenda.settings.set reviewTime`
+  works; no control).
+- **A resumed goal** (Undo after "done", or Resume) has no check-in until the
+  agent plans one: its next turn in that conversation or the next daily review.
+- **Subgoals with their own schedule.** A goal has a plan of steps the owner
+  ticks and the agent reads; a step is not a goal of its own with a timeframe
+  or check-ins.
+- **Delivery retry after the relay was unreachable** (see Failure modes).
+- **Desktop's step tick** waits for the agent's answer; the phones show it at
+  once (`AgentGoalsModel` / `AgentGoalsState.setStep`).
 
 ## Tests
 
@@ -458,4 +499,6 @@ own task, the check-in card), `test_internal_tool_visibility.py` (hidden on
 every surface; fails without the fix), `test_feature_rpc_agenda.py` (RPCs,
 profile host allowlist), `test_goal_cards.py` (cards on replies, history and
 proactive pushes; owner step/rename), `test_profile_agenda_push.py` (named
-agents' pushes through the primary host, once).
+agents' pushes through the primary host, once), `test_web_channel_agent_first.py`
+(a relay session opened for an agent-first message; refusal, silence, retries).
+Every fix from the live test has a test that fails without it.
