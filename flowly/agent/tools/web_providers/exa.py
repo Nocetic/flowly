@@ -8,6 +8,7 @@ worker thread.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 from typing import Any
 
@@ -15,6 +16,10 @@ from loguru import logger
 
 from flowly.agent.tools.web_providers._config import provider_section
 from flowly.agent.tools.web_providers.base import WebSearchProvider
+
+
+def _sdk_installed() -> bool:
+    return importlib.util.find_spec("exa_py") is not None
 
 
 def _exa_key() -> str:
@@ -57,7 +62,8 @@ class ExaWebSearchProvider(WebSearchProvider):
         section = provider_section("exa")
         if not getattr(section, "enabled", False):
             return False
-        return bool(_exa_key())
+        # Configured is not enough: without its SDK every call fails.
+        return _sdk_installed() and bool(_exa_key())
 
     def search(self, query: str, limit: int = 5) -> dict[str, Any]:
         try:

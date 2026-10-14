@@ -30,7 +30,11 @@ When it starts one, the agent writes the subagent's brief itself: the goal, what
 
 ### The agent keeps working
 
-Starting a subagent returns at once with its run id; the agent carries on with whatever doesn't depend on it. When its next step needs a subagent's result it waits with `agent_wait`, which returns as soon as a subagent finishes or writes to it, or you write to the agent — it never sleeps or polls a task list. When the subagent finishes, its result reaches the agent as a message: the title, the run id, the tools it used and up to 8,000 characters of its result. The agent reads anything beyond that with `agent_read`, which only ever shows runs started in the same conversation. If the conversation is busy when a subagent finishes, the message waits until it frees up.
+Starting a subagent returns at once with its run id. The agent does whatever doesn't depend on it, tells you briefly what is running and ends its turn, so the chat stays free while subagents work. Subagents started in the same turn report back together: when the last of them finishes, their results reach the agent in one message — each with its title, run id, the tools it used and its result (up to 8,000 characters for a single run, 24,000 shared across a batch) — and the agent answers your request as a whole from there. A subagent alone in its turn reports as soon as it finishes. The agent reads anything beyond what was shown with `agent_read`, which only ever shows runs started in the same conversation. If the conversation is busy when the results arrive, they wait until it frees up; if you write while the agent is working on them, your message is answered right after.
+
+`agent_wait` is for the rare case where the agent cannot finish its own work in a turn without a result due shortly. It returns as soon as a subagent finishes or writes, or you write; a single wait lasts at most two minutes (30 seconds by default), and a turn waits at most five minutes in all before it ends and lets the results arrive as a message. The agent never sleeps or polls a task list.
+
+A turn that keeps getting results it already has — re-reading the same finished result, polling something that stopped changing — is told so, and after four such results in a row it answers with what it has, without tools. A subagent going round in circles the same way wraps up with a summary.
 
 ### Talking while they work
 

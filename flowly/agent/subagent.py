@@ -15,6 +15,7 @@ from loguru import logger
 from flowly.bus.events import ConversationInboundMessage
 from flowly.bus.queue import MessageBus
 from flowly.providers.base import LLMProvider
+from flowly.agent.repetition import RepetitionGuard, mark_repeated
 from flowly.agent.tools.base import Tool
 from flowly.agent.tools.discovery import (
     annotate_search_repetition,
@@ -116,6 +117,8 @@ _REPLY_WAIT_SECONDS = 300
 # Result text handed to the parent with the completion notice; the rest
 # is one agent_read call away.
 _ANNOUNCE_RESULT_CHARS = 8_000
+# What one notice carries in all when several runs report together.
+_ANNOUNCE_BATCH_CHARS = 24_000
 
 
 class SubagentToolRegistry(ToolRegistry):
@@ -142,6 +145,11 @@ class SubagentToolRegistry(ToolRegistry):
 _NOTICE_HEADER_RE = re.compile(
     r"^\[(?:Subagent|Message from subagent) '.*?'.*?run_id=(?P<run_id>[0-9a-f-]{36})"
     r"(?:, message_id=(?P<message_id>[0-9a-f]{16}))?",
+    re.MULTILINE,
+)
+# Every run a completion notice reports (several when a batch reports together).
+_NOTICE_RUN_ID_RE = re.compile(
+    r"^\[Subagent '.*?'.*?\] run_id=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
     re.MULTILINE,
 )
 
@@ -458,6 +466,9 @@ class SubagentManager:
                 continue
             recent = now - record.ended_at < _REANNOUNCE_WITHIN_SECONDS
             if recent and record.outcome in ("ok", "error", "timeout"):
+                # Announced before the restart but never handled: it must be
+                # claimable again by its batch's notice.
+                self._registry.update(record.run_id, announced=False)
                 try:
                     result = self._registry.read_result(record.run_id, 0, 200_000)["content"]
                 except (FileNotFoundError, ValueError, OSError):
@@ -532,6 +543,7 @@ class SubagentManager:
         origin: str = "system",
         context: str | None = None,
         parent_session_key: str | None = None,
+        batch_id: str = "",
     ) -> str:
         """
         Spawn a subagent to execute a task in the background.
@@ -557,6 +569,8 @@ class SubagentManager:
             parent_session_key: The starting conversation's own key when it
                 is not ``origin_channel:origin_chat_id`` (a desktop chat);
                 results and messages return to that conversation.
+            batch_id: Runs started in the same turn share it; their results
+                reach the conversation together, once the last has finished.
 
         Returns:
             JSON status string.
@@ -624,6 +638,7 @@ class SubagentManager:
             mark=assign_mark(run_id, {
                 str(rec.mark.get("glyph")) for rec in siblings if rec.mark
             }),
+            batch_id=batch_id,
         )
         self._registry.register(record)
 
@@ -676,11 +691,12 @@ class SubagentManager:
             "title": resolved_display,
             "model": resolved_model,
             "message": (
-                f"'{resolved_display}' is running in the background. Its result will "
-                "reach you as a message when it finishes. Keep working on whatever "
-                "does not depend on it; don't redo its task or guess its result. If "
-                "nothing else is left, tell the owner briefly what is running and end "
-                "your turn."
+                f"'{resolved_display}' is running in the background. When everything "
+                "you started in this turn has finished, the results reach you "
+                "together as a new message and you continue from there. Don't wait "
+                "for them, don't redo their tasks and don't guess their results: do "
+                "any work that does not depend on them, then tell the owner briefly "
+                "what is running and end your turn."
             ),
         })
 
@@ -875,7 +891,9 @@ class SubagentManager:
                 f"{_total_timeout:.0f}s, max_iter={max_iterations}"
             )
 
-            while iteration < max_iterations:
+            repetition = RepetitionGuard()
+            stalled = False
+            while iteration < max_iterations and not stalled:
                 iteration += 1
                 # Messages the main agent sent since the last step.
                 for note in self._take_inbox(run_id):
@@ -1114,6 +1132,9 @@ class SubagentManager:
                         # Truncate long tool results to prevent context bloat
                         if len(result) > 4000:
                             result = result[:4000] + f"\n[... truncated from {len(result)} chars]"
+                        if repetition.observe(effective_tool_name, result):
+                            result = mark_repeated(effective_tool_name, result)
+                            stalled = repetition.stalled
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call.id,
@@ -1266,14 +1287,19 @@ class SubagentManager:
             #      instead of replacing it with a generic fallback.
             # Safety: tools=None makes another tool-call loop
             # structurally impossible.
-            _hit_max_iter = final_result is None and iteration >= max_iterations
+            # Results that only repeat earlier ones end the run's tool use the
+            # same way the iteration cap does: with a summary of what it has.
+            _hit_max_iter = final_result is None and (iteration >= max_iterations or stalled)
             _hit_llm_errors = (
                 final_result is not None
                 and final_result.startswith("Error: Task failed")
                 and bool(_tool_trace)
             )
             if _hit_max_iter or _hit_llm_errors:
-                _reason = "max iterations" if _hit_max_iter else "LLM errors exhausted"
+                _reason = (
+                    ("repeating itself" if stalled else "max iterations")
+                    if _hit_max_iter else "LLM errors exhausted"
+                )
                 logger.info(
                     f"[SubagentManager] [{run_id[:8]}] {_reason} — "
                     "injecting summary grace-call"
@@ -1514,8 +1540,10 @@ class SubagentManager:
         run_id, message_id = header.group("run_id"), header.group("message_id")
         if message_id:
             return message_id in self._consumed_mail
-        record = self._registry.get(run_id)
-        return record is not None and record.delivery_state == "delivered"
+        # A notice for several runs is handled once all of them are.
+        run_ids = _NOTICE_RUN_ID_RE.findall(content or "") or [run_id]
+        records = [self._registry.get(rid) for rid in run_ids]
+        return all(r is not None and r.delivery_state == "delivered" for r in records)
 
     async def wait_for_children(
         self,
@@ -1656,63 +1684,137 @@ class SubagentManager:
         if record and artifact_id not in record.artifact_ids:
             self._registry.update(run_id, artifact_ids=[*record.artifact_ids, artifact_id])
 
-    async def _announce(self, run_id: str, result: str, status: str) -> None:
-        """Deliver result to parent agent — via queue if parent is busy."""
-        record = self._registry.get(run_id)
-        if not record:
-            return
-
+    def _notice_section(self, record: SubagentRunRecord, result: str, status: str, limit: int) -> str:
+        """One run's part of a completion notice: header, brief and result."""
         status_text = {
             "ok": "completed successfully",
             "error": "failed",
             "timeout": "timed out",
         }.get(status, status)
-
         duration = ""
         if record.started_at and record.ended_at:
-            secs = int(record.ended_at - record.started_at)
-            duration = f" (runtime: {secs}s)"
+            duration = f" (runtime: {int(record.ended_at - record.started_at)}s)"
 
         # The parent gets enough of the result to act on, and the run id to
         # read the rest — never a preview it cannot get past.
         result_text = result or ""
-        shown = result_text[:_ANNOUNCE_RESULT_CHARS]
+        shown = result_text[:limit]
         more = ""
-        if len(result_text) > _ANNOUNCE_RESULT_CHARS:
+        if len(result_text) > limit:
             more = (
-                f"\n\n[{len(result_text) - _ANNOUNCE_RESULT_CHARS} more characters — "
-                f"read them with agent_read(run_id=\"{run_id}\", "
-                f"offset={_ANNOUNCE_RESULT_CHARS})]"
+                f"\n\n[{len(result_text) - limit} more characters — "
+                f"read them with agent_read(run_id=\"{record.run_id}\", offset={limit})]"
             )
 
         # One-line "Tools used: web_search×2, exec×1" summary, so the parent
         # can judge what the child actually did.
-        _tool_summary = ""
+        tool_summary = ""
         if record.tool_trace:
             from collections import Counter
             counts = Counter(t.get("tool", "?") for t in record.tool_trace)
             parts = [f"{name}×{n}" if n > 1 else name for name, n in counts.most_common()]
-            _tool_summary = f"\nTools used ({len(record.tool_trace)} calls): {', '.join(parts)}"
+            tool_summary = f"\nTools used ({len(record.tool_trace)} calls): {', '.join(parts)}"
 
-        _disp = record.display_name or record.label
+        title = record.display_name or record.label
         brief = record.task if len(record.task) <= 600 else record.task[:600] + " […]"
-        announce_content = (
-            f"[Subagent '{_disp}' {status_text}{duration}] run_id={run_id}{_tool_summary}\n\n"
+        return (
+            f"[Subagent '{title}' {status_text}{duration}] run_id={record.run_id}{tool_summary}\n\n"
             f"Brief: {brief}\n\n"
-            f"Result:\n{shown}{more}\n\n"
-            "This is the subagent's own report: check what matters before relying "
-            "on it, and don't redo its work. Tell the owner what it means for their "
-            "request in your own words; don't show run ids."
+            f"Result:\n{shown}{more}"
         )
 
-        await self._deliver_to_parent(record, announce_content, summary=f"{_disp} — {status_text}")
+    def _stored_result(self, record: SubagentRunRecord) -> str:
+        """A finished run's result as its completion notice shows it."""
+        if record.result_available:
+            try:
+                return self._registry.read_result(record.run_id, 0, 200_000)["content"]
+            except (FileNotFoundError, ValueError, OSError):
+                pass
+        if record.outcome == "timeout":
+            return "(task timed out)"
+        if record.outcome in ("cancelled", "interrupted"):
+            return "(task was interrupted)"
+        return record.error or record.result_preview or ""
+
+    async def _announce(self, run_id: str, result: str, status: str) -> None:
+        """Hand a finished run's result to the conversation that started it.
+
+        Runs started in the same turn report back together: while one of
+        them is still going, a finished run's result is held, and the last
+        one to finish delivers every held result in a single notice — one
+        turn that can answer the owner's request as a whole, instead of a
+        reply per part. A run alone in its turn reports at once.
+        """
+        record = self._registry.get(run_id)
+        if not record:
+            return
+        members = [record]
+        if record.batch_id:
+            batch = [
+                r for r in self._registry.all()
+                if r.batch_id == record.batch_id
+                and r.parent_session_key == record.parent_session_key
+                and r.origin != "system"
+            ]
+            if any(r.ended_at is None for r in batch if r.run_id != run_id):
+                logger.info(
+                    f"[SubagentManager] [{run_id[:8]}] finished; held until the rest of its batch ends"
+                )
+                return
+            # Claim before any await: the last two runs of a batch can finish
+            # together, and only one of them may deliver.
+            members = [
+                r for r in batch
+                if r.run_id == run_id
+                or (not r.announced and r.delivery_state in ("pending", "queued"))
+            ]
+            members.sort(key=lambda r: r.created_at)
+        if record.batch_id and record.announced and len(members) == 1:
+            return
+        for member in members:
+            self._registry.update(member.run_id, announced=True)
+
+        # Results the main agent already took with agent_wait are not
+        # handed over again.
+        to_tell = [m for m in members if m.delivery_state != "delivered"]
+        if not to_tell:
+            return
+        sections = []
+        limit = _ANNOUNCE_RESULT_CHARS if len(to_tell) == 1 else max(
+            2_000, _ANNOUNCE_BATCH_CHARS // len(to_tell),
+        )
+        for member in to_tell:
+            if member.run_id == run_id:
+                sections.append(self._notice_section(member, result, status, limit))
+            else:
+                sections.append(self._notice_section(
+                    member, self._stored_result(member), member.outcome or "unknown", limit,
+                ))
+        if len(to_tell) == 1:
+            announce_content = (
+                f"{sections[0]}\n\n"
+                "This is the subagent's own report: check what matters before relying "
+                "on it, and don't redo its work. Tell the owner what it means for their "
+                "request in your own words; don't show run ids."
+            )
+        else:
+            announce_content = (
+                "\n\n---\n\n".join(sections)
+                + f"\n\nThese {len(to_tell)} subagents were started together and have all "
+                "finished. These are their own reports: check what matters before relying "
+                "on them, and don't redo their work. Answer the owner's request as a whole, "
+                "in your own words; don't show run ids."
+            )
+        titles = ", ".join(m.display_name or m.label for m in to_tell)
+        await self._deliver_to_parent(record, announce_content, summary=f"{titles} — finished")
         # Only a result still waiting becomes "queued": one that needs no
         # delivery (cancelled, interrupted) or that the main agent already
         # took with agent_wait keeps its state, so the notice is not handled
         # twice and a goal never waits for it.
-        current = self._registry.get(run_id)
-        delivery = "queued" if current and current.delivery_state == "pending" else None
-        self._registry.update(run_id, announced=True, **({"delivery_state": delivery} if delivery else {}))
+        for member in to_tell:
+            current = self._registry.get(member.run_id)
+            if current and current.delivery_state == "pending":
+                self._registry.update(member.run_id, delivery_state="queued")
 
     # ------------------------------------------------------------------
     # Helpers

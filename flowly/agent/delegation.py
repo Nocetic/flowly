@@ -22,8 +22,9 @@ from __future__ import annotations
 import contextvars
 import re
 import unicodedata
+import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Literal
 
 Origin = Literal["owner", "agent", "system"]
@@ -67,6 +68,14 @@ class DelegationTurn:
     # True when the turn should stop waiting and look up: the owner wrote
     # something new into it, or stopped it.
     should_yield: Callable[[], bool] | None = None
+    # Whether what the owner writes during the turn reaches it (an owner's
+    # turn) or waits for the next one (a turn a finished subagent started).
+    steerable: bool = True
+    # Subagents started in the same turn report back together, once the
+    # last of them has finished.
+    turn_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    # Seconds this turn has spent in agent_wait (mutable, the turn's own).
+    waited: list[float] = field(default_factory=lambda: [0.0], compare=False)
 
 
 @dataclass(frozen=True)

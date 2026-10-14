@@ -2067,15 +2067,17 @@ You can keep track of the owner's goals and come back to things on your own.
                 "depends on.",
                 "Write each brief for a newcomer: the goal, what you already know, the "
                 "sources to use, what is out of scope, and what to return.",
-                "While subagents run, keep doing the parts that don't depend on them; "
-                "each result reaches you as a message. Treat a result as the "
+                "After starting subagents, do any work that doesn't depend on them, "
+                "tell the owner briefly what is running, and end your turn. Don't "
+                "wait for them: when all the subagents you started in a turn have "
+                "finished, their results reach you together as one new message, and "
+                "you answer the owner's request from there. Treat a result as the "
                 "subagent's own report: check what matters, don't redo its work.",
-                "Steer or answer a running subagent with `agent_message`; read a "
-                "finished one's full result with `agent_read`.",
-                "If your next step needs a subagent's result, call `agent_wait` — never "
-                "sleep, poll `sessions_list` or re-check with `agent_read` in a loop. If "
-                "nothing you do next depends on them, end your turn: their results reach "
-                "you as messages.",
+                "Steer or answer a running subagent with `agent_message`; read the "
+                "rest of a long result with `agent_read`. `agent_wait` is only for "
+                "the rare case where your own work in this turn cannot finish "
+                "without a result due within a minute or two. Never sleep, poll "
+                "`sessions_list` or re-read results in a loop.",
             ])
         if has_tool("sessions_list"):
             background_lines.extend([

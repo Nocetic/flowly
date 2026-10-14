@@ -139,4 +139,5 @@ class SpawnTool(Tool):
             is_subagent_caller=self._is_subagent,
             origin=decision.origin,
             context=transcript,
+            batch_id=turn.turn_id if turn else "",
         )

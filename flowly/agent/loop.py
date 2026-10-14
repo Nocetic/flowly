@@ -18,7 +18,7 @@ from typing import Any, Awaitable, Callable
 from collections import OrderedDict
 from loguru import logger
 
-from flowly.bus.events import InboundMessage, OutboundMessage
+from flowly.bus.events import ConversationInboundMessage, InboundMessage, OutboundMessage
 from flowly.bus.queue import MessageBus
 from flowly.providers.base import (
     PROVIDER_REPLAY_KEY,
@@ -3705,10 +3705,19 @@ class AgentLoop:
             await self._record_group_observation(msg)
             return
 
-        if msg.channel == "web" or (msg.channel == "system" and msg.metadata.get(_AGENDA_ITEM)):
+        if (
+            msg.channel == "web"
+            or (msg.channel == "system" and msg.metadata.get(_AGENDA_ITEM))
+            or (msg.channel == "system" and msg.sender_id == "subagent"
+                and isinstance(msg, ConversationInboundMessage))
+        ):
             # An agenda wake-up may research for minutes; it must not hold up
             # other conversations' system turns (finished tasks reporting back).
             # The agenda never wakes a conversation while a turn runs there.
+            # A subagent's report is its conversation's own turn — that
+            # conversation's turn lock keeps it in order — and must not stop
+            # every other conversation (or the owner's next message, which
+            # ends any waiting it does) from being read meanwhile.
             self._spawn_concurrent_turn(msg)
         else:
             await self._process_turn(msg)
@@ -4860,6 +4869,19 @@ class AgentLoop:
             or ("call sid:" in lowered and "user said:" in lowered)
             or ("call sid:" in lowered and "kullanıcı şunu söyledi:" in lowered)
         )
+
+    def _has_running_subagents(self, session_key: str) -> bool:
+        """Whether subagents this conversation started are still working."""
+        manager = getattr(self, "subagents", None)
+        if manager is None or not session_key:
+            return False
+        try:
+            return any(
+                r.parent_session_key == session_key and r.ended_at is None and r.origin != "system"
+                for r in manager.registry.all()
+            )
+        except (OSError, ValueError):
+            return False
 
     def _turn_should_yield(self, run_id: str) -> Callable[[], bool] | None:
         """For a waiting tool: did the owner write into or stop this turn?"""
@@ -6086,7 +6108,12 @@ class AgentLoop:
                         if '"error"' in c[:300] or '"_occluded"' in c[:300]:
                             recent_errors += 1
                 error_rate = recent_errors / recent_total if recent_total else 0
-                healthy = recent_total >= 5 and error_rate < 0.4
+                # Results repeating ones the turn already had are no
+                # progress, however error-free.
+                healthy = (
+                    recent_total >= 5 and error_rate < 0.4
+                    and repetition.repeats_in_a_row < 2
+                )
 
                 logger.warning(
                     f"Soft iteration warning at {iteration}/{max_turn_iterations} "
@@ -7327,6 +7354,13 @@ class AgentLoop:
                 })
                 continue
 
+            # Ending the turn is right, plan or not, when this conversation's
+            # subagents are still working (their results start the next turn)
+            # or when the turn was told to answer without tools.
+            _end_turn_expected = repetition.stalled or self._has_running_subagents(
+                _current_session_key,
+            )
+
             # ── Plan end-turn guard (Phase 2b) ──────────────────────
             # If a plan was created in this turn AND it's still active
             # (not complete/blocked/aborted), the agent is trying to end
@@ -7343,7 +7377,7 @@ class AgentLoop:
             #   3. Errors during the check are swallowed — guard must
             #      NEVER block end-turn on infrastructure issues.
             try:
-                if not getattr(self, "_plan_nudged_this_turn", False):
+                if not _end_turn_expected and not getattr(self, "_plan_nudged_this_turn", False):
                     from flowly.agent.planner.state import get_plan_state
                     sess = getattr(self.tools, "_active_session_id", "") or ""
                     plan = get_plan_state().get(sess) if sess else None
@@ -7402,7 +7436,7 @@ class AgentLoop:
             # agent is trying to end, nudge once to finish / block / hand
             # back. Never fires for sessions without a general plan.
             try:
-                if not getattr(self, "_general_plan_nudged_this_turn", False):
+                if not _end_turn_expected and not getattr(self, "_general_plan_nudged_this_turn", False):
                     from flowly.plans.manager import get_plan_manager
                     gplan = get_plan_manager().get_current(_current_session_key)
                     if gplan and gplan.status == "executing":
@@ -9505,6 +9539,9 @@ class AgentLoop:
         provider_state_out: dict[str, Any] = {}
         # A system wake-up (a subagent's result, a notice) is not the owner
         # speaking: nothing in it can authorise a new subagent.
+        # The owner's next message waits behind this turn rather than
+        # entering it, so this turn stops waiting as soon as one arrives.
+        owner_epoch = self.goal_user_epoch(session_key)
         system_turn = DelegationTurn(
             owner_text=msg.content or "",
             conversation=conversation_from_history(self._history_with_summary_anchor(session)),
@@ -9513,6 +9550,8 @@ class AgentLoop:
             origin_channel=origin_channel,
             origin_chat_id=origin_chat_id,
             session_key=session_key,
+            should_yield=lambda: self.goal_user_epoch(session_key) != owner_epoch,
+            steerable=False,
         )
         with delegation_turn_scope(system_turn):
             final_content, tool_results, _executed_tools, system_usage, _loop_messages = await self._run_llm_tool_loop(

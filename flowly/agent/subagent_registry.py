@@ -80,6 +80,8 @@ class SubagentRunRecord:
     origin: str = "agent"
     # The shape and hue every client draws for this run: {"glyph", "hue"}.
     mark: dict[str, Any] = field(default_factory=dict)
+    # Runs started in the same turn share it and report back together.
+    batch_id: str = ""
 
 
 
@@ -144,6 +146,8 @@ class SubagentRegistry:
             raise ValueError("invalid run origin")
         if not isinstance(record.mark, dict):
             raise ValueError("invalid run mark")
+        if not isinstance(record.batch_id, str):
+            raise ValueError("invalid run batch")
         return record
 
     def _read_locked(self) -> None:

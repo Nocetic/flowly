@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import TYPE_CHECKING, Any
 
 from flowly.agent.tool_context import current_tool_origin
@@ -61,10 +62,12 @@ class AgentReadTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Read a subagent's status and its full result, page by page. Use it "
-            "when the completion message says more text is available, or to "
-            "check on a subagent you started. Don't poll in a loop: completion "
-            "reaches you as a message."
+            "Read the rest of a finished subagent's result, page by page — when "
+            "its completion message says more text is available, or to get back "
+            "a result from an earlier turn you no longer have. A result that "
+            "already reached you is not new: use it instead of reading it again. "
+            "Don't use this to check on running subagents; their results reach "
+            "you as a message."
         )
 
     @property
@@ -249,8 +252,11 @@ class ChildAgentMessageTool(Tool):
                           ensure_ascii=False)
 
 
-_WAIT_DEFAULT_SECONDS = 120
-_WAIT_MAX_SECONDS = 600
+_WAIT_DEFAULT_SECONDS = 30
+_WAIT_MAX_SECONDS = 120
+# All the waiting one turn may do. Past it the turn ends and the results
+# arrive as a message, so the owner is never left behind a busy chat.
+_WAIT_TURN_BUDGET_SECONDS = 300
 
 
 class AgentWaitTool(Tool):
@@ -266,12 +272,14 @@ class AgentWaitTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Wait for your running subagents when your next step needs what they "
-            "find. Returns as soon as one finishes or sends you a message (with "
-            "its result or message), when the owner writes to you, or at the "
-            "timeout. Use it instead of sleeping or checking task lists; if "
-            "nothing you do next depends on them, just end your turn — their "
-            "results reach you as messages."
+            "Rarely needed. Results of subagents you started reach you by "
+            "themselves, together, as a new message once they have all "
+            "finished — so after starting them, end your turn. Wait only when "
+            "you are in the middle of your own work in this turn and cannot "
+            "finish it without a result expected within a minute or two. "
+            "Returns as soon as one finishes or sends you a message, when the "
+            "owner writes, or at the timeout. Never sleep or check task lists "
+            "instead."
         )
 
     @property
@@ -316,12 +324,43 @@ class AgentWaitTool(Tool):
         except (TypeError, ValueError):
             timeout = _WAIT_DEFAULT_SECONDS
         turn = current_turn()
-        outcome = await self._manager.wait_for_children(
-            session_key, resolved, timeout=timeout,
-            should_yield=turn.should_yield if turn else None,
-        )
-        if outcome["interrupted"]:
+        if turn is not None:
+            left = _WAIT_TURN_BUDGET_SECONDS - turn.waited[0]
+            if left < 1:
+                return json.dumps({
+                    "finished": [], "messages": [], "timed_out": True, "interrupted": False,
+                    "still_running": [
+                        r.display_name or r.label for r in self._manager.registry.all()
+                        if r.parent_session_key == session_key and r.ended_at is None
+                        and r.origin != "system"
+                    ],
+                    "note": "This turn has waited long enough. End your turn now: tell "
+                            "the owner briefly what is still running. The results "
+                            "reach you as a message when they finish.",
+                }, ensure_ascii=False)
+            timeout = min(timeout, int(left))
+        started = time.monotonic()
+        try:
+            outcome = await self._manager.wait_for_children(
+                session_key, resolved, timeout=timeout,
+                should_yield=turn.should_yield if turn else None,
+            )
+        finally:
+            if turn is not None:
+                turn.waited[0] += time.monotonic() - started
+        if outcome["interrupted"] and turn is not None and not turn.steerable:
+            outcome["note"] = (
+                "The owner has sent a new message; you'll answer it right after "
+                "this. Finish this reply now with what you have."
+            )
+        elif outcome["interrupted"]:
             outcome["note"] = "The owner wrote to you; read it and answer before waiting again."
+        elif outcome["timed_out"] and outcome["still_running"]:
+            outcome["note"] = (
+                "Still running. Unless your own work in this turn needs them, end "
+                "your turn: tell the owner briefly what is running. The results "
+                "reach you as a message when they finish."
+            )
         elif not (outcome["finished"] or outcome["messages"] or outcome["still_running"]):
             outcome["note"] = "No subagent of this conversation is running or waiting to be read."
         return json.dumps(outcome, ensure_ascii=False)

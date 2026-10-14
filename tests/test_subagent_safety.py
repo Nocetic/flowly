@@ -634,10 +634,15 @@ class TestMaxIterationsGraceCall:
     async def test_grace_call_fires_when_iterations_exhausted(
         self, tmp_path: Path
     ) -> None:
-        # Provider that keeps calling list_dir for 15 iterations, then
-        # (when tools=None forces it) returns plain summary content.
+        # Provider that keeps calling list_dir until the iteration cap, then
+        # (when tools=None forces it) returns plain summary content. Each
+        # call lists a different folder: a run that keeps getting the same
+        # result stops sooner (tests/test_repetition_guard.py).
         from flowly.providers.base import ToolCallRequest
         ws_abs = str(tmp_path)
+        for i in range(40):
+            (tmp_path / f"d{i}").mkdir()
+            (tmp_path / f"d{i}" / f"f{i}.txt").write_text("x")
 
         class _LoopyProvider(LLMProvider):
             def __init__(self) -> None:
@@ -667,7 +672,7 @@ class TestMaxIterationsGraceCall:
                     tool_calls=[ToolCallRequest(
                         id=f"tc-{self.calls}",
                         name="list_dir",
-                        arguments={"path": ws_abs},
+                        arguments={"path": f"{ws_abs}/d{self.calls}"},
                     )],
                 )
 
