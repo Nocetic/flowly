@@ -1910,7 +1910,9 @@ class AgentLoop:
                 logger.warning(f"[skill-gov] auto {mode} failed: {exc}")
 
     # System sessions that should never get a chat title.
-    _NO_TITLE_PREFIXES = ("heartbeat:", "cron:", "system:", "memory:", "review:")
+    # ``agenda:`` is the agent's own daily review: nobody reads its title, and
+    # titling it cost a model call every morning.
+    _NO_TITLE_PREFIXES = ("heartbeat:", "cron:", "system:", "memory:", "review:", "agenda:")
 
     def _set_provisional_title(self, session: Any, user_content: str) -> None:
         """Seed a placeholder title from the user's opening message.

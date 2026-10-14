@@ -3,6 +3,7 @@ conversation it is about, which may decide to say nothing."""
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -266,7 +267,6 @@ async def test_a_local_conversation_s_message_needs_no_relay_session():
 
 
 def _wake_prompt(goal=None):
-    import datetime as dt
     from zoneinfo import ZoneInfo
 
     from flowly.agenda.prompts import wake_prompt
@@ -293,3 +293,23 @@ def test_a_goal_check_in_writes_when_the_owner_has_not_reported():
     # The silence-by-default wording stays for plain follow-ups only.
     assert "nothing new, they already handled it" not in prompt
     assert "nothing new, they already handled it" in _wake_prompt()
+
+
+@pytest.mark.asyncio
+async def test_the_daily_review_is_never_titled():
+    """Titling ``agenda:review`` cost a model call every morning for a session
+    nobody opens; an owner's conversation is still titled."""
+    agent = object.__new__(AgentLoop)
+    agent._title_tasks = {}
+    started: list[str] = []
+
+    async def _title(session, user, final):
+        started.append(session.key)
+
+    agent._autotitle_session = _title
+    review = SimpleNamespace(key="agenda:review", metadata={}, messages=[{"role": "user", "content": "plan"}])
+    agent._maybe_autotitle_session(review, "plan today", "Planned one follow-up.")
+    chat = SimpleNamespace(key="web:conv1", metadata={}, messages=[{"role": "user", "content": "hi"}])
+    agent._maybe_autotitle_session(chat, "hi", "Hello.")
+    await asyncio.sleep(0)
+    assert started == ["web:conv1"]
