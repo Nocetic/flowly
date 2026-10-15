@@ -5266,15 +5266,14 @@ class AgentLoop:
         outbound builder knows to stop iterating and flag the
         outgoing message as aborted.
         """
-        from flowly.providers.base import LLMResponse
-        accumulated_text = ""
-        final_response = None
-        chunk_count = 0
+        from flowly.providers.streamed_reply import StreamedReply
+
+        reply = StreamedReply()
         aborted = False
         steered = False
 
         async def consume_stream() -> None:
-            nonlocal accumulated_text, final_response, chunk_count, aborted
+            nonlocal aborted
             stream = self.provider.chat_stream(
                 messages=messages,
                 tools=tools,
@@ -5295,25 +5294,22 @@ class AgentLoop:
                         # Partial arguments keep the watchdog alive but never
                         # create a user-facing preparation stage or tool call.
                         self._touch_activity("receiving tool arguments")
-                    # Error text is routing input, not user-visible model output.
-                    # Keep it on the final response for classification but never
-                    # stream raw provider/SDK payloads into a client bubble.
-                    if chunk.content and chunk.finish_reason != "error":
-                        chunk_count += 1
-                        accumulated_text += chunk.content
-                        self._steering().observe_text(run_id, chunk.content)
+                    # Error text is routing input, not user-visible model output:
+                    # ``feed`` keeps it on the final response for classification
+                    # and never returns it as text for a client bubble.
+                    text = reply.feed(chunk)
+                    if text:
+                        self._steering().observe_text(run_id, text)
                         # Heartbeat for the inactivity watchdog — every stream
                         # chunk counts as progress. Without this a long streaming
                         # reply could look "idle" to the poller even though the
                         # model is actively emitting tokens.
                         self._touch_activity("receiving stream response")
-                        logger.debug(f"[stream] chunk #{chunk_count}: {len(chunk.content)} chars")
+                        logger.debug(f"[stream] chunk #{reply.chunks}: {len(text)} chars")
                         try:
-                            await stream_callback(chunk.content)
+                            await stream_callback(text)
                         except Exception as e:
                             logger.warning(f"[stream] stream_callback error: {e}")
-                    if chunk.finish_reason:
-                        final_response = chunk
 
             finally:
                 close_stream = getattr(stream, "aclose", None)
@@ -5331,80 +5327,23 @@ class AgentLoop:
 
         if aborted:
             logger.info(
-                f"[stream] aborted at chunk #{chunk_count}, "
-                f"{len(accumulated_text)} chars preserved, run_id={run_id}"
+                f"[stream] aborted at chunk #{reply.chunks}, "
+                f"{len(reply.text)} chars preserved, run_id={run_id}"
             )
 
-        logger.info(f"[stream] done: {chunk_count} chunks, {len(accumulated_text)} total chars{' (ABORTED)' if aborted else ''}")
+        logger.info(f"[stream] done: {reply.chunks} chunks, {len(reply.text)} total chars{' (ABORTED)' if aborted else ''}")
 
         if aborted or steered:
-            # Build a synthetic final response that carries the
-            # partial text + aborted finish_reason. We don't preserve
-            # any partial tool_calls — half-built tool_call deltas
-            # are unsafe to execute.
-            return LLMResponse(
-                content=accumulated_text or None,
-                finish_reason="aborted" if aborted else "steered",
-                usage=dict(final_response.usage) if steered and final_response and final_response.usage else {},
-                partial_content_delivered=bool(accumulated_text),
-            )
+            # A synthetic final response carrying the partial text and the
+            # aborted / steered finish_reason. Partial tool_calls are never
+            # kept — half-built tool_call deltas are unsafe to execute.
+            return reply.interrupted("aborted" if aborted else "steered", keep_usage=steered)
 
-        # Preserve usage across the final-response rebuild. The earlier
-        # constructions dropped ``usage`` by omission, which meant every
-        # streaming turn surfaced an empty usage dict to the accumulator
-        # in ``_run_llm_tool_loop``. Explicitly carrying it through lets
-        # prompt_tokens / cache_read_tokens / cache_write_tokens reach
-        # the outbound metadata (and, via channel event, the UI's
-        # context-window indicator). ``LLMResponse.usage`` is typed as
-        # a plain dict with a default factory, so we fall back to an
-        # empty dict rather than None to keep downstream ``dict.get``
-        # calls safe.
-        final_usage = dict(final_response.usage) if final_response and final_response.usage else {}
-        final_error_info = final_response.error_info if final_response else None
-        final_provider_state = (
-            dict(final_response.provider_state)
-            if final_response and final_response.provider_state
-            else {}
-        )
-        final_provider_replay = (
-            copy.deepcopy(final_response.provider_replay)
-            if final_response and final_response.provider_replay
-            else {}
-        )
-        if final_response is None:
-            final_response = LLMResponse(
-                content=accumulated_text or None,
-                finish_reason="stop",
-                usage=final_usage,
-                partial_content_delivered=bool(accumulated_text),
-                provider_state=final_provider_state,
-                provider_replay=final_provider_replay,
-            )
-        elif final_response.tool_calls:
-            # Final chunk had tool calls — content came in earlier deltas
-            final_response = LLMResponse(
-                content=accumulated_text or None,
-                tool_calls=final_response.tool_calls,
-                finish_reason=final_response.finish_reason,
-                usage=final_usage,
-                error_info=final_error_info,
-                partial_content_delivered=bool(accumulated_text),
-                provider_state=final_provider_state,
-                provider_replay=final_provider_replay,
-            )
-        else:
-            # Pure text — use accumulated content
-            final_response = LLMResponse(
-                content=accumulated_text or final_response.content,
-                finish_reason=final_response.finish_reason,
-                usage=final_usage,
-                error_info=final_error_info,
-                partial_content_delivered=bool(accumulated_text),
-                provider_state=final_provider_state,
-                provider_replay=final_provider_replay,
-            )
-
-        return final_response
+        # The finished reply as one response. Usage, the provider's
+        # continuity state and replay items come from the final chunk, so
+        # prompt_tokens / cache_read_tokens / cache_write_tokens reach the
+        # outbound metadata (and the UI's context-window indicator).
+        return reply.response()
 
     async def _chat_without_stream(
         self,
