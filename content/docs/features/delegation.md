@@ -37,6 +37,16 @@ A turn that keeps getting results it already has — re-reading the same finishe
 
 The agent can message its running subagents at any time with `agent_message` — one, several, or all of the conversation's — to steer, narrow or answer them. A subagent reads the message at its next step; a tool call already in progress is never cut short. A subagent can message the agent in turn, to ask something it can't settle itself or to report something the agent must know before it finishes, and it can wait up to five minutes for the answer. In the chat these exchanges show only as "Sent message to …" steps; the full exchange is in the subagent's transcript.
 
+### Each subagent keeps its own conversation
+
+Every subagent working for you has a conversation of its own, kept the way your conversations are: the task the agent gave it (with the conversation it was given, on its first turn), every step it took, every tool result as it read it, the agent's messages to it, and its result with its tokens and running time. Nothing in it is shortened for display. A tool result too long for the subagent to read in full is cut to the same length the agent itself would read, and its whole output is saved with the subagent's conversation; the subagent can read the rest from there.
+
+- **Read only.** Only the agent that started a subagent writes to its conversation. You can read it from any app — desktop, phone, or through another of your agents — but never write to it: a message, a steer, a compaction, a model change or a deletion aimed at it is refused.
+- **Private.** It is stored apart from your conversations, so it never shows up in your chat list, in conversation search, in what other apps can read through Flowly's MCP server, or in what Flowly learns about you. The agent's file tools cannot open it either.
+- **How long it stays.** A subagent is open while it may still get work, and closes after seven days with nothing to do. Its conversation and its saved tool output are kept 30 days after it closes, then removed — unless its result never reached the conversation that started it. Deleting that conversation closes its subagents and removes their conversations right away.
+- **At most 16 open.** A conversation keeps at most 16 subagents open. Starting one more closes the one that has been idle longest; the agent is told which, and its conversation stays readable.
+- Subagents that ran before this version have no conversation of their own; their transcript still opens as before. Background bookkeeping (self-review, Board) never gets one.
+
 ### Limits
 
 - A subagent has the same limits as the agent itself: the same number of steps per run and no overall time limit. Each model call and each tool call has its own timeout, and a subagent that keeps getting results it already has wraps up with a summary of what it found.
@@ -55,7 +65,7 @@ Subagents carry on after Flowly restarts — whether you quit it, it updated, or
 
 Flowly never repeats a step that was in progress at that moment. Instead the subagent is told plainly what may have happened — for example that a command it started may have finished, been cut off or still be running — so it checks before doing anything again. A step that had not started yet is reported to it as not run.
 
-There are limits. A subagent is continued only within a day of Flowly stopping; after a longer break, or if Flowly keeps restarting without it getting any further (three times), or after an update that cannot read its saved work, it stops where it was and the conversation is told once. The working record is deleted as soon as the subagent finishes. Background bookkeeping, and subagents started from a terminal session (`flowly agent`), are not continued.
+There are limits. A subagent is continued only within a day of Flowly stopping; after a longer break, or if Flowly keeps restarting without it getting any further (three times), or after an update that cannot read its saved work, it stops where it was and the conversation is told once. The working record is deleted as soon as the subagent finishes; what it did stays in its conversation, saved once, even when it was continued after a restart. Background bookkeeping, and subagents started from a terminal session (`flowly agent`), are not continued.
 
 A subagent's result counts as delivered only once the conversation has saved the reply that dealt with it. If Flowly stops in between, the result reaches the conversation again after the restart, never twice. A result that finished up to a day before Flowly started again still arrives, saying how long ago it finished.
 
