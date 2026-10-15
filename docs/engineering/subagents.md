@@ -11,7 +11,8 @@ with the `spawn` tool; the run reports back to the conversation that started it.
 model run, its own (restricted) tools and its own transcript, and costs a full run of its own.
 Every subagent working for the owner is a **thread** (§16): a real conversation
 `subagent:<threadId>`, stored apart from the owner's, that only its parent agent writes and every
-client may read. A run is one turn of its thread.
+client may read. A run is one turn of its thread; the main agent gives a thread more turns with
+`agent_followup` and closes it with `agent_close` (§16b).
 
 **Nothing in the harness pushes the main agent toward or away from delegating.** The agent
 decides, or the owner asks. The prompt and tool descriptions state facts (it runs in the
@@ -24,21 +25,21 @@ are gone (`test_delegation_rule.py` pins the current contract).
 
 | File | Role |
 |---|---|
-| `flowly/agent/subagent.py` | `SubagentManager`: spawn, the child loop, messaging, waiting, delivery (announce), cancel, recovery, metrics hook |
-| `flowly/agent/subagent_registry.py` | `SubagentRunRecord` + `SubagentRegistry` (`runs.json` index and `threads.json` edges under one lock, result files, transcripts, pruning, `claim`, the thread cap, idle close, `forget_parent`, `maintain`), `ThreadCapReached`, `add_usage`, `append_jsonl` |
-| `flowly/agent/subagent_threads.py` | Threads (§16): `SubagentThreadRecord`, `decode_thread`, `thread_view`, `SubagentThreadStore` (the thread conversations: `SessionManager` in `<home>/subagents/sessions`, raw outputs in `<home>/subagents/spill/<threadId>`, `commit_turn`, `display_rows`, `delete`, `prune`), the cap / idle / retention constants |
+| `flowly/agent/subagent.py` | `SubagentManager`: spawn, follow-ups (`followup`), closing (`close_threads`), the child loop, messaging (`send_to_child`, `message_thread`, `_carry_over`), waiting, delivery (announce), cancel, recovery, metrics hook |
+| `flowly/agent/subagent_registry.py` | `SubagentRunRecord` + `SubagentRegistry` (`runs.json` index and `threads.json` edges under one lock, result files, transcripts, pruning, `claim`, the thread cap, idle close, `close_thread`, `queue_mail`, `forget_parent`, `maintain`), `ThreadCapReached`, `add_usage`, `append_jsonl` |
+| `flowly/agent/subagent_threads.py` | Threads (§16): `SubagentThreadRecord`, `decode_thread`, `thread_view`, `thread_history` / `repair_thread_history` (a thread's history as its next turn's model gets it), `SubagentThreadStore` (the thread conversations: `SessionManager` in `<home>/subagents/sessions`, raw outputs in `<home>/subagents/spill/<threadId>`, `commit_turn`, `turn_context`, `persist_context`, `display_rows`, `delete`, `prune`), the cap / idle / retention / pending-mail constants |
 | `flowly/session/keys.py` | `is_subagent_thread`, `require_rpc_subagent_access` (a subagent conversation is read only, §16), `SUBAGENT_THREAD_READABLE_METHODS` |
 | `flowly/session/history_rows.py` | The `chat.history` row projection shared by `chat.history` and `subagents.history` (`history_row`, `subagent_history_row`) |
 | `flowly/agent/subagent_owner.py` | Who owns a run (`process_owner`) and whether that owner is gone (`owner_state`) |
-| `flowly/agent/subagent_checkpoint.py` | A running run's checkpoint (`SubagentCheckpoint`), `ChildState` (with the run's journal), `append_message`, `apply_step` / `apply_microcompact` / `apply_compacted`, `restore_child_state`, `tool_class` |
-| `flowly/compaction/` | The main agent's context management, which the child uses as is (§4.1): `CompactionService`, `ProviderRequestCoordinator.fit`, `pruning.iteration_strip_passes` / `strip_old_tool_results` / `microcompact_tool_results`, `summarizer.collect_summary_usage` |
+| `flowly/agent/subagent_checkpoint.py` | A running turn's checkpoint (`SubagentCheckpoint`, version 3: on top of the thread's history), `ChildState` (with the run's journal), `append_message`, `apply_step` / `apply_microcompact` / `apply_compacted`, `restore_child_state`, `history_digest`, `task_index`, `open_call_ids`, `tool_class` |
+| `flowly/compaction/` | The main agent's context management, which the child uses as is (§4.1): `CompactionService`, `ProviderRequestCoordinator.fit` (with `pin_at` for a later turn's task), `pruning.iteration_strip_passes` / `strip_old_tool_results` / `microcompact_tool_results`, `summarizer.collect_summary_usage` |
 | `flowly/agent/subagent_observation.py` | `run_view` (the wire shape of a run), `TaskEvents` (coalesced `subagent.*` events) |
 | `flowly/agent/subagent_stream.py` | A thread turn, live (§16a): `ChildStream` (journal → events, the in-flight entry, one terminal), `SubagentStreamHub` (ordered, non-blocking delivery to the transports' watchers), `child_event_access` |
 | `flowly/agent/subagent_metrics.py` | One metric line per ended run (`metrics.jsonl`), `summarize` |
 | `flowly/agent/delegation.py` | `DelegationTurn` (per-turn facts in a context var), owner-quote check, conversation fork, marks |
 | `flowly/agent/tools/spawn.py` | The `spawn` tool |
-| `flowly/agent/tools/agent_tools.py` | `agent_read`, `agent_message` (parent and child side), `agent_wait` |
-| `flowly/agent/tools/sessions_list.py` | List / cancel this conversation's tasks (`run_id="all"` stops them all) |
+| `flowly/agent/tools/agent_tools.py` | `agent_read`, `agent_message` (parent and child side), `agent_followup`, `agent_close`, `agent_wait`; `resolve_own_run`, `resolve_own_thread` |
+| `flowly/agent/tools/sessions_list.py` | List this conversation's subagents (threads) and tasks / cancel tasks (`run_id="all"` stops them all) |
 | `flowly/agent/repetition.py` | Repetition guard used by both the main loop and the child loop |
 | `flowly/agent/loop.py` | Turn wiring: `DelegationTurn` binding, system (report) turns, dispatch, plan-guard exemption |
 | `flowly/channels/feature_rpc.py` | `subagents.list/get/result/transcript/history/watch/unwatch/cancel/stats/spawn` RPCs; the read-only refusal for every feature RPC (§16) |
@@ -73,7 +74,8 @@ Arguments: `title` (shown to the owner, in their language), `task` (the brief), 
   `"subagent:" + run_id`; siblings never share a glyph. Clients draw it everywhere the run
   appears.
 
-The tool returns `{"status":"started","run_id","title","model","message"}`; the message tells
+The tool returns `{"status":"started","run_id","agent_id","title","model","message"}` (`agent_id`
+is the thread's id, the first run's; no `agent_id` for a run with no thread); the message tells
 the agent the results arrive together as a new message, not to wait, not to redo the work.
 
 ## 4. The child run
@@ -82,7 +84,8 @@ the agent the results arrive together as a new message, not to wait, not to redo
 `ChildState`, §8 "Checkpoint"):
 
 * **Prompt.** `_build_subagent_prompt`: one task, act with tools, report with checkable
-  evidence (URLs, paths, ids), say what could not be done.
+  evidence (URLs, paths, ids), say what could not be done. A later turn of the thread keeps the
+  prompt its first turn saved (§16b).
 * **Tools.** A fresh restricted registry (`SubagentToolRegistry`): files, exec, web, skills,
   knowledge graph, artifact, the child-side `agent_message`. Blocked: spawning (no recursion),
   `agent_read`, `agent_wait`, cron, owner-facing I/O, external writes, GUI tools, cross-session
@@ -138,8 +141,12 @@ loop's tool loop does, against the window of **the child's model**:
   kept); if that is not enough, the history is **summarized** — the last resort, a model call
   (`CompactionService.compact`, `track_cycle=False`) with `CHILD_SUMMARY_INSTRUCTIONS` (the work
   so far, evidence with exact URLs/paths/ids, failures, what is not done; never "the user").
-  The system prompt and the brief are **pinned** (`fit(pinned=1)`): never summarized, kept
-  verbatim; the list becomes `[system, summary, brief, kept tail…]`. A later summary updates the
+  The system prompt and the turn's task are **pinned** (`fit(pin_at=task_index(state))`, the
+  task's place in the list; `pinned=1` when a recorded list no longer has it): never summarized,
+  kept verbatim; the list becomes `[system, summary, brief, kept tail…]`. On a later turn the task
+  follows the thread's history, which is compactable like the rest: a summary takes the place of
+  what it covers, and what it keeps stays on its side of the task (`[system, summary, kept
+  history…, task, kept work…]`, §16b). A later summary updates the
   earlier one (it is fed as the previous record), so there is one summary at a time. The summary
   is made by the service's own provider and model (the main agent's, like the main agent's own
   summaries) and its calls' `usage` is collected (`collect_summary_usage`, a context variable
@@ -165,8 +172,12 @@ loop's tool loop does, against the window of **the child's model**:
 
 ## 5. Talking to running subagents
 
-* `agent_message(to=run_id | [ids] | "all", message)` — parent → child, this conversation's runs
-  only.
+* `agent_message(to=agent_id | run_id | [ids] | "all", message)` — parent → child, this
+  conversation's subagents only. A subagent with a task running reads it at its next step
+  (`delivered`); an open one with nothing running keeps it for its next task (`queued`, the
+  thread's `pending_mail`, at most 32; no task starts); a closed one refuses it (`closed`, with
+  `closed_text`). A run with no thread (from before threads) answers as before (`finished`).
+  `"all"`: every running one.
 * Child → parent: `agent_message(message, await_reply?)` queues a notice for the parent (with a
   `message_id`) and wakes it; with `await_reply` the child waits up to 300 s for a reply.
   Questions are delivered at once, never batched.
@@ -199,9 +210,13 @@ loop's tool loop does, against the window of **the child's model**:
    `conversation_key` = the parent conversation's own key — a desktop chat's key is not
    `channel:chat_id`). If the parent is mid-turn it is queued (`subagent_announce_queue`).
 
-Notice text: per run `[Subagent '<title>' <status> (runtime: Ns)] run_id=<id>`, tools used,
-brief (≤ 600 chars), result (8 000 chars alone; 24 000 shared across a batch, at least 2 000
-each), then guidance (check what matters, don't redo, answer as a whole, no run ids).
+Notice text: per run `[Subagent '<title>' <status> (runtime: Ns[, task N])] run_id=<id>
+agent_id=<threadId>` (`task N` for a thread's later turn; no `agent_id` for a run with no thread),
+tools used, brief (≤ 600 chars), result (8 000 chars alone; 24 000 shared across a batch, at
+least 2 000 each), then guidance (check what matters, don't redo, answer as a whole, no run or
+agent ids) and, when a subagent of it is still open, the fact that it keeps its conversation
+(`agent_followup` gives it another task, `agent_close` ends it). The notice regexes match the run
+id wherever `agent_id` follows it.
 
 ### The report turn
 
@@ -304,7 +319,8 @@ save** as the turn, and only then `mark_delivered` (`pending | queued | taken �
 
 * `subagents.cancel` RPC (owner, from a client) and `sessions_list(action="cancel",
   run_id=<id>|"all")` (agent). `cancel` sets the outcome `cancelled`, cancels the task and awaits
-  it.
+  it. It stops the **task**; the thread stays open for the next one. `agent_close` closes the
+  thread and stops its running task (§16b).
 * A task cancelled before its first step has no handler of its own; the spawn task's done
   callback (`_cleanup`) finishes the record, records its metric and runs `_announce` so siblings
   holding for it are released — unless a shutdown suspended it (§11).
@@ -360,7 +376,7 @@ save** as the turn, and only then `mark_delivered` (`pending | queued | taken �
 
 ### Checkpoint
 
-A running run that will be continued after a restart (`resumable`: owner/agent runs of a process
+A running turn that will be continued after a restart (`resumable`: owner/agent runs of a process
 with `resume_enabled` — the gateway sets it; not system, `wait`, `silent` or wall-clock runs, and
 not the CLI) keeps a checkpoint: `runs-checkpoints/<sha256(run_id)>.jsonl`, 0600, append-only JSON
 lines `{v, n, t, type, …}` (`subagent_checkpoint.py` lists every type). Unlike the transcript it
@@ -372,7 +388,19 @@ arrive (`mail`) and when read (`step` / `inbox`), each step's tool-result cuts (
 fitting of a request (`microcompact`, `compacted`), the summary (grace) call and the final result.
 `model`, `tool_start`, `mail`, `compacted` and `final` are fsynced.
 
-* **Format (version 2).** `step {iteration, notes, mail, strip: [[keepLast, maxOldChars], …]}`;
+* **Format (version 3).** The header names the thread's history the turn started from:
+  `baseCount` (messages of `thread_history`, between the system prompt and the first message)
+  and `baseDigest` (`history_digest`, SHA-256 of their canonical JSON), and `threadId`, `turn`,
+  `trigger`, `sessionKey`. The checkpoint holds the **running turn only**; `restore_child_state`
+  rebuilds `[system, *history[:baseCount], firstMessage]` from the thread's conversation and
+  replays the lines on top, so it does not grow with the thread. A history that no longer
+  matches its digest refuses the replay (`ResumeRefusal("base")` → `resume_unsupported`, §11)
+  unless the turn's `final` is already recorded (then no history is needed; the state is marked
+  `base_mismatch` and nothing is kept from it). `mail` may carry `mailKind: "task"` (+ `batch`,
+  `origin`): a task given to the running turn; a step's `notes` hold it as `{"text", "kind":
+  "task"}`. **Version 2** is version 3 with no history (`baseCount` 0) and is continued; a v2 file
+  continued by this build gets v3 lines after its v2 header. Version 1 and newer versions are not.
+  `step {iteration, notes, mail, strip: [[keepLast, maxOldChars], …]}`;
   `microcompact {iteration, reason, keepRecentFull, truncateChars}` — a fitting that only cut old
   tool results, recorded with the parameters it used; `compacted {iteration, reason, summarized,
   messages, tokensBefore, tokensAfter}` — a summary, recorded as **the exact list that replaced the
@@ -504,6 +532,14 @@ left, and never keeps the agent from starting. A result already in the checkpoin
 recorded whatever the bounds. A stop on request that lands in the same moment as a shutdown wins
 (the run ends `cancelled`, it is not suspended).
 
+A later turn (follow-up) continues the same way: the replay rebuilds the thread's history from its
+conversation, checks it against the header's digest and continues; a changed history ends it
+`resume_unsupported` (*"The subagent's saved conversation no longer matches the one this task
+started from…"*). A turn that a restart ends without continuing it (past the bounds, no usable
+checkpoint) still takes its place in the thread (`_save_settled_turn`: the task and a closing
+row with what the conversation was told, `aborted`), so a later task's history says it was
+asked and did not finish.
+
 Accepted limits: the checkpoint's `coreVersion` is recorded but not compared — within one format
 the replay cuts old results through this version's functions with the recorded parameters, so an
 update that changes how they cut only changes how the rebuilt history is cut, never which calls
@@ -531,7 +567,9 @@ fatal tool again would otherwise loop forever).
   add `{kind: "resumed", at, attempt, after}`, `{kind: "compacted", at, iteration, reason,
   tokensBefore, tokensAfter, summary}` and `tool` items with `status: interrupted | not_run`.
 * `run_view` adds (additively, `schemaVersion` stays 2) `threadId`, `turn`, `trigger`,
-  `threadStatus` (`open` | `closed`) and `threadRuns`. A subagent run from before threads has
+  `threadStatus` (`open` | `closed`) and `threadRuns`. A thread that closes (`agent_close`, the
+  cap) moves its runs' revisions in the same write and their views go out again as
+  `subagent.completed`, so a client's run store (which drops same-revision views) shows it closed. A subagent run from before threads has
   `threadId = runId`, `threadStatus: "closed"` and `legacy: true`; system runs and delegated tasks
   have `threadId: null`.
 * RPCs: `subagents.list`, `.get`, `.result`, `.transcript {runId, after, limit}` →
@@ -547,11 +585,12 @@ fatal tool again would otherwise loop forever).
 
 Every ended run appends one JSON line to `metrics.jsonl` (next to `runs.json`): `runId`, times,
 `durationS`, `origin`, `kind`, `model`, `outcome`, `errorCode`, `toolCalls`, `tokens`,
-`channel`. Never the brief, result or conversation. Lines are appended with `append_jsonl` (a
+`channel`, `trigger` (`spawn` | `followup`). Never the brief, result or conversation. Lines are appended with `append_jsonl` (a
 torn line never swallows the next). The file keeps its newest half past 8 MB, so
 metrics outlive the 30-day run pruning. `subagents.stats` returns, for the last `days`:
-`runs`, `byOrigin`, `outcomes`, `durationS {average, p50, p90}`, `tokens`, `toolCalls`, and
-`byDay` (UTC). System runs are left out unless asked; a run recorded twice counts once.
+`runs`, `byOrigin`, `outcomes`, `durationS {average, p50, p90}`, `tokens`, `toolCalls`,
+`byTrigger {spawn, followup}` (a line from before follow-ups counts as `spawn`), and `byDay`
+(UTC). System runs are left out unless asked; a run recorded twice counts once.
 
 ## 14. Tests and evaluation
 
@@ -575,6 +614,24 @@ metrics outlive the 30-day run pruning. `subagents.stats` returns, for the last 
   run; an already-taken notice opens no run; ordering; other conversations not held up; surface
   choice and refusals; the profile host forwarding; a real authenticated gateway socket;
   compaction before and after; agenda wake-ups unchanged).
+* Follow-ups (§16b): `test_subagent_followup.py` — an idle follow-up is a new turn whose model
+  gets the thread's own conversation (same system prompt, earlier task, call, result, report,
+  then the labeled task), saved, reported (`task 2`, `agent_id`) and counted (metrics,
+  `byTrigger`); the owner-quote label; a follow-up while running enters the turn
+  (`noteKind: "task"` live and in history) and one report covers it; a task that arrives as the
+  turn ends starts the next turn; a closed subagent (agent, deleted parent, idle) refuses tasks and
+  messages with the reason; `agent_close` stops a working one with no report and tells clients;
+  spawns and follow-ups of one parent turn report together; the running limits; a message kept for
+  the next task; `agent_read` by `agent_id`, `sessions_list`; the new tool descriptions hold no
+  steering; history repair (unit, a turn stopped mid-call, an older conversation with a call left
+  open mid-history) against a strict provider-ordering check; checkpoint v3 — the golden replay at
+  every model call of a follow-up turn on top of the thread's history, across a cut and a summary
+  that is then kept and that turn 3 starts from; a long thread whose next task's first request is
+  over the window; a restart mid follow-up (no call runs twice, exact list, one notice), a changed
+  history (`resume_unsupported`), a crash after the turn was saved (no model call), a version-2
+  checkpoint; a follow-up turn's stream (`run_started` with `trigger: "followup"`, `turn: 2`).
+  `test_provider_request_coordinator.py` pins `pin_at` (order kept around the pin, a cut in place,
+  `pin_at=1` = `pinned=1`).
 * Context: `test_subagent_compaction.py` (request + reply fit the child's model for small and large
   windows, the shared service and its learned ceilings, `AgentLoop` wiring, the main loop's cut
   schedule, a request under the threshold untouched, a failed summary retried, a request that
@@ -595,7 +652,9 @@ metrics outlive the 30-day run pruning. `subagents.stats` returns, for the last 
   `FLOWLY_EVAL_ONLY=a,b`). Checks what the agent *did*: explanations answered without tools,
   "don't search" respected, a detailed single task done itself, explicit delegation starts
   exactly one, "one agent each" starts one per part, its own part is still done, and after
-  starting subagents the agent ends its turn instead of waiting or polling.
+  starting subagents the agent ends its turn instead of waiting or polling, and asked to give the
+  subagent that already reported another task it calls `agent_followup` on that subagent rather
+  than spawning a new one (`followup-same-agent`, a conversation seeded with the earlier report).
 
 ## 15. Live steps whose calls are all hidden
 
@@ -611,8 +670,8 @@ adopt this branch.
 
 ## 16. Threads: every subagent is a conversation
 
-Design: `output/research/subagent-threads-2026-10-15/TASARIM.md` (phase 1 is built; deviations
-below).
+Design: `output/research/subagent-threads-2026-10-15/TASARIM.md` (phases 1, 2 and 4 are built;
+deviations below, §16a and §16b).
 
 **Identity.** A subagent started for the owner or by the agent (`origin` `owner` | `agent`) is a
 thread whose id is its first run's `run_id`, so its conversation key is the
@@ -664,9 +723,10 @@ thread.
 
 **Edges** (`SubagentThreadRecord`, `threads.json`): `thread_id`, `parent_session_key`,
 `child_session_key`, `status` (`open` | `closed`), `created_at`, `closed_at`, `closed_reason`
-(`parent_deleted`, `idle`, `cap`; `agent` and `owner` are reserved for phase 4), `origin`, `title`,
-`mark`, `model`, `depth`, `runs` (oldest first), `active_run_id`, `last_run_ended_at`, `usage`
-(summed over ended runs), `revision`, `updated_at`. `register(record, thread=…, open_cap=…)` writes
+(`agent` — `agent_close`; `parent_deleted`, `idle`, `cap`; `owner` has no client path), `origin`,
+`title`, `mark`, `model` (its latest turn's), `depth`, `runs` (oldest first), `active_run_id`,
+`last_run_ended_at`, `usage` (summed over ended runs), `revision`, `updated_at`, `pending_mail`
+(`[{id, text, at}]`, messages for its next task). `register(record, thread=…, open_cap=…)` writes
 the run and its new thread together; a run ending (`update` with `ended_at`) clears
 `active_run_id`, sets `last_run_ended_at` and adds its tokens in the same write. Reading reconciles
 a thread whose run is gone or ended.
@@ -678,9 +738,11 @@ by `maintain()` at startup, from `resume_pending`):
 * **Cap:** a conversation keeps at most `MAX_OPEN_THREADS_PER_CONVERSATION` (16) open. `spawn`
   past it closes the thread idle longest (`cap`), under the registry lock, and the tool result says
   so as a fact: *"This conversation keeps at most 16 subagents open; starting this one closed '…',
-  idle the longest. Its history stays readable."* If every open thread has a task running
-  (`ThreadCapReached`) the spawn is refused: *"16 subagents of this conversation are open and all
-  of them are working; one must finish before another can start."*
+  idle the longest. Its history stays readable. agent_close closes a subagent that is no longer
+  needed."* If every open thread has a task running (`ThreadCapReached`) the spawn is refused:
+  *"16 subagents of this conversation are open and all of them are working; one must finish, or
+  be closed with agent_close, before another can start."* Follow-ups open no thread and are not
+  counted.
 * **Retention:** a closed thread is removed `THREAD_RETENTION_SECONDS` (30 days) after
   `closed_at`, with its conversation, lock and spill dir — unless one of its runs still has a
   result waiting to be delivered. Files are pruned by name only (`subagent_<uuid>[.full].jsonl`,
@@ -726,37 +788,22 @@ and RPCs with additive fields, and no new events.
 **Deviations from the design.**
 * *Spill retention* (design §11 question 2): raw outputs live in the thread's own spill dir and go
   with its conversation (owner decision: kept 30 days after close), not in the 7-day temp dir.
-* *The cap.* The design refuses a spawn past 16 open threads and points to `agent_close`, which
-  phase 1 does not have; refusing would block a busy conversation's delegation for up to a week.
-  Phase 1 closes the thread idle longest instead and tells the agent; it refuses only when all 16
-  are working. Phase 4 decides whether to refuse once `agent_close` exists.
+* *The cap.* The design refuses a spawn past 16 open threads and points to `agent_close`; refusing
+  would block a busy conversation's delegation for up to a week. Phase 1 closes the thread idle
+  longest instead and tells the agent; it refuses only when all 16 are working. Phase 4 keeps that
+  (owner decision) and adds `agent_close` to both texts as a fact.
 * No `subagents.close` RPC: the owner decided no client writes a thread, and closing is the
   parent agent's (phase 4 `agent_close`) — or idle, cap, deletion.
 * A deleted parent's running turns are not cancelled (they were not before either); their turn is
   not saved.
-* The working context (`<key>.jsonl`) holds the turns uncut; the design's persisting of a
-  summarized working context (`prepare_compaction_archive`…) is phase 4's, when a follow-up first
-  reads it.
+* The working context (`<key>.jsonl`) holds the turns uncut unless a turn summarized its
+  context; then the summary is kept for the next turn (§16b, `persist_context`).
 * `SessionManager.read_run_result` keeps its fixed `<home>/sessions` path: nothing reads a
   thread's result through it (the result is in `runs-results/`).
 
 **Phase 2** (live turns) is built: §16a.
 
-**What phase 4 must know.**
-* `_run_turn` builds `[system (meta.systemPrompt), *session.get_history(), task]`; `get_history`
-  projects the extra fields away, but `_repair_tool_sequence` only repairs the *tail*: an aborted
-  turn (stopped mid tool calls) is followed by its closing row, so its open calls sit mid-history
-  and must be answered or dropped before a provider sees them. The pinned part becomes
-  `[system, this turn's task]`.
-* Checkpoint v3 must add `baseCount` / `baseDigest` and replay on top of the saved history; today a
-  checkpoint holds the whole run from the header, and `restore_child_state` rebuilds
-  `system_prompt`, `first_message` and the journal from it. The commit stays at the same point
-  (before `finish`) and stays idempotent through `meta.runs`, which survives compaction of the
-  working context (do not rely on scanning rows).
-* `register(record)` already turns a run with `thread_id` of an open, idle thread into its next turn
-  (`runs.append`, `active_run_id`); `agent_close` / `subagents.close` close reasons `agent` /
-  `owner` are already valid. `turn` / `trigger` are on the run record and in `run_view`.
-* A follow-up of a thread closed `parent_deleted` must be refused (its conversation is gone).
+**Phase 4** (follow-ups, closing) is built: §16b.
 
 ## 16a. A thread turn, live (`flowly/agent/subagent_stream.py`)
 
@@ -769,11 +816,11 @@ parent's report turn keeps `turnOrigin: "subagent"` under the parent's key):
 
 | Event | When | Data |
 |---|---|---|
-| `chat` `run_started` | The run's loop begins (a run continued after a restart: again, `resumed: true`) | `hiddenPrompt: false`, `steerable: false`, `prompt` (the brief), `promptAuthor: "main_agent"`, `threadId`, `turn`, `trigger`, `parentSessionKey`, `title`, `mark`, `model`, `withConversation`, `startedAt` (ms), `resumed?` |
+| `chat` `run_started` | The run's loop begins (a run continued after a restart: again, `resumed: true`) | `hiddenPrompt: false`, `steerable: false`, `prompt` (the brief; a follow-up's task), `promptAuthor: "main_agent"`, `threadId`, `turn`, `trigger` (`spawn` \| `followup`), `parentSessionKey`, `title`, `mark`, `model`, `withConversation` (first turn only), `startedAt` (ms), `resumed?` |
 | `agent` | Each model reply that has text (step granularity; the closing reply too) | `stream: "assistant"`, `data: {text}` |
 | `chat` `iteration_step` | Each reply with tool calls, each tool result | The main loop's shape (`flowly.tool_activity.iteration_event_payload`): `iterationIdx`, `role`, `content`, `tool_calls?`, `tool_call_id?`, `name?`, `tool_activity?`; a tool result not `ok` adds `status` (`error`, `timeout`, `interrupted`, `not_run`). A reply without calls mid-run (the main agent wrote meanwhile) is a step with `tool_calls: []` |
 | `chat` `tool_progress` | A call is queued, runs, ends | `ToolProgress`'s shape: `iterationIdx`, `revision`, `call {id, index, name, arguments, state, …}` |
-| `chat` `agent_note` | The child read a message from the main agent at a step | `iterationIdx`, `author: "main_agent"`, `content` (as saved) |
+| `chat` `agent_note` | The child read a message from the main agent at a step | `iterationIdx`, `author: "main_agent"`, `content` (as saved), `noteKind: "task"` for a task given to the running turn |
 | `compaction` | A summary fits the run's context (a cut alone is none) | `phase` `started` → `completed` \| `failed`, `compactionId`, `tokensBefore`, `tokensAfter`, `messagesRemoved` |
 | `chat` `final` | Outcome `ok`, or stopped (`cancelled` / `interrupted`: `aborted: true`, empty text) | `outcome`, `message {role, content: [{type: "text", text}], usage}` (the run's tokens), `model`, `durationMs`, `completedAt` |
 | `chat` `error` | Outcome `error` / `timeout` | `outcome`, `errorCode` (the run's), `errorTitle`, `errorMessage` (the result text), `retryable: false`, `usage`, `model`, `durationMs`, `completedAt` |
@@ -849,6 +896,108 @@ locks anything among the owner's conversations for a `subagent:` key.
 **Unchanged:** batching, delivery and the parent's report turns (`turnOrigin: "subagent"` on the
 parent's key), `subagent.*` events, `subagents.transcript`. Older clients never bind a `subagent:`
 conversation, so they get none of these events.
+
+## 16b. Follow-ups and closing (phase 4)
+
+Design §6 (Codex `followup_task` semantics). A thread takes more than one task; every task is a
+run (`trigger: "followup"`, `turn` = its number) of the same thread and conversation key, so
+delivery, batching, metrics, cancel and resume stay per run.
+
+**Tools** (main agent; all blocked inside a child). Targets are this conversation's subagents by
+`agent_id` (the thread id) or the run id of any of its tasks, full or a unique prefix of ≥ 8
+characters (`resolve_own_thread`); another conversation's read as not found; a subagent from
+before threads has no conversation and takes no task.
+
+| Tool | Does |
+|---|---|
+| `agent_followup(to, task, owner_request?, model?)` | `SubagentManager.followup`. **Idle and open:** registers a run of the thread (`register` appends it to `runs`, sets `active_run_id`, moves `pending_mail` into the run's `notes` in the same write) and starts it; returns `{status:"started", run_id, agent_id, turn, title, model, message}` (the spawn's wording). **Working:** the task goes to the running turn's inbox as a task (`send_to_child(kind="task")`, durable `mail` line), read at its next step as `[Task from the main agent]` (`agent_note`, `noteKind: "task"`); returns `{status:"added_to_running_task", run_id, agent_id, turn, message}`. **Closed:** `{status:"closed", agent_id, title, error: closed_text}` — a fact per reason (`agent`, `owner`, `idle`, `cap`, `parent_deleted` — the last always refused, its conversation is gone). Also `rejected` (the limits), `busy` (recorded running with no process here, or another task just started). |
+| `agent_close(to: id \| [ids] \| "all")` | `close_threads`: `registry.close_thread(reason="agent")` (drops `pending_mail`, moves the thread's runs' revisions), then a running task is cancelled (`cancelled`, no report, its turn saved `aborted`) and the runs' views go out again. `already_closed` with its reason when it was. |
+| `agent_message` | Extended (§5): idle → `queued`, closed → `closed`. |
+| `agent_read(run_id \| agent_id)` | `agent_id`: the thread's latest ended run's result (`agent_id`, `task_number` in the reply). |
+| `sessions_list(list)` | Adds `Subagents (N):` — per thread `'<title>' [agent_id <8>] — open, working \| open, idle \| closed (<reason>), N tasks; latest result: …`; task lines say `task N`. `cancel` stops the task only. |
+
+Descriptions state what happens (background, report together, same limits, history kept, closed
+takes nothing); nothing in them steers toward or away from a follow-up or a new subagent
+(`test_the_new_tools_state_facts_and_never_steer`). The system prompt's subagent block adds one
+fact: a subagent keeps its conversation after it reports, `agent_followup` gives it another task,
+`agent_close` ends it. `agent_followup` is in the plan guard's side-effect tools and the cron and
+profile-task disabled tools, like `spawn`.
+
+**Origin.** `owner_request` goes through the same owner-quote check as `spawn`
+(`spawn_origin`): it labels the run `owner` or `agent`, never refuses. The thread keeps its first
+run's origin.
+
+**Model.** The owner's named model, else the turn's model (as `spawn`), so a provider switch
+moves later turns along; the thread's `model` follows its latest turn.
+
+**Limits.** `_admission_error` is shared by spawn and follow-up: shutdown, 8 running in the process,
+3 running per conversation. A follow-up opens no thread, so the 16-open cap does not apply.
+
+**Batches and reports.** A follow-up run carries the parent turn's `batch_id`, so spawns and
+follow-ups started in one turn report in one notice (§6); the header names `agent_id` and
+`task N`. A task given to a running turn is covered by that turn's report.
+
+**Late tasks and messages.** A task or message that reaches a turn too late to be read (the turn's
+last step, its summary call, or after its answer) is not lost: when the run's task ends
+(`_start_run_task`'s cleanup, not for a run suspended by a shutdown — its unread mail is in its
+checkpoint), `_carry_over` keeps messages as the thread's `pending_mail` and starts the next turn
+with the tasks (the first starts it, later ones join it), with the batch and origin each was given
+under. Nothing is carried for a closed thread.
+
+**The turn's input** (`_child_run`, follow-up): `SubagentThreadStore.turn_context(threadId)` →
+the saved `systemPrompt` (`meta.subagent`; rebuilt with `_build_subagent_prompt` when the first
+turn ended without one) and `thread_history(session.messages)`: the protocol fields of the
+canonical rows (a kept summary as its `system` row; `context_boundary` and client-only rows left
+out), a stopped turn's empty closing row as `[This task was stopped before it finished.]`, then
+`repair_thread_history`. The first message is `followup_message(task, notes)`: each waiting message
+as `[Message from the main agent]\n…`, then `[Task from the main agent]\n<task>`. `ChildState(messages
+= [system, *history, first], base_count, base_digest)`; the checkpoint header records both.
+
+**History repair** (`repair_thread_history`). A stopped or crashed turn can leave a reply whose
+calls have no result mid-history (its closing row and later turns follow); `_repair_tool_sequence`
+only repairs the tail. Every reply's calls are answered right after it in call order — the recorded
+result if there is one, else `UNANSWERED_CALL_TEXT` (*"No result: the turn that made this call
+ended before its result was recorded. It may or may not have run; check before relying on it."*);
+a result answering no call of the reply before it is dropped; an empty reply without calls says
+`[No reply.]`. New turns do not leave such holes: `_save_turn` answers a stopped turn's open calls
+before saving (`open_call_ids`; `interrupted` with `STOPPED_CALL_TEXT` for a call that started —
+`ChildState.started_calls`, rebuilt from `tool_start` — else `not_run` with
+`NOT_STARTED_CALL_TEXT`). Pinned by a strict provider-ordering check in the tests.
+
+**Context of a long thread.** Every request of a follow-up is fitted like any child request
+(§4.1) with the turn's task pinned in place (`pin_at`): the thread's earlier turns are
+compactable; a summary's list is `[system, summary, kept history…, task, kept work…]`. When a turn
+summarized (`ChildState.summarized`, set by `apply_compacted(summarized=True)`, replayed from
+`compacted.summarized`), `_save_turn` keeps it after saving the turn:
+`SubagentThreadStore.persist_context` rewrites the working context `<key>.jsonl` to
+`[summary, *kept]` — `kept` = the messages after the summary at the turn's end plus its closing
+reply — with the owner's compaction machinery (`prepare_compaction_archive` marks the replaced
+rows compacted in the append-only display log, `append_compaction_summary` archives the summary and
+any kept message that is not a saved row as hidden derived copies, `mark_full_synced`, the pending
+transaction / boundary markers, then `finalize_compaction_archive` / `finalize_context_boundary`
+in a second save). A kept message that is a saved row keeps that row (uncut, with its fields).
+`subagents.history` still shows every row, with a `context_boundary` seam. Idempotent per run
+(`meta.contextRun`), and only after the turn itself is saved (`meta.runs`), so a crash between the
+two is finished by the replay of `final`. The next turn starts from the summary — no summary call
+for what was already summarized.
+
+**Streaming (§16a).** A follow-up turn streams as any turn: `run_started` with `trigger:
+"followup"`, its `turn`, the task as `prompt`, `withConversation: false`; its `iterationIdx` count
+from 0 in its own journal; `chat.inflight {K}` holds it while it runs.
+
+**History rows.** A follow-up's task row has `turn`, `trigger: "followup"` and `brief` (the bare
+task; the content is the labeled first message); a task given to a running turn is an
+`agent_note` row with `noteKind: "task"`. `thread_view` adds `pendingMessages`.
+
+**Deviations from the design.**
+* `agent_message` to an idle subagent queues in `threads.json` (`pending_mail`, ≤ 32) as designed;
+  a message or task that arrives too late for a running turn is carried over (not in the design).
+* No `subagents.close` RPC (owner decision, §16); `owner` stays a valid reason with no path.
+* The 16-open cap keeps closing the idle-longest thread (owner decision); it is not a refusal.
+* A restart that cannot continue a turn saves a minimal turn for it (`_save_settled_turn`), so
+  the thread's history has every task it was given.
+* Accepted: a crash between `persist_context`'s two saves leaves its markers, which the session's
+  next load finishes (as for the owner's conversations).
 
 ## 17. Open items
 

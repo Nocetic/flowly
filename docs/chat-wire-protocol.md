@@ -68,7 +68,7 @@ Discriminated by `data.state`.
 | `streaming` | One delta of assistant text. | `delta` |
 | `iteration_step` | One tool-protocol step inside the turn. | `iterationIdx`, `role`, `content`, `tool_calls?`, `tool_call_id?`, `name?` |
 | `tool_progress` | A call's state changed (queued, running, ended). Not a step. | `iterationIdx`, `revision`, `call` |
-| `agent_note` | A subagent's turn only (§4.8): the main agent's message it read. Not a step. | `iterationIdx`, `author`, `content` |
+| `agent_note` | A subagent's turn only (§4.8): the main agent's message (or, `noteKind: "task"`, a task) it read. Not a step. | `iterationIdx`, `author`, `content`, `noteKind?` |
 | `final` | **Terminal.** The turn's durable assistant message. | `message.content[]`, `model`, `usage`, `completedAt`, `durationMs`, `aborted?`, `attachments?`, `toolMessages?` |
 | `aborted` | Legacy early terminal. The authoritative `final, aborted:true` still follows. | — |
 | `error` | **Terminal.** Provider/agent failure as a product state. | `errorCode`, `errorTitle`, `errorMessage`, `retryable` |
@@ -228,8 +228,11 @@ history read.
 
 **4.8 — A subagent's own turn streams to whoever watches it.** A subagent
 working for the owner is a thread with its own read-only conversation
-`K = subagent:<threadId>`. While a turn of it runs (run id `R`), the server
-sends that turn's events — only to clients that watch the thread:
+`K = subagent:<threadId>`. Each task it gets is a turn of `K` with a run id of
+its own: the first (`trigger: "spawn"`, `turn: 1`, run id = `threadId`), then
+each follow-up the main agent gives it (`trigger: "followup"`, `turn` 2, 3, …).
+While a turn of it runs (run id `R`), the server sends that turn's events —
+only to clients that watch the thread:
 
 ```
 run_started ─▶ [agent delta | iteration_step | tool_progress | agent_note | compaction]* ─▶ final | error
@@ -242,8 +245,11 @@ run_started ─▶ [agent delta | iteration_step | tool_progress | agent_note | 
 - `run_started`: `hiddenPrompt: false`, `steerable: false`, `prompt` (the task
   the main agent gave — the brief), `promptAuthor: "main_agent"`, `threadId`,
   `turn`, `trigger`, `parentSessionKey`, `title`, `mark`, `model`,
-  `withConversation`, `startedAt`; `resumed: true` when the run continues
-  after a restart (its earlier steps are in `chat.inflight`, not sent again).
+  `withConversation` (the first turn only), `startedAt`; `resumed: true` when
+  the run continues after a restart (its earlier steps are in `chat.inflight`,
+  not sent again). A follow-up turn has `trigger: "followup"`, its `turn`
+  number and the follow-up task as `prompt`; a client starts it as a new turn
+  of the same view, after the turns `subagents.history` already shows.
   There is no `state:"user"` event.
 - `agent {stream:"assistant", data:{text}}`: what the model said, one delta
   per reply (token streaming may later send several). As in an owner's turn,
@@ -252,7 +258,10 @@ run_started ─▶ [agent delta | iteration_step | tool_progress | agent_note | 
 - `iteration_step` / `tool_progress`: an owner's turn's shapes. A tool step
   not `ok` adds `status` (`error`, `timeout`, `interrupted`, `not_run`).
 - `chat {state:"agent_note", iterationIdx, author:"main_agent", content}`: a
-  message from the main agent the subagent read at a step.
+  message from the main agent the subagent read at a step; `noteKind: "task"`
+  when it is a task the main agent gave the running turn (its report covers
+  it). `content` is as the model got it (`[Message from the main agent]` /
+  `[Task from the main agent]` and the text).
 - `compaction {phase, compactionId, tokensBefore, tokensAfter,
   messagesRemoved, sessionKey: K, runId: R}`: a summary fitting the
   subagent's context (§5's lifecycle).

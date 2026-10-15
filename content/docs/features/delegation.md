@@ -23,15 +23,26 @@ When it starts one, the agent writes the subagent's brief itself: the goal, what
 - Runs in the **same Python process** and shares the parent's LLM provider. It runs on the agent's own model unless you named another one for that task.
 - Reads **the conversation so far** — your messages and the agent's replies, without tool calls, tool output or reasoning — then its brief. The agent can start it without the conversation for unrelated work. It also gets your memory and known facts.
 - Gets a **fresh, restricted tool registry**: `read_file`, `write_file`, `edit_file`, `list_dir`, `memory_append`, `exec`, `web_search`, `web_fetch`, `web_extract`, `skill_manage`, `knowledge_graph`, `artifact`. A `self-review` run is forced to `memory_append` + `knowledge_graph` only.
-- **Cannot spawn its own subagents** (no recursion). The tools `spawn`, `agent_read` and `delegate_to` are blocked inside subagents, along with cron, user-facing I/O (`message`, `voice_call`, `email`), external writes (`google_*`, `linear`, `trello`, `x`), GUI/gateway tools (`screenshot`, `browser_tab`, `computer`), cross-session reads (`sessions_list`, `session_search`, `memory_search`, `memory_get` — `memory_append` stays allowed), and `system` / `docker` / `process`.
+- **Cannot spawn its own subagents** (no recursion). The tools `spawn`, `agent_read`, `agent_followup`, `agent_close` and `delegate_to` are blocked inside subagents, along with cron, user-facing I/O (`message`, `voice_call`, `email`), external writes (`google_*`, `linear`, `trello`, `x`), GUI/gateway tools (`screenshot`, `browser_tab`, `computer`), cross-session reads (`sessions_list`, `session_search`, `memory_search`, `memory_get` — `memory_append` stays allowed), and `system` / `docker` / `process`.
 
 ### The agent keeps working
 
-Starting a subagent returns at once with its run id. The agent does whatever doesn't depend on it, tells you briefly what is running and ends its turn, so the chat stays free while subagents work. Subagents started in the same turn report back together: when the last of them finishes, their results reach the agent in one message — each with its title, run id, the tools it used and its result (up to 8,000 characters for a single run, 24,000 shared across a batch) — and the agent answers your request as a whole from there. A subagent alone in its turn reports as soon as it finishes. The agent reads anything beyond what was shown with `agent_read`, which only ever shows runs started in the same conversation. If the conversation is busy when the results arrive, they wait until it frees up; if you write while the agent is working on them, your message is answered right after.
+Starting a subagent returns at once with its run id and its agent id (the subagent itself, which keeps the same id for every task it gets). The agent does whatever doesn't depend on it, tells you briefly what is running and ends its turn, so the chat stays free while subagents work. Subagents started in the same turn report back together: when the last of them finishes, their results reach the agent in one message — each with its title, run id, the tools it used and its result (up to 8,000 characters for a single run, 24,000 shared across a batch) — and the agent answers your request as a whole from there. A subagent alone in its turn reports as soon as it finishes. The agent reads anything beyond what was shown with `agent_read`, which only ever shows runs started in the same conversation. If the conversation is busy when the results arrive, they wait until it frees up; if you write while the agent is working on them, your message is answered right after.
 
 `agent_wait` is for the rare case where the agent cannot finish its own work in a turn without a result due shortly. It returns as soon as a subagent finishes or writes, or you write; a single wait lasts at most two minutes (30 seconds by default), and a turn waits at most five minutes in all before it ends and lets the results arrive as a message. The agent never sleeps or polls a task list.
 
 A turn that keeps getting results it already has — re-reading the same finished result, polling something that stopped changing — is told so, and after four such results in a row it answers with what it has, without tools. A subagent going round in circles the same way wraps up with a summary.
+
+### Giving a subagent more work
+
+A subagent keeps its conversation after it reports, so the agent can give the same subagent another task with `agent_followup` — when you ask ("ask the same agent to also check B") or when it judges that worth it. The subagent picks up with everything it did before in view: its earlier tasks, the tool results it read and the reports it wrote. Nothing in Flowly pushes the agent toward a follow-up or a new subagent; it is the agent's call, or yours.
+
+- **If the subagent has nothing running**, the task starts a new turn of its conversation in the background. It counts toward the same limits as a new subagent (3 running per conversation, 8 overall) and reports back the same way — together with anything else started in the same turn. Its report says which task it is ("task 2").
+- **If the subagent is working**, the task reaches its running turn at its next step, like a message, and that turn's report covers it. A task that arrives just as the turn is finishing starts the subagent's next turn instead.
+- **When you asked for it**, the agent quotes your words and Flowly checks them, as for a new subagent; the task is then shown as started at your request.
+- A message from the agent to a subagent with nothing running (`agent_message`) is kept for its next task; it starts nothing on its own.
+
+The agent closes a subagent it no longer needs with `agent_close`. A closed subagent takes no new task or message; its conversation stays readable. Closing one that is working stops its task, with no report. Stopping a task (from its sidebar, the menu bar, or by asking the agent) stops only that task: the subagent stays open for the next one.
 
 ### Talking while they work
 
@@ -43,8 +54,9 @@ Every subagent working for you has a conversation of its own, kept the way your 
 
 - **Read only.** Only the agent that started a subagent writes to its conversation. You can read it from any app — desktop, phone, or through another of your agents — but never write to it: a message, a steer, a compaction, a model change or a deletion aimed at it is refused.
 - **Private.** It is stored apart from your conversations, so it never shows up in your chat list, in conversation search, in what other apps can read through Flowly's MCP server, or in what Flowly learns about you. The agent's file tools cannot open it either.
-- **How long it stays.** A subagent is open while it may still get work, and closes after seven days with nothing to do. Its conversation and its saved tool output are kept 30 days after it closes, then removed — unless its result never reached the conversation that started it. Deleting that conversation closes its subagents and removes their conversations right away.
-- **At most 16 open.** A conversation keeps at most 16 subagents open. Starting one more closes the one that has been idle longest; the agent is told which, and its conversation stays readable.
+- **Many tasks, one conversation.** Each task the subagent gets is a new turn of the same conversation, marked with its number, so its history reads from the first task to the latest.
+- **How long it stays.** A subagent is open while it may still get work: until the agent closes it, or after seven days with nothing to do. Its conversation and its saved tool output are kept 30 days after it closes, then removed — unless its result never reached the conversation that started it. Deleting that conversation closes its subagents and removes their conversations right away.
+- **At most 16 open.** A conversation keeps at most 16 subagents open. Starting one more closes the one that has been idle longest; the agent is told which (and that it can close the ones it no longer needs itself), and its conversation stays readable. If all 16 are working, no new one starts until one finishes or is closed.
 - Subagents that ran before this version have no conversation of their own; their transcript still opens as before. Background bookkeeping (self-review, Board) never gets one.
 
 ### Limits
@@ -57,6 +69,8 @@ Every subagent working for you has a conversation of its own, kept the way your 
 
 A subagent manages its context the way the agent does, measured against the context window of the model it runs on — so a long run, or a run on a model with a small window, keeps working instead of failing when its history outgrows the window. As the history nears the limit, old tool output is shortened first. If that is not enough, the work so far is summarized and the subagent carries on from the summary; its brief is always kept exactly as the agent wrote it. If the model's provider still rejects a request as too large, Flowly shrinks it further and sends it once more, and remembers that provider's real limit for that model, for the agent and every subagent.
 
+A subagent that has done many tasks has a long conversation; its next task is fitted the same way. Its earlier turns are summarized like the rest when they no longer fit — the task it was just given is always kept exactly as written — and the summary is kept with its conversation, so its next task starts from it instead of summarizing again. Its full conversation stays readable as it was.
+
 A summary is a model call: its tokens count toward the subagent's total. While it is being made, the subagent shows as compacting, and its transcript marks the point where its history was summarized, with how much smaller it became. A summary made before a restart is kept with the subagent's working record and is never made again.
 
 ### When Flowly restarts
@@ -65,7 +79,7 @@ Subagents carry on after Flowly restarts — whether you quit it, it updated, or
 
 Flowly never repeats a step that was in progress at that moment. Instead the subagent is told plainly what may have happened — for example that a command it started may have finished, been cut off or still be running — so it checks before doing anything again. A step that had not started yet is reported to it as not run.
 
-There are limits. A subagent is continued only within a day of Flowly stopping; after a longer break, or if Flowly keeps restarting without it getting any further (three times), or after an update that cannot read its saved work, it stops where it was and the conversation is told once. The working record is deleted as soon as the subagent finishes; what it did stays in its conversation, saved once, even when it was continued after a restart. Background bookkeeping, and subagents started from a terminal session (`flowly agent`), are not continued.
+There are limits. A subagent is continued only within a day of Flowly stopping; after a longer break, or if Flowly keeps restarting without it getting any further (three times), or after an update that cannot read its saved work, it stops where it was and the conversation is told once. The working record is deleted as soon as the subagent finishes; what it did stays in its conversation, saved once, even when it was continued after a restart. Background bookkeeping, and subagents started from a terminal session (`flowly agent`), are not continued. A later task of a subagent continues the same way, on top of its conversation; if that conversation changed meanwhile, the task stops where it was and the conversation is told once.
 
 A subagent's result counts as delivered only once the conversation has saved the reply that dealt with it. If Flowly stops in between, the result reaches the conversation again after the restart, never twice. A result that finished up to a day before Flowly started again still arrives, saying how long ago it finished.
 
@@ -75,7 +89,7 @@ When Flowly is shut down, subagents are stopped before anything else, so they ar
 
 Every subagent counts the tokens it uses — input, output and cache reads — as it works. The count is shown live while it runs and stays with it when it ends. Flowly shows tokens, not prices.
 
-Each run that ends also leaves a short record — when it ran, who started it, how it ended, how long it took and its tokens; never its brief or result — which outlives the 30-day run history. The bot's subagent statistics (runs, outcomes, durations and tokens, day by day) come from these records.
+Each run that ends also leaves a short record — when it ran, who started it, how it ended, how long it took and its tokens; never its brief or result — which outlives the 30-day run history. The bot's subagent statistics (runs, outcomes, durations and tokens, day by day, and how many were a subagent's first task or a later one) come from these records.
 
 ### No stored specialists
 
