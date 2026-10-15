@@ -462,7 +462,9 @@ metrics outlive the 30-day run pruning. `subagents.stats` returns, for the last 
   `test_subagent_profile_transport.py`, `test_subagent_report_streaming.py` (a report turn
   streams on the direct gateway and the relay like an owner turn — `run_started`, deltas, tool
   steps, one final, command record, hidden in-flight prompt; the bus fallback; Stop and
-  exactly-once delivery; an already-taken notice opens no run; ordering; surface choice;
+  exactly-once delivery; a failing report gives back what it took (`release_taken`) and ends its
+  run; an already-taken notice opens no run; ordering; other conversations not held up; surface
+  choice and refusals; the profile host forwarding; a real authenticated gateway socket;
   compaction before and after; agenda wake-ups unchanged).
 * Restarts: `test_subagent_restart.py` (torn lines, owners and claims, the delivery commit point,
   long downtime, shutdown order), `test_subagent_checkpoint.py` (the golden replay at every model
