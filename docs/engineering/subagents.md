@@ -24,6 +24,7 @@ are gone (`test_delegation_rule.py` pins the current contract).
 | `flowly/agent/subagent.py` | `SubagentManager`: spawn, the child loop, messaging, waiting, delivery (announce), cancel, recovery, metrics hook |
 | `flowly/agent/subagent_registry.py` | `SubagentRunRecord` + `SubagentRegistry` (`runs.json` index, result files, transcripts, file lock, pruning, `claim`), `add_usage`, `append_jsonl` |
 | `flowly/agent/subagent_owner.py` | Who owns a run (`process_owner`) and whether that owner is gone (`owner_state`) |
+| `flowly/agent/subagent_checkpoint.py` | A running run's checkpoint (`SubagentCheckpoint`), `ChildState`, `apply_step`, `restore_child_state`, `tool_class` |
 | `flowly/agent/subagent_observation.py` | `run_view` (the wire shape of a run), `TaskEvents` (coalesced `subagent.*` events) |
 | `flowly/agent/subagent_metrics.py` | One metric line per ended run (`metrics.jsonl`), `summarize` |
 | `flowly/agent/delegation.py` | `DelegationTurn` (per-turn facts in a context var), owner-quote check, conversation fork, marks |
@@ -68,7 +69,8 @@ the agent the results arrive together as a new message, not to wait, not to redo
 
 ## 4. The child run
 
-`SubagentManager._run_subagent` → `_do_run`:
+`SubagentManager._run_subagent` → `_child_run` (tools from `_child_tools`; the loop's state is a
+`ChildState`, §8 "Checkpoint"):
 
 * **Prompt.** `_build_subagent_prompt`: one task, act with tools, report with checkable
   evidence (URLs, paths, ids), say what could not be done.
@@ -210,6 +212,34 @@ save** as the turn, and only then `mark_delivered` (`pending | queued | taken �
   stays gapless.
 * Pruning: user-facing runs after 30 days, system or `cleanup=delete` runs after 1 day — never a
   run whose result is still undelivered.
+
+### Checkpoint
+
+A running run that will be continued after a restart (`resumable`: owner/agent runs of a process
+with `resume_enabled` — the gateway sets it; not system, `wait`, `silent` or wall-clock runs, and
+not the CLI) keeps a checkpoint: `runs-checkpoints/<sha256(run_id)>.jsonl`, 0600, append-only JSON
+lines `{v, n, t, type, …}` (`subagent_checkpoint.py` lists every type). Unlike the transcript it
+is what the provider saw: the system prompt and first message (brief + forked conversation) as
+sent, each model reply with tool calls — full arguments, ids, `extra_content` — written **before**
+its tools run, `tool_start` before a tool runs and `tool` with the exact message appended
+(meta-tool answers too) plus what the repetition guard saw, messages from the main agent when they
+arrive (`mail`) and when read (`step` / `inbox`), each step's context budget, the overflow trim,
+the summary call and the final result. `model`, `tool_start`, `mail` and `final` are fsynced.
+
+* **Exact rebuild.** Every change to the child's message list goes through a function the replay
+  calls too (`apply_step` for the inbox and the strip/trim compaction with the step's recorded
+  budget, `_answer_tool` for tool messages, the overflow trim, the grace prompt), so
+  `restore_child_state(records)` rebuilds the list the provider was sent, step for step
+  (`test_subagent_checkpoint.py` checks it at every model call). The repetition guard is rebuilt
+  from the results it saw (a marked result is unmarked first), the search memo from the search
+  results.
+* **Calls.** The last reply's calls without a `tool` record come back as `open_calls`: started
+  (`tool_start`, may have had effects) or not; `suspended` after a start marks it stopped by a
+  clean shutdown. A reply that `agent_message` read counts as read only if that call finished.
+* **Lifetime.** Deleted when the run ends (after the registry has its result); the registry's
+  pruning also removes any checkpoint whose run is no longer running. Past 16 MB, or if the disk
+  refuses a line, the checkpoint is dropped and the run marked not resumable — the run itself
+  goes on. System runs never keep one (they hold the owner's conversation and memory).
 
 ## 9. Repetition guard (`flowly/agent/repetition.py`)
 

@@ -116,6 +116,10 @@ class SubagentRunRecord:
     # Times a startup announced this finished result again because the
     # conversation never saved a turn that handled it.
     reannounced: int = 0
+    # Continued after a restart (subagent_checkpoint): set at spawn for
+    # owner/agent runs of a gateway that report back; cleared if its
+    # checkpoint cannot be kept.
+    resumable: bool = False
 
 
 
@@ -218,6 +222,8 @@ class SubagentRegistry:
             raise ValueError("invalid run owner")
         if type(record.reannounced) is not int or record.reannounced < 0:
             raise ValueError("invalid run counters")
+        if type(record.resumable) is not bool:
+            raise ValueError("invalid run flags")
         return record
 
     def _read_locked(self) -> None:
@@ -286,6 +292,18 @@ class SubagentRegistry:
                         path.unlink()
                     except OSError:
                         logger.warning("Could not prune an expired subagent transcript")
+        # A checkpoint lives only while its run is running: one left behind by
+        # a crash after the run ended (or whose run is gone) is removed here.
+        keep_checkpoints = {
+            self.checkpoint_path(r.run_id).name for r in self._runs.values() if r.ended_at is None
+        }
+        if self._checkpoint_dir.exists():
+            for path in self._checkpoint_dir.glob("*.jsonl"):
+                if re.fullmatch(r"[0-9a-f]{64}\.jsonl", path.name) and path.name not in keep_checkpoints:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        logger.warning("Could not prune a finished subagent checkpoint")
 
     @property
     def _result_dir(self) -> Path:
@@ -300,6 +318,14 @@ class SubagentRegistry:
 
     def _transcript_path(self, run_id: str) -> Path:
         return self._transcript_dir / (hashlib.sha256(run_id.encode()).hexdigest() + ".jsonl")
+
+    @property
+    def _checkpoint_dir(self) -> Path:
+        return self._path.with_name(self._path.stem + "-checkpoints")
+
+    def checkpoint_path(self, run_id: str) -> Path:
+        """Where a running run's checkpoint lives (subagent_checkpoint)."""
+        return self._checkpoint_dir / (hashlib.sha256(run_id.encode()).hexdigest() + ".jsonl")
 
     def append_transcript(self, run_id: str, item: dict[str, Any]) -> int:
         """Append one step of a run's transcript; returns its sequence number.

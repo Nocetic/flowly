@@ -15,7 +15,7 @@ from loguru import logger
 from flowly.bus.events import ConversationInboundMessage
 from flowly.bus.queue import MessageBus
 from flowly.providers.base import LLMProvider
-from flowly.agent.repetition import RepetitionGuard, mark_repeated
+from flowly.agent.repetition import mark_repeated
 from flowly.agent.tools.base import Tool
 from flowly.agent.tools.discovery import (
     annotate_search_repetition,
@@ -29,6 +29,13 @@ from flowly.agent.tools.web import WebSearchTool, WebFetchTool, WebExtractTool
 from flowly.agent.subagent_metrics import append_metric, metrics_path
 from flowly.agent.subagent_registry import SubagentRegistry, SubagentRunRecord, add_usage
 from flowly.agent import subagent_owner
+from flowly.agent.subagent_checkpoint import (
+    ChildState,
+    GRACE_PROMPT,
+    SubagentCheckpoint,
+    apply_step,
+    tool_class,
+)
 from flowly.agent.delegation import MAX_CHILDREN_PER_CONVERSATION, assign_mark
 from flowly.agent.tools.agent_tools import ChildAgentMessageTool
 from flowly.agent.subagent_observation import TaskEvents, run_view
@@ -203,6 +210,14 @@ def record_subagent_reports(metadata: dict[str, Any], run_ids: list[str]) -> Non
     metadata[SUBAGENT_REPORTS_KEY] = kept[-_REPORTS_KEPT:]
 
 
+def _core_version() -> str:
+    try:
+        from flowly import __version__
+        return str(__version__)
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
 def _age_text(seconds: float) -> str:
     seconds = max(0, int(seconds))
     if seconds < 3_600:
@@ -344,6 +359,8 @@ def _subagent_context_budget(model: str) -> int:
 def _trim_to_context_budget(
     messages: list[dict[str, Any]],
     model: str,
+    *,
+    budget: int | None = None,
 ) -> list[dict[str, Any]]:
     """Collapse old tool results until the list fits the model's window.
 
@@ -355,7 +372,9 @@ def _trim_to_context_budget(
     """
     from flowly.compaction.estimator import estimate_messages_tokens
 
-    budget = _subagent_context_budget(model)
+    # A child run passes the budget it recorded for the step, so a restart
+    # compacts its rebuilt list exactly as the live one was.
+    budget = _subagent_context_budget(model) if budget is None else budget
     if estimate_messages_tokens(messages) <= budget:
         return messages
 
@@ -419,6 +438,13 @@ class SubagentManager:
         # session's SUBAGENT_REPORTS_KEY). AgentLoop sets it; None = unknown.
         self.committed_reports: Callable[[str], set[str]] | None = None
         self._shutting_down = False
+        # Whether this process continues its runs after a restart. The
+        # gateway turns it on; a CLI session has nobody to continue them.
+        self.resume_enabled = False
+        # Checkpoints of this process's resumable runs (subagent_checkpoint),
+        # and the tool call each run is in (a reply it reads is that call's).
+        self._checkpoints: dict[str, SubagentCheckpoint] = {}
+        self._current_call: dict[str, str] = {}
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         # Pending deliveries of held batch results, by parent and batch.
         self._batch_flushes: dict[str, asyncio.Task[None]] = {}
@@ -428,9 +454,10 @@ class SubagentManager:
         # (other sessions / other cron jobs keep running).
         self._children_by_parent: dict[str, set[str]] = {}
         self._busy_sessions: set[str] = set()
-        # Messages from the main agent waiting for a running child's next
-        # step, and a wake-up for a child waiting on a reply.
-        self._inboxes: dict[str, list[str]] = {}
+        # Messages from the main agent ({"id", "text"}) waiting for a
+        # running child's next step, and a wake-up for a child waiting on a
+        # reply.
+        self._inboxes: dict[str, list[dict[str, str]]] = {}
         self._inbox_events: dict[str, asyncio.Event] = {}
         # Messages children sent to a conversation, kept so a waiting main
         # agent can take them directly, and a wake-up for that wait.
@@ -768,6 +795,13 @@ class SubagentManager:
             }),
             batch_id=batch_id,
             owner=subagent_owner.process_owner(self._instance),
+            # Continued after a restart: work a conversation waits for, in a
+            # process that continues runs. A run waited for inline, a silent
+            # one, system bookkeeping or one with a wall clock is not.
+            resumable=bool(
+                self.resume_enabled and origin in ("owner", "agent")
+                and not (wait or silent) and not timeout_seconds
+            ),
         )
         self._registry.register(record)
 
@@ -853,6 +887,7 @@ class SubagentManager:
         timeout_seconds: int | None,
         skip_announce: bool = False,
         context: str | None = None,
+        restored: ChildState | None = None,
     ) -> str:
         """Execute the subagent task and optionally announce the result.
 
@@ -862,663 +897,52 @@ class SubagentManager:
         output) is skipped. Sync-mode spawn uses this so the cron agent
         receives the child's response inline instead of as a separate
         system message on a later turn.
+
+        ``restored`` continues a run a restart stopped, from the state its
+        checkpoint rebuilt (see resume_pending); the run keeps its start.
         """
-        logger.info(f"[SubagentManager] [{run_id[:8]}] starting: {label}")
-        self._registry.update(run_id, started_at=time.time())
-
-        async def _do_run() -> tuple[str, bool, list[dict[str, Any]]]:
-            nonlocal status, error_str, error_code
-            # Subagent tool registry — factory lookup over a fixed allowlist.
-            # SubagentToolRegistry still refuses blocked names (spawn,
-            # delegate_to, cron, message, …) on register so a broken
-            # allowlist can't smuggle a dangerous tool in either.
-            # When the parent has governance enabled, fire its post_tool_call
-            # hook from the subagent's registry too, so self-review's memory/KG
-            # writes are governed like the main agent's.
-            sub_hooks = None
-            if self.governance_post_tool is not None:
-                from flowly.agent.hooks import HookRegistry
-                sub_hooks = HookRegistry()
-                sub_hooks.register("post_tool_call", self.governance_post_tool)
-            tools = SubagentToolRegistry(hooks=sub_hooks)
-
-            def _build_kg_tool() -> Any:
-                from flowly.agent.tools.knowledge_graph import KnowledgeGraphTool
-                kg_state = self._state_dir
-                if not (kg_state / "knowledge_graph.sqlite3").exists():
-                    alt = self.workspace.parent / "knowledge_graph.sqlite3"
-                    if alt.exists():
-                        kg_state = self.workspace.parent
-                return KnowledgeGraphTool(state_dir=kg_state)
-
-            def _build_artifact_tool() -> Any:
-                if self.artifact_tool_factory is not None:
-                    return self.artifact_tool_factory()
-                from flowly.artifacts.store import get_store
-                from flowly.agent.tools.artifact import ArtifactTool
-                art_tool = ArtifactTool(store=get_store(self._state_dir))
-                if self._artifact_on_change:
-                    art_tool.set_on_change(self._artifact_on_change)
-                return art_tool
-
-            from flowly.agent.tools.skill_manage import SkillManageTool
-
-            # Factory map: name → builder; the keys are the child's allowlist.
-            _TOOL_FACTORIES: dict[str, Any] = {
-                "read_file": lambda: ReadFileTool(workspace=self.workspace),
-                "write_file": lambda: WriteFileTool(workspace=self.workspace),
-                "edit_file": lambda: EditFileTool(workspace=self.workspace),
-                "list_dir": lambda: ListDirTool(workspace=self.workspace),
-                "memory_append": lambda: MemoryAppendTool(workspace=self.workspace),
-                "exec": lambda: ExecTool(
-                    config=self.exec_config, working_dir=str(self.workspace),
-                ),
-                "web_search": lambda: WebSearchTool(
-                    api_key=self.brave_api_key,
-                    proxy_url=self._web_search_proxy_url,
-                    server_id=self._web_search_server_id,
-                    auth_token=self._web_search_auth_token,
-                ),
-                "web_fetch": lambda: WebFetchTool(),
-                "web_extract": lambda: WebExtractTool(),
-                "skill_manage": lambda: SkillManageTool(workspace=self.workspace),
-                "knowledge_graph": _build_kg_tool,
-                "artifact": _build_artifact_tool,
-                "agent_message": lambda: ChildAgentMessageTool(self, run_id),
-            }
-
-            requested = set(_TOOL_FACTORIES.keys())
-            own = self._registry.get(run_id)
-            if own is not None and own.origin == "system":
-                # Background bookkeeping has no conversation to talk to.
-                requested.discard("agent_message")
-            if label == "self-review":
-                # Self-review is only for memory/KG evolution. Replace the
-                # default tool set so it cannot create skills indirectly via
-                # skill_manage or by writing workspace skill files.
-                requested = {"memory_append", "knowledge_graph"}
-
-            for tool_name in requested:
-                factory = _TOOL_FACTORIES.get(tool_name)
-                if factory is None:
-                    continue
-                try:
-                    tools.register(factory())
-                except ValueError as blocked:
-                    # The blocklist guard is authoritative.
-                    logger.warning(
-                        f"[SubagentManager] [{run_id[:8]}] refused blocked tool: {blocked}"
-                    )
-                except Exception as e:
-                    # Optional tools (KG, artifact) may fail to build on
-                    # fresh installs. Non-fatal — just not available.
-                    logger.debug(
-                        f"[SubagentManager] [{run_id[:8]}] tool "
-                        f"'{tool_name}' unavailable: {e}"
-                    )
-
-            # Build messages with subagent-specific prompt
-            system_prompt = self._build_subagent_prompt(task, label=label)
-            if build_tool_disclosure(
-                tools.get_definitions(),
-                toolsets=tools.get_toolsets(),
-                sources=tools.get_discovery_sources(),
-                intent_text=task,
-            ).enabled:
-                system_prompt += (
-                    "\n\nSome safe tools are represented by a compact catalog. "
-                    "They may be invoked through tool_call. tool_search is available "
-                    "when a name or compact signature is unclear; its results include "
-                    "complete schemas and valid invocation options."
-                )
-            first_message = (
-                f"## Conversation so far\n\n{context}\n\n## Your task\n\n{task}"
-                if context else task
-            )
-            messages: list[dict[str, Any]] = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": first_message},
-            ]
-            self._transcribe(run_id, {
-                "kind": "brief", "content": _clip(task, 8_000), "withConversation": bool(context),
-            })
-
-            # Run agent loop (limited iterations)
-            max_iterations = self.max_iterations
-            iteration = 0
-            _tool_search_result_sets: dict[tuple[str, ...], int] = {}
-            final_result: str | None = None
-            _model_used_artifact = False
-            # P1.2 — structured tool trace, one dict per call
-            # (args_bytes / result_bytes / status / duration_ms) so the
-            # parent LLM and registry audit know exactly what happened —
-            # not just which tools fired.
-            _tool_trace = tool_trace
-            _consecutive_errors = 0  # Global error counter (not per-iteration)
-            _MAX_CONSECUTIVE_ERRORS = 3
-            # Context overflow gets one rescue attempt per run. Beyond that the
-            # task genuinely does not fit and retrying only burns tokens.
-            _input_budget_recovered = False
-
-            # P1.1 — subagent→parent activity heartbeat. Called at each
-            # iteration + tool boundary so a 10-min subagent keeps the
-            # parent's cron inactivity timer fresh. No-op if parent didn't
-            # wire a callback (tests, headless). Failures are swallowed —
-            # heartbeat must never kill the child.
-            def _heartbeat(desc: str, tool: str | None = None) -> None:
-                touch = self.parent_activity_touch
-                if touch is None:
-                    return
-                try:
-                    touch(desc, tool)
-                except Exception:
-                    pass
-
-            # No wall clock unless a caller asked for one: each model call
-            # then gets the fixed timeout below, as the main agent's do.
-            _total_timeout: float | None = (
-                float(timeout_seconds) if (timeout_seconds and timeout_seconds > 0) else None
-            )
-            _start_time = time.time()
-            logger.info(
-                f"[SubagentManager] [{run_id[:8]}] total timeout: "
-                f"{f'{_total_timeout:.0f}s' if _total_timeout else 'none'}, max_iter={max_iterations}"
-            )
-
-            repetition = RepetitionGuard()
-            stalled = False
-            while iteration < max_iterations and not stalled:
-                iteration += 1
-                # Messages the main agent sent since the last step.
-                for note in self._take_inbox(run_id):
-                    messages.append({
-                        "role": "user",
-                        "content": f"[Message from the main agent]\n{note}",
-                    })
-                await self._progress(run_id, {"phase": "thinking", "iteration": iteration})
-                _heartbeat(
-                    f"subagent {label}: iteration {iteration}/{max_iterations}",
-                    None,
-                )
-
-                # Adaptive per-call timeout. When a wall-clock total is
-                # set, split the remaining budget across remaining
-                # iterations (min 60s, biased 1.5× to favour earlier
-                # calls). When unbounded, fall back to a fixed 300s
-                # ceiling — enough for slow providers, still below any
-                # human-patience threshold.
-                if _total_timeout is not None:
-                    _elapsed = time.time() - _start_time
-                    _remaining = max(60.0, _total_timeout - _elapsed)
-                    _remaining_iters = max(1, max_iterations - iteration + 1)
-                    _llm_call_timeout = max(60.0, min(_remaining, _remaining / _remaining_iters * 1.5))
-                else:
-                    _llm_call_timeout = _MODEL_CALL_TIMEOUT_SECONDS
-
-                # Context management: strip old tool results to save tokens
-                # (keep recent, compact old)
-                if iteration > 3:
-                    messages = _strip_subagent_tool_results(
-                        messages, keep_last=3, max_old_chars=300,
-                    )
-                if iteration > 7:
-                    messages = _strip_subagent_tool_results(
-                        messages, keep_last=2, max_old_chars=150,
-                    )
-                # Iteration count is a poor proxy for context pressure: three
-                # iterations that each read a large file overflow long before
-                # the fixed thresholds above fire, and a small-window model
-                # overflows sooner still. Measure the actual budget too.
-                messages = _trim_to_context_budget(messages, model)
-
-                tool_disclosure = build_tool_disclosure(
-                    tools.get_definitions(),
-                    toolsets=tools.get_toolsets(),
-                    sources=tools.get_discovery_sources(),
-                    intent_text=task,
-                )
-                response = await self.provider.chat(
-                    messages=messages,
-                    tools=list(tool_disclosure.definitions),
-                    model=model,
-                    max_tokens=subagent_output_budget(model),
-                    timeout=_llm_call_timeout,
-                )
-                await self._count_usage(run_id, response.usage)
-
-                if response.has_tool_calls:
-                    _consecutive_errors = 0  # Successful LLM call — reset error counter
-                    # Add assistant message with tool calls
-                    tool_call_dicts = [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": json.dumps(tc.arguments),
-                            },
-                            # Replay Gemini thought_signature (stripped for
-                            # non-Gemini targets in the provider). See loop.py.
-                            **({"extra_content": tc.extra_content} if getattr(tc, "extra_content", None) else {}),
-                        }
-                        for tc in response.tool_calls
-                    ]
-                    messages.append({
-                        "role": "assistant",
-                        "content": response.content or "",
-                        "tool_calls": tool_call_dicts,
-                    })
-                    self._transcribe(run_id, {
-                        "kind": "assistant",
-                        "content": response.content or "",
-                        "toolCalls": [
-                            {
-                                "id": tc.id,
-                                "name": tc.name,
-                                "arguments": _clip(json.dumps(tc.arguments, ensure_ascii=False), 1_500),
-                            }
-                            for tc in response.tool_calls
-                        ],
-                    })
-
-                    # Execute tools
-                    for tool_call in response.tool_calls:
-                        protocol_tool_name = tool_call.name
-                        effective_tool_name = protocol_tool_name
-                        tool_args = dict(tool_call.arguments)
-
-                        if protocol_tool_name == "tool_search":
-                            search_offset = tool_args.get("offset", 0)
-                            try:
-                                search_limit = max(
-                                    1,
-                                    min(
-                                        int(tool_args.get("limit", 5)),
-                                        tool_disclosure.search_max_limit,
-                                    ),
-                                )
-                            except (TypeError, ValueError):
-                                search_limit = 5
-                            try:
-                                search_offset = max(0, int(search_offset))
-                            except (TypeError, ValueError):
-                                search_offset = 0
-                            result = tool_disclosure.search(
-                                query=str(tool_args.get("query", "")),
-                                toolset=str(tool_args.get("toolset", "")),
-                                limit=search_limit,
-                                offset=search_offset,
-                            )
-                            result = annotate_search_repetition(
-                                result,
-                                _tool_search_result_sets,
-                            )
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "name": protocol_tool_name,
-                                "content": result,
-                            })
-                            continue
-
-                        if protocol_tool_name == "tool_describe":
-                            result = tool_disclosure.describe(str(tool_args.get("name", "")))
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "name": protocol_tool_name,
-                                "content": result,
-                            })
-                            continue
-
-                        if protocol_tool_name == "tool_call":
-                            resolved = tool_disclosure.resolve_call(
-                                str(tool_args.get("name", "")),
-                                tool_args.get("arguments"),
-                            )
-                            if isinstance(resolved, str):
-                                messages.append({
-                                    "role": "tool",
-                                    "tool_call_id": tool_call.id,
-                                    "name": protocol_tool_name,
-                                    "content": resolved,
-                                })
-                                continue
-                            effective_tool_name, tool_args = resolved
-
-                        if (
-                            protocol_tool_name != "tool_call"
-                            and effective_tool_name not in tool_disclosure.direct_names
-                        ):
-                            result = f"Error: Tool '{effective_tool_name}' is unavailable."
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "name": protocol_tool_name,
-                                "content": result,
-                            })
-                            continue
-
-                        logger.debug(
-                            f"[SubagentManager] [{run_id[:8]}] tool: {effective_tool_name}"
-                        )
-                        if effective_tool_name == "artifact":
-                            _model_used_artifact = True
-                        _heartbeat(
-                            f"subagent {label}: running {effective_tool_name}",
-                            effective_tool_name,
-                        )
-                        _tool_t0 = time.monotonic()
-                        _tool_status = "ok"
-                        step = {"tool": effective_tool_name, "args_bytes": len(json.dumps(tool_args or {}).encode()),
-                                "result_bytes": 0, "status": "running", "duration_ms": 0,
-                                "started_at": time.time()}
-                        _tool_trace.append(step)
-                        self._registry.update(run_id, tool_trace=_tool_trace)
-                        await self._progress(run_id, {"phase": "tool", "tool": effective_tool_name,
-                                                      "iteration": iteration})
-                        try:
-                            if (
-                                effective_tool_name == "artifact"
-                                and "session_key" not in tool_args
-                            ):
-                                tool_args["session_key"] = f"{origin_channel}:{origin_chat_id}"
-                            result = await asyncio.wait_for(
-                                tools.execute(effective_tool_name, tool_args),
-                                # Per-tool timeout; a question to the main agent
-                                # may wait the full reply window instead.
-                                timeout=(
-                                    _REPLY_WAIT_SECONDS + 30
-                                    if effective_tool_name == "agent_message" else 120
-                                ),
-                            )
-                        except asyncio.TimeoutError:
-                            result = f"Error: Tool '{effective_tool_name}' timed out after 120s"
-                            _tool_status = "timeout"
-                            logger.warning(
-                                f"[SubagentManager] [{run_id[:8]}] tool timeout: "
-                                f"{effective_tool_name}"
-                            )
-                        except Exception as e:
-                            result = f"Error executing {effective_tool_name}: {e}"
-                            _tool_status = "error"
-                            logger.warning(
-                                f"[SubagentManager] [{run_id[:8]}] tool error: "
-                                f"{effective_tool_name}: {e}"
-                            )
-                        _tool_duration_ms = int((time.monotonic() - _tool_t0) * 1000)
-                        # Flip status to "error" if the tool returned a
-                        # human-readable error string without raising
-                        # (common for validation-level failures).
-                        if _tool_status == "ok" and result.startswith("Error"):
-                            _tool_status = "error"
-                        step.update(result_bytes=len(result.encode()), status=_tool_status,
-                                    duration_ms=_tool_duration_ms, ended_at=time.time())
-                        self._registry.update(run_id, tool_trace=_tool_trace)
-                        if effective_tool_name == "artifact" and _tool_status == "ok":
-                            try:
-                                payload = json.loads(result)
-                                artifact_id = _created_artifact_id(payload, tool_args)
-                                if artifact_id:
-                                    self._link_artifact(run_id, artifact_id)
-                            except (TypeError, ValueError):
-                                pass
-                        await self._progress(run_id, {"phase": "thinking", "iteration": iteration})
-                        # Truncate long tool results to prevent context bloat
-                        if len(result) > 4000:
-                            result = result[:4000] + f"\n[... truncated from {len(result)} chars]"
-                        if repetition.observe(effective_tool_name, result):
-                            result = mark_repeated(effective_tool_name, result)
-                            stalled = repetition.stalled
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "name": protocol_tool_name,
-                            "content": result,
-                        })
-                        self._transcribe(run_id, {
-                            "kind": "tool",
-                            "toolCallId": tool_call.id,
-                            "name": effective_tool_name,
-                            "status": _tool_status,
-                            "content": _clip(result, 2_000),
-                        })
-                else:
-                    # Error response (timeout, provider error)
-                    if response.finish_reason == "error":
-                        _consecutive_errors += 1
-                        # P1.4 — route by error category. Rate limits get
-                        # long jittered waits (anti thundering-herd);
-                        # context overflow and auth are not retryable
-                        # (retrying the same prompt / bad key is pointless);
-                        # everything else falls through to short jitter.
-                        from flowly.agent.error_classifier import (
-                            classify_response, backoff_for, ErrorCategory,
-                        )
-                        _category = classify_response(response)
-                        _delay = backoff_for(
-                            _category,
-                            _consecutive_errors,
-                            retry_after_seconds=(
-                                response.error_info.retry_after_seconds
-                                if response.error_info is not None
-                                else None
-                            ),
-                        )
-                        _err_snippet = (response.content or "")[:100]
-
-                        # One-shot overflow recovery. Giving up here throws
-                        # away everything the subagent has already done, when
-                        # the fix is usually just old tool output it no longer
-                        # needs. Trim hard and retry once; a second overflow
-                        # means the task really is too big.
-                        if (
-                            _category in {
-                                ErrorCategory.CONTEXT_OVERFLOW,
-                                ErrorCategory.INPUT_TOO_LARGE,
-                            }
-                            and not _input_budget_recovered
-                        ):
-                            _input_budget_recovered = True
-                            _before = len(messages)
-                            messages = _strip_subagent_tool_results(
-                                messages, keep_last=1, max_old_chars=60,
-                            )
-                            logger.warning(
-                                f"[SubagentManager] [{run_id[:8]}] input budget exceeded — "
-                                f"trimmed tool history ({_before} messages) and retrying once"
-                            )
-                            continue
-
-                        if _delay is None:
-                            logger.error(
-                                f"[SubagentManager] [{run_id[:8]}] LLM error "
-                                f"category={_category.value} is not retryable: {_err_snippet}"
-                            )
-                            if _category == ErrorCategory.CONTEXT_OVERFLOW:
-                                final_result = (
-                                    "Error: Context overflow — task too large "
-                                    "for the model's window. Retry with a "
-                                    "smaller scope."
-                                )
-                            elif _category == ErrorCategory.INPUT_TOO_LARGE:
-                                final_result = (
-                                    "Error: The provider input limit was exceeded. "
-                                    "Retry with fewer large inputs or a smaller scope."
-                                )
-                            elif _category == ErrorCategory.AUTH:
-                                final_result = (
-                                    "Error: Authentication failed. "
-                                    "Check the provider API key."
-                                )
-                            elif _category == ErrorCategory.INSUFFICIENT_CREDITS:
-                                final_result = (
-                                    "Error: Out of credits. Your Flowly usage "
-                                    "credits are exhausted — top up or upgrade "
-                                    "your plan to continue."
-                                )
-                            elif _category == ErrorCategory.IMAGE_INPUT_UNSUPPORTED:
-                                final_result = (
-                                    "Error: This model can't read images. Choose "
-                                    "a vision-capable model or remove the image."
-                                )
-                            else:
-                                # Never leak wrapped provider/SDK payloads into
-                                # a parent-agent result. Unknown terminal kinds
-                                # get stable product copy; raw detail stays logged.
-                                final_result = "Error: The model provider couldn't respond."
-                            status, error_str, error_code = "error", final_result, _category.value
-                            break
-
-                        if _consecutive_errors <= _MAX_CONSECUTIVE_ERRORS and iteration < max_iterations:
-                            logger.warning(
-                                f"[SubagentManager] [{run_id[:8]}] LLM error "
-                                f"#{_consecutive_errors} ({_category.value}) on "
-                                f"iteration {iteration}, backoff {_delay:.1f}s: "
-                                f"{_err_snippet}"
-                            )
-                            await self._progress(run_id, {"phase": "retrying", "attempt": _consecutive_errors,
-                                                          "errorCode": _category.value})
-                            await asyncio.sleep(_delay)
-                            continue
-                        else:
-                            logger.error(
-                                f"[SubagentManager] [{run_id[:8]}] LLM errors exhausted "
-                                f"({_consecutive_errors} consecutive, last={_category.value})"
-                            )
-                            final_result = f"Error: Task failed after {_consecutive_errors} consecutive LLM errors."
-                            status, error_str, error_code = "error", final_result, _category.value
-                            break
-
-                    # Empty response check
-                    if not response.content or not response.content.strip():
-                        logger.warning(f"[SubagentManager] [{run_id[:8]}] empty response on iteration {iteration}")
-                        if iteration < max_iterations:
-                            continue  # Retry
-                        final_result = "Task produced no output."
-                        status, error_str, error_code = "error", final_result, "empty_response"
-                        break
-
-                    # Successful response — reset error counter
-                    _consecutive_errors = 0
-                    if self._inboxes.get(run_id) and iteration < max_iterations:
-                        # The main agent wrote while this answer was being
-                        # produced: read it before finishing, never drop it.
-                        messages.append({"role": "assistant", "content": response.content})
-                        continue
-                    final_result = response.content
-                    break
-
-            # Graceful summary grace-call. Two paths into this block:
-            #   1. max-iter exit: final_result is None because the LLM kept
-            #      calling tools until the iteration cap. We inject a
-            #      final user message and ask for a summary.
-            #   2. LLM-error exhaustion: final_result is set to the
-            #      "Task failed after N consecutive LLM errors" string.
-            #      If we have any tool_trace to summarise, try one more
-            #      call — the errors may have been transient 504s and
-            #      the provider is back up now. On failure we KEEP the
-            #      original error string (informative to the parent)
-            #      instead of replacing it with a generic fallback.
-            # Safety: tools=None makes another tool-call loop
-            # structurally impossible.
-            # Results that only repeat earlier ones end the run's tool use the
-            # same way the iteration cap does: with a summary of what it has.
-            _hit_max_iter = final_result is None and (iteration >= max_iterations or stalled)
-            _hit_llm_errors = (
-                final_result is not None
-                and final_result.startswith("Error: Task failed")
-                and bool(_tool_trace)
-            )
-            if _hit_max_iter or _hit_llm_errors:
-                _reason = (
-                    ("repeating itself" if stalled else "max iterations")
-                    if _hit_max_iter else "LLM errors exhausted"
-                )
-                logger.info(
-                    f"[SubagentManager] [{run_id[:8]}] {_reason} — "
-                    "injecting summary grace-call"
-                )
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "You cannot call any more tools. Provide a brief "
-                        "final summary of what you accomplished and found "
-                        "so far based on your previous tool results. Do "
-                        "not call tools — just answer directly."
-                    ),
-                })
-                _heartbeat(f"subagent {label}: generating summary", None)
-                await self._progress(run_id, {"phase": "summarizing"})
-                _preserved = final_result  # None for max-iter, error string for llm-errors
-                try:
-                    summary_response = await self.provider.chat(
-                        messages=messages,
-                        tools=None,  # CRITICAL: prevent another tool loop
-                        model=model,
-                        max_tokens=4096,
-                        timeout=60,
-                    )
-                    await self._count_usage(run_id, summary_response.usage)
-                    if summary_response.finish_reason != "error" and summary_response.content and summary_response.content.strip():
-                        final_result = summary_response.content
-                        status, error_str, error_code = "ok", None, None
-                    elif _hit_max_iter:
-                        status, error_code = "error", "summary_failed"
-                        final_result = (
-                            f"Reached the iteration limit ({max_iterations}) "
-                            "but the summary response was empty."
-                        )
-                    # _hit_llm_errors + empty summary → keep _preserved error
-                except Exception as e:
-                    logger.warning(
-                        f"[SubagentManager] [{run_id[:8]}] summary grace-call failed: {e}"
-                    )
-                    if _hit_max_iter:
-                        status, error_code = "error", "summary_failed"
-                        final_result = (
-                            f"Reached the iteration limit ({max_iterations}) "
-                            "and the summary attempt failed."
-                        )
-                    # _hit_llm_errors + grace-call failed → keep _preserved error
-                    else:
-                        final_result = _preserved
-
-            _tool_names = [t.get("tool", "?") for t in _tool_trace[:20]]
-            logger.info(
-                f"[SubagentManager] [{run_id[:8]}] finished: {iteration} iterations, "
-                f"{len(_tool_trace)} tool calls: {', '.join(_tool_names)}"
-            )
-            return (
-                final_result or "Task completed but no final response was generated.",
-                _model_used_artifact,
-                _tool_trace,
-            )
+        logger.info(f"[SubagentManager] [{run_id[:8]}] {'continuing' if restored else 'starting'}: {label}")
+        if restored is None:
+            self._registry.update(run_id, started_at=time.time())
+        record = self._registry.get(run_id)
+        if record is not None and record.resumable and run_id not in self._checkpoints:
+            self._checkpoints[run_id] = SubagentCheckpoint(self._registry.checkpoint_path(run_id))
 
         final_result: str = ""
         status: str = "ok"
         error_str: str | None = None
         error_code: str | None = None
-        tool_trace: list[dict[str, Any]] = []
+        # P1.2 — structured tool trace, one dict per call
+        # (args_bytes / result_bytes / status / duration_ms) so the
+        # parent LLM and registry audit know exactly what happened —
+        # not just which tools fired. A continued run keeps its own.
+        tool_trace: list[dict[str, Any]] = (
+            [dict(step) for step in record.tool_trace] if restored is not None and record else []
+        )
+        suspended = False
 
         try:
+            run = self._child_run(
+                run_id, task, label, origin_channel, origin_chat_id, model,
+                timeout_seconds, context, tool_trace, restored,
+            )
             # Wall-clock guard is opt-in: positive timeout_seconds enforces
             # a hard cap; 0 / None runs unbounded (rely on max_iter +
             # per-call + heartbeat).
             if timeout_seconds and timeout_seconds > 0:
-                final_result, model_used_artifact, tool_trace = await asyncio.wait_for(
-                    _do_run(), timeout=timeout_seconds,
+                final_result, status, error_str, error_code = await asyncio.wait_for(
+                    run, timeout=timeout_seconds,
                 )
             else:
-                final_result, model_used_artifact, tool_trace = await _do_run()
+                final_result, status, error_str, error_code = await run
 
             durable_result = final_result
 
-            # Classify the outcome. `_do_run` signals LLM-error exhaustion
-            # by returning final_result starting with "Error: Task failed"
-            # — that's not an exception, so without this check the registry
-            # would record outcome="ok" even when every LLM call hit a 504
-            # and the parent receives a bare error string.
+            # Classify the outcome. The child loop signals LLM-error
+            # exhaustion by returning final_result starting with "Error: Task
+            # failed" — that's not an exception, so without this check the
+            # registry would record outcome="ok" even when every LLM call hit
+            # a 504 and the parent receives a bare error string.
             if status == "error" or (final_result and final_result.startswith("Error: Task failed")):
                 status = "error"
                 error_str = final_result
@@ -1527,6 +951,10 @@ class SubagentManager:
                 )
             else:
                 logger.info(f"[SubagentManager] [{run_id[:8]}] completed successfully")
+            # The result is in the checkpoint before the registry records it:
+            # a crash in between finishes the run with it, no model call.
+            self._log(run_id, "final", durable=True, status=status, error=error_str,
+                      errorCode=error_code, result=durable_result)
             self._registry.finish(run_id, status, result=durable_result,
                                   error=error_str, error_code=error_code)
 
@@ -1564,6 +992,11 @@ class SubagentManager:
             status = "error"
             error_str = final_result
 
+        finally:
+            if not suspended:
+                # The result (or the end) is durable in the registry now.
+                self._drop_checkpoint(run_id)
+
         self._transcribe(run_id, {
             "kind": "result", "status": status, "content": _clip(final_result or "", 8_000),
         })
@@ -1573,6 +1006,698 @@ class SubagentManager:
         finally:
             await self._emit_event("subagent.completed", run_id, label, status, error_str)
         return final_result
+
+    def _child_tools(self, run_id: str, label: str) -> SubagentToolRegistry:
+        """The restricted tools one child run gets.
+
+        Factory lookup over a fixed allowlist. SubagentToolRegistry still
+        refuses blocked names (spawn, delegate_to, cron, message, …) on
+        register so a broken allowlist can't smuggle a dangerous tool in
+        either. When the parent has governance enabled, its post_tool_call
+        hook fires from the subagent's registry too, so self-review's
+        memory/KG writes are governed like the main agent's.
+        """
+        sub_hooks = None
+        if self.governance_post_tool is not None:
+            from flowly.agent.hooks import HookRegistry
+            sub_hooks = HookRegistry()
+            sub_hooks.register("post_tool_call", self.governance_post_tool)
+        tools = SubagentToolRegistry(hooks=sub_hooks)
+
+        def _build_kg_tool() -> Any:
+            from flowly.agent.tools.knowledge_graph import KnowledgeGraphTool
+            kg_state = self._state_dir
+            if not (kg_state / "knowledge_graph.sqlite3").exists():
+                alt = self.workspace.parent / "knowledge_graph.sqlite3"
+                if alt.exists():
+                    kg_state = self.workspace.parent
+            return KnowledgeGraphTool(state_dir=kg_state)
+
+        def _build_artifact_tool() -> Any:
+            if self.artifact_tool_factory is not None:
+                return self.artifact_tool_factory()
+            from flowly.artifacts.store import get_store
+            from flowly.agent.tools.artifact import ArtifactTool
+            art_tool = ArtifactTool(store=get_store(self._state_dir))
+            if self._artifact_on_change:
+                art_tool.set_on_change(self._artifact_on_change)
+            return art_tool
+
+        from flowly.agent.tools.skill_manage import SkillManageTool
+
+        # Factory map: name → builder; the keys are the child's allowlist.
+        _TOOL_FACTORIES: dict[str, Any] = {
+            "read_file": lambda: ReadFileTool(workspace=self.workspace),
+            "write_file": lambda: WriteFileTool(workspace=self.workspace),
+            "edit_file": lambda: EditFileTool(workspace=self.workspace),
+            "list_dir": lambda: ListDirTool(workspace=self.workspace),
+            "memory_append": lambda: MemoryAppendTool(workspace=self.workspace),
+            "exec": lambda: ExecTool(
+                config=self.exec_config, working_dir=str(self.workspace),
+            ),
+            "web_search": lambda: WebSearchTool(
+                api_key=self.brave_api_key,
+                proxy_url=self._web_search_proxy_url,
+                server_id=self._web_search_server_id,
+                auth_token=self._web_search_auth_token,
+            ),
+            "web_fetch": lambda: WebFetchTool(),
+            "web_extract": lambda: WebExtractTool(),
+            "skill_manage": lambda: SkillManageTool(workspace=self.workspace),
+            "knowledge_graph": _build_kg_tool,
+            "artifact": _build_artifact_tool,
+            "agent_message": lambda: ChildAgentMessageTool(self, run_id),
+        }
+
+        requested = set(_TOOL_FACTORIES.keys())
+        own = self._registry.get(run_id)
+        if own is not None and own.origin == "system":
+            # Background bookkeeping has no conversation to talk to.
+            requested.discard("agent_message")
+        if label == "self-review":
+            # Self-review is only for memory/KG evolution. Replace the
+            # default tool set so it cannot create skills indirectly via
+            # skill_manage or by writing workspace skill files.
+            requested = {"memory_append", "knowledge_graph"}
+
+        for tool_name in requested:
+            factory = _TOOL_FACTORIES.get(tool_name)
+            if factory is None:
+                continue
+            try:
+                tools.register(factory())
+            except ValueError as blocked:
+                # The blocklist guard is authoritative.
+                logger.warning(
+                    f"[SubagentManager] [{run_id[:8]}] refused blocked tool: {blocked}"
+                )
+            except Exception as e:
+                # Optional tools (KG, artifact) may fail to build on
+                # fresh installs. Non-fatal — just not available.
+                logger.debug(
+                    f"[SubagentManager] [{run_id[:8]}] tool "
+                    f"'{tool_name}' unavailable: {e}"
+                )
+        return tools
+
+    def _log(self, run_id: str, kind: str, *, durable: bool = False, **fields: Any) -> None:
+        """Add one line to the run's checkpoint; a checkpoint never fails its run.
+
+        Runs without one (system, waited for, silent, or not started by a
+        gateway) write nothing. A checkpoint that cannot be kept (full, or
+        the disk refused it) is dropped: the run goes on, but a restart
+        will not continue it.
+        """
+        checkpoint = self._checkpoints.get(run_id)
+        if checkpoint is None:
+            return
+        try:
+            checkpoint.append(kind, durable=durable, **fields)
+        except Exception as exc:
+            logger.warning(
+                f"[SubagentManager] [{run_id[:8]}] checkpoint stopped ({type(exc).__name__}); "
+                "this run will not be continued after a restart"
+            )
+            self._drop_checkpoint(run_id)
+            try:
+                self._registry.update(run_id, resumable=False)
+            except Exception:
+                logger.exception("Could not record that a run cannot be continued")
+
+    def _drop_checkpoint(self, run_id: str) -> None:
+        checkpoint = self._checkpoints.pop(run_id, None)
+        if checkpoint is not None:
+            checkpoint.delete()
+
+    def _answer_tool(self, run_id: str, state: ChildState, call_id: str, protocol_name: str,
+                     content: str, *, status: str = "ok", guard: dict[str, Any] | None = None,
+                     search: bool = False) -> None:
+        """Give the model one tool message, and checkpoint exactly that."""
+        state.messages.append({
+            "role": "tool",
+            "tool_call_id": call_id,
+            "name": protocol_name,
+            "content": content,
+        })
+        self._log(run_id, "tool", callId=call_id, protocolName=protocol_name, content=content,
+                  status=status, guard=guard, search=search)
+
+    def _trim_for(self, model: str) -> Callable[..., list[dict[str, Any]]]:
+        def trim(messages: list[dict[str, Any]], *, budget: int) -> list[dict[str, Any]]:
+            return _trim_to_context_budget(messages, model, budget=budget)
+        return trim
+
+    async def _child_run(
+        self,
+        run_id: str,
+        task: str,
+        label: str,
+        origin_channel: str,
+        origin_chat_id: str,
+        model: str,
+        timeout_seconds: int | None,
+        context: str | None,
+        tool_trace: list[dict[str, Any]],
+        restored: ChildState | None,
+    ) -> tuple[str, str, str | None, str | None]:
+        """The child's own loop. Returns (result, status, error, error_code)."""
+        status: str = "ok"
+        error_str: str | None = None
+        error_code: str | None = None
+        tools = self._child_tools(run_id, label)
+        trim = self._trim_for(model)
+
+        if restored is None:
+            # Build messages with subagent-specific prompt
+            system_prompt = self._build_subagent_prompt(task, label=label)
+            if build_tool_disclosure(
+                tools.get_definitions(),
+                toolsets=tools.get_toolsets(),
+                sources=tools.get_discovery_sources(),
+                intent_text=task,
+            ).enabled:
+                system_prompt += (
+                    "\n\nSome safe tools are represented by a compact catalog. "
+                    "They may be invoked through tool_call. tool_search is available "
+                    "when a name or compact signature is unclear; its results include "
+                    "complete schemas and valid invocation options."
+                )
+            first_message = (
+                f"## Conversation so far\n\n{context}\n\n## Your task\n\n{task}"
+                if context else task
+            )
+            state = ChildState(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": first_message},
+                ],
+                max_iterations=self.max_iterations,
+            )
+            self._log(
+                run_id, "header", durable=True, runId=run_id, coreVersion=_core_version(),
+                model=model, label=label, maxIterations=state.max_iterations,
+                systemPrompt=system_prompt, firstMessage=first_message,
+                tools=sorted(tools.tool_names),
+            )
+            self._transcribe(run_id, {
+                "kind": "brief", "content": _clip(task, 8_000), "withConversation": bool(context),
+            })
+        else:
+            state = restored
+            if state.final is not None:
+                # The result was decided before the restart; only recording
+                # it was left. No model call.
+                final = state.final
+                return (final["result"] or "Task completed but no final response was generated.",
+                        final["status"], final["error"], final["errorCode"])
+
+        max_iterations = state.max_iterations
+        final_result: str | None = None
+        _consecutive_errors = 0  # Global error counter (not per-iteration)
+        _MAX_CONSECUTIVE_ERRORS = 3
+
+        # P1.1 — subagent→parent activity heartbeat. Called at each
+        # iteration + tool boundary so a 10-min subagent keeps the
+        # parent's cron inactivity timer fresh. No-op if parent didn't
+        # wire a callback (tests, headless). Failures are swallowed —
+        # heartbeat must never kill the child.
+        def _heartbeat(desc: str, tool: str | None = None) -> None:
+            touch = self.parent_activity_touch
+            if touch is None:
+                return
+            try:
+                touch(desc, tool)
+            except Exception:
+                pass
+
+        # No wall clock unless a caller asked for one: each model call
+        # then gets the fixed timeout below, as the main agent's do.
+        _total_timeout: float | None = (
+            float(timeout_seconds) if (timeout_seconds and timeout_seconds > 0) else None
+        )
+        _start_time = time.time()
+        logger.info(
+            f"[SubagentManager] [{run_id[:8]}] total timeout: "
+            f"{f'{_total_timeout:.0f}s' if _total_timeout else 'none'}, max_iter={max_iterations}"
+        )
+
+        while state.grace is None:
+            if not state.awaiting_model:
+                if state.iteration >= max_iterations or state.stalled:
+                    break
+                # Messages the main agent sent since the last step, and the
+                # compaction the step needs — recorded so a restart rebuilds
+                # the same list.
+                mail = self._take_inbox_entries(run_id)
+                budget = _subagent_context_budget(model)
+                apply_step(state, state.iteration + 1, [m["text"] for m in mail], budget,
+                           _strip_subagent_tool_results, trim)
+                self._log(run_id, "step", iteration=state.iteration,
+                          notes=[m["text"] for m in mail], mail=[m["id"] for m in mail], budget=budget)
+            iteration = state.iteration
+            await self._progress(run_id, {"phase": "thinking", "iteration": iteration})
+            _heartbeat(
+                f"subagent {label}: iteration {iteration}/{max_iterations}",
+                None,
+            )
+
+            # Adaptive per-call timeout. When a wall-clock total is
+            # set, split the remaining budget across remaining
+            # iterations (min 60s, biased 1.5× to favour earlier
+            # calls). When unbounded, fall back to a fixed 300s
+            # ceiling — enough for slow providers, still below any
+            # human-patience threshold.
+            if _total_timeout is not None:
+                _elapsed = time.time() - _start_time
+                _remaining = max(60.0, _total_timeout - _elapsed)
+                _remaining_iters = max(1, max_iterations - iteration + 1)
+                _llm_call_timeout = max(60.0, min(_remaining, _remaining / _remaining_iters * 1.5))
+            else:
+                _llm_call_timeout = _MODEL_CALL_TIMEOUT_SECONDS
+
+            tool_disclosure = build_tool_disclosure(
+                tools.get_definitions(),
+                toolsets=tools.get_toolsets(),
+                sources=tools.get_discovery_sources(),
+                intent_text=task,
+            )
+            response = await self.provider.chat(
+                messages=state.messages,
+                tools=list(tool_disclosure.definitions),
+                model=model,
+                max_tokens=subagent_output_budget(model),
+                timeout=_llm_call_timeout,
+            )
+            await self._count_usage(run_id, response.usage)
+            state.awaiting_model = False
+
+            if response.has_tool_calls:
+                _consecutive_errors = 0  # Successful LLM call — reset error counter
+                # Add assistant message with tool calls
+                tool_call_dicts = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": json.dumps(tc.arguments),
+                        },
+                        # Replay Gemini thought_signature (stripped for
+                        # non-Gemini targets in the provider). See loop.py.
+                        **({"extra_content": tc.extra_content} if getattr(tc, "extra_content", None) else {}),
+                    }
+                    for tc in response.tool_calls
+                ]
+                assistant = {
+                    "role": "assistant",
+                    "content": response.content or "",
+                    "tool_calls": tool_call_dicts,
+                }
+                state.messages.append(assistant)
+                # Written before any of its tools runs: a restart knows every
+                # call this reply made, and which of them had started.
+                self._log(run_id, "model", durable=True, iteration=iteration, message=assistant,
+                          usage=response.usage or {})
+                self._transcribe(run_id, {
+                    "kind": "assistant",
+                    "content": response.content or "",
+                    "toolCalls": [
+                        {
+                            "id": tc.id,
+                            "name": tc.name,
+                            "arguments": _clip(json.dumps(tc.arguments, ensure_ascii=False), 1_500),
+                        }
+                        for tc in response.tool_calls
+                    ],
+                })
+
+                # Execute tools
+                for tool_call in response.tool_calls:
+                    protocol_tool_name = tool_call.name
+                    effective_tool_name = protocol_tool_name
+                    tool_args = dict(tool_call.arguments)
+
+                    if protocol_tool_name == "tool_search":
+                        search_offset = tool_args.get("offset", 0)
+                        try:
+                            search_limit = max(
+                                1,
+                                min(
+                                    int(tool_args.get("limit", 5)),
+                                    tool_disclosure.search_max_limit,
+                                ),
+                            )
+                        except (TypeError, ValueError):
+                            search_limit = 5
+                        try:
+                            search_offset = max(0, int(search_offset))
+                        except (TypeError, ValueError):
+                            search_offset = 0
+                        result = tool_disclosure.search(
+                            query=str(tool_args.get("query", "")),
+                            toolset=str(tool_args.get("toolset", "")),
+                            limit=search_limit,
+                            offset=search_offset,
+                        )
+                        result = annotate_search_repetition(
+                            result,
+                            state.search_sets,
+                        )
+                        self._answer_tool(run_id, state, tool_call.id, protocol_tool_name, result,
+                                          search=True)
+                        continue
+
+                    if protocol_tool_name == "tool_describe":
+                        result = tool_disclosure.describe(str(tool_args.get("name", "")))
+                        self._answer_tool(run_id, state, tool_call.id, protocol_tool_name, result)
+                        continue
+
+                    if protocol_tool_name == "tool_call":
+                        resolved = tool_disclosure.resolve_call(
+                            str(tool_args.get("name", "")),
+                            tool_args.get("arguments"),
+                        )
+                        if isinstance(resolved, str):
+                            self._answer_tool(run_id, state, tool_call.id, protocol_tool_name, resolved,
+                                              status="error")
+                            continue
+                        effective_tool_name, tool_args = resolved
+
+                    if (
+                        protocol_tool_name != "tool_call"
+                        and effective_tool_name not in tool_disclosure.direct_names
+                    ):
+                        result = f"Error: Tool '{effective_tool_name}' is unavailable."
+                        self._answer_tool(run_id, state, tool_call.id, protocol_tool_name, result,
+                                          status="error")
+                        continue
+
+                    logger.debug(
+                        f"[SubagentManager] [{run_id[:8]}] tool: {effective_tool_name}"
+                    )
+                    if effective_tool_name == "artifact":
+                        state.model_used_artifact = True
+                    _heartbeat(
+                        f"subagent {label}: running {effective_tool_name}",
+                        effective_tool_name,
+                    )
+                    _tool_t0 = time.monotonic()
+                    _tool_status = "ok"
+                    step = {"tool": effective_tool_name, "args_bytes": len(json.dumps(tool_args or {}).encode()),
+                            "result_bytes": 0, "status": "running", "duration_ms": 0,
+                            "started_at": time.time()}
+                    tool_trace.append(step)
+                    self._registry.update(run_id, tool_trace=tool_trace)
+                    await self._progress(run_id, {"phase": "tool", "tool": effective_tool_name,
+                                                  "iteration": iteration})
+                    # From here on the call may have effects: a restart never
+                    # runs it again.
+                    self._log(run_id, "tool_start", durable=True, iteration=iteration,
+                              callId=tool_call.id, name=effective_tool_name,
+                              protocolName=protocol_tool_name,
+                              toolClass=tool_class(effective_tool_name, tool_args))
+                    self._current_call[run_id] = tool_call.id
+                    try:
+                        if (
+                            effective_tool_name == "artifact"
+                            and "session_key" not in tool_args
+                        ):
+                            tool_args["session_key"] = f"{origin_channel}:{origin_chat_id}"
+                        result = await asyncio.wait_for(
+                            tools.execute(effective_tool_name, tool_args),
+                            # Per-tool timeout; a question to the main agent
+                            # may wait the full reply window instead.
+                            timeout=(
+                                _REPLY_WAIT_SECONDS + 30
+                                if effective_tool_name == "agent_message" else 120
+                            ),
+                        )
+                    except asyncio.TimeoutError:
+                        result = f"Error: Tool '{effective_tool_name}' timed out after 120s"
+                        _tool_status = "timeout"
+                        logger.warning(
+                            f"[SubagentManager] [{run_id[:8]}] tool timeout: "
+                            f"{effective_tool_name}"
+                        )
+                    except Exception as e:
+                        result = f"Error executing {effective_tool_name}: {e}"
+                        _tool_status = "error"
+                        logger.warning(
+                            f"[SubagentManager] [{run_id[:8]}] tool error: "
+                            f"{effective_tool_name}: {e}"
+                        )
+                    finally:
+                        self._current_call.pop(run_id, None)
+                    _tool_duration_ms = int((time.monotonic() - _tool_t0) * 1000)
+                    # Flip status to "error" if the tool returned a
+                    # human-readable error string without raising
+                    # (common for validation-level failures).
+                    if _tool_status == "ok" and result.startswith("Error"):
+                        _tool_status = "error"
+                    step.update(result_bytes=len(result.encode()), status=_tool_status,
+                                duration_ms=_tool_duration_ms, ended_at=time.time())
+                    self._registry.update(run_id, tool_trace=tool_trace)
+                    if effective_tool_name == "artifact" and _tool_status == "ok":
+                        try:
+                            payload = json.loads(result)
+                            artifact_id = _created_artifact_id(payload, tool_args)
+                            if artifact_id:
+                                self._link_artifact(run_id, artifact_id)
+                        except (TypeError, ValueError):
+                            pass
+                    await self._progress(run_id, {"phase": "thinking", "iteration": iteration})
+                    # Truncate long tool results to prevent context bloat
+                    if len(result) > 4000:
+                        result = result[:4000] + f"\n[... truncated from {len(result)} chars]"
+                    repeated = state.repetition.observe(effective_tool_name, result)
+                    if repeated:
+                        result = mark_repeated(effective_tool_name, result)
+                        state.stalled = state.repetition.stalled
+                    self._answer_tool(run_id, state, tool_call.id, protocol_tool_name, result,
+                                      status=_tool_status,
+                                      guard={"tool": effective_tool_name, "repeated": repeated})
+                    self._transcribe(run_id, {
+                        "kind": "tool",
+                        "toolCallId": tool_call.id,
+                        "name": effective_tool_name,
+                        "status": _tool_status,
+                        "content": _clip(result, 2_000),
+                    })
+            else:
+                # Error response (timeout, provider error)
+                if response.finish_reason == "error":
+                    _consecutive_errors += 1
+                    # P1.4 — route by error category. Rate limits get
+                    # long jittered waits (anti thundering-herd);
+                    # context overflow and auth are not retryable
+                    # (retrying the same prompt / bad key is pointless);
+                    # everything else falls through to short jitter.
+                    from flowly.agent.error_classifier import (
+                        classify_response, backoff_for, ErrorCategory,
+                    )
+                    _category = classify_response(response)
+                    _delay = backoff_for(
+                        _category,
+                        _consecutive_errors,
+                        retry_after_seconds=(
+                            response.error_info.retry_after_seconds
+                            if response.error_info is not None
+                            else None
+                        ),
+                    )
+                    _err_snippet = (response.content or "")[:100]
+
+                    # One-shot overflow recovery. Giving up here throws
+                    # away everything the subagent has already done, when
+                    # the fix is usually just old tool output it no longer
+                    # needs. Trim hard and retry once; a second overflow
+                    # means the task really is too big.
+                    if (
+                        _category in {
+                            ErrorCategory.CONTEXT_OVERFLOW,
+                            ErrorCategory.INPUT_TOO_LARGE,
+                        }
+                        and not state.input_budget_recovered
+                    ):
+                        state.input_budget_recovered = True
+                        _before = len(state.messages)
+                        state.messages = _strip_subagent_tool_results(
+                            state.messages, keep_last=1, max_old_chars=60,
+                        )
+                        self._log(run_id, "recovery", iteration=iteration)
+                        logger.warning(
+                            f"[SubagentManager] [{run_id[:8]}] input budget exceeded — "
+                            f"trimmed tool history ({_before} messages) and retrying once"
+                        )
+                        continue
+
+                    if _delay is None:
+                        logger.error(
+                            f"[SubagentManager] [{run_id[:8]}] LLM error "
+                            f"category={_category.value} is not retryable: {_err_snippet}"
+                        )
+                        if _category == ErrorCategory.CONTEXT_OVERFLOW:
+                            final_result = (
+                                "Error: Context overflow — task too large "
+                                "for the model's window. Retry with a "
+                                "smaller scope."
+                            )
+                        elif _category == ErrorCategory.INPUT_TOO_LARGE:
+                            final_result = (
+                                "Error: The provider input limit was exceeded. "
+                                "Retry with fewer large inputs or a smaller scope."
+                            )
+                        elif _category == ErrorCategory.AUTH:
+                            final_result = (
+                                "Error: Authentication failed. "
+                                "Check the provider API key."
+                            )
+                        elif _category == ErrorCategory.INSUFFICIENT_CREDITS:
+                            final_result = (
+                                "Error: Out of credits. Your Flowly usage "
+                                "credits are exhausted — top up or upgrade "
+                                "your plan to continue."
+                            )
+                        elif _category == ErrorCategory.IMAGE_INPUT_UNSUPPORTED:
+                            final_result = (
+                                "Error: This model can't read images. Choose "
+                                "a vision-capable model or remove the image."
+                            )
+                        else:
+                            # Never leak wrapped provider/SDK payloads into
+                            # a parent-agent result. Unknown terminal kinds
+                            # get stable product copy; raw detail stays logged.
+                            final_result = "Error: The model provider couldn't respond."
+                        status, error_str, error_code = "error", final_result, _category.value
+                        break
+
+                    if _consecutive_errors <= _MAX_CONSECUTIVE_ERRORS and iteration < max_iterations:
+                        logger.warning(
+                            f"[SubagentManager] [{run_id[:8]}] LLM error "
+                            f"#{_consecutive_errors} ({_category.value}) on "
+                            f"iteration {iteration}, backoff {_delay:.1f}s: "
+                            f"{_err_snippet}"
+                        )
+                        await self._progress(run_id, {"phase": "retrying", "attempt": _consecutive_errors,
+                                                      "errorCode": _category.value})
+                        await asyncio.sleep(_delay)
+                        continue
+                    else:
+                        logger.error(
+                            f"[SubagentManager] [{run_id[:8]}] LLM errors exhausted "
+                            f"({_consecutive_errors} consecutive, last={_category.value})"
+                        )
+                        final_result = f"Error: Task failed after {_consecutive_errors} consecutive LLM errors."
+                        status, error_str, error_code = "error", final_result, _category.value
+                        break
+
+                # Empty response check
+                if not response.content or not response.content.strip():
+                    logger.warning(f"[SubagentManager] [{run_id[:8]}] empty response on iteration {iteration}")
+                    if iteration < max_iterations:
+                        continue  # Retry
+                    final_result = "Task produced no output."
+                    status, error_str, error_code = "error", final_result, "empty_response"
+                    break
+
+                # Successful response — reset error counter
+                _consecutive_errors = 0
+                if self._inboxes.get(run_id) and iteration < max_iterations:
+                    # The main agent wrote while this answer was being
+                    # produced: read it before finishing, never drop it.
+                    state.messages.append({"role": "assistant", "content": response.content})
+                    self._log(run_id, "text", iteration=iteration, content=response.content)
+                    continue
+                final_result = response.content
+                break
+
+        # Graceful summary grace-call. Two paths into this block:
+        #   1. max-iter exit: final_result is None because the LLM kept
+        #      calling tools until the iteration cap. We inject a
+        #      final user message and ask for a summary.
+        #   2. LLM-error exhaustion: final_result is set to the
+        #      "Task failed after N consecutive LLM errors" string.
+        #      If we have any tool_trace to summarise, try one more
+        #      call — the errors may have been transient 504s and
+        #      the provider is back up now. On failure we KEEP the
+        #      original error string (informative to the parent)
+        #      instead of replacing it with a generic fallback.
+        # Safety: tools=None makes another tool-call loop
+        # structurally impossible.
+        # Results that only repeat earlier ones end the run's tool use the
+        # same way the iteration cap does: with a summary of what it has.
+        if state.grace is None:
+            _hit_max_iter = final_result is None and (state.iteration >= max_iterations or state.stalled)
+            _hit_llm_errors = (
+                final_result is not None
+                and final_result.startswith("Error: Task failed")
+                and bool(tool_trace)
+            )
+            if _hit_max_iter or _hit_llm_errors:
+                _reason = (
+                    ("repeating itself" if state.stalled else "max iterations")
+                    if _hit_max_iter else "LLM errors exhausted"
+                )
+                state.messages.append({"role": "user", "content": GRACE_PROMPT})
+                state.grace = {"reason": _reason, "hitMaxIter": _hit_max_iter, "preserved": final_result,
+                               "status": status, "errorCode": error_code}
+                self._log(run_id, "phase", phase="grace", **state.grace)
+        if state.grace is not None:
+            _hit_max_iter = bool(state.grace.get("hitMaxIter"))
+            # None for max-iter, the error string for llm-errors.
+            _preserved = state.grace.get("preserved")
+            final_result = _preserved
+            if _preserved is not None:
+                status = state.grace.get("status") or "error"
+                error_str, error_code = _preserved, state.grace.get("errorCode")
+            logger.info(
+                f"[SubagentManager] [{run_id[:8]}] {state.grace.get('reason')} — "
+                "injecting summary grace-call"
+            )
+            _heartbeat(f"subagent {label}: generating summary", None)
+            await self._progress(run_id, {"phase": "summarizing"})
+            try:
+                summary_response = await self.provider.chat(
+                    messages=state.messages,
+                    tools=None,  # CRITICAL: prevent another tool loop
+                    model=model,
+                    max_tokens=4096,
+                    timeout=60,
+                )
+                await self._count_usage(run_id, summary_response.usage)
+                if summary_response.finish_reason != "error" and summary_response.content and summary_response.content.strip():
+                    final_result = summary_response.content
+                    status, error_str, error_code = "ok", None, None
+                elif _hit_max_iter:
+                    status, error_code = "error", "summary_failed"
+                    final_result = (
+                        f"Reached the iteration limit ({max_iterations}) "
+                        "but the summary response was empty."
+                    )
+                # _hit_llm_errors + empty summary → keep _preserved error
+            except Exception as e:
+                logger.warning(
+                    f"[SubagentManager] [{run_id[:8]}] summary grace-call failed: {e}"
+                )
+                if _hit_max_iter:
+                    status, error_code = "error", "summary_failed"
+                    final_result = (
+                        f"Reached the iteration limit ({max_iterations}) "
+                        "and the summary attempt failed."
+                    )
+                # _hit_llm_errors + grace-call failed → keep _preserved error
+                else:
+                    final_result = _preserved
+
+        _tool_names = [t.get("tool", "?") for t in tool_trace[:20]]
+        logger.info(
+            f"[SubagentManager] [{run_id[:8]}] finished: {state.iteration} iterations, "
+            f"{len(tool_trace)} tool calls: {', '.join(_tool_names)}"
+        )
+        return (
+            final_result or "Task completed but no final response was generated.",
+            status, error_str, error_code,
+        )
 
     # ------------------------------------------------------------------
     # Messages between the main agent and a running subagent
@@ -1590,18 +1715,32 @@ class SubagentManager:
         if record.ended_at is not None or run_id not in self._running_tasks:
             return {"run_id": run_id, "status": "finished",
                     "error": "This subagent has already finished; it can't receive messages."}
-        self._inboxes.setdefault(run_id, []).append(text)
+        mail_id = uuid.uuid4().hex[:16]
+        # Durable before the main agent is told it was delivered: a restart
+        # gives the child every message it had not read yet.
+        self._log(run_id, "mail", durable=True, id=mail_id, text=text)
+        self._inboxes.setdefault(run_id, []).append({"id": mail_id, "text": text})
         self._inbox_events.setdefault(run_id, asyncio.Event()).set()
         self._transcribe(run_id, {"kind": "message_in", "from": "orchestrator", "content": text})
         await self._progress(run_id, {"phase": "message_received"})
         return {"run_id": run_id, "status": "delivered"}
 
-    def _take_inbox(self, run_id: str) -> list[str]:
+    def _take_inbox_entries(self, run_id: str) -> list[dict[str, str]]:
         messages = self._inboxes.pop(run_id, [])
         event = self._inbox_events.get(run_id)
         if event is not None:
             event.clear()
         return messages
+
+    def _take_inbox(self, run_id: str) -> list[str]:
+        """Messages read inside a tool call (a reply agent_message waited for)."""
+        entries = self._take_inbox_entries(run_id)
+        call_id = self._current_call.get(run_id)
+        if entries and call_id:
+            # Read only once that call's result is recorded; a restart
+            # before then gives them to the child again.
+            self._log(run_id, "inbox", callId=call_id, ids=[e["id"] for e in entries])
+        return [e["text"] for e in entries]
 
     async def _wait_for_inbox(self, run_id: str, timeout: float) -> list[str]:
         if self._inboxes.get(run_id):
