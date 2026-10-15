@@ -442,10 +442,12 @@ class SubagentManager:
         self._instance = uuid.uuid4().hex
         subagent_owner.register_instance(self._instance)
         self._started_at = time.time()
-        # Results agent_wait handed to a turn not yet saved: run_id → the
-        # conversation's key. Saving the turn delivers them; a turn that
-        # ends without saving gives them back (release_taken).
-        self._taken: dict[str, str] = {}
+        # Results agent_wait handed to a turn not yet saved: run_id → (the
+        # conversation's key, that turn's id). Saving the turn delivers them;
+        # a turn that ends without saving gives back its own (release_taken).
+        # Keyed by turn: an agenda or Board turn of the same conversation can
+        # run alongside the owner's and must never commit or release theirs.
+        self._taken: dict[str, tuple[str, str | None]] = {}
         # Reads the run ids a conversation's saved turns handled (the
         # session's SUBAGENT_REPORTS_KEY). AgentLoop sets it; None = unknown.
         self.committed_reports: Callable[[str], set[str]] | None = None
@@ -546,20 +548,21 @@ class SubagentManager:
                 titles.append(record.display_name or record.label)
         return titles
 
-    def turn_reports(self, session_key: str, notice_run_ids: list[str] | None = None) -> list[str]:
-        """The results a turn of ``session_key`` handled, to commit with its save.
+    def turn_reports(self, session_key: str, notice_run_ids: list[str] | None = None,
+                     turn_id: str | None = None) -> list[str]:
+        """The results turn ``turn_id`` of ``session_key`` handled, to commit with its save.
 
-        The runs a notice reported plus those agent_wait handed to the turn.
+        The runs a notice reported plus those agent_wait handed to that turn.
         The caller records them in the session (record_subagent_reports),
         saves, then calls mark_delivered.
         """
-        taken = [rid for rid, key in self._taken.items() if key == session_key]
+        taken = [rid for rid, owner in self._taken.items() if owner == (session_key, turn_id)]
         return list(dict.fromkeys([*(notice_run_ids or []), *taken]))
 
     def mark_delivered(self, parent_session_key: str, run_ids: list[str]) -> None:
         """Record that the conversation has saved a turn handling these results."""
         for run_id in dict.fromkeys(run_ids):
-            if self._taken.get(run_id) == parent_session_key:
+            if self._taken.get(run_id, ("",))[0] == parent_session_key:
                 del self._taken[run_id]
             record = self._registry.get(run_id)
             if (
@@ -570,15 +573,16 @@ class SubagentManager:
             ):
                 self._registry.update(run_id, delivery_state="delivered")
 
-    def release_taken(self, session_key: str) -> None:
-        """A turn of ``session_key`` ended: results it took but never saved go back.
+    def release_taken(self, session_key: str, turn_id: str | None = None) -> None:
+        """Turn ``turn_id`` of ``session_key`` ended: results it took but never saved go back.
 
         agent_wait handed them to the turn, but the turn was not saved (it
         failed, or was dropped), so the conversation does not have them:
-        they are announced again instead of being lost.
+        they are announced again instead of being lost. Another turn's
+        results are left alone.
         """
-        for run_id, key in list(self._taken.items()):
-            if key != session_key:
+        for run_id, owner in list(self._taken.items()):
+            if owner != (session_key, turn_id):
                 continue
             del self._taken[run_id]
             record = self._registry.get(run_id)
@@ -615,37 +619,44 @@ class SubagentManager:
         )
 
     def _reconcile_undelivered(self, records: list[SubagentRunRecord], owners: dict[str, str]) -> None:
-        now = time.time()
         for record in records:
-            if record.ended_at is None or record.delivery_state not in ("pending", "queued", "taken"):
-                continue
-            if record.kind != "subagent":
-                # A delegated task reports through its own message, not a
-                # subagent notice; it is never announced again here.
-                if now - record.ended_at >= _REANNOUNCE_WITHIN_SECONDS:
-                    self._registry.update(record.run_id, delivery_state="undelivered")
-                continue
-            if self._adopt(record, owners) is None:
-                continue
-            if record.run_id in self._committed(record.parent_session_key):
-                # The turn that handled it was saved; the process stopped
-                # before recording that here.
-                self._registry.update(record.run_id, delivery_state="delivered")
-                continue
-            recent = now - record.ended_at < _REANNOUNCE_WITHIN_SECONDS
-            if recent and record.reannounced < _MAX_REANNOUNCE and record.outcome != "cancelled":
-                # Announced before the restart but never handled: it must be
-                # claimable again by its batch's notice.
-                # A result held for its batch was never announced: holding it
-                # again across restarts does not count against it.
-                told = record.announced or record.delivery_state != "pending"
-                self._registry.update(
-                    record.run_id, announced=False, delivery_state="pending",
-                    reannounced=record.reannounced + int(told),
-                )
-                self._spawn_announce(record.run_id, self._stored_result(record), record.outcome or "unknown")
-            else:
+            try:
+                self._reconcile_one(record, owners)
+            except Exception:
+                logger.exception(f"[SubagentManager] [{record.run_id[:8]}] delivery could not be recovered")
+
+    def _reconcile_one(self, record: SubagentRunRecord, owners: dict[str, str]) -> None:
+        """Deliver, once, a finished result no saved turn handled (see resume_pending)."""
+        now = time.time()
+        if record.ended_at is None or record.delivery_state not in ("pending", "queued", "taken"):
+            return
+        if record.kind != "subagent":
+            # A delegated task reports through its own message, not a
+            # subagent notice; it is never announced again here.
+            if now - record.ended_at >= _REANNOUNCE_WITHIN_SECONDS:
                 self._registry.update(record.run_id, delivery_state="undelivered")
+            return
+        if self._adopt(record, owners) is None:
+            return
+        if record.run_id in self._committed(record.parent_session_key):
+            # The turn that handled it was saved; the process stopped
+            # before recording that here.
+            self._registry.update(record.run_id, delivery_state="delivered")
+            return
+        recent = now - record.ended_at < _REANNOUNCE_WITHIN_SECONDS
+        if recent and record.reannounced < _MAX_REANNOUNCE and record.outcome != "cancelled":
+            # Announced before the restart but never handled: it must be
+            # claimable again by its batch's notice. A result only held for
+            # its batch was never announced: holding it again across
+            # restarts does not count against it.
+            told = record.announced or record.delivery_state != "pending"
+            self._registry.update(
+                record.run_id, announced=False, delivery_state="pending",
+                reannounced=record.reannounced + int(told),
+            )
+            self._spawn_announce(record.run_id, self._stored_result(record), record.outcome or "unknown")
+        else:
+            self._registry.update(record.run_id, delivery_state="undelivered")
 
     def _running_siblings(self, parent_session_key: str) -> list[SubagentRunRecord]:
         """Owner/agent-started runs still going for one conversation."""
@@ -688,45 +699,11 @@ class SubagentManager:
         continued: list[tuple[SubagentRunRecord, ChildState]] = []
         settled: list[tuple[SubagentRunRecord, str, str | None, str | None]] = []
         for record in records:
-            if record.ended_at is not None or record.run_id in self._running_tasks:
-                continue
-            if record.resumable and not self.resume_enabled:
-                continue  # a gateway on this home continues it
-            # Its last sign of life, read before the claim updates it.
-            last_seen = record.suspended_at or record.updated_at or record.created_at
-            adopted = self._adopt(record, owners)
-            if adopted is None:
-                continue
-            state, refusal = self._restorable(adopted)
-            if state is not None and now - last_seen > _RESUME_WITHIN_SECONDS:
-                settled.append((adopted, "interrupted", "suspended_too_long", (
-                    f"Flowly was not running for {_age_text(now - last_seen)} while this task ran, "
-                    "longer than a subagent is continued after a restart (24 h). It was stopped "
-                    "where it was; nothing it had started was run again."
-                )))
-            elif state is not None and adopted.resume_count >= _MAX_RESUMES:
-                settled.append((adopted, "interrupted", "resume_failed", (
-                    f"Flowly restarted {adopted.resume_count} times while this task ran without it "
-                    "finishing another step, so it was stopped where it was; nothing it had "
-                    "started was run again."
-                )))
-            elif state is not None:
-                claimed = self._registry.claim(
-                    adopted.run_id, adopted.owner, adopted.owner,
-                    resume_count=adopted.resume_count + 1,
-                    suspended_seconds=adopted.suspended_seconds + max(0.0, now - last_seen),
-                    suspended_at=None, resumed_at=now, activity={"phase": "resuming"},
-                )
-                if claimed is not None:
-                    continued.append((claimed, state))
-            elif refusal == "version":
-                settled.append((adopted, "interrupted", "resume_unsupported", (
-                    "Flowly was updated while this task ran, and this version cannot continue "
-                    "work saved by the other one. It was stopped where it was; nothing it had "
-                    "started was run again."
-                )))
-            else:
-                settled.append((adopted, "error", "process_restarted", None))
+            try:
+                self._recover_running(record, owners, now, continued, settled)
+            except Exception:
+                # One unreadable or unwritable run never keeps the agent from starting.
+                logger.exception(f"[SubagentManager] [{record.run_id[:8]}] could not be recovered")
         try:
             self._reconcile_undelivered(records, owners)
         except (OSError, ValueError):
@@ -734,31 +711,84 @@ class SubagentManager:
         if settled:
             logger.warning(f"[SubagentManager] Settling {len(settled)} task(s) a restart stopped")
         for record, outcome, code, text in settled:
-            if text is None:
-                self._registry.finish(
-                    record.run_id, "error", error_code="process_restarted",
-                    error="Process restarted before task completed",
-                )
-            else:
-                self._registry.finish(record.run_id, outcome, error=text, error_code=code,
-                                      report=record.delivery_state != "not_required")
-            self._record_metric(record.run_id)
-            if record.delivery_state == "not_required":
-                continue
-            self._spawn_announce(
-                record.run_id, text or "The process restarted before this task completed.",
-                outcome,
-            )
+            try:
+                self._settle(record, outcome, code, text)
+            except Exception:
+                logger.exception(f"[SubagentManager] [{record.run_id[:8]}] could not be settled")
         for record, state in continued:
             try:
                 self._resume(record, state)
             except Exception:
                 logger.exception(f"[SubagentManager] [{record.run_id[:8]}] could not continue")
-                self._registry.finish(record.run_id, "error", error_code="process_restarted",
-                                      error="Process restarted before task completed")
-                self._record_metric(record.run_id)
-                self._spawn_announce(record.run_id, "The process restarted before this task completed.",
-                                     "error")
+                try:
+                    self._settle(record, "error", "process_restarted", None)
+                except Exception:
+                    logger.exception(f"[SubagentManager] [{record.run_id[:8]}] could not be settled")
+
+    def _settle(self, record: SubagentRunRecord, outcome: str, code: str, text: str | None) -> None:
+        """End a run a restart stopped and could not continue; tell its conversation."""
+        if text is None:
+            self._registry.finish(
+                record.run_id, "error", error_code="process_restarted",
+                error="Process restarted before task completed",
+            )
+        else:
+            self._registry.finish(record.run_id, outcome, error=text, error_code=code,
+                                  report=record.delivery_state != "not_required")
+        self._record_metric(record.run_id)
+        if record.delivery_state == "not_required":
+            return
+        self._spawn_announce(
+            record.run_id, text or "The process restarted before this task completed.",
+            outcome,
+        )
+
+    def _recover_running(self, record: SubagentRunRecord, owners: dict[str, str], now: float,
+                         continued: list[tuple[SubagentRunRecord, ChildState]],
+                         settled: list[tuple[SubagentRunRecord, str, str, str | None]]) -> None:
+        """Decide what becomes of one run still marked running (see resume_pending)."""
+        if record.ended_at is not None or record.run_id in self._running_tasks:
+            return
+        if record.resumable and not self.resume_enabled:
+            return  # a gateway on this home continues it
+        # Its last sign of life, read before the claim updates it.
+        last_seen = record.suspended_at or record.updated_at or record.created_at
+        adopted = self._adopt(record, owners)
+        if adopted is None:
+            return
+        state, refusal = self._restorable(adopted)
+        # A result already decided is recorded whatever the bounds: that
+        # takes no model call and loses nothing.
+        decided = state is not None and state.final is not None
+        if state is not None and not decided and now - last_seen > _RESUME_WITHIN_SECONDS:
+            settled.append((adopted, "interrupted", "suspended_too_long", (
+                f"Flowly was not running for {_age_text(now - last_seen)} while this task ran, "
+                "longer than a subagent is continued after a restart (24 h). It was stopped "
+                "where it was; nothing it had started was run again."
+            )))
+        elif state is not None and not decided and adopted.resume_count >= _MAX_RESUMES:
+            settled.append((adopted, "interrupted", "resume_failed", (
+                f"Flowly restarted {adopted.resume_count} times while this task ran without it "
+                "finishing another step, so it was stopped where it was; nothing it had "
+                "started was run again."
+            )))
+        elif state is not None:
+            claimed = self._registry.claim(
+                adopted.run_id, adopted.owner, adopted.owner,
+                resume_count=adopted.resume_count + 1,
+                suspended_seconds=adopted.suspended_seconds + max(0.0, now - last_seen),
+                suspended_at=None, resumed_at=now, activity={"phase": "resuming"},
+            )
+            if claimed is not None:
+                continued.append((claimed, state))
+        elif refusal == "version":
+            settled.append((adopted, "interrupted", "resume_unsupported", (
+                "Flowly was updated while this task ran, and this version cannot continue "
+                "work saved by the other one. It was stopped where it was; nothing it had "
+                "started was run again."
+            )))
+        else:
+            settled.append((adopted, "error", "process_restarted", None))
 
     def _restorable(self, record: SubagentRunRecord) -> tuple[ChildState | None, str | None]:
         """The state a run's checkpoint rebuilds, or why there is none."""
@@ -1065,8 +1095,8 @@ class SubagentManager:
 
     def _suspends(self, run_id: str) -> bool:
         """True while a clean shutdown stops this run to continue it later."""
-        if not self._suspending:
-            return False
+        if not self._suspending or self._cancel_outcomes.get(run_id) == "cancelled":
+            return False  # stopped on request: that wins over the shutdown
         record = self._registry.get(run_id)
         return record is not None and record.ended_at is None and record.resumable
 
@@ -2035,6 +2065,7 @@ class SubagentManager:
         *,
         timeout: float,
         should_yield: Callable[[], bool] | None = None,
+        turn_id: str | None = None,
     ) -> dict[str, Any]:
         """Wait until a child of this conversation finishes or writes.
 
@@ -2106,7 +2137,7 @@ class SubagentManager:
                 item["error"] = record.error
             results.append(item)
             self._registry.update(record.run_id, delivery_state="taken")
-            self._taken[record.run_id] = parent_session_key
+            self._taken[record.run_id] = (parent_session_key, turn_id)
         taken_ids = {m["id"] for m in mail}
         if taken_ids:
             self._parent_mail[parent_session_key] = [

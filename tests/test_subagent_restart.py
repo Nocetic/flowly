@@ -168,9 +168,7 @@ def test_owner_states(tmp_path):
 def test_a_live_process_and_a_reused_pid_are_told_apart(tmp_path):
     sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
-        from flowly.profile import _process_identity
-
-        identity = _process_identity(sleeper.pid)
+        identity = subagent_owner.process_identity(sleeper.pid)
         owner = {"instance": "other", "pid": sleeper.pid, "identity": identity,
                  "boot": subagent_owner.boot_id(), "host": "h"}
         assert subagent_owner.owner_state(owner) == subagent_owner.ALIVE
@@ -180,6 +178,15 @@ def test_a_live_process_and_a_reused_pid_are_told_apart(tmp_path):
     finally:
         sleeper.kill()
         sleeper.wait()
+
+
+def test_a_process_start_reads_the_same_in_any_locale_and_time_zone(monkeypatch):
+    """A Desktop-launched gateway (no LANG) and a Turkish terminal must agree."""
+    plain = subagent_owner.process_identity(os.getpid())
+    monkeypatch.setenv("LANG", "tr_TR.UTF-8")
+    monkeypatch.setenv("LC_ALL", "tr_TR.UTF-8")
+    monkeypatch.setenv("TZ", "Asia/Tokyo")
+    assert subagent_owner.process_identity(os.getpid()) == plain
 
 
 @pytest.mark.asyncio
@@ -469,3 +476,41 @@ def test_the_gateway_stops_subagents_before_anything_else():
     signal_wait = source.index("return_when=asyncio.FIRST_COMPLETED")
     assert source.index("await _shutdown_subagents()", signal_wait) < source.index(
         "# Cancel pending tasks", signal_wait)
+
+
+@pytest.mark.asyncio
+async def test_a_turn_commits_and_gives_back_only_the_results_it_took(tmp_path):
+    """An agenda or Board turn of the same conversation runs alongside the
+    owner's: it must neither give back nor commit what the owner's turn took."""
+    from flowly.agent.delegation import DelegationTurn, delegation_turn_scope
+
+    gated = _Gated()
+    gated.gates = {"A": asyncio.Event()}
+    gated.gates["A"].set()
+    bus = MessageBus()
+    manager = _manager(tmp_path, gated, bus)
+    started = json.loads(await manager.spawn(task="task A", origin_channel="web", origin_chat_id="chat-1",
+                                             parent_session_key=CHAT, origin="agent"))
+    await asyncio.wait_for(bus.consume_inbound(), 2)
+    owner_turn = DelegationTurn(session_key=CHAT)
+    with tool_execution_scope(CHAT), delegation_turn_scope(owner_turn):
+        await AgentWaitTool(manager).execute(timeout_seconds=5)
+    other = "an-agenda-turn"
+    assert manager.turn_reports(CHAT, [], other) == []
+    manager.release_taken(CHAT, other)
+    await _no_notice(bus)
+    assert manager.registry.get(started["run_id"]).delivery_state == "taken"
+    assert manager.turn_reports(CHAT, [], owner_turn.turn_id) == [started["run_id"]]
+    manager.release_taken(CHAT, owner_turn.turn_id)
+    assert "Result of A." in (await asyncio.wait_for(bus.consume_inbound(), 2)).content
+
+
+def test_a_turn_that_never_started_releases_nothing(tmp_path):
+    from flowly.agent.loop import AgentLoop
+
+    loop = object.__new__(AgentLoop)
+    released: list[tuple] = []
+    loop.subagents = type("S", (), {"release_taken": lambda self, *a: released.append(a)})()
+    message = InboundMessage(channel="web", sender_id="owner", chat_id="chat-1", content="hi")
+    loop._release_subagent_results(message)
+    assert released == []

@@ -419,7 +419,9 @@ def restore_child_state(
                     "role": "tool", "tool_call_id": call_id,
                     "name": str(record["protocolName"]), "content": content,
                 })
-                answered.add(call_id)
+                if record.get("status") not in ("interrupted", "not_run"):
+                    # A result a restart wrote never carried a reply to the model.
+                    answered.add(call_id)
                 calls.pop(call_id, None)
                 observe_tool_result(state, record.get("guard"), content, bool(record.get("search")), annotate)
             elif kind == "inbox":

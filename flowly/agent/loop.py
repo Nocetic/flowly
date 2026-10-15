@@ -7932,24 +7932,27 @@ class AgentLoop:
             return set()
         return {rid for rid in session.metadata.get(SUBAGENT_REPORTS_KEY) or [] if isinstance(rid, str)}
 
-    def _subagent_turn_reports(self, session_key: str, notice_run_ids: list[str] | None = None) -> list[str]:
+    def _bind_subagent_turn(self, msg: InboundMessage, session_key: str, turn: DelegationTurn) -> None:
+        """Remember which turn ``msg`` runs, so its taken results are its own."""
+        if not hasattr(self, "_subagent_turns"):
+            self._subagent_turns: dict[int, tuple[str, str]] = {}
+        self._subagent_turns[id(msg)] = (session_key, turn.turn_id)
+
+    def _subagent_turn_reports(self, session_key: str, notice_run_ids: list[str] | None = None,
+                               turn: DelegationTurn | None = None) -> list[str]:
         """The subagent results a turn handled, to be committed with its save."""
         subagents = getattr(self, "subagents", None)
         if subagents is None or not hasattr(subagents, "turn_reports"):
             return list(notice_run_ids or [])
-        return subagents.turn_reports(session_key, notice_run_ids)
+        return subagents.turn_reports(session_key, notice_run_ids, turn.turn_id if turn else None)
 
     def _release_subagent_results(self, msg: InboundMessage) -> None:
+        bound = getattr(self, "_subagent_turns", {}).pop(id(msg), None)
         subagents = getattr(self, "subagents", None)
-        if subagents is None:
-            return
-        session_key = msg.session_key
-        if msg.channel == "system" and session_key.startswith("system:"):
-            # A system notice is that conversation's turn (see
-            # _process_system_message), keyed by its delivery address.
-            session_key = msg.chat_id if ":" in msg.chat_id else f"cli:{msg.chat_id}"
+        if bound is None or subagents is None:
+            return  # the turn never got far enough to take any
         try:
-            subagents.release_taken(session_key)
+            subagents.release_taken(*bound)
         except Exception:
             logger.exception("Could not give back subagent results of an unsaved turn")
 
@@ -9170,6 +9173,7 @@ class AgentLoop:
             session_key=msg.session_key,
             should_yield=self._turn_should_yield(msg.metadata.get("run_id") or ""),
         )
+        self._bind_subagent_turn(msg, msg.session_key, delegation_turn)
         with tool_execution_scope(msg.session_key, allowed_tools=allowed_tools if tools_allowed else frozenset()), self._steering().register(
             msg.metadata.get("run_id") or "", msg.session_key, persist_guidance
         ), delegation_turn_scope(delegation_turn):
@@ -9275,7 +9279,8 @@ class AgentLoop:
         # Subagent results this turn took with agent_wait are delivered by
         # this save, and only by it (see SubagentManager.release_taken).
         subagent_reports = (
-            self._subagent_turn_reports(msg.session_key) if not introduction_failed else []
+            self._subagent_turn_reports(msg.session_key, turn=delegation_turn)
+            if not introduction_failed else []
         )
         record_subagent_reports(session.metadata, subagent_reports)
         self.sessions.save(session)
@@ -9603,6 +9608,7 @@ class AgentLoop:
             should_yield=lambda: self.goal_user_epoch(session_key) != owner_epoch,
             steerable=False,
         )
+        self._bind_subagent_turn(msg, session_key, system_turn)
         with delegation_turn_scope(system_turn):
             final_content, tool_results, _executed_tools, system_usage, _loop_messages = await self._run_llm_tool_loop(
                 messages=messages,
@@ -9680,6 +9686,7 @@ class AgentLoop:
         subagent_reports = self._subagent_turn_reports(
             session_key,
             _SUBAGENT_RUN_ID_RE.findall(msg.content or "") if msg.sender_id == "subagent" else [],
+            system_turn,
         )
         record_subagent_reports(session.metadata, subagent_reports)
         self.sessions.save(session)

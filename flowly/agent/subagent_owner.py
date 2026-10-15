@@ -74,13 +74,39 @@ def _read_boot_id() -> str | None:
     return None
 
 
+def process_identity(pid: int) -> str | None:
+    """When ``pid`` started, the same whichever process asks; None if unknown.
+
+    Rejects pid reuse. ``ps`` prints the start in the caller's locale and
+    time zone, so a Desktop-launched gateway and a terminal with LANG set
+    would see different values for one live process; it is asked in the C
+    locale and UTC.
+    """
+    if pid <= 0:
+        return None
+    try:
+        # Field 22 is the start time; the command field may contain spaces.
+        tail = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(") ", 1)[1].split()
+        return f"linux:{tail[19]}"
+    except (OSError, IndexError, UnicodeDecodeError):
+        pass
+    if os.name == "nt":
+        return None
+    try:
+        value = subprocess.check_output(
+            ["ps", "-o", "lstart=", "-p", str(pid)], text=True, stderr=subprocess.DEVNULL,
+            timeout=2, env={**os.environ, "LC_ALL": "C", "LANG": "C", "TZ": "UTC"},
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return f"ps:{value}" if value else None
+
+
 def _own_identity() -> str | None:
     with _cache_lock:
         if "identity" not in _cached or _cached.get("pid") != os.getpid():
-            from flowly.profile import _process_identity
-
             _cached["pid"] = os.getpid()
-            _cached["identity"] = _process_identity(os.getpid())
+            _cached["identity"] = process_identity(os.getpid())
         return _cached["identity"]
 
 
@@ -147,12 +173,10 @@ def owner_state(owner: Any, instance: str | None = None) -> str:
         if recorded_identity and current and recorded_identity != current:
             return DEAD
         return ALIVE if owner.get("instance") in _LIVE_INSTANCES else DEAD
-    from flowly.profile import _process_identity
-
     if not _pid_alive(pid):
         return DEAD
     if recorded_identity:
-        current = _process_identity(pid)
+        current = process_identity(pid)
         if current and current != recorded_identity:
             return DEAD  # the pid now belongs to another process
     return ALIVE

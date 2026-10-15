@@ -339,6 +339,39 @@ async def test_a_result_decided_before_the_crash_is_recorded_without_a_model_cal
 
 
 @pytest.mark.asyncio
+async def test_a_decided_result_is_recorded_even_past_the_bounds(tmp_path, monkeypatch, side_effects):
+    (tmp_path / "notes.txt").write_text("notes")
+    full, reference = await _reference(tmp_path, monkeypatch, _three_calls(tmp_path))
+    home = tmp_path / "home2"
+    _crash_state(home, reference, _upto(full, "final"), suspended_ago=30 * 3600, resume_count=3)
+    bus = MessageBus()
+    provider = _Scripted()
+    manager = _manager(home, tmp_path, provider, bus)
+    manager.resume_pending()
+    record = await _settle(manager, reference.run_id)
+    assert provider.sent == [] and record.outcome == "ok"
+    assert manager.registry.read_result(reference.run_id)["content"] == "Done."
+
+
+@pytest.mark.asyncio
+async def test_a_stop_on_request_wins_over_a_shutdown_in_the_same_moment(tmp_path):
+    gate = asyncio.Event()
+
+    class _Waits(_Scripted):
+        async def chat(self, **kwargs: Any) -> LLMResponse:
+            await gate.wait()
+            return LLMResponse(content="x")
+
+    manager = _manager(tmp_path / "h", tmp_path, _Waits())
+    started = json.loads(await manager.spawn(task="t", origin_channel="web", origin_chat_id="chat-1",
+                                             parent_session_key=CHAT, origin="agent"))
+    await asyncio.sleep(0.05)
+    manager._cancel_outcomes[started["run_id"]] = "cancelled"  # the owner's stop, mid-flight
+    await manager.shutdown(wait_seconds=1.0)
+    assert manager.registry.get(started["run_id"]).outcome == "cancelled"
+
+
+@pytest.mark.asyncio
 async def test_a_run_stopped_before_its_summary_call_makes_only_that_call(tmp_path, monkeypatch, side_effects):
     script = [LLMResponse(content=None, tool_calls=[_call("c1", "exec", command="echo once")])]
     full, reference = await _reference(tmp_path, monkeypatch, script, max_iterations=1)

@@ -275,6 +275,18 @@ def test_unread_messages_come_back_and_a_reply_read_by_an_unfinished_call_too():
     assert answered.unread_mail == []
 
 
+def test_a_reply_read_by_a_call_a_restart_cut_off_is_read_again():
+    state = restore([
+        _header(), _rec("step", iteration=1, notes=[], mail=[], budget=100_000),
+        _model(("q", "agent_message")), _rec("tool_start", callId="q", name="agent_message"),
+        _rec("mail", id="m2", text="the reply"), _rec("inbox", callId="q", ids=["m2"]),
+        _rec("tool", callId="q", protocolName="agent_message", content="Interrupted: …",
+             status="interrupted", guard=None),
+        _rec("resumed", after="crash", attempt=1, interrupted=["q"], notRun=[]),
+    ])
+    assert [m["id"] for m in state.unread_mail] == ["m2"] and state.open_calls == []
+
+
 def test_the_overflow_trim_and_the_guard_are_rebuilt():
     repeated = cp.mark_repeated("read_file", "same")
     records = [_header(), _rec("step", iteration=1, notes=[], mail=[], budget=100_000),

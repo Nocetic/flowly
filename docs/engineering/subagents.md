@@ -166,7 +166,11 @@ save** as the turn, and only then `mark_delivered` (`pending | queued | taken �
   them for good. Now they are `taken`: a restart announces a `taken` result that no saved turn
   recorded, and `_process_message` calls `release_taken` under the turn lock when a turn ends —
   results it took but never saved (the turn failed, an introduction that left no trace) go back
-  to `pending` and are announced again. `notice_already_handled` treats `taken` as handled, so a
+  to `pending` and are announced again. Taken results belong to the **turn** that took them
+  (`_taken[run_id] = (session_key, turn_id)`, the `DelegationTurn`'s id, bound to the inbound
+  message by `_bind_subagent_turn`): an agenda wake or Board notice runs under its own
+  `system:<key>` lock, alongside the owner's turn of the same conversation, and must neither
+  commit nor give back what the owner's turn took. `notice_already_handled` treats `taken` as handled, so a
   queued notice for the same result is not processed meanwhile.
 
 ## 7. Stopping
@@ -192,12 +196,16 @@ save** as the turn, and only then `mark_delivered` (`pending | queued | taken �
   result again).
 * **Owner.** `spawn` (and `delegate_to`) stamp `owner = {instance, pid, identity, boot, host}`
   (`subagent_owner.process_owner`): the manager instance, the pid and its start identity
-  (`profile._process_identity`, so a reused pid is not mistaken for it), the boot
+  (`subagent_owner.process_identity`: `/proc` start time, else `ps -o lstart` asked in the C locale
+  and UTC — `ps` prints the caller's locale and zone, so a Desktop-launched gateway and a Turkish
+  terminal would otherwise disagree about one live process — so a reused pid is not mistaken for
+  it), the boot
   (`/proc/sys/kernel/random/boot_id`, macOS `kern.bootsessionuuid`), the host name (diagnostic
   only — macOS renames hosts with the network). `owner_state` says OURS / ALIVE / DEAD: no owner
   (records from before owners) → DEAD; another boot → DEAD; our pid → ALIVE only if that manager
   instance lives in this process; another pid → DEAD if it is gone or now has another identity.
-  Anything not provably gone is ALIVE. A Flowly home is assumed to live on one machine.
+  Anything not provably gone is ALIVE. A Flowly home is assumed to live on one machine. On
+  Windows the pid is opened for a query, never signalled (`os.kill(pid, 0)` is not a probe there).
   Startup recovery only touches runs whose owner is DEAD, and takes each over with
   `registry.claim(run_id, new_owner, expected_owner)` — compare-and-set under the index lock, so of
   two processes recovering one home at once only one gets a run. A CLI or second gateway on the
@@ -339,6 +347,17 @@ off (the CLI) leaves resumable runs to the gateway.
 The notice of a continued run says *"(runtime: Ns, continued after a restart)"*; runtime, the
 wire `duration` and the metric's `durationS` leave the downtime (`suspended_seconds`) out.
 `cancel` also ends a run still marked running that no live process works on.
+
+Recovery is per run: one run whose record or checkpoint cannot be read or written is logged and
+left, and never keeps the agent from starting. A result already in the checkpoint (`final`) is
+recorded whatever the bounds. A stop on request that lands in the same moment as a shutdown wins
+(the run ends `cancelled`, it is not suspended).
+
+Accepted limits: the checkpoint's `coreVersion` is recorded but not compared — within one format
+the replay goes through this version's compaction, so an update that changes how old results are
+compacted only changes how the rebuilt history is compacted, never which calls ran. If a
+checkpoint cannot be kept *and* the disk then refuses both deleting it and marking the run not
+resumable, a restart could continue from that older checkpoint.
 
 Deviations from the design report: no `subagentResume` setting (`auto | ask | off`) and no
 `subagents.resume` RPC yet (phase 4); resumed runs are not queued behind the 8-run limit (a

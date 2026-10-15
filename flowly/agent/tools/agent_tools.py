@@ -344,6 +344,7 @@ class AgentWaitTool(Tool):
             outcome = await self._manager.wait_for_children(
                 session_key, resolved, timeout=timeout,
                 should_yield=turn.should_yield if turn else None,
+                turn_id=turn.turn_id if turn else None,
             )
         finally:
             if turn is not None:
