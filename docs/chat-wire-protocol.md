@@ -40,6 +40,7 @@ to ONE caller. They are never conversation state.
 | `sessionKey` | The conversation. `<channel>:<chat_id>`, e.g. `web:abc123`, `desktop:default`. The unit of routing, locking, compaction and history. |
 | `runId` | One turn's lifecycle: the stream, its tool turns, its Stop, its terminal event. |
 | `streamRunId` | Relay only. Present when the durable message id (`runId`) differs from the lifecycle id; then `streamRunId` is the lifecycle one. |
+| `turnOrigin` | Present on every event of a run the server started on its own: `"subagent"` for a subagent's report turn (§4.7). Absent on a client's own turn. |
 
 **Invariants**
 
@@ -63,6 +64,7 @@ Discriminated by `data.state`.
 
 | `state` | Meaning | Key fields |
 | --- | --- | --- |
+| `run_started` | A run the server started opened (§4.7). Not a terminal, no text. | `turnOrigin`, `hiddenPrompt`, `steerable` |
 | `streaming` | One delta of assistant text. | `delta` |
 | `iteration_step` | One tool-protocol step inside the turn. | `iterationIdx`, `role`, `content`, `tool_calls?`, `tool_call_id?`, `name?` |
 | `final` | **Terminal.** The turn's durable assistant message. | `message.content[]`, `model`, `usage`, `completedAt`, `durationMs`, `aborted?`, `attachments?`, `toolMessages?` |
@@ -183,6 +185,41 @@ The agent's proposed working style is appended to the home transcript as an
 assistant row with `kind: "agent_setup_card"` and a `setupCard` payload
 (forwarded by `chat.history`). The row is append-only; clients derive whether
 it is offered, saved (`savedCardId`) or superseded from `agent.home.get`.
+
+**4.7 — A subagent's report turn has no chat.send.** When subagents finish,
+the conversation that started them takes a turn of its own to report their
+results. If a client watches that conversation (a bound gateway socket, a
+relay session), the server runs it through the same runner `chat.send` uses,
+under a fresh run id with a command record `turnOrigin: "subagent"`:
+
+```
+run_started ─▶ [streaming | agent delta | iteration_step | tool_progress]* ─▶ final | error
+```
+
+- Once the turn holds the conversation's turn lock it sends
+  `chat {state:"run_started", runId, sessionKey, turnOrigin:"subagent",
+  hiddenPrompt:true, steerable:false}`. Every later event of the run carries
+  `turnOrigin` and `sessionKey` (direct `agent` deltas included), so a client
+  that missed `run_started` still knows whose run it is.
+- There is no `state:"user"` event: the trigger is a system notice, saved as
+  a hidden row. `chat.inflight` returns the run with `user: ""` and
+  `turnOrigin: "subagent"`.
+- The terminal is an ordinary `final` (relay: `streamRunId` = the run) or
+  `error`, with `turnOrigin`. Stop is `chat.abort(runId)` as for any run.
+- The run is not steerable: `chat.steer` answers `RUN_NOT_ACTIVE`. Clients
+  queue what the owner types and send it as the next turn.
+- A client adopts such a run when it shows that `sessionKey` and is not
+  following a run of its own (an owner's send waiting behind it keeps its
+  bubble). A run it does not adopt still ends in a `final` that the client
+  appends as a message (it owns no live state).
+- Nobody watching: the report goes over the agent bus as before. Local direct
+  clients then get one proactive `final` (`proactive: true`) whose `runId` is
+  the run id the saved reply carries and whose `sessionKey` is the
+  conversation's own key; a client showing that conversation appends it.
+
+Older clients ignore `run_started` and `turnOrigin`; on the relay they see
+the deltas as before, on the direct gateway they show the reply on the next
+history read.
 
 ---
 

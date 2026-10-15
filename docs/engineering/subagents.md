@@ -149,6 +149,64 @@ each), then guidance (check what matters, don't redo, answer as a whole, no run 
   moved" (`goal_user_epoch`, bumped when an owner message arrives, before it waits on the lock).
   `agent_wait` in such a turn returns at once with "the owner sent a new message; finish now".
 * After the turn, `mark_delivered` records the runs as handled (goals wait on this, §10).
+* **Compaction, like the owner's turn.** Before the turn, inside the turn lock, the same pass
+  the post-turn background check runs is awaited (`_compact_before_report` →
+  `_post_turn_compaction(settle=False, should_cancel=Stop)`); after it, the provider's own count
+  is recorded (`_note_turn_usage`) and the post-turn compaction is scheduled. Agenda wake-ups,
+  which share `_process_system_message`, get neither.
+
+### The report turn streams (`flowly/agent/report_turn.py`)
+
+Nobody typed a report turn, so no client started it with `chat.send`. It still streams exactly
+like the owner's turn, because it runs through the surface's own chat runner — the same path a
+standing goal's next turn takes:
+
+1. `_deliver_to_parent._send` calls `SubagentManager.report_submitter` (set by `AgentLoop` to
+   `_submit_report_turn`). The direct-queue path (`subagent_announce_queue`) uses the same
+   `_send`, so queued notices take it too.
+2. `_submit_report_turn` captures the notice's authority the way the bus does
+   (`bind_bus_message`'s rule) and tries the registered runners
+   (`register_report_turn_submitter`): the relay first for a conversation started on the relay
+   (`parent_channel == "web"`), the direct gateway first otherwise. A runner declines when nobody
+   watches the conversation on it (no bound gateway socket; no relay session).
+3. **Nobody declined → the runner owns it.** `GatewayServer.run_report_turn` /
+   `WebChannel.run_report_turn` mint a run id, record the command
+   (`chat_commands.accept(..., {"turnOrigin": "subagent"})`) and start the turn in its own task
+   (the caller is a subagent's completion and never waits on the turn lock). The notice rides
+   as the turn's content with the `REPORT_TURN` marker (`{"sender_id", "chat_id"}`); the agent
+   builds the same `ConversationInboundMessage(channel="system", sender_id="subagent", ...)` the
+   bus would carry (`process_direct` on the direct gateway, the agent queue on the relay), so the
+   turn lock, ordering, `notice_already_handled`, `_bind_subagent_turn`, `release_taken` and
+   the delivery commit point are unchanged.
+4. In the turn: a notice already taken with `agent_wait` ends before anything is announced
+   (command record `aborted`, no event); otherwise `_on_turn_started` begins the in-flight entry
+   **with no user text** and `turnOrigin: "subagent"`, and the runner sends
+   `chat {state:"run_started", runId, sessionKey, turnOrigin:"subagent", hiddenPrompt:true,
+   steerable:false}`. `_process_system_message` passes the runner's `stream_callback`,
+   `on_iteration` and `on_tool_progress` to the tool loop, so deltas, tool steps and tool
+   progress stream live; every event of the run carries `turnOrigin` and `sessionKey`.
+5. The turn returns the owner turn's terminal metadata (`stream_run_id`, `session_key`, usage,
+   context occupancy, `aborted`, `duration_ms`, tool messages, provider `error`) and the runner
+   sends **one** final (or error) under the run id it streamed; no `push_session_message`. The
+   direct runner's final also schedules the offline push.
+6. **Stop** is `chat.abort(runId)`: the run has a command record and an in-flight entry, the tool
+   loop polls `is_run_aborted`, and `should_yield` also yields on it. A stopped report is saved
+   like a stopped owner turn (partial text, `aborted`), so its results are **delivered**: never
+   announced again (the owner stopped the report; it stays in the conversation for the next
+   turn). A turn that ends without saving (crash, cancellation) still gives back what it took
+   (`release_taken`).
+7. **Not steerable.** Its trigger is a hidden system notice and its `DelegationTurn` is not the
+   owner's (`owner_authored=False`), so guidance cannot go into it: `chat.steer` answers
+   `RUN_NOT_ACTIVE` and clients queue what the owner types as their next turn. The owner's
+   message bumps the epoch before it waits on the lock, which ends any `agent_wait` in the
+   report (`should_yield`), so the reply comes promptly.
+8. **Fallback.** Nobody watching (or no runner registered — CLI, tests, plain channels): the
+   notice goes over the bus exactly as before. Local clients get the reply through
+   `push_session_message`, now keyed by the conversation's own key and carrying the run id the
+   saved reply has (`stream_run_id`), so a client that showed the push recognises the saved row;
+   and a phone registered for pushes gets the offline push.
+
+Collaboration authority (`PROFILE_RUN_BINDING`) is dropped for system turns, as on the bus.
 
 ### Delivery commit point
 
@@ -401,7 +459,11 @@ metrics outlive the 30-day run pruning. `subagents.stats` returns, for the last 
   `test_subagent_accounting.py` (limits, tokens, slow sibling, stopped sibling, metrics, stats),
   `test_repetition_guard.py`, `test_subagent_hardening.py`, `test_subagent_conversation_key.py`,
   `test_subagent_transcript.py`, `test_subagent_messaging.py`, `test_subagent_safety.py`,
-  `test_subagent_profile_transport.py`.
+  `test_subagent_profile_transport.py`, `test_subagent_report_streaming.py` (a report turn
+  streams on the direct gateway and the relay like an owner turn — `run_started`, deltas, tool
+  steps, one final, command record, hidden in-flight prompt; the bus fallback; Stop and
+  exactly-once delivery; an already-taken notice opens no run; ordering; surface choice;
+  compaction before and after; agenda wake-ups unchanged).
 * Restarts: `test_subagent_restart.py` (torn lines, owners and claims, the delivery commit point,
   long downtime, shutdown order), `test_subagent_checkpoint.py` (the golden replay at every model
   call, each record kind, refusals, privacy, size cap), `test_subagent_resume.py` (each crash point
