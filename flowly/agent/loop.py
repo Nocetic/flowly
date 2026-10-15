@@ -5704,39 +5704,19 @@ class AgentLoop:
         # Project a detached copy for product surfaces.  The canonical message
         # stays untouched in provider/session history so strict tool-call /
         # tool-result name matching remains valid.
-        from flowly.tool_activity import project_tool_messages_for_ui
+        from flowly.tool_activity import iteration_event_payload
 
         self._steering().observe_iteration(outbound_run_id, iteration_idx, message)
-        projected = project_tool_messages_for_ui(
-            [message], internal_call_ids=self._internal_tool_calls(outbound_run_id),
+        # The agent's own bookkeeping (a goal, a follow-up) is no step. An
+        # assistant step whose calls were all hidden is still a boundary
+        # (``tool_calls: []``): the text streamed so far belongs to it, so a
+        # client moves it out of its live bubble instead of showing it twice.
+        event_payload = iteration_event_payload(
+            message, run_id=outbound_run_id, iteration_idx=iteration_idx,
+            internal_call_ids=self._internal_tool_calls(outbound_run_id),
         )
-        if not projected:
-            return  # the agent's own bookkeeping (a goal, a follow-up): no step
-        ui_message = projected[0]
-        role = ui_message.get("role") or ""
-        if role not in ("assistant", "tool"):
+        if event_payload is None:
             return
-        event_payload: dict[str, Any] = {
-            "runId": outbound_run_id,
-            "iterationIdx": iteration_idx,
-            "role": role,
-            "content": ui_message.get("content") or "",
-        }
-        if role == "assistant" and ui_message.get("tool_calls"):
-            event_payload["tool_calls"] = ui_message["tool_calls"]
-        elif role == "assistant" and message.get("tool_calls"):
-            # Every call was the agent's own bookkeeping (memory, goals) and is
-            # not shown, but this is still a step boundary: the text streamed so
-            # far belongs to this step. An empty list says so, so a client moves
-            # the text out of its live bubble instead of showing it twice.
-            event_payload["tool_calls"] = []
-        if role == "tool":
-            if ui_message.get("tool_call_id"):
-                event_payload["tool_call_id"] = ui_message["tool_call_id"]
-            if ui_message.get("name"):
-                event_payload["name"] = ui_message["name"]
-            if ui_message.get("tool_activity"):
-                event_payload["tool_activity"] = ui_message["tool_activity"]
 
         # Direct-callback path (the direct gateway / any ``process_direct``
         # caller): deliver the event straight to the caller's transport — e.g.

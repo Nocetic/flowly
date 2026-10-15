@@ -199,3 +199,48 @@ def project_tool_messages_for_ui(
         projected_messages.append(projected)
 
     return projected_messages
+
+
+def iteration_event_payload(
+    message: Mapping[str, Any],
+    *,
+    run_id: str,
+    iteration_idx: int,
+    internal_call_ids: set[str],
+) -> dict[str, Any] | None:
+    """One live ``iteration_step`` event's payload for a turn's message, or None.
+
+    ``{runId, iterationIdx, role, content, tool_calls?, tool_call_id?, name?,
+    tool_activity?}`` — the shape the relay writes to ``tool_turns/`` and every
+    client maps to its tool panel. None for what is not shown: the agent's own
+    bookkeeping (an internal call and its result) and any role but
+    ``assistant`` / ``tool``. An assistant step whose calls were all hidden
+    still carries ``tool_calls: []``: it is a step boundary for the text
+    streamed before it. Shared by the main loop and a subagent's live turn
+    (flowly.agent.subagent_stream), so both send the same steps.
+    """
+    projected = project_tool_messages_for_ui([message], internal_call_ids=internal_call_ids)
+    if not projected:
+        return None
+    ui_message = projected[0]
+    role = ui_message.get("role") or ""
+    if role not in ("assistant", "tool"):
+        return None
+    payload: dict[str, Any] = {
+        "runId": run_id,
+        "iterationIdx": iteration_idx,
+        "role": role,
+        "content": ui_message.get("content") or "",
+    }
+    if role == "assistant" and ui_message.get("tool_calls"):
+        payload["tool_calls"] = ui_message["tool_calls"]
+    elif role == "assistant" and message.get("tool_calls"):
+        payload["tool_calls"] = []
+    if role == "tool":
+        if ui_message.get("tool_call_id"):
+            payload["tool_call_id"] = ui_message["tool_call_id"]
+        if ui_message.get("name"):
+            payload["name"] = ui_message["name"]
+        if ui_message.get("tool_activity"):
+            payload["tool_activity"] = ui_message["tool_activity"]
+    return payload
