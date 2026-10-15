@@ -24,7 +24,8 @@ are gone (`test_delegation_rule.py` pins the current contract).
 | `flowly/agent/subagent.py` | `SubagentManager`: spawn, the child loop, messaging, waiting, delivery (announce), cancel, recovery, metrics hook |
 | `flowly/agent/subagent_registry.py` | `SubagentRunRecord` + `SubagentRegistry` (`runs.json` index, result files, transcripts, file lock, pruning, `claim`), `add_usage`, `append_jsonl` |
 | `flowly/agent/subagent_owner.py` | Who owns a run (`process_owner`) and whether that owner is gone (`owner_state`) |
-| `flowly/agent/subagent_checkpoint.py` | A running run's checkpoint (`SubagentCheckpoint`), `ChildState`, `apply_step`, `restore_child_state`, `tool_class` |
+| `flowly/agent/subagent_checkpoint.py` | A running run's checkpoint (`SubagentCheckpoint`), `ChildState`, `apply_step` / `apply_microcompact` / `apply_compacted`, `restore_child_state`, `tool_class` |
+| `flowly/compaction/` | The main agent's context management, which the child uses as is (§4.1): `CompactionService`, `ProviderRequestCoordinator.fit`, `pruning.iteration_strip_passes` / `strip_old_tool_results` / `microcompact_tool_results`, `summarizer.collect_summary_usage` |
 | `flowly/agent/subagent_observation.py` | `run_view` (the wire shape of a run), `TaskEvents` (coalesced `subagent.*` events) |
 | `flowly/agent/subagent_metrics.py` | One metric line per ended run (`metrics.jsonl`), `summarize` |
 | `flowly/agent/delegation.py` | `DelegationTurn` (per-turn facts in a context var), owner-quote check, conversation fork, marks |
@@ -88,11 +89,61 @@ the agent the results arrive together as a new message, not to wait, not to redo
 * **Messages in.** The main agent's `agent_message` lands in the child's inbox and is read at
   its next step (never interrupting a tool call). A message arriving during the final answer is
   still read (the child takes one more step).
-* **Tokens.** After every model call (including the grace call) `_count_usage` adds the
-  provider's `usage` to the record (`add_usage`: `prompt_tokens` → input, `completion_tokens` →
-  output, `cache_read_tokens` → cacheRead, `total_tokens` or the sum → total) and publishes a
-  progress event, so clients show it live. Tokens only — no price.
+* **Tokens.** After every model call (including the grace call, an overflow retry and each call a
+  summary made, §4.1) `_count_usage` adds the provider's `usage` to the record (`add_usage`:
+  `prompt_tokens` → input, `completion_tokens` → output, `cache_read_tokens` → cacheRead,
+  `total_tokens` or the sum → total) and publishes a progress event, so clients show it live.
+  Tokens only — no price.
 * **Transcript.** Each step is appended to the run's transcript (§8).
+
+### 4.1 Context management — the main agent's
+
+The child has no context management of its own. `SubagentManager` gets the main agent's
+`CompactionService` (`AgentLoop` builds it first and passes `compaction=`; without one — tests,
+embeddings — a stateless service with the same defaults) and drives the same pieces the main
+loop's tool loop does, against the window of **the child's model**:
+
+* **Window, threshold, reserve.** `effective_context_window_for(model)`: the catalog window
+  (else the family table, else the configured window; a pinned `compaction.contextWindow` wins),
+  clamped to the Flowly proxy's per-model cap and to any input ceiling a provider taught the
+  service. Threshold = window − `effective_reserve_tokens_for(model)` (the configured reserve,
+  at most 35 % of the window, at least 512). A request — messages **and the real tool schemas**
+  (`ProviderRequestCoordinator.budget`) — must fit the threshold. The reply budget
+  (`subagent_output_budget`: ≤ 16,384, ≤ 25 % of the window, ≤ the reserve) stays inside the
+  reserve, so request + reply fit one window; the grace call asks for at most 4,096.
+* **Each step** cuts old tool results on the main loop's schedule (`iteration_strip_passes`:
+  from iteration 6 all but the last 3 to 300 chars, from 9 all but the last 2 to 150).
+* **Each request** (`_call_model` → `_fit_request` → `ProviderRequestCoordinator.fit`, the main
+  agent's per-request fitting): under the threshold it goes out as it is. Over it the run shows
+  `activity {"phase": "compacting", "iteration", "reason": "threshold"}`; microcompact cuts all
+  but the newest `microcompact.keepRecentFull` tool results to `truncateChars` (spill pointers
+  kept); if that is not enough, the history is **summarized** — the last resort, a model call
+  (`CompactionService.compact`, `track_cycle=False`) with `CHILD_SUMMARY_INSTRUCTIONS` (the work
+  so far, evidence with exact URLs/paths/ids, failures, what is not done; never "the user").
+  The system prompt and the brief are **pinned** (`fit(pinned=1)`): never summarized, kept
+  verbatim; the list becomes `[system, summary, brief, kept tail…]`. A later summary updates the
+  earlier one (it is fed as the previous record), so there is one summary at a time. The summary
+  is made by the service's own provider and model (the main agent's, like the main agent's own
+  summaries) and its calls' `usage` is collected (`collect_summary_usage`, a context variable
+  per task, failed attempts included) and counted toward the run.
+* **A request that cannot be made to fit is not sent.** A summary that failed (provider error,
+  timeout, a summary that would not shrink anything: `RequestFit.retryable`) is an ordinary
+  transient error — retried within the run's error budget; anything structural (system prompt,
+  brief and tool schemas alone fill the window) ends the run `input_too_large`, as the main agent
+  fails closed.
+* **Overflow.** A `context_overflow` / `input_too_large` rejection is handled as the main agent
+  handles it (`_call_provider_with_context_recovery`): `input_too_large` teaches the service the
+  provider's ceiling (`note_observed_input_limit`, the advertised limit or 90 % of the rejected
+  estimate) — learned per model and shared by the main agent and every child; then the request is
+  fitted with `force_reduction` (`reason: "overflow"`) and sent **once** more, only if that changed
+  it. A second rejection ends the run with the overflow error.
+* Per-request fitting keeps no breaker or session state (`track_cycle=False`, no lease), as for
+  the main agent's own per-request fitting. The old subagent-only trimming
+  (`_strip_subagent_tool_results`, `_trim_to_context_budget`, a 4K guess for tool schemas, no
+  summaries, a one-off overflow trim) is gone.
+* **Visible.** A summary adds a transcript item `{kind: "compacted", at, iteration, reason,
+  tokensBefore, tokensAfter, summary}` (estimates of the whole request; summary clipped to 4,000
+  chars) and is logged; the activity goes back to the step's phase when fitting ends.
 
 ## 5. Talking to running subagents
 
@@ -291,16 +342,30 @@ is what the provider saw: the system prompt and first message (brief + forked co
 sent, each model reply with tool calls — full arguments, ids, `extra_content` — written **before**
 its tools run, `tool_start` before a tool runs and `tool` with the exact message appended
 (meta-tool answers too) plus what the repetition guard saw, messages from the main agent when they
-arrive (`mail`) and when read (`step` / `inbox`), each step's context budget, the overflow trim,
-the summary call and the final result. `model`, `tool_start`, `mail` and `final` are fsynced.
+arrive (`mail`) and when read (`step` / `inbox`), each step's tool-result cuts (`step.strip`), each
+fitting of a request (`microcompact`, `compacted`), the summary (grace) call and the final result.
+`model`, `tool_start`, `mail`, `compacted` and `final` are fsynced.
 
+* **Format (version 2).** `step {iteration, notes, mail, strip: [[keepLast, maxOldChars], …]}`;
+  `microcompact {iteration, reason, keepRecentFull, truncateChars}` — a fitting that only cut old
+  tool results, recorded with the parameters it used; `compacted {iteration, reason, summarized,
+  messages, tokensBefore, tokensAfter}` — a summary, recorded as **the exact list that replaced the
+  old one** (a summary is a model call and cannot be computed again). The rule: deterministic
+  changes are recorded with their parameters, the rest with their result. A cut whose replay
+  would not reproduce exactly what was sent is recorded as `compacted` with `summarized: false`
+  (the live loop checks before choosing). Version 1 (a `budget` per step, a `recovery` trim) is
+  not replayed: its runs end `resume_unsupported` (§11) — v1 never shipped beyond this branch.
 * **Exact rebuild.** Every change to the child's message list goes through a function the replay
-  calls too (`apply_step` for the inbox and the strip/trim compaction with the step's recorded
-  budget, `_answer_tool` for tool messages, the overflow trim, the grace prompt), so
-  `restore_child_state(records)` rebuilds the list the provider was sent, step for step
-  (`test_subagent_checkpoint.py` checks it at every model call). The repetition guard is rebuilt
-  from the results it saw (a marked result is unmarked first), the search memo from the search
-  results.
+  calls too (`apply_step` for the inbox and the step's cuts, `apply_microcompact` and
+  `apply_compacted` for a fitted request, `_answer_tool` for tool messages, the grace prompt), so
+  `restore_child_state(records)` rebuilds the list the provider was sent, call for call
+  (`test_subagent_checkpoint.py` checks it at every model call, through cuts, summaries and an
+  overflow retry). The repetition guard is rebuilt from the results it saw (a marked result is
+  unmarked first), the search memo from the search results.
+* **Crash around a summary.** After `compacted`: the restart rebuilds the summarized list and
+  makes the model call with it — no summary call. Before it (the summary was paid for but not
+  written): the step is rebuilt as it was, the request is fitted again and the summary made once
+  more; its tokens are counted again, because they were spent again.
 * **Calls.** The last reply's calls without a `tool` record come back as `open_calls`: started
   (`tool_start`, may have had effects) or not; `suspended` after a start marks it stopped by a
   clean shutdown. A reply that `agent_message` read counts as read only if that call finished.
@@ -414,8 +479,9 @@ recorded whatever the bounds. A stop on request that lands in the same moment as
 (the run ends `cancelled`, it is not suspended).
 
 Accepted limits: the checkpoint's `coreVersion` is recorded but not compared — within one format
-the replay goes through this version's compaction, so an update that changes how old results are
-compacted only changes how the rebuilt history is compacted, never which calls ran. If a
+the replay cuts old results through this version's functions with the recorded parameters, so an
+update that changes how they cut only changes how the rebuilt history is cut, never which calls
+ran; summaries are replayed from their recorded result whatever the version. If a
 checkpoint cannot be kept *and* the disk then refuses both deleting it and marking the run not
 resumable, a restart could continue from that older checkpoint.
 
@@ -433,9 +499,11 @@ fatal tool again would otherwise loop forever).
   (`inputTokens`, `outputTokens`, `cacheReadTokens`, `totalTokens`), tools used,
   `childSessionKey`, delivery state (`taken` included), `resumedAt` (when it last continued after
   a restart, else null) and `suspendedSeconds` (downtime left out of `duration`). `activity.phase`
-  adds `suspended` (stopped by a shutdown to continue later) and `resuming` (claimed by a starting
-  process, before its next step). Transcript items add `{kind: "resumed", at, attempt, after}`
-  and `tool` items with `status: interrupted | not_run`.
+  adds `suspended` (stopped by a shutdown to continue later), `resuming` (claimed by a starting
+  process, before its next step) and `compacting` (`{phase, iteration, reason: "threshold" |
+  "overflow"}`, while a request is fitted — a summary call may take seconds; §4.1). Transcript items
+  add `{kind: "resumed", at, attempt, after}`, `{kind: "compacted", at, iteration, reason,
+  tokensBefore, tokensAfter, summary}` and `tool` items with `status: interrupted | not_run`.
 * RPCs: `subagents.list`, `.get`, `.result`, `.transcript {runId, after, limit}` →
   `{task, items, nextSeq, more, done}`, `.cancel {runId}`, `.stats {days, includeSystem}`,
   `.spawn` (manual, origin owner).
@@ -466,13 +534,22 @@ metrics outlive the 30-day run pruning. `subagents.stats` returns, for the last 
   run; an already-taken notice opens no run; ordering; other conversations not held up; surface
   choice and refusals; the profile host forwarding; a real authenticated gateway socket;
   compaction before and after; agenda wake-ups unchanged).
+* Context: `test_subagent_compaction.py` (request + reply fit the child's model for small and large
+  windows, the shared service and its learned ceilings, `AgentLoop` wiring, the main loop's cut
+  schedule, a request under the threshold untouched, a failed summary retried, a request that
+  cannot fit never sent, an overflow compacted and retried once — not forever, a 40-step run on a
+  16K model that summarizes repeatedly and finishes with every request under the threshold and
+  every reply under the reserve, summary tokens per task).
 * Restarts: `test_subagent_restart.py` (torn lines, owners and claims, the delivery commit point,
   long downtime, shutdown order), `test_subagent_checkpoint.py` (the golden replay at every model
-  call, each record kind, refusals, privacy, size cap), `test_subagent_resume.py` (each crash point
-  rebuilt from a reference run's checkpoint and recovered in a fresh manager: no call runs twice,
-  exact provider list, one notice; suspend, two processes, version skew, crash loop, long
-  downtime, batches, goals, unread messages, orphans), `test_subagent_resume_process.py` (real
-  processes, real SIGKILL mid-tool and mid-model-call, two recovering processes, a fatal call).
+  call — one run through the step cuts, an overflow summary and the grace call, one over a small
+  window through a microcompact, a threshold summary and a 413 that names the provider's ceiling;
+  each record kind, refusals, version 1, privacy, size cap), `test_subagent_resume.py` (each crash
+  point rebuilt from a reference run's checkpoint and recovered in a fresh manager: no call runs
+  twice, exact provider list, one notice; a crash just before and just after a `compacted` record;
+  suspend, two processes, version skew both ways, crash loop, long downtime, batches, goals, unread
+  messages, orphans), `test_subagent_resume_process.py` (real processes, real SIGKILL mid-tool and
+  mid-model-call, two recovering processes, a fatal call).
 * Live model: `tests/test_agent_behavior_real.py` (`-m real_llm`, `FLOWLY_EVAL_CONFIG`,
   `FLOWLY_EVAL_ONLY=a,b`). Checks what the agent *did*: explanations answered without tools,
   "don't search" respected, a detailed single task done itself, explicit delegation starts

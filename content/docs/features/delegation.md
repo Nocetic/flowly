@@ -43,6 +43,12 @@ The agent can message its running subagents at any time with `agent_message` —
 - Stopping the conversation's turn stops the agent, not its subagents — they usually outlive the turn that started them. Stop a subagent on its own from its sidebar or the menu bar, or ask the agent ("stop them all").
 - If one subagent is slow, the others don't wait for it forever: five minutes after the first of them finished, the results so far reach the agent, which hears which ones are still working; theirs follow when they finish. A subagent you stopped is mentioned, not waited for.
 
+### Long runs
+
+A subagent manages its context the way the agent does, measured against the context window of the model it runs on — so a long run, or a run on a model with a small window, keeps working instead of failing when its history outgrows the window. As the history nears the limit, old tool output is shortened first. If that is not enough, the work so far is summarized and the subagent carries on from the summary; its brief is always kept exactly as the agent wrote it. If the model's provider still rejects a request as too large, Flowly shrinks it further and sends it once more, and remembers that provider's real limit for that model, for the agent and every subagent.
+
+A summary is a model call: its tokens count toward the subagent's total. While it is being made, the subagent shows as compacting, and its transcript marks the point where its history was summarized, with how much smaller it became. A summary made before a restart is kept with the subagent's working record and is never made again.
+
 ### When Flowly restarts
 
 Subagents carry on after Flowly restarts — whether you quit it, it updated, or it crashed. A subagent keeps a private working record while it runs, and when Flowly starts again it picks up from its last finished step, with everything it had done so far. Its result reaches the conversation as usual, and a goal waiting on it keeps waiting. Its token count carries on from where it was, and its running time leaves out the time Flowly was closed.
