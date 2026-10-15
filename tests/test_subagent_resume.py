@@ -781,3 +781,50 @@ def test_the_wire_view_leaves_the_downtime_out_of_the_duration():
     view = run_view(record)
     assert view["duration"] == pytest.approx(400, abs=1)
     assert view["resumedAt"] == record.resumed_at and view["suspendedSeconds"] == 3600.0
+
+
+@pytest.mark.asyncio
+async def test_after_a_restart_the_continued_runs_report_is_handled_and_delivered_once(
+    tmp_path, monkeypatch, side_effects,
+):
+    """With the agent loop: the continued run reports, the report turn is saved, a goal goes on."""
+    from flowly.agent.loop import AgentLoop
+    from flowly.agent.subagent import SUBAGENT_REPORTS_KEY
+    from flowly.config.schema import Config
+
+    (tmp_path / "notes.txt").write_text("notes")
+    full, reference = await _reference(tmp_path, monkeypatch, _three_calls(tmp_path))
+    side_effects.write_text("")
+
+    class _Both(_Scripted):
+        async def chat(self, **kwargs: Any) -> LLMResponse:
+            if str(kwargs["messages"][0].get("content", "")).startswith("# Subagent"):
+                return await super().chat(**kwargs)
+            return LLMResponse(content="The report is ready.")
+
+    bus = MessageBus()
+    loop = AgentLoop(bus=bus, provider=_Both(), workspace=tmp_path, main_config=Config(),
+                     max_iterations=5, soft_warn_at_iteration=0)
+    try:
+        home = Path(loop.subagents.registry._path).parent
+        _crash_state(home, reference, _upto(full, "tool_start", "c2"))
+        loop.subagents.resume_enabled = True
+        loop.subagents.resume_pending()
+        assert loop.subagents.pending_for_goal(CHAT) == [reference.display_name]
+        notice = await asyncio.wait_for(bus.consume_inbound(), 3)
+        assert "continued after a restart" in notice.content
+        await loop._process_system_message(notice)
+        record = loop.subagents.registry.get(reference.run_id)
+        assert record.delivery_state == "delivered"
+        assert reference.run_id in loop.sessions.read(CHAT).metadata[SUBAGENT_REPORTS_KEY]
+        assert loop.subagents.pending_for_goal(CHAT) == []
+        assert side_effects.read_text() == ""
+        # A later start finds nothing to repeat.
+        subagent_owner.forget_instance(loop.subagents._instance)
+        again = MessageBus()
+        later = _manager(home, tmp_path, _Scripted(), again)
+        later.committed_reports = loop._committed_subagent_reports
+        later.resume_pending()
+        assert await _notices(again) == []
+    finally:
+        loop.stop()

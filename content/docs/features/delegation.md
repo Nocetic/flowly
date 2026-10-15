@@ -47,7 +47,7 @@ The agent can message its running subagents at any time with `agent_message` —
 
 Subagents carry on after Flowly restarts — whether you quit it, it updated, or it crashed. A subagent keeps a private working record while it runs, and when Flowly starts again it picks up from its last finished step, with everything it had done so far. Its result reaches the conversation as usual, and a goal waiting on it keeps waiting. Its token count carries on from where it was, and its running time leaves out the time Flowly was closed.
 
-A step that was in progress at that moment is never repeated on its own: the subagent is told plainly what may have happened — for example that a command it started may have finished, been cut off or still be running — so it checks before doing anything again. A step that had not started yet is simply reported as not run.
+Flowly never repeats a step that was in progress at that moment. Instead the subagent is told plainly what may have happened — for example that a command it started may have finished, been cut off or still be running — so it checks before doing anything again. A step that had not started yet is reported to it as not run.
 
 There are limits. A subagent is continued only within a day of Flowly stopping; after a longer break, or if Flowly keeps restarting without it getting any further (three times), or after an update that cannot read its saved work, it stops where it was and the conversation is told once. The working record is deleted as soon as the subagent finishes. Background bookkeeping, and subagents started from a terminal session (`flowly agent`), are not continued.
 
