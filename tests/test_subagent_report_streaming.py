@@ -600,3 +600,59 @@ async def test_over_a_real_gateway_socket_a_client_that_opened_the_chat_sees_the
         assert final["data"]["message"]["content"][0]["text"] == "It was 2021."
     finally:
         agent.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_report_turn_that_fails_gives_back_what_it_took_and_ends_its_run(tmp_path, monkeypatch):
+    """release_taken still runs for a live report: a turn that ends unsaved
+    gives back the results it took, nothing is delivered, and the client
+    gets the run's one terminal (an error) instead of a stuck stream."""
+    provider = _Provider()
+    agent = _agent(tmp_path, provider)
+    server = _gateway(agent)
+    ws = _FakeWS()
+    server._session_ws[CHAT] = ws
+    released: list[tuple] = []
+    real_release = agent.subagents.release_taken
+    monkeypatch.setattr(agent.subagents, "release_taken",
+                        lambda *args: (released.append(args), real_release(*args)))
+
+    async def broken(**_kwargs):
+        raise RuntimeError("provider exploded")
+
+    monkeypatch.setattr(agent, "_run_llm_tool_loop", broken)
+    try:
+        child = await _spawn(agent)
+        await _until(lambda: _finals(ws))
+        started, terminal = _chat(ws)[0], _finals(ws)[0]
+        assert started["state"] == "run_started"
+        assert terminal["state"] == "error" and terminal["runId"] == started["runId"]
+        assert terminal["turnOrigin"] == REPORT_TURN_ORIGIN
+        assert server.chat_commands.lookup(CHAT, started["runId"])["status"] == "error"
+        assert released and released[0][0] == CHAT
+        assert agent.subagents.registry.get(child).delivery_state == "queued"
+        session = agent.sessions.get_or_create(CHAT)
+        assert child not in (session.metadata.get(SUBAGENT_REPORTS_KEY) or [])
+    finally:
+        agent.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_live_report_does_not_hold_up_another_conversation(tmp_path):
+    provider = _Provider()
+    provider.hold = asyncio.Event()
+    agent = _agent(tmp_path, provider)
+    server = _gateway(agent)
+    ws = _FakeWS()
+    server._session_ws[CHAT] = ws
+    try:
+        await _spawn(agent)
+        await _until(lambda: provider.main_calls >= 2)  # the report is parked mid-turn
+        other = _Provider(session_key="desktop:other")
+        agent.provider = other
+        reply = await asyncio.wait_for(agent.process_direct("hello", session_key="desktop:other"), 5)
+        assert reply == "It was 2021."  # answered while the report still runs
+        assert not _finals(ws)
+    finally:
+        provider.hold.set()
+        agent.stop()
