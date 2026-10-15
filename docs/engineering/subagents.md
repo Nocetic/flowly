@@ -176,7 +176,9 @@ save** as the turn, and only then `mark_delivered` (`pending | queued | taken �
   it.
 * A task cancelled before its first step has no handler of its own; the spawn task's done
   callback (`_cleanup`) finishes the record, records its metric and runs `_announce` so siblings
-  holding for it are released.
+  holding for it are released — unless a shutdown suspended it (§11).
+* `cancel` also ends a run still marked running that no live process works on (a restart left it
+  to a process that does not continue runs).
 * The owner's chat Stop stops the main agent's turn only, as in Codex: subagents keep running
   (they usually outlive the turn that started them). Each subagent is stopped on its own (its
   sidebar / notch "Stop", or by asking the agent).
@@ -261,26 +263,88 @@ downtime holds the goal while its report turn runs.
 
 ## 11. Restart
 
-**Shutdown.** The gateway calls `subagents.shutdown()` first — right when the signal arrives and
-again (a no-op) at the top of its cleanup — before MCP, cron, the gateway server and channels
-close: Desktop kills a foreground gateway 3 s after SIGTERM (`flowlyai-service.ts`) and a named
-agent's runtime 5 s after (`profile-runtime-supervisor.ts`), so subagents cannot wait for the rest
-to close first. `shutdown` refuses new spawns, cancels running children and waits up to 1.5 s
-for their handlers.
+Design: `output/research/subagent-resume-2026-10-15/RAPOR.md` (phases 1–3 are built; deviations
+are noted below).
 
-**Startup** (`resume_pending`, from `AgentLoop.run()`):
+**Shutdown suspends.** The gateway calls `subagents.shutdown()` first — right when the signal
+arrives and again (a no-op) at the top of its cleanup — before MCP, cron, the gateway server and
+channels close: Desktop kills a foreground gateway 3 s after SIGTERM (`flowlyai-service.ts`) and a
+named agent's runtime 5 s after (`profile-runtime-supervisor.ts`), so subagents cannot wait for
+the rest to close first. `stop_all` (also from `AgentLoop.stop()`) refuses new spawns; a
+`resumable` run gets `suspended_at` and `activity {"phase": "suspended", "reason"}` in the
+registry *before* its task is cancelled, and its handler writes `suspended` to the checkpoint and
+re-raises — no `finish`, no notice, no metric; the done callback leaves it too. It stays
+`running`, as Desktop requires (a finished run never comes back to running). Any other run is
+interrupted as before — except one a conversation waits for in a process that continues runs but
+whose checkpoint could not be kept: it ends `interrupted` / `shutdown` with its delivery still
+pending, so the next start tells the conversation (`_finish_cancelled`). `shutdown` then waits up
+to 1.5 s for the handlers. A SIGKILL in between
+is the crash path below, with the same result.
 
-1. Finished runs whose result no saved turn handled (`pending`, `queued`, `taken`), kind
-   `subagent`, owner gone: taken over (`claim`); if the session's `subagentReports` has the run it
-   is recorded delivered; otherwise, if it ended within **24 h** and was announced again fewer
-   than 3 times (`reannounced`), its `announced` flag is reset (so its batch can claim it) and it
-   is announced again — the notice says *"It finished <age> ago, before Flowly restarted; this
-   result reaches you only now."* Older ones become `undelivered`. The count stops a result whose
-   report turn keeps taking the process down from being announced at every start. (The window was
-   one hour: results from before a night with Flowly closed were silently dropped.) Delegated
+**Startup** (`resume_pending`, from `AgentLoop.run()`, before goals resume). Only runs whose owner
+is provably gone are touched, each taken over with `claim` (§8); a process with `resume_enabled`
+off (the CLI) leaves resumable runs to the gateway.
+
+1. A run still marked running is **continued** when it is `resumable`, its checkpoint is readable
+   and of this format, its last sign of life (`suspended_at`, else `updated_at`) is within
+   **24 h**, and it was continued fewer than **3** times in a row without finishing a step
+   (`resume_count`). It is claimed with `resume_count + 1`, `suspended_seconds +=` the downtime,
+   `resumed_at`, `activity {"phase": "resuming"}`; `_resume` then:
+   * answers every call of its last reply that has no result — **never running one again**: a
+     call with no `tool_start` gets *"Not run: Flowly restarted before this call started. Nothing
+     was done; call it again if you still need it."*; one that started gets a factual note for its
+     kind (`interrupted_result`, by `tool_class` recorded at `tool_start`): read (changed nothing),
+     write (the file may be complete, partial or unchanged — read it), exec (*may have finished,
+     been cut off, or still be running — check its effects*; after a clean shutdown: *was stopped
+     when Flowly shut down*), agent_message (may not have reached the main agent; a reply arrives
+     as a message), anything else (may or may not have taken effect — check before doing it
+     again). These go to the checkpoint, the messages and the transcript (`tool` items with
+     `status: interrupted | not_run`); the trace's running steps become `interrupted`. They are
+     not shown to the repetition guard.
+   * gives back the main agent's messages it had not read;
+   * writes `resumed {after: "shutdown" | "crash", attempt, interrupted, notRun}` to the checkpoint
+     and `{kind: "resumed", at, attempt, after}` to the transcript;
+   * starts `_run_subagent(restored=state)`: `started_at` is kept, tokens keep adding to `usage`.
+     The loop continues where the checkpoint stopped: a step whose model call never answered is
+     redone with the same iteration number; a summary call asked for is redone; a result already
+     recorded in the checkpoint (`final`) is recorded and announced without any model call.
+   A finished real tool call afterwards sets `resume_count` back to 0, so the bound counts
+   restarts with no progress (a call that takes the process down every time ends after three
+   continues); the iteration limit bounds the rest.
+2. Past the bounds the run ends as **interrupted** and its conversation is told once (`finish(…,
+   report=True)` keeps its delivery pending): `suspended_too_long` (*"Flowly was not running for
+   <age> while this task ran, longer than a subagent is continued after a restart (24 h)…"*),
+   `resume_failed` (*"Flowly restarted N times while this task ran without it finishing another
+   step…"*), `resume_unsupported` for a checkpoint of another format (*"Flowly was updated while
+   this task ran, and this version cannot continue work saved by the other one…"*). Each says
+   nothing it had started was run again.
+3. A run with no checkpoint (from before checkpoints, not resumable, or stopped before its first
+   step) is finished as `error` (`process_restarted`) and announced, as before. No migration.
+4. Finished runs whose result no saved turn handled (`pending`, `queued`, `taken`), kind
+   `subagent`: recorded delivered if the session's `subagentReports` has them; otherwise, if
+   they ended within **24 h** and were announced again fewer than 3 times (`reannounced`; a result
+   only held for its batch does not count), their `announced` flag is reset (so their batch can
+   claim them) and they are announced again — the notice says *"It finished <age> ago, before
+   Flowly restarted; this result reaches you only now."* Older ones become `undelivered`. (The
+   window was one hour: results from before a night with Flowly closed were dropped.) Delegated
    tasks report through their own message and are never announced again here.
-2. Runs still marked running whose owner is gone are taken over and finished as `error`
-   (`process_restarted`), their metric recorded and announced.
+5. **Batches.** A held result whose batch has a continued sibling is held again: `_announce` sees
+   the sibling running. The hold timer is rebuilt from the registry with an absolute deadline —
+   300 s after the first held result ended, and for a result held before the restart at least
+   120 s from now (`_RESUMED_BATCH_HOLD_SECONDS`), so the continued sibling gets a moment.
+6. **Goals.** A continued run is running (`ended_at` unset), so a goal parked on it keeps waiting
+   (`pending_for_goal`); it ends and is reported as usual, or past the bounds is reported as
+   interrupted, and the barrier opens once that report's turn is saved.
+
+The notice of a continued run says *"(runtime: Ns, continued after a restart)"*; runtime, the
+wire `duration` and the metric's `durationS` leave the downtime (`suspended_seconds`) out.
+`cancel` also ends a run still marked running that no live process works on.
+
+Deviations from the design report: no `subagentResume` setting (`auto | ask | off`) and no
+`subagents.resume` RPC yet (phase 4); resumed runs are not queued behind the 8-run limit (a
+gateway left at most 8); the boot id joins pid and process identity in the owner; the crash-loop
+count resets on a finished tool call rather than on the next model reply (a model that calls the
+fatal tool again would otherwise loop forever).
 
 ## 12. Events and RPCs
 
@@ -288,7 +352,11 @@ for their handlers.
   `subagent.progress` (activity, tool steps, tokens), `subagent.completed`. Wire shape is
   `run_view` (schemaVersion 2): ids, label, status, timing, origin, mark, `usage`
   (`inputTokens`, `outputTokens`, `cacheReadTokens`, `totalTokens`), tools used,
-  `childSessionKey`, delivery state.
+  `childSessionKey`, delivery state (`taken` included), `resumedAt` (when it last continued after
+  a restart, else null) and `suspendedSeconds` (downtime left out of `duration`). `activity.phase`
+  adds `suspended` (stopped by a shutdown to continue later) and `resuming` (claimed by a starting
+  process, before its next step). Transcript items add `{kind: "resumed", at, attempt, after}`
+  and `tool` items with `status: interrupted | not_run`.
 * RPCs: `subagents.list`, `.get`, `.result`, `.transcript {runId, after, limit}` →
   `{task, items, nextSeq, more, done}`, `.cancel {runId}`, `.stats {days, includeSystem}`,
   `.spawn` (manual, origin owner).
@@ -313,6 +381,13 @@ metrics outlive the 30-day run pruning. `subagents.stats` returns, for the last 
   `test_repetition_guard.py`, `test_subagent_hardening.py`, `test_subagent_conversation_key.py`,
   `test_subagent_transcript.py`, `test_subagent_messaging.py`, `test_subagent_safety.py`,
   `test_subagent_profile_transport.py`.
+* Restarts: `test_subagent_restart.py` (torn lines, owners and claims, the delivery commit point,
+  long downtime, shutdown order), `test_subagent_checkpoint.py` (the golden replay at every model
+  call, each record kind, refusals, privacy, size cap), `test_subagent_resume.py` (each crash point
+  rebuilt from a reference run's checkpoint and recovered in a fresh manager: no call runs twice,
+  exact provider list, one notice; suspend, two processes, version skew, crash loop, long
+  downtime, batches, goals, unread messages, orphans), `test_subagent_resume_process.py` (real
+  processes, real SIGKILL mid-tool and mid-model-call, two recovering processes, a fatal call).
 * Live model: `tests/test_agent_behavior_real.py` (`-m real_llm`, `FLOWLY_EVAL_CONFIG`,
   `FLOWLY_EVAL_ONLY=a,b`). Checks what the agent *did*: explanations answered without tools,
   "don't search" respected, a detailed single task done itself, explicit delegation starts
@@ -333,7 +408,11 @@ adopt this branch.
 
 ## 16. Open items
 
-* Work running when the gateway restarts is lost (finished as `process_restarted`). Resuming it
-  is the last task of this round (design: `output/research/subagent-resume-2026-10-15/`).
+* Restarts, phase 4: an `ask` / `off` setting, a `subagents.resume` RPC, and continuing a run
+  without a checkpoint from its transcript; Desktop's "resuming…" pill, the `resumed` divider and
+  an offline state.
+* The main agent's own turn is not continued after a restart (a report turn that crashed is
+  processed again, so its own side effects may repeat — design report §4.2 D2). A child's message
+  to the main agent that was not yet handled is lost in a crash.
 * Relay-connected clients and subagent events: see the round-3 research
   (`output/research/agents-v2-round3-2026-10-15/`).

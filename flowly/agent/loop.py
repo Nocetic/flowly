@@ -4294,12 +4294,10 @@ class AgentLoop:
     def stop(self) -> None:
         """Stop the agent loop.
 
-        Cascades to subagents so the gateway shutdown doesn't leave
-        background tasks running (which would end up in the registry
-        as ``ended_at=None`` and surface on the next boot as spurious
-        "Process restarted before task completed" errors). Each
-        subagent task catches CancelledError and records an
-        "interrupted" outcome gracefully — see ``_run_subagent``.
+        Cascades to subagents so the shutdown doesn't leave background
+        tasks running. A run the next start continues is suspended (it
+        stays running in the registry); any other records an
+        "interrupted" outcome — see ``SubagentManager.stop_all``.
         """
         self._running = False
         goal_runtime = getattr(self, "goal_runtime", None)
@@ -4316,11 +4314,13 @@ class AgentLoop:
                 logger.exception("AgentLoop.stop: goal process unsubscribe failed")
             self._goal_process_unsubscribe = None
         try:
-            cancelled = self.subagents.cancel_all()
+            # Runs a restart continues are suspended, the rest interrupted
+            # (SubagentManager.stop_all); the gateway already did this first.
+            cancelled = self.subagents.stop_all()
             if cancelled:
-                logger.info(f"Agent loop: cancelled {cancelled} subagent(s) on stop()")
+                logger.info(f"Agent loop: stopped {cancelled} subagent(s) on stop()")
         except Exception:
-            logger.exception("AgentLoop.stop: subagent cancel_all failed")
+            logger.exception("AgentLoop.stop: stopping subagents failed")
 
         semantic_router = getattr(self, "_semantic_tool_router", None)
         unsubscribe = getattr(self, "_semantic_registry_unsubscribe", None)

@@ -879,6 +879,9 @@ def gateway(
         state_dir=get_data_dir(),
         main_config=config,
     )
+    # The gateway continues subagents a restart stopped (their checkpoints
+    # and suspend-on-shutdown); a CLI session leaves them to it.
+    agent.subagents.resume_enabled = True
 
     # Multi-agent setup (if agents are configured in config.json)
     multi_agents = config.agents.agents

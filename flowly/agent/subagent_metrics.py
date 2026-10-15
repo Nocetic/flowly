@@ -43,7 +43,8 @@ def metric_line(record: SubagentRunRecord) -> dict[str, Any]:
         "runId": record.run_id,
         "endedAt": round(ended, 3),
         "createdAt": round(record.created_at, 3),
-        "durationS": round(max(0.0, ended - started), 3),
+        # Time it worked: a downtime it was continued across is left out.
+        "durationS": round(max(0.0, ended - started - (record.suspended_seconds or 0.0)), 3),
         "origin": record.origin,
         "kind": record.kind,
         "model": record.model,

@@ -58,7 +58,9 @@ def run_view(record: SubagentRunRecord, *, detail: bool = False) -> dict[str, An
     duration = None
     if record.started_at is not None:
         end = record.ended_at if record.ended_at is not None else time.time()
-        duration = round(max(0, end - record.started_at), 1)
+        # Time it worked: the downtime of a restart it continued across is
+        # left out.
+        duration = round(max(0, end - record.started_at - (record.suspended_seconds or 0.0)), 1)
     view = {
         "schemaVersion": 2, "runId": record.run_id, "shortId": record.run_id[:8],
         "label": record.display_name or record.label, "task": record.task,
@@ -84,6 +86,10 @@ def run_view(record: SubagentRunRecord, *, detail: bool = False) -> dict[str, An
             "totalTokens": int(record.usage.get("total", 0)),
         },
         "childSessionKey": record.child_session_key,
+        # Continued after a restart: when it last continued (None if it
+        # never was) and the downtime left out of ``duration``.
+        "resumedAt": record.resumed_at,
+        "suspendedSeconds": round(record.suspended_seconds or 0.0, 1),
     }
     if detail:
         view["toolTrace"] = deepcopy(record.tool_trace)

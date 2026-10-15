@@ -193,8 +193,10 @@ class OpenCall:
 
     id: str
     name: str            # as the model called it (the protocol name)
+    arguments: dict[str, Any] = field(default_factory=dict)
     started: bool = False
     effective: str = ""  # the tool that ran (tool_call resolves to another)
+    kind: str = ""       # tool_class() of what ran, as recorded when it started
     # A clean shutdown was recorded after it started (exec's process group
     # was stopped then); otherwise the process died under it.
     stopped: bool = False
@@ -233,6 +235,68 @@ class ResumeRefusal:
 
     reason: str   # "missing" | "version" | "corrupt"
     detail: str = ""
+
+
+def _arguments(raw: Any) -> dict[str, Any]:
+    try:
+        value = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+NOT_RUN_TEXT = (
+    "Not run: Flowly restarted before this call started. Nothing was done; "
+    "call it again if you still need it."
+)
+
+
+def interrupted_result(call: OpenCall) -> tuple[str, str]:
+    """(status, text) answering a call a restart left without a result.
+
+    The call is never run again. The text says what that kind of call may
+    have left behind, so the model can check before relying on it.
+    """
+    if not call.started:
+        return "not_run", NOT_RUN_TEXT
+    kind = call.kind or tool_class(call.effective or call.name, call.arguments)
+    if kind == "read":
+        text = (
+            "Interrupted: Flowly restarted while this was running and its result was lost. "
+            "It changes nothing; call it again if you still need it."
+        )
+    elif kind == "write":
+        path = str(call.arguments.get("path") or "the file")
+        text = (
+            f"Interrupted: Flowly restarted while this was writing {path}. The file may be "
+            "complete, partial or unchanged; read it before relying on it."
+        )
+    elif kind == "exec":
+        if call.stopped:
+            text = (
+                "Interrupted: this command was started before Flowly restarted and was stopped "
+                "when Flowly shut down. It may have finished or been cut off part-way; check its "
+                "effects (files, processes) before relying on it or running it again."
+            )
+        else:
+            text = (
+                "Interrupted: this command was started before Flowly restarted. It may have "
+                "finished, been cut off, or still be running (it runs in its own session); check "
+                "its effects (files, processes) before relying on it or running it again."
+            )
+    elif kind == "message":
+        text = (
+            "Interrupted: Flowly restarted while this ran. Your message may not have reached "
+            "the main agent, and no reply reached this call; a reply that arrives reaches you "
+            "as a message from the main agent."
+        )
+    else:
+        text = (
+            "Interrupted: Flowly restarted while this was running. It may or may not have taken "
+            "effect; check the current state before doing it again, since doing it twice may "
+            "duplicate it."
+        )
+    return "interrupted", text
 
 
 def main_agent_note(text: str) -> dict[str, Any]:
@@ -327,7 +391,10 @@ def restore_child_state(
                 state.messages.append(message)
                 state.awaiting_model = False
                 calls = {
-                    str(call["id"]): OpenCall(id=str(call["id"]), name=str(call["function"]["name"]))
+                    str(call["id"]): OpenCall(
+                        id=str(call["id"]), name=str(call["function"]["name"]),
+                        arguments=_arguments(call["function"].get("arguments")),
+                    )
                     for call in message.get("tool_calls") or []
                 }
             elif kind == "text":
@@ -342,6 +409,7 @@ def restore_child_state(
                 if call is not None:
                     call.started = True
                     call.effective = str(record.get("name") or call.name)
+                    call.kind = str(record.get("toolClass") or tool_class(call.effective, call.arguments))
                 if record.get("name") == "artifact":
                     state.model_used_artifact = True
             elif kind == "tool":

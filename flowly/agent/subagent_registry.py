@@ -120,6 +120,13 @@ class SubagentRunRecord:
     # owner/agent runs of a gateway that report back; cleared if its
     # checkpoint cannot be kept.
     resumable: bool = False
+    # Restarts it was continued across with no step finished since (a
+    # crash loop is bounded by it), when a clean shutdown suspended it, the
+    # downtime left out of its duration, and when it last continued.
+    resume_count: int = 0
+    suspended_at: float | None = None
+    suspended_seconds: float = 0.0
+    resumed_at: float | None = None
 
 
 
@@ -186,7 +193,7 @@ class SubagentRegistry:
                 raise ValueError("invalid run text")
         if not record.run_id or record.created_at is None:
             raise ValueError("missing run identity")
-        for name in ("created_at", "started_at", "ended_at", "updated_at"):
+        for name in ("created_at", "started_at", "ended_at", "updated_at", "suspended_at", "resumed_at"):
             value = getattr(record, name)
             if value is not None and (type(value) not in (int, float) or not math.isfinite(value)):
                 raise ValueError("invalid run timestamp")
@@ -224,6 +231,11 @@ class SubagentRegistry:
             raise ValueError("invalid run counters")
         if type(record.resumable) is not bool:
             raise ValueError("invalid run flags")
+        if type(record.resume_count) is not int or record.resume_count < 0:
+            raise ValueError("invalid run counters")
+        if (type(record.suspended_seconds) not in (int, float) or not math.isfinite(record.suspended_seconds)
+                or record.suspended_seconds < 0):
+            raise ValueError("invalid run downtime")
         return record
 
     def _read_locked(self) -> None:
@@ -457,7 +469,11 @@ class SubagentRegistry:
                 raise
 
     def finish(self, run_id: str, outcome: str, *, result: str = "",
-               error: str | None = None, error_code: str | None = None) -> None:
+               error: str | None = None, error_code: str | None = None,
+               report: bool = False) -> None:
+        """Record a run's end. A cancelled or interrupted run needs no
+        delivery — unless ``report``: a run a restart could not continue is
+        interrupted, and its conversation must hear so once."""
         with self._lock:
             self._read_locked()
             record = self._runs.get(run_id)
@@ -468,7 +484,10 @@ class SubagentRegistry:
             self.update(run_id, ended_at=time.time(), outcome=outcome, error=error,
                         error_code=error_code, result_preview=result[:1200],
                         result_chars=len(result), result_available=bool(result),
-                        delivery_state="not_required" if outcome in ("cancelled", "interrupted") else record.delivery_state)
+                        delivery_state=(
+                            "not_required" if outcome in ("cancelled", "interrupted") and not report
+                            else record.delivery_state
+                        ))
 
     def claim(self, run_id: str, owner: dict[str, Any], expected_owner: dict[str, Any],
               **changes: Any) -> SubagentRunRecord | None:

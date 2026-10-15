@@ -32,8 +32,12 @@ from flowly.agent import subagent_owner
 from flowly.agent.subagent_checkpoint import (
     ChildState,
     GRACE_PROMPT,
+    ResumeRefusal,
     SubagentCheckpoint,
     apply_step,
+    interrupted_result,
+    read_checkpoint,
+    restore_child_state,
     tool_class,
 )
 from flowly.agent.delegation import MAX_CHILDREN_PER_CONVERSATION, assign_mark
@@ -127,6 +131,14 @@ _REANNOUNCE_WITHIN_SECONDS = 86_400
 # …and at most this many times: a result whose report turn keeps taking the
 # process down is not announced at every start forever.
 _MAX_REANNOUNCE = 3
+# A run a restart stopped is continued if its last sign of life is this
+# recent, and at most this many restarts in a row without it finishing a
+# step since (a call that takes the process down every time ends there).
+_RESUME_WITHIN_SECONDS = 86_400
+_MAX_RESUMES = 3
+# A result held for its batch before a restart waits at least this long for
+# the siblings that continue, then is delivered anyway.
+_RESUMED_BATCH_HOLD_SECONDS = 120
 # The conversation's record of the subagent results its saved turns handled:
 # session.metadata[SUBAGENT_REPORTS_KEY], newest last, written in the same
 # save as the turn. This is the delivery commit point.
@@ -438,6 +450,9 @@ class SubagentManager:
         # session's SUBAGENT_REPORTS_KEY). AgentLoop sets it; None = unknown.
         self.committed_reports: Callable[[str], set[str]] | None = None
         self._shutting_down = False
+        # Set by a clean shutdown: resumable runs are suspended, not ended.
+        self._suspending = False
+        self._suspend_reason = "shutdown"
         # Whether this process continues its runs after a restart. The
         # gateway turns it on; a CLI session has nobody to continue them.
         self.resume_enabled = False
@@ -621,9 +636,12 @@ class SubagentManager:
             if recent and record.reannounced < _MAX_REANNOUNCE and record.outcome != "cancelled":
                 # Announced before the restart but never handled: it must be
                 # claimable again by its batch's notice.
+                # A result held for its batch was never announced: holding it
+                # again across restarts does not count against it.
+                told = record.announced or record.delivery_state != "pending"
                 self._registry.update(
                     record.run_id, announced=False, delivery_state="pending",
-                    reannounced=record.reannounced + 1,
+                    reannounced=record.reannounced + int(told),
                 )
                 self._spawn_announce(record.run_id, self._stored_result(record), record.outcome or "unknown")
             else:
@@ -639,14 +657,26 @@ class SubagentManager:
         return records
 
     def resume_pending(self) -> None:
-        """Called on startup: settle what a stopped process left unfinished.
+        """Called on startup: continue or settle what a stopped process left.
 
         Only runs whose owner is provably gone are touched (subagent_owner):
-        a live gateway's runs are never settled from another process. Runs
-        that were still going are marked failed and announced. Runs that had
-        finished but whose result no saved turn handled are announced again
-        (with their age) when they ended within a day, and otherwise
-        recorded as undelivered so nothing waits on them.
+        a live process's runs are never settled from another one, and of two
+        processes recovering one home only one takes each run (registry
+        claim).
+
+        A run that was still going is continued from its checkpoint
+        (_resume) when it can be: resumable, its checkpoint readable and of
+        this format, its last sign of life within _RESUME_WITHIN_SECONDS and
+        fewer than _MAX_RESUMES restarts in a row without a finished step.
+        Past those bounds it ends as interrupted and its conversation is
+        told once; a run with no checkpoint (from before checkpoints, or not
+        resumable) is finished as failed and announced, as before. A
+        process that does not continue runs (resume_enabled off: the CLI)
+        leaves resumable runs to the gateway.
+
+        Finished results no saved turn handled are announced again (with
+        their age) when they ended within a day; a result held for its
+        batch waits again for siblings that continue.
         """
         try:
             records = self._registry.all()
@@ -654,24 +684,151 @@ class SubagentManager:
             logger.exception("Subagent history recovery unavailable")
             return
         owners: dict[str, str] = {}
+        now = time.time()
+        continued: list[tuple[SubagentRunRecord, ChildState]] = []
+        settled: list[tuple[SubagentRunRecord, str, str | None, str | None]] = []
+        for record in records:
+            if record.ended_at is not None or record.run_id in self._running_tasks:
+                continue
+            if record.resumable and not self.resume_enabled:
+                continue  # a gateway on this home continues it
+            # Its last sign of life, read before the claim updates it.
+            last_seen = record.suspended_at or record.updated_at or record.created_at
+            adopted = self._adopt(record, owners)
+            if adopted is None:
+                continue
+            state, refusal = self._restorable(adopted)
+            if state is not None and now - last_seen > _RESUME_WITHIN_SECONDS:
+                settled.append((adopted, "interrupted", "suspended_too_long", (
+                    f"Flowly was not running for {_age_text(now - last_seen)} while this task ran, "
+                    "longer than a subagent is continued after a restart (24 h). It was stopped "
+                    "where it was; nothing it had started was run again."
+                )))
+            elif state is not None and adopted.resume_count >= _MAX_RESUMES:
+                settled.append((adopted, "interrupted", "resume_failed", (
+                    f"Flowly restarted {adopted.resume_count} times while this task ran without it "
+                    "finishing another step, so it was stopped where it was; nothing it had "
+                    "started was run again."
+                )))
+            elif state is not None:
+                claimed = self._registry.claim(
+                    adopted.run_id, adopted.owner, adopted.owner,
+                    resume_count=adopted.resume_count + 1,
+                    suspended_seconds=adopted.suspended_seconds + max(0.0, now - last_seen),
+                    suspended_at=None, resumed_at=now, activity={"phase": "resuming"},
+                )
+                if claimed is not None:
+                    continued.append((claimed, state))
+            elif refusal == "version":
+                settled.append((adopted, "interrupted", "resume_unsupported", (
+                    "Flowly was updated while this task ran, and this version cannot continue "
+                    "work saved by the other one. It was stopped where it was; nothing it had "
+                    "started was run again."
+                )))
+            else:
+                settled.append((adopted, "error", "process_restarted", None))
         try:
             self._reconcile_undelivered(records, owners)
         except (OSError, ValueError):
             logger.exception("Subagent delivery recovery unavailable")
-        pending = [r for r in records if r.ended_at is None and r.run_id not in self._running_tasks]
-        adopted = [r for r in (self._adopt(r, owners) for r in pending) if r is not None]
-        if not adopted:
-            return
-        logger.warning(f"[SubagentManager] Found {len(adopted)} pending task(s) from previous run — marking as failed")
-        for record in adopted:
-            self._registry.finish(
-                record.run_id, "error", error_code="process_restarted",
-                error="Process restarted before task completed",
-            )
+        if settled:
+            logger.warning(f"[SubagentManager] Settling {len(settled)} task(s) a restart stopped")
+        for record, outcome, code, text in settled:
+            if text is None:
+                self._registry.finish(
+                    record.run_id, "error", error_code="process_restarted",
+                    error="Process restarted before task completed",
+                )
+            else:
+                self._registry.finish(record.run_id, outcome, error=text, error_code=code,
+                                      report=record.delivery_state != "not_required")
             self._record_metric(record.run_id)
             if record.delivery_state == "not_required":
                 continue
-            self._spawn_announce(record.run_id, "The process restarted before this task completed.", "error")
+            self._spawn_announce(
+                record.run_id, text or "The process restarted before this task completed.",
+                outcome,
+            )
+        for record, state in continued:
+            try:
+                self._resume(record, state)
+            except Exception:
+                logger.exception(f"[SubagentManager] [{record.run_id[:8]}] could not continue")
+                self._registry.finish(record.run_id, "error", error_code="process_restarted",
+                                      error="Process restarted before task completed")
+                self._record_metric(record.run_id)
+                self._spawn_announce(record.run_id, "The process restarted before this task completed.",
+                                     "error")
+
+    def _restorable(self, record: SubagentRunRecord) -> tuple[ChildState | None, str | None]:
+        """The state a run's checkpoint rebuilds, or why there is none."""
+        if not record.resumable:
+            return None, "not_resumable"
+        try:
+            records = read_checkpoint(self._registry.checkpoint_path(record.run_id))
+        except OSError:
+            logger.exception(f"[SubagentManager] [{record.run_id[:8]}] checkpoint unreadable")
+            return None, "unreadable"
+        restored = restore_child_state(
+            records, strip=_strip_subagent_tool_results,
+            trim=self._trim_for(record.model or self.model),
+            annotate=annotate_search_repetition,
+        )
+        if isinstance(restored, ResumeRefusal):
+            if restored.reason != "missing":
+                logger.warning(
+                    f"[SubagentManager] [{record.run_id[:8]}] checkpoint cannot be continued: "
+                    f"{restored.reason} {restored.detail}"
+                )
+            return None, restored.reason
+        return restored, None
+
+    def _resume(self, record: SubagentRunRecord, state: ChildState) -> None:
+        """Continue a run a restart stopped, from its rebuilt state.
+
+        Calls of its last reply that have no result are answered — never
+        run again: a call that had not started is "not run", one that had
+        started gets a factual note for its kind of tool (subagent_checkpoint
+        .interrupted_result). Messages from the main agent it had not read
+        are given back. The transcript gets those calls and a ``resumed``
+        item; the checkpoint a ``resumed`` line.
+        """
+        run_id = record.run_id
+        now = time.time()
+        after = "shutdown" if state.suspended else "crash"
+        self._checkpoints[run_id] = SubagentCheckpoint(self._registry.checkpoint_path(run_id))
+        interrupted: list[str] = []
+        not_run: list[str] = []
+        for call in state.open_calls:
+            status, text = interrupted_result(call)
+            (not_run if status == "not_run" else interrupted).append(call.id)
+            self._answer_tool(run_id, state, call.id, call.name, text, status=status)
+            self._transcribe(run_id, {
+                "kind": "tool", "toolCallId": call.id, "name": call.effective or call.name,
+                "status": status, "content": text,
+            })
+        if any(step.get("status") == "running" for step in record.tool_trace):
+            trace = [dict(step, status="interrupted") if step.get("status") == "running" else step
+                     for step in record.tool_trace]
+            self._registry.update(run_id, tool_trace=trace)
+        state.open_calls = []
+        attempt = record.resume_count
+        self._log(run_id, "resumed", durable=True, after=after, attempt=attempt,
+                  interrupted=interrupted, notRun=not_run)
+        self._transcribe(run_id, {"kind": "resumed", "at": now, "attempt": attempt, "after": after})
+        if state.unread_mail:
+            self._inboxes[run_id] = list(state.unread_mail)
+            self._inbox_events.setdefault(run_id, asyncio.Event()).set()
+        state.suspended = False
+        logger.info(
+            f"[SubagentManager] [{run_id[:8]}] continuing after a {after} (attempt {attempt}; "
+            f"{len(interrupted)} call(s) interrupted, {len(not_run)} not run)"
+        )
+        self._start_run_task(run_id, record.parent_session_key, self._run_subagent(
+            run_id, record.task, record.label, record.parent_channel, record.parent_chat_id,
+            record.model or self.model, None, restored=state,
+        ))
+        self._publish_event("subagent.progress", run_id)
 
     # ------------------------------------------------------------------
     # Public spawn
@@ -808,50 +965,11 @@ class SubagentManager:
         logger.info(f"[SubagentManager] Spawned [{run_id[:8]}]: {resolved_display}")
 
         await self._emit_event("subagent.started", run_id, resolved_display, "running")
-        bg_task = asyncio.create_task(
-            self._run_subagent(run_id, task, display_label, origin_channel, origin_chat_id,
-                               resolved_model, timeout_seconds,
-                               skip_announce=wait or silent, context=context)
-        )
-        self._running_tasks[run_id] = bg_task
-        self._children_by_parent.setdefault(parent_session_key, set()).add(run_id)
-
-        def _cleanup(_task: asyncio.Task, _rid: str = run_id, _pk: str = parent_session_key) -> None:
-            try:
-                # A task cancelled before its first instruction has no handler.
-                rec = self._registry.get(_rid)
-                if rec and rec.ended_at is None:
-                    outcome = self._cancel_outcomes.get(_rid, "interrupted") if _task.cancelled() else "error"
-                    self._registry.finish(_rid, outcome,
-                                          error_code="cancelled" if _task.cancelled() else "worker_failed",
-                                          error="Task interrupted" if _task.cancelled() else "Task could not finish")
-                    self._record_metric(_rid)
-                    self._publish_event("subagent.completed", _rid)
-                    ended = self._registry.get(_rid)
-                    # Its siblings may be holding their results for it, and a
-                    # failure is still news to the conversation.
-                    if ended and (ended.batch_id or ended.delivery_state in ("pending", "queued")):
-                        report = asyncio.ensure_future(self._announce(_rid, ended.error or "", outcome))
-                        report.add_done_callback(
-                            lambda t: t.exception() if not t.cancelled() and t.exception() else None
-                        )
-            except Exception:
-                logger.exception("Could not persist task cleanup")
-            finally:
-                if not _task.cancelled():
-                    _task.exception()
-                self._cancel_outcomes.pop(_rid, None)
-                self._running_tasks.pop(_rid, None)
-                self._inboxes.pop(_rid, None)
-                self._inbox_events.pop(_rid, None)
-                self._wake(_pk)
-                siblings = self._children_by_parent.get(_pk)
-                if siblings is not None:
-                    siblings.discard(_rid)
-                    if not siblings:
-                        self._children_by_parent.pop(_pk, None)
-
-        bg_task.add_done_callback(_cleanup)
+        bg_task = self._start_run_task(run_id, parent_session_key, self._run_subagent(
+            run_id, task, display_label, origin_channel, origin_chat_id,
+            resolved_model, timeout_seconds,
+            skip_announce=wait or silent, context=context,
+        ))
         if wait:
             return await bg_task
 
@@ -875,6 +993,82 @@ class SubagentManager:
     # ------------------------------------------------------------------
     # Internal execution (core loop preserved from original)
     # ------------------------------------------------------------------
+
+    def _start_run_task(self, run_id: str, parent_session_key: str, run: Any) -> asyncio.Task:
+        """Run a child (new or continued) as this process's task for ``run_id``."""
+        bg_task = asyncio.create_task(run)
+        self._running_tasks[run_id] = bg_task
+        self._children_by_parent.setdefault(parent_session_key, set()).add(run_id)
+
+        def _cleanup(_task: asyncio.Task, _rid: str = run_id, _pk: str = parent_session_key) -> None:
+            try:
+                # A task cancelled before its first instruction has no handler.
+                rec = self._registry.get(_rid)
+                if rec and rec.ended_at is None and not (_task.cancelled() and self._suspends(_rid)):
+                    outcome = self._cancel_outcomes.get(_rid, "interrupted") if _task.cancelled() else "error"
+                    if _task.cancelled():
+                        self._finish_cancelled(_rid, outcome)
+                    else:
+                        self._registry.finish(_rid, outcome, error_code="worker_failed",
+                                              error="Task could not finish")
+                    self._record_metric(_rid)
+                    self._publish_event("subagent.completed", _rid)
+                    ended = self._registry.get(_rid)
+                    # Its siblings may be holding their results for it, and a
+                    # failure is still news to the conversation.
+                    if ended and (ended.batch_id or ended.delivery_state in ("pending", "queued")):
+                        report = asyncio.ensure_future(self._announce(_rid, ended.error or "", outcome))
+                        report.add_done_callback(
+                            lambda t: t.exception() if not t.cancelled() and t.exception() else None
+                        )
+            except Exception:
+                logger.exception("Could not persist task cleanup")
+            finally:
+                if not _task.cancelled():
+                    _task.exception()
+                self._cancel_outcomes.pop(_rid, None)
+                self._running_tasks.pop(_rid, None)
+                self._inboxes.pop(_rid, None)
+                self._inbox_events.pop(_rid, None)
+                self._checkpoints.pop(_rid, None)
+                self._wake(_pk)
+                siblings = self._children_by_parent.get(_pk)
+                if siblings is not None:
+                    siblings.discard(_rid)
+                    if not siblings:
+                        self._children_by_parent.pop(_pk, None)
+
+        bg_task.add_done_callback(_cleanup)
+        return bg_task
+
+    def _finish_cancelled(self, run_id: str, outcome: str) -> None:
+        """Record a run stopped by a cancel, a cascade or a shutdown.
+
+        A run stopped on request needs no report. One a gateway's shutdown
+        interrupted although its conversation waits for it (its checkpoint
+        could not be kept, so it cannot be continued) is reported at the
+        next start instead of vanishing.
+        """
+        record = self._registry.get(run_id)
+        lost = (
+            outcome == "interrupted" and self._shutting_down and self.resume_enabled
+            and record is not None and record.origin != "system"
+            and record.delivery_state != "not_required"
+        )
+        if lost:
+            self._registry.finish(
+                run_id, outcome, error_code="shutdown", report=True,
+                error="Flowly shut down while this task ran, and it could not be continued.",
+            )
+        else:
+            self._registry.finish(run_id, outcome, error="Task interrupted", error_code="cancelled")
+
+    def _suspends(self, run_id: str) -> bool:
+        """True while a clean shutdown stops this run to continue it later."""
+        if not self._suspending:
+            return False
+        record = self._registry.get(run_id)
+        return record is not None and record.ended_at is None and record.resumable
 
     async def _run_subagent(
         self,
@@ -965,6 +1159,13 @@ class SubagentManager:
             status = "timeout"
 
         except asyncio.CancelledError:
+            if self._suspends(run_id):
+                # A clean shutdown: the run is stopped to be continued after
+                # the restart, not finished. Nothing is announced.
+                suspended = True
+                logger.info(f"[SubagentManager] [{run_id[:8]}] suspended for the restart")
+                self._log(run_id, "suspended", durable=True, reason=self._suspend_reason)
+                raise
             # Cancelled via cancel_children (parent interrupt cascade) or
             # cancel() (explicit user cancel). Persist the outcome and
             # announce to the parent so the user sees what happened —
@@ -972,7 +1173,7 @@ class SubagentManager:
             # cancelled and doesn't treat it as a "completed" future.
             logger.info(f"[SubagentManager] [{run_id[:8]}] cancelled")
             outcome = self._cancel_outcomes.get(run_id, "interrupted")
-            self._registry.finish(run_id, outcome, error="Task interrupted", error_code="cancelled")
+            self._finish_cancelled(run_id, outcome)
             self._transcribe(run_id, {"kind": "result", "status": outcome, "content": ""})
             if not skip_announce:
                 try:
@@ -1123,6 +1324,12 @@ class SubagentManager:
                 self._registry.update(run_id, resumable=False)
             except Exception:
                 logger.exception("Could not record that a run cannot be continued")
+
+    def _made_progress(self, run_id: str) -> None:
+        """A step finished after a restart: the crash-loop count starts over."""
+        record = self._registry.get(run_id)
+        if record is not None and record.resume_count:
+            self._registry.update(run_id, resume_count=0)
 
     def _drop_checkpoint(self, run_id: str) -> None:
         checkpoint = self._checkpoints.pop(run_id, None)
@@ -1476,6 +1683,7 @@ class SubagentManager:
                     self._answer_tool(run_id, state, tool_call.id, protocol_tool_name, result,
                                       status=_tool_status,
                                       guard={"tool": effective_tool_name, "repeated": repeated})
+                    self._made_progress(run_id)
                     self._transcribe(run_id, {
                         "kind": "tool",
                         "toolCallId": tool_call.id,
@@ -1994,7 +2202,11 @@ class SubagentManager:
         }.get(status, status)
         duration = ""
         if record.started_at and record.ended_at:
-            duration = f" (runtime: {int(record.ended_at - record.started_at)}s)"
+            # Time it worked: the downtime of a restart it continued across
+            # is left out.
+            runtime = int(max(0.0, record.ended_at - record.started_at - (record.suspended_seconds or 0.0)))
+            continued = ", continued after a restart" if record.resumed_at else ""
+            duration = f" (runtime: {runtime}s{continued})"
 
         # The parent gets enough of the result to act on, and the run id to
         # read the rest — never a preview it cannot get past.
@@ -2040,6 +2252,9 @@ class SubagentManager:
         if record.outcome == "timeout":
             return "(task timed out)"
         if record.outcome in ("cancelled", "interrupted"):
+            # A run a restart could not continue says why.
+            if record.error and record.error_code not in (None, "cancelled"):
+                return record.error
             return "(task was interrupted)"
         return record.error or record.result_preview or ""
 
@@ -2164,8 +2379,20 @@ class SubagentManager:
         if current is not None and not current.done():
             return
 
+        # _BATCH_HOLD_SECONDS after the first result was held. A result held
+        # before a restart gives the siblings that continued a fresh moment.
+        held_since = min(
+            (r.ended_at for r in self._registry.all()
+             if r.batch_id == record.batch_id and r.parent_session_key == record.parent_session_key
+             and r.ended_at is not None and not r.announced and r.delivery_state in ("pending", "queued")),
+            default=time.time(),
+        )
+        deadline = held_since + _BATCH_HOLD_SECONDS
+        if held_since < self._started_at:
+            deadline = max(deadline, time.time() + _RESUMED_BATCH_HOLD_SECONDS)
+
         async def flush_later() -> None:
-            await asyncio.sleep(_BATCH_HOLD_SECONDS)
+            await asyncio.sleep(max(0.0, deadline - time.time()))
             held = sorted(
                 (
                     r for r in self._registry.all()
@@ -2306,18 +2533,51 @@ Do not create, patch, install, or manage skills. Do not edit project files or ru
             logger.info(f"[SubagentManager] shutdown: cancelled {count} running subagent(s)")
         return count
 
-    async def shutdown(self, wait_seconds: float = 1.5) -> int:
+    def stop_all(self, reason: str = "shutdown") -> int:
+        """Stop every running subagent for a shutdown; returns how many.
+
+        A run that will be continued after the restart (``resumable``) is
+        suspended: it stays running in the registry with ``suspended_at``
+        and ``activity.phase == "suspended"``, its handler writes
+        ``suspended`` to its checkpoint and announces nothing, and the next
+        start continues it. Any other run is interrupted as before. New
+        spawns are refused from here on. Idempotent.
+        """
+        self._shutting_down = True
+        self._suspending = True
+        self._suspend_reason = reason
+        now = time.time()
+        count = 0
+        for run_id, task in list(self._running_tasks.items()):
+            if task.done():
+                continue
+            record = self._registry.get(run_id)
+            if record is not None and record.resumable and record.ended_at is None:
+                try:
+                    self._registry.update(run_id, activity={"phase": "suspended", "reason": reason},
+                                          suspended_at=now)
+                except Exception:
+                    logger.exception("Could not record a suspended subagent")
+            task.cancel()
+            count += 1
+        # Held batch results are re-armed from the registry at the next start.
+        for flush in list(self._batch_flushes.values()):
+            flush.cancel()
+        if count:
+            logger.info(f"[SubagentManager] shutdown: stopped {count} running subagent(s)")
+        return count
+
+    async def shutdown(self, wait_seconds: float = 1.5, reason: str = "shutdown") -> int:
         """Stop every running subagent first, and give each a moment to record it.
 
         The gateway calls this before anything else on its way down: the
         owner's desktop kills a foreground gateway 3 s after asking it to
         stop (a named agent's runtime after 5 s), so subagents cannot wait
-        for channels, cron and the gateway server to close first. New spawns
-        are refused from here on. Idempotent.
+        for channels, cron and the gateway server to close first. See
+        stop_all for what happens to each run. Idempotent.
         """
-        self._shutting_down = True
         tasks = [task for task in self._running_tasks.values() if not task.done()]
-        count = self.cancel_all()
+        count = self.stop_all(reason)
         if tasks and wait_seconds > 0:
             await asyncio.wait(tasks, timeout=wait_seconds)
         return count
@@ -2348,8 +2608,21 @@ Do not create, patch, install, or manage skills. Do not edit project files or ru
         return count
 
     async def cancel(self, run_id_prefix: str) -> str:
-        """Cancel a running subagent by run_id (prefix match)."""
+        """Cancel a running subagent by run_id (prefix match).
+
+        A run still marked running that no live process works on (a restart
+        left it and this process does not continue runs) is ended here.
+        """
         matches = [rid for rid in self._running_tasks if run_id_prefix and rid.startswith(run_id_prefix)]
+        if not matches and run_id_prefix:
+            orphans = [r for r in self._registry.all()
+                       if r.ended_at is None and r.run_id.startswith(run_id_prefix)]
+            if len(orphans) == 1 and self._adopt(orphans[0], {}) is not None:
+                run_id = orphans[0].run_id
+                self._registry.finish(run_id, "cancelled", error="Task interrupted", error_code="cancelled")
+                self._record_metric(run_id)
+                self._publish_event("subagent.completed", run_id)
+                return json.dumps({"status": "cancelled", "run_id": run_id})
         if len(matches) != 1:
             return json.dumps({"status": "error", "error": "Task ID is missing, unknown or ambiguous"})
         run_id = matches[0]
