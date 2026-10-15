@@ -56,7 +56,7 @@ from flowly.agent.subagent_checkpoint import (
     task_index,
     tool_class,
 )
-from flowly.agent.error_classifier import ErrorCategory, classify_response, extract_input_limit_tokens
+from flowly.agent.error_classifier import ErrorCategory, backoff_for, classify_response, extract_input_limit_tokens
 from flowly.compaction.pruning import iteration_strip_passes, microcompact_tool_results
 from flowly.compaction.request_guard import (
     ProviderRequestCoordinator,
@@ -67,6 +67,7 @@ from flowly.compaction.request_guard import (
 from flowly.compaction.service import CompactionService
 from flowly.compaction.summarizer import collect_summary_usage
 from flowly.providers.base import LLMErrorInfo, LLMResponse
+from flowly.providers.streamed_reply import StreamedReply
 from flowly.agent.delegation import MAX_CHILDREN_PER_CONVERSATION, assign_mark
 from flowly.agent.tools.agent_tools import ChildAgentMessageTool
 from flowly.agent.subagent_observation import TaskEvents, run_view
@@ -259,6 +260,29 @@ def closed_text(thread: SubagentThreadRecord) -> str:
 def _with_conversation(record: SubagentRunRecord, state: ChildState) -> bool:
     """Whether the turn's first message carries the forked conversation (a thread's first turn only)."""
     return record.turn == 1 and bool(state.first_message) and state.first_message != record.task
+
+
+def _blocking_may_succeed(category: ErrorCategory) -> bool:
+    """Whether a blocking call may succeed where the stream failed before any text.
+
+    The main loop's rule (a retryable failure: a transient fault, a rate
+    limit, a model or route that does not stream), and a rejected key: the
+    providers' blocking call moves to a fallback key, their stream does not.
+    A request too large, no credits or an image the model cannot read are
+    rejected the same either way (``_call_model`` handles the first).
+    """
+    return category is ErrorCategory.AUTH or backoff_for(category, 1) is not None
+
+
+def _streams_tokens(provider: Any) -> bool:
+    """Whether the provider streams a reply token by token.
+
+    ``LLMProvider.chat_stream`` itself makes one blocking ``chat`` call and
+    yields its whole reply; a provider that keeps it is called with ``chat``
+    as before (its reply goes out as one delta).
+    """
+    own = getattr(type(provider), "chat_stream", None)
+    return callable(own) and own is not LLMProvider.chat_stream
 
 
 def _clip(text: str, limit: int) -> str:
@@ -2118,10 +2142,28 @@ class SubagentManager:
         if not fitted.fits:
             return self._unfit_response(run_id, fitted)
 
-        async def dispatch() -> LLMResponse:
+        async def blocking() -> LLMResponse:
             response = await self.provider.chat(messages=state.messages, tools=tools, model=model,
                                                 max_tokens=max_tokens, timeout=timeout)
             await self._count_usage(run_id, response.usage)
+            return response
+
+        async def dispatch() -> LLMResponse:
+            # The reply streams token by token only while somebody watches the
+            # thread and the provider streams; otherwise the call is today's.
+            stream = self._streams.get(run_id)
+            if stream is None or not _streams_tokens(self.provider) or not stream.watched():
+                return await blocking()
+            response = await self._stream_model(run_id, stream, state.messages, tools=tools, model=model,
+                                                max_tokens=max_tokens, timeout=timeout)
+            await self._count_usage(run_id, response.usage)
+            if (response.finish_reason == "error" and not response.partial_content_delivered
+                    and _blocking_may_succeed(classify_response(response))):
+                # As the main loop: a stream that failed before any text falls
+                # back to one blocking call (a model or route without streaming;
+                # the blocking call also rotates a rejected key).
+                logger.warning(f"[SubagentManager] [{run_id[:8]}] streaming failed, falling back to a blocking call")
+                return await blocking()
             return response
 
         response = await dispatch()
@@ -2154,6 +2196,60 @@ class SubagentManager:
             f"{recovered.after.estimated_input_tokens} estimated tokens)"
         )
         return await dispatch()
+
+    async def _stream_model(
+        self, run_id: str, stream: ChildStream, messages: list[dict[str, Any]], *,
+        tools: list[dict[str, Any]] | None, model: str, max_tokens: int, timeout: float,
+    ) -> LLMResponse:
+        """One model call whose reply streams to the thread's watchers.
+
+        The provider's ``chat_stream`` (the main agent's streaming path),
+        assembled by :class:`StreamedReply` into the response ``chat`` would
+        have given: the whole text, the tool calls (``extra_content``
+        included), the finish reason and the final chunk's usage. Its text
+        goes out as it comes (``ChildStream.stream_text``, coalesced); nothing
+        of it is recorded until the reply is complete — the run's checkpoint
+        and journal get it exactly as from a blocking call. ``timeout`` bounds
+        the whole reply, as it bounds a blocking call. A failed reply's text
+        is taken back from the watchers (``discard_reply``); its error text is
+        what classifies the failure.
+        """
+        reply = StreamedReply()
+        stream.begin_reply()
+        timed_out = False
+        chunks = self.provider.chat_stream(messages=messages, tools=tools, model=model, max_tokens=max_tokens)
+        try:
+            async with asyncio.timeout(timeout) as deadline:
+                async for chunk in chunks:
+                    text = reply.feed(chunk)
+                    if text:
+                        stream.stream_text(text)
+        except TimeoutError:
+            if not deadline.expired():
+                raise
+            timed_out = True
+        finally:
+            close = getattr(chunks, "aclose", None)
+            if close is not None:
+                try:
+                    await close()
+                except Exception:  # noqa: BLE001 — a provider that cannot close
+                    logger.debug(f"[SubagentManager] [{run_id[:8]}] closing the stream failed", exc_info=True)
+        stream.end_reply()  # a run stopped mid-reply sends nothing more: its terminal follows
+        if timed_out:
+            logger.warning(f"[SubagentManager] [{run_id[:8]}] streamed model call timed out after {timeout:.0f}s")
+            response = LLMResponse(content=f"Error calling LLM: the model call timed out after {timeout:.0f}s",
+                                   finish_reason="error", partial_content_delivered=bool(reply.text))
+        else:
+            response = reply.response()
+            final = reply.final
+            if response.finish_reason == "error" and final is not None:
+                response = LLMResponse(content=final.content, finish_reason="error", usage=dict(response.usage),
+                                       error_info=final.error_info,
+                                       partial_content_delivered=response.partial_content_delivered)
+        if response.finish_reason == "error":
+            stream.discard_reply()
+        return response
 
     @staticmethod
     def _unfit_response(run_id: str, fitted: RequestFit) -> LLMResponse:
@@ -2646,6 +2742,8 @@ class SubagentManager:
                 # Empty response check
                 if not response.content or not response.content.strip():
                     logger.warning(f"[SubagentManager] [{run_id[:8]}] empty response on iteration {iteration}")
+                    if stream is not None:
+                        stream.discard_reply()  # not recorded: whatever streamed goes
                     if iteration < max_iterations:
                         continue  # Retry
                     final_result = "Task produced no output."
@@ -2719,7 +2817,11 @@ class SubagentManager:
                     max_tokens=min(_GRACE_MAX_OUTPUT_TOKENS, self._output_budget(model)),
                     timeout=60, activity={"phase": "summarizing"},
                 )
-                if summary_response.finish_reason != "error" and summary_response.content and summary_response.content.strip():
+                summarized = bool(summary_response.finish_reason != "error" and summary_response.content
+                                  and summary_response.content.strip())
+                if not summarized and stream is not None:
+                    stream.discard_reply()  # an empty summary is not the result
+                if summarized:
                     final_result = summary_response.content
                     status, error_str, error_code = "ok", None, None
                     if stream is not None:

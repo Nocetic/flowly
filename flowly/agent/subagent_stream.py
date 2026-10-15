@@ -6,9 +6,12 @@ when the run ends; while it runs, the same live events an owner's turn has
 stream under that key and the run's id (docs/chat-wire-protocol.md §4.8):
 
 * ``chat {state:"run_started"}`` once, with the task (``prompt``, the brief);
-* ``agent {stream:"assistant", data:{text}}`` — what the model said, one
-  delta per model reply (``ChildStream.delta`` is the hook token streaming
-  will feed);
+* ``agent {stream:"assistant", data:{text}}`` — what the model said: token
+  by token while somebody watches (``ChildStream.stream_text``, coalesced),
+  else one delta per model reply;
+* ``chat {state:"stream_reset", text}`` — a streamed reply that failed and
+  is made again: the live text is ``text`` from here on (what came before the
+  failed reply);
 * ``chat {state:"iteration_step"}`` per reply with tool calls and per tool
   result, in the main loop's shape (``iteration_event_payload``);
 * ``chat {state:"tool_progress"}`` as a call is queued, runs and ends;
@@ -66,6 +69,11 @@ STREAM_VERSION = 1
 # events are dropped (``chat.inflight`` still has them); a terminal never is.
 _QUEUE_LIMIT = 1024
 _DELIVERY_TIMEOUT_SECONDS = 10.0
+# Streamed text goes out at most this often per run (a delta coalesces the
+# tokens of the interval) and, while the conversation's watchers are behind,
+# waits in the run until they caught up — unless this much piled up.
+_DELTA_INTERVAL_SECONDS = 0.05
+_DELTA_MAX_CHARS = 16_384
 
 Delivery = Callable[[], Awaitable[Any]]
 
@@ -135,6 +143,11 @@ class SubagentStreamHub:
             except Exception:  # noqa: BLE001
                 logger.debug("Subagent stream: watch check failed", exc_info=True)
         return False
+
+    def backlog(self, session_key: str) -> int:
+        """Events queued for ``session_key``'s watchers, not yet being delivered."""
+        queue = self._queues.get(session_key)
+        return len(queue) if queue else 0
 
     def publish(self, event: str, session_key: str, data: dict[str, Any], *,
                 access: Any = None, terminal: bool = False) -> None:
@@ -243,6 +256,13 @@ class ChildStream:
         self._compaction_id = ""
         self._compaction_before = 0
         self._progress = ToolProgress(run_id, self._publish_progress)
+        # A streamed model reply (``begin_reply`` … commit or ``discard_reply``):
+        # tokens not sent yet, the text sent so far, the live text before it.
+        self._buffer = ""
+        self._reply = ""
+        self._before_reply = ""
+        self._last_flush = 0.0
+        self._timer: asyncio.TimerHandle | None = None
 
     # ── wire ────────────────────────────────────────────────────────────
 
@@ -312,7 +332,11 @@ class ChildStream:
             logger.debug(f"[SubagentStream] [{self.run_id[:8]}] progress failed", exc_info=True)
 
     def delta(self, text: str) -> None:
-        """Assistant text, as an ``agent`` delta (token streaming will call this per chunk)."""
+        """Assistant text, as an ``agent`` delta, kept in the in-flight entry.
+
+        The entry and the event change together (no await between them), so a
+        watcher whose snapshot is taken in between gets the text exactly once.
+        """
         from flowly.agent import inflight
 
         if self._ended or not text:
@@ -325,7 +349,140 @@ class ChildStream:
                              "data": {"text": text}})
 
     def answer(self, text: str) -> None:
-        """The run's closing reply was produced: its text as the turn's last delta."""
+        """The run's closing reply was produced: the live text becomes exactly it."""
+        self._commit(text, show=bool(text))
+
+    # ── a streamed reply ────────────────────────────────────────────────
+
+    def watched(self) -> bool:
+        """Whether anybody would receive this turn's events now (cheap)."""
+        sink = self.sink
+        check = getattr(sink, "watched", None) if sink is not None else None
+        if check is None or self._ended or not self._live:
+            return False
+        try:
+            return bool(check(self.session_key))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def begin_reply(self) -> None:
+        """A model call whose reply streams starts."""
+        from flowly.agent import inflight
+
+        if self._reply or self._buffer:
+            self.discard_reply()  # a reply is always kept or discarded first; never glue two
+        try:
+            self._before_reply = inflight.text(self.session_key, self.run_id)
+        except Exception:  # noqa: BLE001
+            self._before_reply = ""
+
+    def stream_text(self, text: str) -> None:
+        """Tokens of the reply being streamed.
+
+        Coalesced: a delta goes out at most every ``_DELTA_INTERVAL_SECONDS``
+        and, while the conversation's queue still holds events for its
+        watchers, waits here (up to ``_DELTA_MAX_CHARS``) — so the queue holds
+        about one delta of a long reply however slow a watcher is, and the run
+        never waits for any of it.
+        """
+        if self._ended or not text:
+            return
+        self._buffer += text
+        self._maybe_flush()
+
+    def end_reply(self) -> None:
+        """The streamed call returned: what is left of its tokens goes out now."""
+        self._flush()
+
+    def discard_reply(self) -> None:
+        """The streamed reply failed and is not recorded: take its text back.
+
+        Watchers get ``chat {state:"stream_reset", text}``: the live text is
+        ``text`` from here on (what it was before the reply began); the
+        in-flight entry changes with it.
+        """
+        self._cancel_timer()
+        self._buffer = ""
+        if not self._reply:
+            return
+        self._reply = ""
+        self._reset_text(self._before_reply)
+
+    def _commit(self, text: str, *, show: bool) -> None:
+        """The reply as recorded: make the live text end exactly with ``text``.
+
+        A streamed reply's text already went out (the recorded text is what
+        streamed, so nothing more is sent); a reply that did not stream goes
+        out whole, as one delta.
+        """
+        self._flush()
+        sent, self._reply = self._reply, ""
+        if not sent:
+            if show:
+                self.delta(text)
+            return
+        if text == sent:
+            return
+        if text.startswith(sent):
+            self.delta(text[len(sent):])
+            return
+        self._reset_text(self._before_reply)
+        if show:
+            self.delta(text)
+
+    def _reset_text(self, text: str) -> None:
+        from flowly.agent import inflight
+
+        if self._ended:
+            return
+        try:
+            inflight.replace_text(self.session_key, self.run_id, text)
+        except Exception:  # noqa: BLE001
+            logger.debug(f"[SubagentStream] [{self.run_id[:8]}] in-flight text failed", exc_info=True)
+        self._chat({"state": "stream_reset", "text": text})
+
+    def _behind(self) -> bool:
+        backlog = getattr(self.sink, "backlog", None)
+        if backlog is None:
+            return False
+        try:
+            return backlog(self.session_key) > 0
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _maybe_flush(self) -> None:
+        if not self._buffer or self._ended:
+            return
+        wait = self._last_flush + _DELTA_INTERVAL_SECONDS - time.monotonic()
+        if len(self._buffer) >= _DELTA_MAX_CHARS or (wait <= 0 and not self._behind()):
+            self._flush()
+            return
+        if self._timer is None:
+            try:
+                self._timer = asyncio.get_running_loop().call_later(
+                    wait if wait > 0 else _DELTA_INTERVAL_SECONDS, self._on_timer)
+            except RuntimeError:  # no loop: nothing to wait on
+                self._flush()
+
+    def _on_timer(self) -> None:
+        self._timer = None
+        try:
+            self._maybe_flush()
+        except Exception:  # noqa: BLE001 — the stream never fails the run
+            logger.debug(f"[SubagentStream] [{self.run_id[:8]}] delta failed", exc_info=True)
+
+    def _cancel_timer(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+
+    def _flush(self) -> None:
+        self._cancel_timer()
+        text, self._buffer = self._buffer, ""
+        if not text or self._ended:
+            return
+        self._last_flush = time.monotonic()
+        self._reply += text
         self.delta(text)
 
     def compaction(self, phase: str, *, tokens_before: int = 0, tokens_after: int = 0,
@@ -371,6 +528,7 @@ class ChildStream:
         if self._compaction_id:
             self.compaction("failed")
         self._ended = True
+        self._cancel_timer()  # unsent tokens of a reply cut short are not the result
         duration = duration_ms if duration_ms is not None else int((time.time() - self._started_at) * 1000)
         common = {"model": self.model, "outcome": outcome, "durationMs": max(0, int(duration)),
                   "completedAt": datetime.now(timezone.utc).isoformat()}
@@ -401,6 +559,8 @@ class ChildStream:
         from flowly.agent import inflight
 
         self._ended = True
+        self._cancel_timer()
+        self._buffer = self._reply = ""
         try:
             inflight.finish(self.session_key, self.run_id)
         except Exception:  # noqa: BLE001
@@ -420,9 +580,9 @@ class ChildStream:
                 continue
             role = row.get("role")
             if role == "assistant":
+                # The reply as recorded; a streamed one already went out.
                 text = _text(row.get("content"))
-                if text.strip():
-                    self.delta(text)
+                self._commit(text, show=bool(text.strip()))
                 calls = row.get("tool_calls")
                 if isinstance(calls, list) and calls:
                     await self._progress.announce(index, calls)

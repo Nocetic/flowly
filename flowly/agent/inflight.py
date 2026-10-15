@@ -149,6 +149,20 @@ def clear_text(session_key: str, run_id: str, steering_sequence: int = 0) -> Non
         cur["updatedAt"] = time.time()
 
 
+def text(session_key: str, run_id: str) -> str:
+    """The run's live text since its last step boundary ("" for another run or none)."""
+    cur = _runs.get(session_key)
+    return cur["text"] if cur and cur.get("runId") == run_id else ""
+
+
+def replace_text(session_key: str, run_id: str, text: str) -> None:
+    """A streamed reply was taken back: the live text is ``text`` from here on."""
+    cur = _runs.get(session_key)
+    if cur and cur.get("runId") == run_id:
+        cur["text"] = text
+        cur["updatedAt"] = time.time()
+
+
 def finish(session_key: str, run_id: str) -> None:
     """Drop the run once it settles (final / aborted / error). Only clears
     if the stored run still matches — a newer run for the same session
