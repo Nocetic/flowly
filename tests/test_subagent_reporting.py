@@ -25,6 +25,7 @@ from typing import Any
 import pytest
 
 from flowly.agent.delegation import DelegationTurn, delegation_turn_scope
+from flowly.agent import subagent_owner
 from flowly.agent.subagent import SubagentManager
 from flowly.agent.subagent_registry import SubagentRegistry
 from flowly.agent.tool_context import tool_execution_scope
@@ -163,6 +164,7 @@ async def test_after_a_restart_held_results_still_report_together(tmp_path):
     children.gates["A"].set()
     await _no_notice(bus)
     # The process stops here, with A's result held and B still running.
+    subagent_owner.forget_instance(manager._instance)
     restarted_bus = MessageBus()
     restarted = _manager(tmp_path, _Children(), restarted_bus)
     try:

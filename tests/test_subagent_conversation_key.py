@@ -147,6 +147,9 @@ async def test_waiting_returns_the_result_and_the_queued_notice_is_not_handled_a
     assert outcome["still_running"] == [] and outcome["timed_out"] is False
     notice = await asyncio.wait_for(bus.consume_inbound(), 2)
     assert manager.notice_already_handled(notice.content) is True
+    # Taken, not yet delivered: the goal waits until the turn is saved.
+    assert manager.pending_for_goal(CHAT_KEY) == ["A"]
+    manager.mark_delivered(CHAT_KEY, manager.turn_reports(CHAT_KEY))
     assert manager.pending_for_goal(CHAT_KEY) == []
 
 

@@ -134,6 +134,9 @@ def test_a_cancelled_run_and_a_stale_undelivered_result_do_not_hold_a_goal(tmp_p
     registry._runs["stale-1"].ended_at = time.time() - 3600
     with registry._lock:
         registry._write_locked()
+    # The grace also counts from this process's start (a result announced
+    # again after a restart holds the goal while it is handled).
+    manager._started_at = time.time() - 3600
     assert manager.pending_for_goal("web:g") == []
 
 
@@ -146,7 +149,10 @@ async def test_after_a_restart_a_recent_unhandled_result_is_announced_again(tmp_
     first.registry.register(_record("old-1"))
     first.registry.finish("old-1", "ok", result="old")
     first.registry.update("old-1", delivery_state="queued")
-    first.registry._runs["old-1"].ended_at = time.time() - 7200
+    # A result from before a night with Flowly closed still reaches the
+    # conversation; one older than a day does not.
+    first.registry._runs["recent-1"].ended_at = time.time() - 9 * 3600
+    first.registry._runs["old-1"].ended_at = time.time() - 25 * 3600
     with first.registry._lock:
         first.registry._write_locked()
 
@@ -155,6 +161,7 @@ async def test_after_a_restart_a_recent_unhandled_result_is_announced_again(tmp_
     restarted.resume_pending()
     notice = await asyncio.wait_for(bus.consume_inbound(), 2)
     assert "run_id=recent-1" in notice.content and "the answer" in notice.content
+    assert "finished 9 h 0 min ago, before Flowly restarted" in notice.content
     assert restarted.registry.get("old-1").delivery_state == "undelivered"
 
 

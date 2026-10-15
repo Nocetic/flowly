@@ -22,7 +22,8 @@ are gone (`test_delegation_rule.py` pins the current contract).
 | File | Role |
 |---|---|
 | `flowly/agent/subagent.py` | `SubagentManager`: spawn, the child loop, messaging, waiting, delivery (announce), cancel, recovery, metrics hook |
-| `flowly/agent/subagent_registry.py` | `SubagentRunRecord` + `SubagentRegistry` (`runs.json` index, result files, transcripts, file lock, pruning), `add_usage` |
+| `flowly/agent/subagent_registry.py` | `SubagentRunRecord` + `SubagentRegistry` (`runs.json` index, result files, transcripts, file lock, pruning, `claim`), `add_usage`, `append_jsonl` |
+| `flowly/agent/subagent_owner.py` | Who owns a run (`process_owner`) and whether that owner is gone (`owner_state`) |
 | `flowly/agent/subagent_observation.py` | `run_view` (the wire shape of a run), `TaskEvents` (coalesced `subagent.*` events) |
 | `flowly/agent/subagent_metrics.py` | One metric line per ended run (`metrics.jsonl`), `summarize` |
 | `flowly/agent/delegation.py` | `DelegationTurn` (per-turn facts in a context var), owner-quote check, conversation fork, marks |
@@ -103,7 +104,9 @@ the agent the results arrive together as a new message, not to wait, not to redo
 * `agent_wait(run_ids?, timeout_seconds)` — rarely needed. 30 s default, 120 s max, **300 s per
   turn** in all (the turn's `DelegationTurn.waited`). Returns as soon as a child finishes or
   writes, the owner writes (`should_yield`), or at the timeout. Results it returns are marked
-  delivered and are not handed over again.
+  `taken` and are not handed over again; saving the turn makes them `delivered` (§6, "Delivery
+  commit point"), and a turn that ends without saving gives them back (`release_taken`): they
+  are announced again.
 
 ## 6. Results reach the conversation — together
 
@@ -145,6 +148,25 @@ each), then guidance (check what matters, don't redo, answer as a whole, no run 
   `agent_wait` in such a turn returns at once with "the owner sent a new message; finish now".
 * After the turn, `mark_delivered` records the runs as handled (goals wait on this, §10).
 
+### Delivery commit point
+
+A result is *delivered* only once the conversation has durably saved the turn that handled
+it. Both turn-final saves — the report turn (`_process_system_message`) and the owner's turn
+(`_process_message_inner`) — call `turn_reports(session_key, notice_run_ids)` (the notice's
+runs plus what `agent_wait` took into the turn), write them into
+`session.metadata["subagentReports"]` (`record_subagent_reports`, newest 256 kept) **in the same
+save** as the turn, and only then `mark_delivered` (`pending | queued | taken → delivered`).
+
+* A crash between that save and `mark_delivered` used to announce the result again (the owner got
+  two answers). Now a restart reads the session's `subagentReports` (`committed_reports`, set by
+  `AgentLoop` to `sessions.read`) and records it delivered without a notice.
+* `agent_wait` used to mark results delivered before its turn was saved; a crash in between lost
+  them for good. Now they are `taken`: a restart announces a `taken` result that no saved turn
+  recorded, and `_process_message` calls `release_taken` under the turn lock when a turn ends —
+  results it took but never saved (the turn failed, an introduction that left no trace) go back
+  to `pending` and are announced again. `notice_already_handled` treats `taken` as handled, so a
+  queued notice for the same result is not processed meanwhile.
+
 ## 7. Stopping
 
 * `subagents.cancel` RPC (owner, from a client) and `sessions_list(action="cancel",
@@ -161,12 +183,31 @@ each), then guidance (check what matters, don't redo, answer as a whole, no run 
 
 * `runs.json` (atomic writes under a `FileLock`) holds `SubagentRunRecord`s. Notable fields:
   `origin` (owner/agent/system), `mark`, `batch_id`, `usage`, `delivery_state`
-  (pending → queued → delivered | undelivered | not_required), `announced`, `tool_trace`,
-  `result_preview/chars/available`.
+  (pending → queued → taken → delivered | undelivered | not_required), `announced`, `tool_trace`,
+  `result_preview/chars/available`, `owner` (below), `reannounced` (times a startup announced the
+  result again).
+* **Owner.** `spawn` (and `delegate_to`) stamp `owner = {instance, pid, identity, boot, host}`
+  (`subagent_owner.process_owner`): the manager instance, the pid and its start identity
+  (`profile._process_identity`, so a reused pid is not mistaken for it), the boot
+  (`/proc/sys/kernel/random/boot_id`, macOS `kern.bootsessionuuid`), the host name (diagnostic
+  only — macOS renames hosts with the network). `owner_state` says OURS / ALIVE / DEAD: no owner
+  (records from before owners) → DEAD; another boot → DEAD; our pid → ALIVE only if that manager
+  instance lives in this process; another pid → DEAD if it is gone or now has another identity.
+  Anything not provably gone is ALIVE. A Flowly home is assumed to live on one machine.
+  Startup recovery only touches runs whose owner is DEAD, and takes each over with
+  `registry.claim(run_id, new_owner, expected_owner)` — compare-and-set under the index lock, so of
+  two processes recovering one home at once only one gets a run. A CLI or second gateway on the
+  same home no longer finishes a live gateway's work as "restarted".
 * Result bodies live in `runs-results/`; transcripts in `runs-transcripts/` as JSON lines
   `{seq, ts, kind, …}` with kinds `brief`, `assistant` (with `toolCalls`), `tool`,
   `message_in`, `message_out`, `result`. `read_transcript(run_id, after, limit)` pages by `seq`
-  with an offset cursor cache. System runs keep no transcript.
+  with an offset cursor cache. System runs keep no transcript. Transcripts are 0600 (older ones
+  are made private when next written).
+* **Torn lines.** Transcripts and `metrics.jsonl` are append-only JSON lines written through
+  `append_jsonl`: when a crash left the last line without its newline, the next record starts on
+  a line of its own (it used to be glued onto the fragment, losing both). Readers skip the
+  fragment. After a restart a transcript's `seq` continues from the last readable step, so it
+  stays gapless.
 * Pruning: user-facing runs after 30 days, system or `cleanup=delete` runs after 1 day — never a
   run whose result is still undelivered.
 
@@ -183,16 +224,33 @@ loop's iteration checkpoint. Real changes (other numbers, pages, files) are neve
 
 A goal parked on its subagents waits on the `subagents:<key>` barrier until
 `pending_for_goal` is empty: every non-system run of the conversation ended *and handled*
-(`delivery_state` delivered), with a 600 s grace for a result that was published but never
-handled (a crash between the two).
+(`delivery_state` delivered; `taken` still waits for its turn's save), with a 600 s grace for a
+result that was published but never handled (a crash between the two). The grace counts from the
+later of the run's end and this process's start, so a result announced again after a long
+downtime holds the goal while its report turn runs.
 
 ## 11. Restart
 
-`resume_pending` on startup: runs still marked running are finished as `error`
-(`process_restarted`), their metric recorded and announced; results that ended within the last
-hour but were never handled are announced again (their `announced` flag reset so their batch can
-claim them); older ones become `undelivered`. Running work is not resumed — see the open item
-in §15.
+**Shutdown.** The gateway calls `subagents.shutdown()` first — right when the signal arrives and
+again (a no-op) at the top of its cleanup — before MCP, cron, the gateway server and channels
+close: Desktop kills a foreground gateway 3 s after SIGTERM (`flowlyai-service.ts`) and a named
+agent's runtime 5 s after (`profile-runtime-supervisor.ts`), so subagents cannot wait for the rest
+to close first. `shutdown` refuses new spawns, cancels running children and waits up to 1.5 s
+for their handlers.
+
+**Startup** (`resume_pending`, from `AgentLoop.run()`):
+
+1. Finished runs whose result no saved turn handled (`pending`, `queued`, `taken`), kind
+   `subagent`, owner gone: taken over (`claim`); if the session's `subagentReports` has the run it
+   is recorded delivered; otherwise, if it ended within **24 h** and was announced again fewer
+   than 3 times (`reannounced`), its `announced` flag is reset (so its batch can claim it) and it
+   is announced again — the notice says *"It finished <age> ago, before Flowly restarted; this
+   result reaches you only now."* Older ones become `undelivered`. The count stops a result whose
+   report turn keeps taking the process down from being announced at every start. (The window was
+   one hour: results from before a night with Flowly closed were silently dropped.) Delegated
+   tasks report through their own message and are never announced again here.
+2. Runs still marked running whose owner is gone are taken over and finished as `error`
+   (`process_restarted`), their metric recorded and announced.
 
 ## 12. Events and RPCs
 
@@ -211,7 +269,8 @@ in §15.
 
 Every ended run appends one JSON line to `metrics.jsonl` (next to `runs.json`): `runId`, times,
 `durationS`, `origin`, `kind`, `model`, `outcome`, `errorCode`, `toolCalls`, `tokens`,
-`channel`. Never the brief, result or conversation. The file keeps its newest half past 8 MB, so
+`channel`. Never the brief, result or conversation. Lines are appended with `append_jsonl` (a
+torn line never swallows the next). The file keeps its newest half past 8 MB, so
 metrics outlive the 30-day run pruning. `subagents.stats` returns, for the last `days`:
 `runs`, `byOrigin`, `outcomes`, `durationS {average, p50, p90}`, `tokens`, `toolCalls`, and
 `byDay` (UTC). System runs are left out unless asked; a run recorded twice counts once.
@@ -245,6 +304,6 @@ adopt this branch.
 ## 16. Open items
 
 * Work running when the gateway restarts is lost (finished as `process_restarted`). Resuming it
-  is the last task of this round and gets its own design.
+  is the last task of this round (design: `output/research/subagent-resume-2026-10-15/`).
 * Relay-connected clients and subagent events: see the round-3 research
   (`output/research/agents-v2-round3-2026-10-15/`).

@@ -49,7 +49,7 @@ from flowly.agent.tools.voice import VoiceCallTool
 from flowly.agent.tools.process import ProcessTool
 from flowly.exec.process_registry import get_registry as _get_process_registry
 from flowly.exec.process_checkpoint import ProcessCheckpoint
-from flowly.agent.subagent import SubagentManager
+from flowly.agent.subagent import SUBAGENT_REPORTS_KEY, SubagentManager, record_subagent_reports
 from flowly.session.manager import (
     ConcurrentSessionWriteError,
     SessionBusyError,
@@ -1116,6 +1116,9 @@ class AgentLoop:
             state_dir=self._state_dir,
             max_iterations=self.max_iterations,
         )
+        # Which results a conversation's saved turns handled: the delivery
+        # commit point a restart checks before announcing one again.
+        self.subagents.committed_reports = self._committed_subagent_reports
 
         # Compaction service
         self.compaction = CompactionService(
@@ -7870,7 +7873,13 @@ class AgentLoop:
                             result = on_started(msg.content)
                             if inspect.isawaitable(result):
                                 await result
-                        response = await self._process_message_unlocked(msg)
+                        try:
+                            response = await self._process_message_unlocked(msg)
+                        finally:
+                            # Still under the turn lock: results this turn
+                            # took with agent_wait but never saved go back
+                            # to be announced (saved ones are delivered).
+                            self._release_subagent_results(msg)
                         if response is not None and msg.channel != 'system':
                             # The transport session id can be reused or have legacy
                             # aliases. The run's own stable conversation is authoritative.
@@ -7915,6 +7924,34 @@ class AgentLoop:
                 if binding is not None:
                     binding.close()
                 PROFILE_RUN_BINDING.reset(token)
+
+    def _committed_subagent_reports(self, session_key: str) -> set[str]:
+        """Subagent results the saved turns of ``session_key`` handled."""
+        session = self.sessions.read(session_key)
+        if session is None:
+            return set()
+        return {rid for rid in session.metadata.get(SUBAGENT_REPORTS_KEY) or [] if isinstance(rid, str)}
+
+    def _subagent_turn_reports(self, session_key: str, notice_run_ids: list[str] | None = None) -> list[str]:
+        """The subagent results a turn handled, to be committed with its save."""
+        subagents = getattr(self, "subagents", None)
+        if subagents is None or not hasattr(subagents, "turn_reports"):
+            return list(notice_run_ids or [])
+        return subagents.turn_reports(session_key, notice_run_ids)
+
+    def _release_subagent_results(self, msg: InboundMessage) -> None:
+        subagents = getattr(self, "subagents", None)
+        if subagents is None:
+            return
+        session_key = msg.session_key
+        if msg.channel == "system" and session_key.startswith("system:"):
+            # A system notice is that conversation's turn (see
+            # _process_system_message), keyed by its delivery address.
+            session_key = msg.chat_id if ":" in msg.chat_id else f"cli:{msg.chat_id}"
+        try:
+            subagents.release_taken(session_key)
+        except Exception:
+            logger.exception("Could not give back subagent results of an unsaved turn")
 
     async def _process_message_unlocked(
         self, msg: InboundMessage
@@ -9235,7 +9272,15 @@ class AgentLoop:
                 provider_state_out,
                 turn_start_index=turn_start_index,
             )
+        # Subagent results this turn took with agent_wait are delivered by
+        # this save, and only by it (see SubagentManager.release_taken).
+        subagent_reports = (
+            self._subagent_turn_reports(msg.session_key) if not introduction_failed else []
+        )
+        record_subagent_reports(session.metadata, subagent_reports)
         self.sessions.save(session)
+        if subagent_reports:
+            self.subagents.mark_delivered(msg.session_key, subagent_reports)
         await self._index_turn_media(
             session, reply_media_assets, msg.media, msg.channel
         )
@@ -9628,14 +9673,20 @@ class AgentLoop:
             provider_state_out,
             turn_start_index=turn_start_index,
         )
+        # The results this turn handled — the notice's, and any it took with
+        # agent_wait — are recorded in the same save as the turn: that save
+        # is what delivers them. A crash right after it cannot make a
+        # restart announce them a second time.
+        subagent_reports = self._subagent_turn_reports(
+            session_key,
+            _SUBAGENT_RUN_ID_RE.findall(msg.content or "") if msg.sender_id == "subagent" else [],
+        )
+        record_subagent_reports(session.metadata, subagent_reports)
         self.sessions.save(session)
-        if msg.sender_id == "subagent" and subagents is not None:
+        if subagent_reports and subagents is not None:
             # The conversation has now handled these results; a goal waiting
             # on them may continue.
-            subagents.mark_delivered(
-                session_key,
-                _SUBAGENT_RUN_ID_RE.findall(msg.content or ""),
-            )
+            subagents.mark_delivered(session_key, subagent_reports)
         # A system/announce turn has no inbound attachment — it is triggered by
         # the agent's own machinery, not by a person handing it a file.
         await self._index_turn_media(session, reply_media_assets, None, origin_channel)

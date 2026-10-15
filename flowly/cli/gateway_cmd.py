@@ -2571,6 +2571,13 @@ Respond to the user now:"""
         _catalog_task: asyncio.Task | None = None
         _manager_task: asyncio.Task | None = None
         _board_orchestrator = getattr(agent, "_board_orchestrator", None)
+
+        async def _shutdown_subagents() -> None:
+            try:
+                await agent.subagents.shutdown(wait_seconds=1.5)
+            except Exception:
+                logger.exception("Subagent shutdown failed")
+
         try:
             if local_runtime:
                 gateway_server.set_managed_runtime_control(
@@ -2840,6 +2847,10 @@ Respond to the user now:"""
                 [main_task, asyncio.create_task(shutdown_event.wait())],
                 return_when=asyncio.FIRST_COMPLETED
             )
+            # Subagents first: Desktop kills a foreground gateway 3 s after
+            # SIGTERM (a named agent's runtime after 5 s), long before
+            # channels, cron and the server have closed.
+            await _shutdown_subagents()
 
             # Cancel pending tasks
             for task in pending:
@@ -2852,6 +2863,7 @@ Respond to the user now:"""
         finally:
             # Graceful shutdown
             console.print("[dim]Cleaning up...[/dim]")
+            await _shutdown_subagents()  # no-op when already done above
             from flowly.channels import feature_rpc as _feature_rpc
             await _feature_rpc.close_mcp_connection_runtime()
             if voice_plugin:

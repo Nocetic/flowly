@@ -22,7 +22,7 @@ from typing import Any, Iterable
 
 from loguru import logger
 
-from flowly.agent.subagent_registry import SubagentRunRecord
+from flowly.agent.subagent_registry import SubagentRunRecord, append_jsonl
 
 METRICS_FILE = "metrics.jsonl"
 # Past this size the file keeps its newest half.
@@ -58,13 +58,9 @@ def metric_line(record: SubagentRunRecord) -> dict[str, Any]:
 def append_metric(path: Path, record: SubagentRunRecord) -> None:
     """Add one ended run; a metric never fails the run it describes."""
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(metric_line(record), ensure_ascii=False, separators=(",", ":")) + "\n"
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        try:
-            os.write(fd, line.encode("utf-8"))
-        finally:
-            os.close(fd)
+        # A line torn by a crash is left on its own; this one starts fresh.
+        append_jsonl(path, line.encode("utf-8"))
         if path.stat().st_size > _MAX_BYTES:
             _keep_newest_half(path)
     except OSError:

@@ -31,6 +31,31 @@ _PRUNE_AFTER_SECONDS = 30 * 86_400
 # go after a day.
 _SYSTEM_PRUNE_AFTER_SECONDS = 86_400
 _SETTLED_DELIVERY = frozenset({"not_required", "delivered", "undelivered"})
+# A result's delivery: pending → queued (its notice was published) → taken
+# (agent_wait handed it to a turn not saved yet) → delivered (the
+# conversation saved the turn that handled it); or undelivered, or
+# not_required (nobody waits for it).
+
+
+def append_jsonl(path: Path, line: bytes) -> None:
+    """Append one JSON line to an append-only file, mode 0600.
+
+    A crash can leave the last line without its newline. Appending straight
+    after it would glue the new record onto the torn one and lose both, so a
+    record that follows a torn line starts on a line of its own; readers
+    skip the torn fragment as an unreadable line.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
+    try:
+        size = os.fstat(fd).st_size
+        if size:
+            os.lseek(fd, size - 1, os.SEEK_SET)
+            if os.read(fd, 1) != b"\n":
+                line = b"\n" + line
+        os.write(fd, line)
+    finally:
+        os.close(fd)
 
 
 def _retention_seconds(record: "SubagentRunRecord") -> int:
@@ -84,6 +109,13 @@ class SubagentRunRecord:
     batch_id: str = ""
     # Tokens the run has used so far: {"input", "output", "cacheRead", "total"}.
     usage: dict[str, int] = field(default_factory=dict)
+    # The process working on it (subagent_owner.process_owner): only that
+    # process works on the run; another may take it over only once the
+    # owner is provably gone. Empty for runs recorded before owners existed.
+    owner: dict[str, Any] = field(default_factory=dict)
+    # Times a startup announced this finished result again because the
+    # conversation never saved a turn that handled it.
+    reannounced: int = 0
 
 
 
@@ -180,6 +212,12 @@ class SubagentRegistry:
             not isinstance(k, str) or type(v) is not int or v < 0 for k, v in record.usage.items()
         ):
             raise ValueError("invalid run usage")
+        if not isinstance(record.delivery_state, str):
+            raise ValueError("invalid delivery state")
+        if not isinstance(record.owner, dict):
+            raise ValueError("invalid run owner")
+        if type(record.reannounced) is not int or record.reannounced < 0:
+            raise ValueError("invalid run counters")
         return record
 
     def _read_locked(self) -> None:
@@ -268,8 +306,10 @@ class SubagentRegistry:
 
         The transcript is what a client shows when the owner opens a
         subagent: its brief, what it said, the tools it called, messages
-        exchanged with the main agent and its result. Only the run's own
-        task writes it, so a process-local lock is enough.
+        exchanged with the main agent and its result. Only the run's owner
+        writes it, so a process-local lock is enough. After a restart the
+        sequence continues from the last readable step, so it stays
+        gapless, and a step torn by a crash is left behind on its own line.
         """
         with self._transcript_lock:
             if run_id not in self._runs:
@@ -277,18 +317,34 @@ class SubagentRegistry:
             seq = self._transcript_seq.get(run_id)
             path = self._transcript_path(run_id)
             if seq is None:
-                seq = 0
-                if path.exists():
-                    with path.open(encoding="utf-8") as stream:
-                        seq = sum(1 for _ in stream)
+                seq = self._last_transcript_seq(path)
             seq += 1
             entry = {"seq": seq, "ts": time.time(), **item}
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
-                stream.flush()
+            append_jsonl(path, (json.dumps(entry, ensure_ascii=False) + "\n").encode("utf-8"))
             self._transcript_seq[run_id] = seq
             return seq
+
+    @staticmethod
+    def _last_transcript_seq(path: Path) -> int:
+        if not path.exists():
+            return 0
+        try:
+            # Written before transcripts were private.
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        last = 0
+        with path.open("rb") as stream:
+            for raw in stream:
+                if not raw.endswith(b"\n"):
+                    break
+                try:
+                    entry = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict) and type(entry.get("seq")) is int:
+                    last = max(last, entry["seq"])
+        return last
 
     def read_transcript(self, run_id: str, after: int = 0, limit: int = 200) -> dict[str, Any]:
         """Transcript steps with ``seq > after``, oldest first, at most ``limit``."""
@@ -353,7 +409,8 @@ class SubagentRegistry:
             if record is None:
                 return
             if record.ended_at is not None:
-                changes = {k: v for k, v in changes.items() if k in ("announced", "delivery_state")}
+                changes = {k: v for k, v in changes.items()
+                           if k in ("announced", "delivery_state", "reannounced")}
             if not changes:
                 return
             for key, value in changes.items():
@@ -386,6 +443,35 @@ class SubagentRegistry:
                         error_code=error_code, result_preview=result[:1200],
                         result_chars=len(result), result_available=bool(result),
                         delivery_state="not_required" if outcome in ("cancelled", "interrupted") else record.delivery_state)
+
+    def claim(self, run_id: str, owner: dict[str, Any], expected_owner: dict[str, Any],
+              **changes: Any) -> SubagentRunRecord | None:
+        """Take a run over from ``expected_owner``; None when someone else did.
+
+        Compare-and-set under the index lock: two processes recovering the
+        same home at once see the same dead owner, and only the first one
+        to claim gets the run. ``changes`` are applied in the same write.
+        """
+        with self._lock:
+            self._read_locked()
+            record = self._runs.get(run_id)
+            if record is None or record.owner != expected_owner:
+                return None
+            if record.ended_at is not None:
+                changes = {k: v for k, v in changes.items()
+                           if k in ("announced", "delivery_state", "reannounced")}
+            for key, value in {"owner": owner, **changes}.items():
+                if key in record.__dataclass_fields__ and key not in ("run_id", "revision", "created_at"):
+                    setattr(record, key, value)
+            record.updated_at = time.time()
+            record.revision += 1
+            try:
+                self._decode(asdict(record))
+                self._write_locked()
+            except Exception:
+                self._read_locked()
+                raise
+            return record
 
     def read_result(self, run_id: str, offset: int = 0, limit: int = 32000) -> dict:
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 200000:

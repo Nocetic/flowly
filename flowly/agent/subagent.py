@@ -28,6 +28,7 @@ from flowly.exec.types import ExecConfig
 from flowly.agent.tools.web import WebSearchTool, WebFetchTool, WebExtractTool
 from flowly.agent.subagent_metrics import append_metric, metrics_path
 from flowly.agent.subagent_registry import SubagentRegistry, SubagentRunRecord, add_usage
+from flowly.agent import subagent_owner
 from flowly.agent.delegation import MAX_CHILDREN_PER_CONVERSATION, assign_mark
 from flowly.agent.tools.agent_tools import ChildAgentMessageTool
 from flowly.agent.subagent_observation import TaskEvents, run_view
@@ -107,11 +108,23 @@ _DEFAULT_MAX_ITERATIONS = 100
 _MODEL_CALL_TIMEOUT_SECONDS = 300.0
 _MAX_CONCURRENT_SUBAGENTS = 8
 # A finished run's result that the conversation has not handled in this long
-# no longer holds a goal (see pending_for_goal).
+# no longer holds a goal (see pending_for_goal). Counted from the later of its
+# end and this process's start, so a result announced again after a long
+# downtime still holds the goal while its report turn runs.
 _UNDELIVERED_GRACE_SECONDS = 600
-# After a restart, a finished run whose result was never handled is announced
-# again only if it ended this recently; older ones are recorded undelivered.
-_REANNOUNCE_WITHIN_SECONDS = 3_600
+# After a restart, a finished run whose result no saved turn handled is
+# announced again if it ended within this long — a night or a weekend day
+# with Flowly closed still delivers — and the notice says how old it is.
+# Older ones are recorded undelivered.
+_REANNOUNCE_WITHIN_SECONDS = 86_400
+# …and at most this many times: a result whose report turn keeps taking the
+# process down is not announced at every start forever.
+_MAX_REANNOUNCE = 3
+# The conversation's record of the subagent results its saved turns handled:
+# session.metadata[SUBAGENT_REPORTS_KEY], newest last, written in the same
+# save as the turn. This is the delivery commit point.
+SUBAGENT_REPORTS_KEY = "subagentReports"
+_REPORTS_KEPT = 256
 # How long a child may wait for the main agent's reply (agent_message).
 _REPLY_WAIT_SECONDS = 300
 # Result text handed to the parent with the completion notice; the rest
@@ -175,6 +188,28 @@ def _created_artifact_id(payload: Any, tool_args: dict[str, Any]) -> str | None:
 
 def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + f" […{len(text) - limit} more]"
+
+
+def record_subagent_reports(metadata: dict[str, Any], run_ids: list[str]) -> None:
+    """Note in a session's metadata that its turn handled these results.
+
+    Written into the same save as the turn, so "the conversation has this
+    result" and "the result is delivered" can never disagree after a crash.
+    """
+    if not run_ids:
+        return
+    kept = [rid for rid in metadata.get(SUBAGENT_REPORTS_KEY) or [] if isinstance(rid, str)]
+    kept = [rid for rid in kept if rid not in run_ids] + list(dict.fromkeys(run_ids))
+    metadata[SUBAGENT_REPORTS_KEY] = kept[-_REPORTS_KEPT:]
+
+
+def _age_text(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 3_600:
+        return f"{max(1, seconds // 60)} min"
+    if seconds < 86_400:
+        return f"{seconds // 3_600} h {seconds % 3_600 // 60} min"
+    return f"{seconds // 86_400} d {seconds % 86_400 // 3_600} h"
 
 
 def _looks_like_code(s: str) -> bool:
@@ -372,6 +407,18 @@ class SubagentManager:
         self.brave_api_key = brave_api_key
         self.exec_config = exec_config or ExecConfig()
         self._registry = registry or SubagentRegistry()
+        # This manager's identity as an owner of runs (subagent_owner).
+        self._instance = uuid.uuid4().hex
+        subagent_owner.register_instance(self._instance)
+        self._started_at = time.time()
+        # Results agent_wait handed to a turn not yet saved: run_id → the
+        # conversation's key. Saving the turn delivers them; a turn that
+        # ends without saving gives them back (release_taken).
+        self._taken: dict[str, str] = {}
+        # Reads the run ids a conversation's saved turns handled (the
+        # session's SUBAGENT_REPORTS_KEY). AgentLoop sets it; None = unknown.
+        self.committed_reports: Callable[[str], set[str]] | None = None
+        self._shutting_down = False
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         # Pending deliveries of held batch results, by parent and batch.
         self._batch_flushes: dict[str, asyncio.Task[None]] = {}
@@ -445,46 +492,113 @@ class SubagentManager:
             if record.parent_session_key != parent_session_key or record.origin == "system":
                 continue
             waiting = record.ended_at is None or (
-                record.delivery_state in ("pending", "queued")
+                record.delivery_state in ("pending", "queued", "taken")
                 # A result that was never handled within the grace period
                 # (a crash between publishing and handling) stops holding
-                # the goal rather than parking it for good.
-                and now - record.ended_at < _UNDELIVERED_GRACE_SECONDS
+                # the goal rather than parking it for good. The period
+                # starts again with this process: a result announced again
+                # after a restart is handled now, not when it ended.
+                and now - max(record.ended_at, self._started_at) < _UNDELIVERED_GRACE_SECONDS
             )
             if waiting:
                 titles.append(record.display_name or record.label)
         return titles
 
+    def turn_reports(self, session_key: str, notice_run_ids: list[str] | None = None) -> list[str]:
+        """The results a turn of ``session_key`` handled, to commit with its save.
+
+        The runs a notice reported plus those agent_wait handed to the turn.
+        The caller records them in the session (record_subagent_reports),
+        saves, then calls mark_delivered.
+        """
+        taken = [rid for rid, key in self._taken.items() if key == session_key]
+        return list(dict.fromkeys([*(notice_run_ids or []), *taken]))
+
     def mark_delivered(self, parent_session_key: str, run_ids: list[str]) -> None:
-        """Record that the conversation has handled these finished runs' results."""
+        """Record that the conversation has saved a turn handling these results."""
         for run_id in dict.fromkeys(run_ids):
+            if self._taken.get(run_id) == parent_session_key:
+                del self._taken[run_id]
             record = self._registry.get(run_id)
             if (
                 record is not None
                 and record.parent_session_key == parent_session_key
                 and record.ended_at is not None
-                and record.delivery_state in ("pending", "queued")
+                and record.delivery_state in ("pending", "queued", "taken")
             ):
                 self._registry.update(run_id, delivery_state="delivered")
 
-    def _reconcile_undelivered(self) -> None:
+    def release_taken(self, session_key: str) -> None:
+        """A turn of ``session_key`` ended: results it took but never saved go back.
+
+        agent_wait handed them to the turn, but the turn was not saved (it
+        failed, or was dropped), so the conversation does not have them:
+        they are announced again instead of being lost.
+        """
+        for run_id, key in list(self._taken.items()):
+            if key != session_key:
+                continue
+            del self._taken[run_id]
+            record = self._registry.get(run_id)
+            if record is None or record.delivery_state != "taken":
+                continue
+            self._registry.update(run_id, delivery_state="pending", announced=False)
+            self._spawn_announce(run_id, self._stored_result(record), record.outcome or "unknown")
+
+    def _spawn_announce(self, run_id: str, result: str, status: str) -> None:
+        task = asyncio.ensure_future(self._announce(run_id, result, status))
+        task.add_done_callback(lambda t: t.exception() if not t.cancelled() and t.exception() else None)
+
+    def _committed(self, parent_session_key: str) -> set[str]:
+        reader = self.committed_reports
+        if reader is None:
+            return set()
+        try:
+            return set(reader(parent_session_key))
+        except Exception:
+            logger.exception("Could not read which subagent results a conversation saved")
+            return set()
+
+    def _adopt(self, record: SubagentRunRecord, owners: dict[str, str], **changes: Any) -> SubagentRunRecord | None:
+        """Take ``record`` over when its owner is provably gone; else None."""
+        key = json.dumps(record.owner, sort_keys=True)
+        if key not in owners:
+            owners[key] = subagent_owner.owner_state(record.owner, self._instance)
+        if owners[key] == subagent_owner.ALIVE:
+            return None  # another live process is working on it
+        if owners[key] == subagent_owner.OURS:
+            return record
+        return self._registry.claim(
+            record.run_id, subagent_owner.process_owner(self._instance), record.owner, **changes,
+        )
+
+    def _reconcile_undelivered(self, records: list[SubagentRunRecord], owners: dict[str, str]) -> None:
         now = time.time()
-        for record in self._registry.all():
-            if record.ended_at is None or record.delivery_state not in ("pending", "queued"):
+        for record in records:
+            if record.ended_at is None or record.delivery_state not in ("pending", "queued", "taken"):
+                continue
+            if record.kind != "subagent":
+                # A delegated task reports through its own message, not a
+                # subagent notice; it is never announced again here.
+                if now - record.ended_at >= _REANNOUNCE_WITHIN_SECONDS:
+                    self._registry.update(record.run_id, delivery_state="undelivered")
+                continue
+            if self._adopt(record, owners) is None:
+                continue
+            if record.run_id in self._committed(record.parent_session_key):
+                # The turn that handled it was saved; the process stopped
+                # before recording that here.
+                self._registry.update(record.run_id, delivery_state="delivered")
                 continue
             recent = now - record.ended_at < _REANNOUNCE_WITHIN_SECONDS
-            if recent and record.outcome in ("ok", "error", "timeout"):
+            if recent and record.reannounced < _MAX_REANNOUNCE and record.outcome != "cancelled":
                 # Announced before the restart but never handled: it must be
                 # claimable again by its batch's notice.
-                self._registry.update(record.run_id, announced=False)
-                try:
-                    result = self._registry.read_result(record.run_id, 0, 200_000)["content"]
-                except (FileNotFoundError, ValueError, OSError):
-                    result = record.result_preview or record.error or ""
-                task = asyncio.create_task(self._announce(record.run_id, result, record.outcome))
-                task.add_done_callback(
-                    lambda t: t.exception() if not t.cancelled() and t.exception() else None
+                self._registry.update(
+                    record.run_id, announced=False, delivery_state="pending",
+                    reannounced=record.reannounced + 1,
                 )
+                self._spawn_announce(record.run_id, self._stored_result(record), record.outcome or "unknown")
             else:
                 self._registry.update(record.run_id, delivery_state="undelivered")
 
@@ -498,27 +612,31 @@ class SubagentManager:
         return records
 
     def resume_pending(self) -> None:
-        """Called on startup: settle what the previous process left unfinished.
+        """Called on startup: settle what a stopped process left unfinished.
 
-        Runs that were still going are marked failed and announced. Runs that
-        had finished but whose result never reached their conversation (the
-        process stopped between publishing and handling it) are announced
-        again if recent, and otherwise recorded as undelivered so nothing
-        waits on them.
+        Only runs whose owner is provably gone are touched (subagent_owner):
+        a live gateway's runs are never settled from another process. Runs
+        that were still going are marked failed and announced. Runs that had
+        finished but whose result no saved turn handled are announced again
+        (with their age) when they ended within a day, and otherwise
+        recorded as undelivered so nothing waits on them.
         """
         try:
-            self._reconcile_undelivered()
-        except (OSError, ValueError):
-            logger.exception("Subagent delivery recovery unavailable")
-        try:
-            pending = self._registry.pending()
+            records = self._registry.all()
         except (OSError, ValueError):
             logger.exception("Subagent history recovery unavailable")
             return
-        if not pending:
+        owners: dict[str, str] = {}
+        try:
+            self._reconcile_undelivered(records, owners)
+        except (OSError, ValueError):
+            logger.exception("Subagent delivery recovery unavailable")
+        pending = [r for r in records if r.ended_at is None and r.run_id not in self._running_tasks]
+        adopted = [r for r in (self._adopt(r, owners) for r in pending) if r is not None]
+        if not adopted:
             return
-        logger.warning(f"[SubagentManager] Found {len(pending)} pending task(s) from previous run — marking as failed")
-        for record in pending:
+        logger.warning(f"[SubagentManager] Found {len(adopted)} pending task(s) from previous run — marking as failed")
+        for record in adopted:
             self._registry.finish(
                 record.run_id, "error", error_code="process_restarted",
                 error="Process restarted before task completed",
@@ -526,11 +644,7 @@ class SubagentManager:
             self._record_metric(record.run_id)
             if record.delivery_state == "not_required":
                 continue
-            # Track recovery announce tasks (audit: was fire-and-forget)
-            task = asyncio.create_task(
-                self._announce(record.run_id, "The process restarted before this task completed.", "error")
-            )
-            task.add_done_callback(lambda t: t.exception() if not t.cancelled() and t.exception() else None)
+            self._spawn_announce(record.run_id, "The process restarted before this task completed.", "error")
 
     # ------------------------------------------------------------------
     # Public spawn
@@ -592,6 +706,11 @@ class SubagentManager:
                 "error": "Subagents cannot spawn other subagents",
             })
 
+        if self._shutting_down:
+            return json.dumps({
+                "status": "rejected",
+                "error": "Flowly is shutting down; no new subagent can start now.",
+            })
         parent_session_key = parent_session_key or f"{origin_channel}:{origin_chat_id}"
         # Concurrency limits — a runaway parent can't pin the event loop, and
         # one conversation can't take every slot from the others.
@@ -648,6 +767,7 @@ class SubagentManager:
                 str(rec.mark.get("glyph")) for rec in siblings if rec.mark
             }),
             batch_id=batch_id,
+            owner=subagent_owner.process_owner(self._instance),
         )
         self._registry.register(record)
 
@@ -1559,7 +1679,7 @@ class SubagentManager:
         # A notice for several runs is handled once all of them are.
         run_ids = _NOTICE_RUN_ID_RE.findall(content or "") or [run_id]
         records = [self._registry.get(rid) for rid in run_ids]
-        return all(r is not None and r.delivery_state == "delivered" for r in records)
+        return all(r is not None and r.delivery_state in ("delivered", "taken") for r in records)
 
     async def wait_for_children(
         self,
@@ -1573,8 +1693,10 @@ class SubagentManager:
 
         Returns as soon as there is something to act on — finished results
         not yet handled, messages from children — or the owner wrote into
-        the turn, or the timeout passed. What it returns is marked handled,
-        so the same result or message is not processed again as a notice.
+        the turn, or the timeout passed. What it returns is marked taken, so
+        the same result or message is not processed again as a notice; it
+        becomes delivered when the turn is saved (mark_delivered), and goes
+        back to be announced again if the turn ends unsaved (release_taken).
         """
         def targets() -> list[SubagentRunRecord]:
             records = [
@@ -1636,7 +1758,8 @@ class SubagentManager:
             if record.error:
                 item["error"] = record.error
             results.append(item)
-            self._registry.update(record.run_id, delivery_state="delivered")
+            self._registry.update(record.run_id, delivery_state="taken")
+            self._taken[record.run_id] = parent_session_key
         taken_ids = {m["id"] for m in mail}
         if taken_ids:
             self._parent_mail[parent_session_key] = [
@@ -1756,8 +1879,14 @@ class SubagentManager:
 
         title = record.display_name or record.label
         brief = record.task if len(record.task) <= 600 else record.task[:600] + " […]"
+        late = ""
+        if record.ended_at is not None and record.ended_at < self._started_at:
+            late = (
+                f"\nIt finished {_age_text(time.time() - record.ended_at)} ago, before Flowly "
+                "restarted; this result reaches you only now."
+            )
         return (
-            f"[Subagent '{title}' {status_text}{duration}] run_id={record.run_id}{tool_summary}\n\n"
+            f"[Subagent '{title}' {status_text}{duration}] run_id={record.run_id}{tool_summary}{late}\n\n"
             f"Brief: {brief}\n\n"
             f"Result:\n{shown}{more}"
         )
@@ -1833,7 +1962,7 @@ class SubagentManager:
         # report: whoever stopped it already knows.
         to_tell = [
             m for m in members
-            if m.delivery_state != "delivered" and m.outcome != "cancelled"
+            if m.delivery_state not in ("delivered", "taken") and m.outcome != "cancelled"
         ]
         if not to_tell:
             return
@@ -2036,6 +2165,22 @@ Do not create, patch, install, or manage skills. Do not edit project files or ru
             flush.cancel()
         if count:
             logger.info(f"[SubagentManager] shutdown: cancelled {count} running subagent(s)")
+        return count
+
+    async def shutdown(self, wait_seconds: float = 1.5) -> int:
+        """Stop every running subagent first, and give each a moment to record it.
+
+        The gateway calls this before anything else on its way down: the
+        owner's desktop kills a foreground gateway 3 s after asking it to
+        stop (a named agent's runtime after 5 s), so subagents cannot wait
+        for channels, cron and the gateway server to close first. New spawns
+        are refused from here on. Idempotent.
+        """
+        self._shutting_down = True
+        tasks = [task for task in self._running_tasks.values() if not task.done()]
+        count = self.cancel_all()
+        if tasks and wait_seconds > 0:
+            await asyncio.wait(tasks, timeout=wait_seconds)
         return count
 
     def cancel_children(self, parent_session_key: str) -> int:

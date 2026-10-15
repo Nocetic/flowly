@@ -43,6 +43,12 @@ The agent can message its running subagents at any time with `agent_message` —
 - Stopping the conversation's turn stops the agent, not its subagents — they usually outlive the turn that started them. Stop a subagent on its own from its sidebar or the menu bar, or ask the agent ("stop them all").
 - If one subagent is slow, the others don't wait for it forever: five minutes after the first of them finished, the results so far reach the agent, which hears which ones are still working; theirs follow when they finish. A subagent you stopped is mentioned, not waited for.
 
+### When Flowly restarts
+
+A subagent's result counts as delivered only once the conversation has saved the reply that dealt with it. If Flowly stops in between — closed, updated, or crashed — the result reaches the conversation again after the restart, never twice: a reply that was already saved is not repeated. A result that finished up to a day before Flowly started again still arrives, saying how long ago it finished; older ones are not brought up.
+
+When Flowly is shut down, subagents are stopped before anything else, so they are recorded before the app's shutdown deadline. Another Flowly process on the same machine (a terminal session, a second gateway) never settles subagents that a running Flowly is still working on.
+
 ### Tokens and statistics
 
 Every subagent counts the tokens it uses — input, output and cache reads — as it works. The count is shown live while it runs and stays with it when it ends. Flowly shows tokens, not prices.
