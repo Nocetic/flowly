@@ -8,32 +8,45 @@ message list can be rebuilt. It exists only while the run is running and is
 deleted once its result is durable; the registry also prunes any file whose
 run is no longer running. System runs keep none.
 
-Every line is ``{"v": 1, "n": <sequence>, "t": <time>, "type": …, …}``:
+Every line is ``{"v": 2, "n": <sequence>, "t": <time>, "type": …, …}``:
 
-=============  =============================================================
-``header``     system prompt, first message (brief + forked conversation),
-               model, iteration limit, core version
-``mail``       a message from the main agent arrived (not yet read)
-``step``       iteration k began: messages read from the inbox, the context
-               budget its trim used
-``model``      the model's reply with tool calls — written BEFORE any of its
-               tools run (full arguments, ids, ``extra_content``), with usage
-``text``       a reply kept because a message arrived while it was produced
-``recovery``   the one-off trim after a context overflow
-``tool_start`` a tool is about to run (written before it starts)
-``tool``       a tool message as appended (full content), its status and
-               what the repetition guard saw
-``inbox``      messages a tool call read (agent_message's reply)
-``phase``      the summary (grace) call was asked for, and why
-``final``      the run's result, before the registry records it
-``suspended``  a clean shutdown stopped the run to continue it later
-``resumed``    the run continued after a restart
-=============  =============================================================
+===============  ===========================================================
+``header``       system prompt, first message (brief + forked conversation),
+                 model, iteration limit, core version
+``mail``         a message from the main agent arrived (not yet read)
+``step``         iteration k began: messages read from the inbox, the
+                 old-tool-result passes it applied (``strip``)
+``microcompact`` the request was fitted by cutting old tool results, with
+                 the parameters used (``keepRecentFull``, ``truncateChars``)
+``compacted``    the request was fitted by a summary (a model call): the
+                 exact message list that replaced the old one, with the
+                 estimates before and after (``summarized: false`` for a cut
+                 the replay could not have redone from its parameters)
+``model``        the model's reply with tool calls — written BEFORE any of
+                 its tools run (full arguments, ids, ``extra_content``),
+                 with usage
+``text``         a reply kept because a message arrived while it was produced
+``tool_start``   a tool is about to run (written before it starts)
+``tool``         a tool message as appended (full content), its status and
+                 what the repetition guard saw
+``inbox``        messages a tool call read (agent_message's reply)
+``phase``        the summary (grace) call was asked for, and why
+``final``        the run's result, before the registry records it
+``suspended``    a clean shutdown stopped the run to continue it later
+``resumed``      the run continued after a restart
+===============  ===========================================================
 
-``model``, ``tool_start``, ``mail`` and ``final`` are fsynced: they are the
-lines a restart must be able to trust (a call that may have started, a
-message the main agent was told was delivered, a result). Others are
-flushed; losing one only makes the restart redo a step that had no effect.
+``model``, ``tool_start``, ``mail``, ``compacted`` and ``final`` are fsynced:
+they are the lines a restart must be able to trust (a call that may have
+started, a message the main agent was told was delivered, a summary that
+cost a model call, a result). Others are flushed; losing one only makes the
+restart redo a step that had no effect.
+
+Deterministic changes to the message list are recorded with their
+parameters and replayed through the same function; a summary cannot be
+computed again, so it is recorded as its result. Version 1 (a context budget
+per step and a one-off overflow trim) is not continued: its runs end
+``resume_unsupported``.
 
 ``restore_child_state`` replays the lines through the same functions the
 live loop uses, so the rebuilt list is the live one, step for step.
@@ -51,8 +64,9 @@ from typing import Any, Callable
 from loguru import logger
 
 from flowly.agent.repetition import RepetitionGuard, mark_repeated
+from flowly.compaction.pruning import microcompact_tool_results, strip_old_tool_results
 
-CHECKPOINT_VERSION = 1
+CHECKPOINT_VERSION = 2
 # A run whose checkpoint grows past this stops checkpointing and is not
 # continued after a restart (typically a run writes 0.3–2 MB).
 MAX_CHECKPOINT_BYTES = 16 * 1024 * 1024
@@ -209,7 +223,6 @@ class ChildState:
     messages: list[dict[str, Any]]
     max_iterations: int
     iteration: int = 0
-    input_budget_recovered: bool = False
     model_used_artifact: bool = False
     repetition: RepetitionGuard = field(default_factory=RepetitionGuard)
     stalled: bool = False
@@ -303,28 +316,35 @@ def main_agent_note(text: str) -> dict[str, Any]:
     return {"role": "user", "content": f"[Message from the main agent]\n{text}"}
 
 
-def apply_step(
-    state: ChildState, iteration: int, notes: list[str], budget: int,
-    strip: Callable[..., list[dict[str, Any]]],
-    trim: Callable[..., list[dict[str, Any]]],
-) -> None:
-    """Begin iteration ``iteration``: read the inbox, compact old results.
+def apply_step(state: ChildState, iteration: int, notes: list[str],
+               strip: list[tuple[int, int]]) -> None:
+    """Begin iteration ``iteration``: read the inbox, cut old tool results.
 
-    The live loop and the replay both go through here, so a rebuilt list is
-    compacted exactly as the live one was.
+    ``strip`` is the ``(keep_last, max_old_chars)`` passes the step applies
+    (``iteration_strip_passes``, the main loop's schedule). The live loop and
+    the replay both go through here, so a rebuilt list is cut exactly as the
+    live one was.
     """
     state.iteration = iteration
     for note in notes:
         state.messages.append(main_agent_note(note))
-    # Strip old tool results to save tokens (keep recent, compact old).
-    if iteration > 3:
-        state.messages = strip(state.messages, keep_last=3, max_old_chars=300)
-    if iteration > 7:
-        state.messages = strip(state.messages, keep_last=2, max_old_chars=150)
-    # Iteration count is a poor proxy for context pressure: measure the
-    # actual budget too.
-    state.messages = trim(state.messages, budget=budget)
+    for keep_last, max_old_chars in strip:
+        state.messages = strip_old_tool_results(state.messages, keep_last=keep_last,
+                                                max_old_chars=max_old_chars)
     state.awaiting_model = True
+
+
+def apply_microcompact(state: ChildState, keep_recent_full: int, truncate_chars: int) -> None:
+    """The request was fitted by cutting old tool results (``microcompact``)."""
+    state.messages = microcompact_tool_results(
+        state.messages, keep_recent_full=keep_recent_full, truncate_chars=truncate_chars,
+    )
+
+
+def apply_compacted(state: ChildState, messages: list[dict[str, Any]]) -> None:
+    """The request was fitted to a recorded list (a summary's, or a cut the
+    replay could not redo): that exact list replaces the old one."""
+    state.messages = [dict(message) for message in messages]
 
 
 def observe_tool_result(state: ChildState, guard: dict[str, Any] | None, content: str,
@@ -346,8 +366,6 @@ def observe_tool_result(state: ChildState, guard: dict[str, Any] | None, content
 def restore_child_state(
     records: list[dict[str, Any]],
     *,
-    strip: Callable[..., list[dict[str, Any]]],
-    trim: Callable[..., list[dict[str, Any]]],
     annotate: Callable[..., str],
 ) -> ChildState | ResumeRefusal:
     """Replay a checkpoint into the state the run had when it stopped.
@@ -383,9 +401,16 @@ def restore_child_state(
                 mail[str(record["id"])] = str(record["text"])
             elif kind == "step":
                 apply_step(state, int(record["iteration"]), [str(n) for n in record.get("notes", [])],
-                           int(record["budget"]), strip, trim)
+                           [(int(keep), int(chars)) for keep, chars in record.get("strip", [])])
                 consumed.update(str(i) for i in record.get("mail", []))
                 calls = {}
+            elif kind == "microcompact":
+                apply_microcompact(state, int(record["keepRecentFull"]), int(record["truncateChars"]))
+            elif kind == "compacted":
+                messages = record["messages"]
+                if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
+                    raise TypeError("compacted messages")
+                apply_compacted(state, messages)
             elif kind == "model":
                 message = record["message"]
                 state.messages.append(message)
@@ -399,10 +424,6 @@ def restore_child_state(
                 }
             elif kind == "text":
                 state.messages.append({"role": "assistant", "content": str(record["content"])})
-                state.awaiting_model = False
-            elif kind == "recovery":
-                state.input_budget_recovered = True
-                state.messages = strip(state.messages, keep_last=1, max_old_chars=60)
                 state.awaiting_model = False
             elif kind == "tool_start":
                 call = calls.get(str(record["callId"]))

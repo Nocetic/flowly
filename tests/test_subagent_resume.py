@@ -32,12 +32,9 @@ import pytest
 
 from flowly.agent import subagent as subagent_module
 from flowly.agent import subagent_owner
-from flowly.agent.subagent import (
-    SubagentManager,
-    _strip_subagent_tool_results,
-    _trim_to_context_budget,
-)
+from flowly.agent.subagent import SubagentManager
 from flowly.agent.subagent_checkpoint import (
+    CHECKPOINT_VERSION,
     GRACE_PROMPT,
     NOT_RUN_TEXT,
     SubagentCheckpoint,
@@ -51,6 +48,9 @@ from flowly.agent.tools.discovery import annotate_search_repetition
 from flowly.agent.tools.filesystem import WriteFileTool
 from flowly.agent.tools.shell import ExecTool
 from flowly.bus.queue import MessageBus
+from flowly.compaction.service import CompactionService
+from flowly.compaction.summarizer import SUMMARIZE_SYSTEM_PROMPT
+from flowly.compaction.types import CompactionConfig, is_summary_message
 from flowly.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
 CHAT = "web:chat-1"
@@ -91,11 +91,17 @@ class _Scripted(LLMProvider):
         self.default = default
         self.sent: list[list[dict[str, Any]]] = []
         self.tools_offered: list[Any] = []
+        self.summary_calls: list[list[dict[str, Any]]] = []
 
     def get_default_model(self) -> str:
         return MODEL
 
     async def chat(self, **kwargs: Any) -> LLMResponse:
+        if kwargs["messages"] and kwargs["messages"][0].get("content") == SUMMARIZE_SYSTEM_PROMPT:
+            # The compaction service summarizing the run's history.
+            self.summary_calls.append(copy.deepcopy(kwargs["messages"]))
+            return LLMResponse(content="Record: the draft was written.",
+                               usage={"prompt_tokens": 40, "completion_tokens": 9})
         self.sent.append(copy.deepcopy(kwargs["messages"]))
         self.tools_offered.append(kwargs.get("tools"))
         step = self.script.pop(0) if self.script else LLMResponse(
@@ -106,20 +112,20 @@ class _Scripted(LLMProvider):
 
 
 def _manager(home: Path, workspace: Path, provider: LLMProvider, bus: MessageBus | None = None,
-             *, resume: bool = True, max_iterations: int = 30) -> SubagentManager:
+             *, resume: bool = True, max_iterations: int = 30, window: int | None = None) -> SubagentManager:
+    compaction = None
+    if window is not None:
+        compaction = CompactionService(provider=provider, model=MODEL, config=CompactionConfig(
+            context_window=window, context_window_explicit=True))
     manager = SubagentManager(provider=provider, workspace=workspace, bus=bus or MessageBus(),
                               registry=SubagentRegistry(home / "runs.json"), state_dir=workspace,
-                              max_iterations=max_iterations)
+                              max_iterations=max_iterations, compaction=compaction)
     manager.resume_enabled = resume
     return manager
 
 
 def restore(records: list[dict[str, Any]]):
-    return restore_child_state(
-        records, strip=_strip_subagent_tool_results,
-        trim=lambda messages, *, budget: _trim_to_context_budget(messages, MODEL, budget=budget),
-        annotate=annotate_search_repetition,
-    )
+    return restore_child_state(records, annotate=annotate_search_repetition)
 
 
 def _call(call_id: str, name: str, **arguments: Any) -> ToolCallRequest:
@@ -156,7 +162,8 @@ def _dead_owner() -> dict[str, Any]:
 # ── A reference run, and the states a restart finds ──────────────────────────
 
 async def _reference(tmp_path: Path, monkeypatch, script: list[Any], *, max_iterations: int = 30,
-                     task: str = "Prepare the report") -> tuple[list[dict[str, Any]], SubagentRunRecord]:
+                     task: str = "Prepare the report",
+                     window: int | None = None) -> tuple[list[dict[str, Any]], SubagentRunRecord]:
     """Run a child to its end; return its whole checkpoint and its record."""
     kept: dict[str, list[dict[str, Any]]] = {}
     real_append = SubagentCheckpoint.append
@@ -167,7 +174,8 @@ async def _reference(tmp_path: Path, monkeypatch, script: list[Any], *, max_iter
 
     monkeypatch.setattr(SubagentCheckpoint, "append", keep)
     provider = _Scripted(script)
-    manager = _manager(tmp_path / "reference", tmp_path, provider, max_iterations=max_iterations)
+    manager = _manager(tmp_path / "reference", tmp_path, provider, max_iterations=max_iterations,
+                       window=window)
     started = json.loads(await manager.spawn(task=task, origin_channel="web", origin_chat_id="chat-1",
                                              parent_session_key=CHAT, origin="agent",
                                              context="owner: prepare it\nagent: starting"))
@@ -314,6 +322,55 @@ async def test_a_run_continues_from_each_crash_point_and_runs_no_call_twice(
     assert all(step["status"] != "running" for step in record.tool_trace)
     # One metric line, no checkpoint left.
     assert [row["runId"] for row in read_metrics(metrics_path(home / "runs.json"))] == [reference.run_id]
+    assert not manager.registry.checkpoint_path(reference.run_id).exists()
+
+
+# A run whose second request is over the threshold of a small window: its
+# history is summarized (a model call) before the call goes out.
+_SMALL_WINDOW = 12_000
+
+
+def _write_then_report(tmp_path: Path) -> list[Any]:
+    return [
+        LLMResponse(content="Drafting.", tool_calls=[
+            _call("c1", "write_file", path=str(tmp_path / "draft.md"), content="R" * 12_000),
+        ], usage={"prompt_tokens": 100, "completion_tokens": 20}),
+        LLMResponse(content="Report done.", usage={"prompt_tokens": 150, "completion_tokens": 10}),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("point", ["before_compacted", "after_compacted"])
+async def test_a_restart_around_a_summary_makes_it_at_most_once_more(tmp_path, monkeypatch, side_effects, point):
+    """A crash after the summary was recorded continues from it with no
+    summary call; a crash before it (the summary was paid but not written)
+    makes it again. Either way the call it fitted is made once, with the
+    summarized list, and nothing runs again."""
+    full, reference = await _reference(tmp_path, monkeypatch, _write_then_report(tmp_path),
+                                       window=_SMALL_WINDOW)
+    compacted = next(r for r in full if r["type"] == "compacted")
+    assert compacted["summarized"] and compacted["reason"] == "threshold"
+    side_effects.write_text("")
+    prefix = _upto(full, "compacted") if point == "after_compacted" else _upto(full, "step", nth=2)
+    home = tmp_path / "home2"
+    before = _crash_state(home, reference, prefix)
+    provider = _Scripted()
+    manager = _manager(home, tmp_path, provider, window=_SMALL_WINDOW)
+    manager.resume_pending()
+    record = await _settle(manager, reference.run_id)
+
+    assert record.outcome == "ok" and side_effects.read_text() == ""
+    assert len(provider.sent) == 1
+    sent = provider.sent[0]
+    assert is_summary_message(sent[1]) and sent[2] == restore(_upto(full, "header")).messages[1]
+    if point == "after_compacted":
+        assert provider.summary_calls == []
+        assert sent == compacted["messages"] == restore(prefix).messages
+    else:
+        assert provider.summary_calls, "the unrecorded summary is made again"
+        assert not any(r["type"] == "compacted" for r in prefix)
+    summaries = len(provider.summary_calls)
+    assert record.usage["input"] == before.usage.get("input", 0) + 7 + 40 * summaries
     assert not manager.registry.checkpoint_path(reference.run_id).exists()
 
 
@@ -570,13 +627,30 @@ async def test_a_process_that_does_not_continue_runs_leaves_them_to_the_gateway(
     assert record.ended_at is None and record.owner["instance"] == "a-stopped-process"
 
 
+def _first_format(record: dict[str, Any]) -> dict[str, Any]:
+    """A record as version 1 wrote it: a context budget per step, no cut passes."""
+    old = dict(record, v=1)
+    if old["type"] == "step":
+        old.pop("strip", None)
+        old["budget"] = 90_000
+    return old
+
+
 @pytest.mark.asyncio
-async def test_a_checkpoint_of_another_format_ends_the_run_with_a_notice(tmp_path, monkeypatch, side_effects):
+@pytest.mark.parametrize("version", ["older", "newer"])
+async def test_a_checkpoint_of_another_format_ends_the_run_with_a_notice(
+    tmp_path, monkeypatch, side_effects, version,
+):
+    """A checkpoint written by the first format (before runs compacted like
+    the main agent) or by a newer build is not replayed: the run ends
+    ``resume_unsupported`` with one notice, and nothing is run again."""
     (tmp_path / "notes.txt").write_text("notes")
     full, reference = await _reference(tmp_path, monkeypatch, _three_calls(tmp_path))
     home = tmp_path / "home2"
-    newer = [dict(r, v=2) for r in _upto(full, "model")]
-    _crash_state(home, reference, newer)
+    prefix = _upto(full, "model")
+    other = ([_first_format(r) for r in prefix] if version == "older"
+             else [dict(r, v=CHECKPOINT_VERSION + 1) for r in prefix])
+    _crash_state(home, reference, other)
     bus = MessageBus()
     provider = _Scripted()
     manager = _manager(home, tmp_path, provider, bus)
@@ -779,7 +853,8 @@ async def test_messages_the_child_had_not_read_come_back(tmp_path, monkeypatch, 
     full, reference = await _reference(tmp_path, monkeypatch, _three_calls(tmp_path))
     home = tmp_path / "home2"
     prefix = _upto(full, "tool", "c3") + [
-        {"v": 1, "n": 99, "t": time.time(), "type": "mail", "id": "m1", "text": "Use the 2024 numbers."},
+        {"v": CHECKPOINT_VERSION, "n": 99, "t": time.time(), "type": "mail", "id": "m1",
+         "text": "Use the 2024 numbers."},
     ]
     _crash_state(home, reference, prefix)
     provider = _Scripted()

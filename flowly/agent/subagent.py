@@ -34,12 +34,25 @@ from flowly.agent.subagent_checkpoint import (
     GRACE_PROMPT,
     ResumeRefusal,
     SubagentCheckpoint,
+    apply_compacted,
+    apply_microcompact,
     apply_step,
     interrupted_result,
     read_checkpoint,
     restore_child_state,
     tool_class,
 )
+from flowly.agent.error_classifier import ErrorCategory, classify_response, extract_input_limit_tokens
+from flowly.compaction.pruning import iteration_strip_passes, microcompact_tool_results
+from flowly.compaction.request_guard import (
+    ProviderRequestCoordinator,
+    RequestFit,
+    request_fingerprint,
+    request_too_large_response,
+)
+from flowly.compaction.service import CompactionService
+from flowly.compaction.summarizer import collect_summary_usage
+from flowly.providers.base import LLMErrorInfo, LLMResponse
 from flowly.agent.delegation import MAX_CHILDREN_PER_CONVERSATION, assign_mark
 from flowly.agent.tools.agent_tools import ChildAgentMessageTool
 from flowly.agent.subagent_observation import TaskEvents, run_view
@@ -274,134 +287,44 @@ def _derive_display_name(task: str) -> str:
     return first or "task"
 
 
-def _strip_subagent_tool_results(
-    messages: list[dict[str, Any]],
-    keep_last: int = 3,
-    max_old_chars: int = 300,
-) -> list[dict[str, Any]]:
-    """Compact old tool results to reduce token usage.
-
-    Keeps the last `keep_last` tool results at full length.
-    Truncates older ones to `max_old_chars` with a placeholder.
-    Keeps the last ``keep_last`` tool results at full length; older
-    ones are compacted to ``max_old_chars`` with a placeholder.
-    """
-    tool_indices = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
-    if len(tool_indices) <= keep_last:
-        return messages
-
-    to_truncate = set(tool_indices[:-keep_last])
-    result = list(messages)
-    for i in to_truncate:
-        content = result[i].get("content", "")
-        if len(content) > max_old_chars:
-            result[i] = {
-                **result[i],
-                "content": content[:max_old_chars] + "\n[compacted: old output removed to save context]",
-            }
-    return result
-
-
-# Headroom left for the subagent's own reply. Smaller than the main loop's
-# reserve: a subagent answers with a result, not a conversation.
-_SUBAGENT_RESERVE_TOKENS = 8_000
-# …but never more than this share of a small model's window, or the reserve
-# alone swallows the context the subagent is supposed to think with.
-_SUBAGENT_MAX_RESERVE_SHARE = 0.35
-# Cap on one reply. Also clamped to the window: asked for 16,384 output
-# tokens, a 16,385-token model has nothing left to read the request with.
+# A reply may claim at most this many output tokens, and at most this share of
+# the window: asked for 16,384 output tokens, a 16,385-token model has nothing
+# left to read the request with. It also stays inside the reserve the
+# compaction threshold leaves (CompactionService.effective_reserve_tokens_for),
+# so a request fitted to the threshold plus its reply fit one window.
 _SUBAGENT_MAX_OUTPUT_TOKENS = 16_384
 _SUBAGENT_MAX_OUTPUT_SHARE = 0.25
-# Everything a request carries besides the messages: tool schemas and the
-# system preamble. Counted so the three parts are budgeted against ONE window
-# instead of each being sized as if it were alone.
-_SUBAGENT_OVERHEAD_TOKENS = 4_000
-# Slack between the planned request and the hard limit. The message-list size
-# is an ESTIMATE (tokenisers disagree by model and language), so a plan that
-# lands exactly on the window lands over it about half the time.
-_SUBAGENT_SAFETY_MARGIN_SHARE = 0.05
+_SUBAGENT_MIN_OUTPUT_TOKENS = 512
+# The grace (summary) call's reply.
+_GRACE_MAX_OUTPUT_TOKENS = 4_096
+# The brief (the child's first message) is authoritative input: a request
+# summary keeps it verbatim after the summary, like the system prompt.
+_PINNED_BRIEF = 1
+
+# What a summary of a subagent's own work keeps. The brief stays verbatim
+# beside it, so the summary is the record of the work itself.
+CHILD_SUMMARY_INSTRUCTIONS = (
+    "This is the working record of a subagent doing one task for the main "
+    "agent; its brief is kept verbatim beside this record and is not part of "
+    "it. Record the work so far: each action and its outcome (files read or "
+    "written, commands run, pages fetched), the evidence found with the exact "
+    "URLs, paths, identifiers, numbers and quotes a final report needs, what "
+    "failed and why, and what is not done yet. Refer to the task and the main "
+    "agent, never to a user."
+)
 
 
-def subagent_context_window(model: str) -> int:
-    """The model's real window, or a conservative guess."""
-    from flowly.compaction.service import _heuristic_context_window
-
-    window = 0
-    try:
-        from flowly.integrations.model_catalog import get_context_window
-
-        window = get_context_window(model) or 0
-    except Exception:  # noqa: BLE001 — catalog is best-effort
-        window = 0
-    if not window:
-        window = _heuristic_context_window(model) or 128_000
-    return max(1, window)
-
-
-def subagent_output_budget(model: str) -> int:
-    """Output tokens one subagent reply may claim.
+def subagent_output_budget(window: int, reserve: int) -> int:
+    """Output tokens one subagent reply may claim in ``window``.
 
     A constant 16,384 was sent to every model. On a 16,385-token model that
     leaves one token for the entire request — the provider rejects it, and no
-    amount of trimming the message list can help, because the overflow is the
-    reply budget itself.
+    amount of compacting the message list can help, because the overflow is
+    the reply budget itself.
     """
-    window = subagent_context_window(model)
-    return max(512, min(_SUBAGENT_MAX_OUTPUT_TOKENS,
-                        int(window * _SUBAGENT_MAX_OUTPUT_SHARE)))
-
-
-def _subagent_context_budget(model: str) -> int:
-    """Tokens a subagent may spend on its message list for ``model``.
-
-    Sized against the SAME window as the reply and the fixed overhead, so the
-    three together fit one request. Budgeting the message list alone let a
-    16,385-token model be handed 8,385 tokens of messages plus a 16,384-token
-    reply plus tool schemas — 25K+ into a 16K window, rejected every time.
-    """
-    window = subagent_context_window(model)
-    reserve = max(
-        subagent_output_budget(model),
-        min(_SUBAGENT_RESERVE_TOKENS, int(window * _SUBAGENT_MAX_RESERVE_SHARE)),
-    )
-    margin = int(window * _SUBAGENT_SAFETY_MARGIN_SHARE)
-    return max(1_000, window - reserve - _SUBAGENT_OVERHEAD_TOKENS - margin)
-
-
-def _trim_to_context_budget(
-    messages: list[dict[str, Any]],
-    model: str,
-    *,
-    budget: int | None = None,
-) -> list[dict[str, Any]]:
-    """Collapse old tool results until the list fits the model's window.
-
-    Subagents deliberately do NOT summarize: their context is disposable by
-    design, and a summarization call inside one doubles its cost for work
-    that is thrown away when it returns. Progressive truncation is the cheap
-    half of what the main loop does, and it is what keeps a long subagent
-    from dying on a provider 413 instead of returning its result.
-    """
-    from flowly.compaction.estimator import estimate_messages_tokens
-
-    # A child run passes the budget it recorded for the step, so a restart
-    # compacts its rebuilt list exactly as the live one was.
-    budget = _subagent_context_budget(model) if budget is None else budget
-    if estimate_messages_tokens(messages) <= budget:
-        return messages
-
-    for keep_last, max_chars in ((2, 200), (1, 120), (1, 60)):
-        messages = _strip_subagent_tool_results(
-            messages, keep_last=keep_last, max_old_chars=max_chars,
-        )
-        if estimate_messages_tokens(messages) <= budget:
-            return messages
-
-    logger.warning(
-        "Subagent context still over budget after truncation "
-        f"({estimate_messages_tokens(messages)} > {budget}); the provider may reject it"
-    )
-    return messages
+    return max(_SUBAGENT_MIN_OUTPUT_TOKENS, min(
+        _SUBAGENT_MAX_OUTPUT_TOKENS, int(window * _SUBAGENT_MAX_OUTPUT_SHARE), reserve,
+    ))
 
 
 class SubagentManager:
@@ -428,6 +351,7 @@ class SubagentManager:
         web_search_server_id: str | None = None,
         web_search_auth_token: str | None = None,
         max_iterations: int = _DEFAULT_MAX_ITERATIONS,
+        compaction: CompactionService | None = None,
     ):
         self.provider = provider
         # The main agent's own limit; AgentLoop passes it in.
@@ -435,6 +359,13 @@ class SubagentManager:
         self.workspace = workspace
         self.bus = bus
         self.model = model or provider.get_default_model()
+        # The main agent's context management (AgentLoop passes its own
+        # service): windows, the proxy cap and provider-learned input
+        # ceilings, the threshold, microcompact and summaries are the same,
+        # and a ceiling one learns every other request uses. Without one
+        # (tests, embeddings) a stateless service of the same defaults.
+        self.compaction = compaction or CompactionService(provider=provider, model=self.model)
+        self._requests = ProviderRequestCoordinator(self.compaction)
         self.brave_api_key = brave_api_key
         self.exec_config = exec_config or ExecConfig()
         self._registry = registry or SubagentRegistry()
@@ -804,11 +735,7 @@ class SubagentManager:
         except OSError:
             logger.exception(f"[SubagentManager] [{record.run_id[:8]}] checkpoint unreadable")
             return None, "unreadable"
-        restored = restore_child_state(
-            records, strip=_strip_subagent_tool_results,
-            trim=self._trim_for(record.model or self.model),
-            annotate=annotate_search_repetition,
-        )
+        restored = restore_child_state(records, annotate=annotate_search_repetition)
         if isinstance(restored, ResumeRefusal):
             if restored.reason != "missing":
                 logger.warning(
@@ -1384,10 +1311,156 @@ class SubagentManager:
         self._log(run_id, "tool", callId=call_id, protocolName=protocol_name, content=content,
                   status=status, guard=guard, search=search)
 
-    def _trim_for(self, model: str) -> Callable[..., list[dict[str, Any]]]:
-        def trim(messages: list[dict[str, Any]], *, budget: int) -> list[dict[str, Any]]:
-            return _trim_to_context_budget(messages, model, budget=budget)
-        return trim
+    # ------------------------------------------------------------------
+    # Context management: the main agent's, per request
+    # ------------------------------------------------------------------
+
+    def _output_budget(self, model: str) -> int:
+        return subagent_output_budget(self.compaction.effective_context_window_for(model),
+                                      self.compaction.effective_reserve_tokens_for(model))
+
+    async def _fit_request(
+        self, run_id: str, state: ChildState, tools: list[dict[str, Any]] | None, model: str,
+        iteration: int, *, overflow: bool, activity: dict[str, Any],
+    ) -> RequestFit:
+        """Fit the run's next request to its model, as the main agent fits its own.
+
+        ``ProviderRequestCoordinator.fit``: nothing while the request (messages
+        and tool schemas) is under the compaction threshold of ``model``'s
+        window; past it, old tool results are cut (microcompact); if that is
+        not enough, the history is summarized — the last resort, a model call.
+        After a context-overflow rejection (``overflow``) it reduces harder.
+        The system prompt and the brief are kept verbatim.
+
+        What changed the list is checkpointed before the request goes out: a
+        cut with its parameters (``microcompact``), a summary with the list it
+        produced (``compacted``, fsynced), so a restart rebuilds it without a
+        model call. The summary's tokens count toward the run.
+        """
+        requests = self._requests
+        before = requests.budget(state.messages, tools, model, pinned=_PINNED_BRIEF)
+        if not overflow and before.estimated_input_tokens <= before.input_limit:
+            return RequestFit(state.messages, before, before)
+        reason = "overflow" if overflow else "threshold"
+        await self._progress(run_id, {"phase": "compacting", "iteration": iteration, "reason": reason})
+        micro = self.compaction.config.microcompact
+        keep_recent_full, truncate_chars = micro.keep_recent_full, micro.truncate_chars
+        original = state.messages
+        calls: list[dict[str, Any]] = []
+        try:
+            with collect_summary_usage() as calls:
+                fitted = await requests.fit(
+                    original, tools, model, session_key=f"subagent:{run_id}",
+                    force_reduction=overflow, pinned=_PINNED_BRIEF,
+                    custom_instructions=CHILD_SUMMARY_INSTRUCTIONS,
+                )
+        except Exception as exc:  # noqa: BLE001 — fitting fails closed, never the run
+            logger.warning(f"[SubagentManager] [{run_id[:8]}] request fitting failed: {exc}")
+            fitted = RequestFit(original, before, before, failure=f"request fitting failed: {exc}",
+                                retryable=True)
+        finally:
+            for usage in calls:
+                await self._count_usage(run_id, usage)
+        if fitted.fits and fitted.changed:
+            summarized = fitted.compaction is not None
+            if not summarized and microcompact_tool_results(
+                original, keep_recent_full=keep_recent_full, truncate_chars=truncate_chars,
+            ) == fitted.messages:
+                apply_microcompact(state, keep_recent_full, truncate_chars)
+                self._log(run_id, "microcompact", iteration=iteration, reason=reason,
+                          keepRecentFull=keep_recent_full, truncateChars=truncate_chars)
+            else:
+                # A summary cannot be computed again: the list it produced is
+                # the record (and so is any cut the replay could not redo).
+                apply_compacted(state, fitted.messages)
+                self._log(run_id, "compacted", durable=True, iteration=iteration, reason=reason,
+                          summarized=summarized, messages=state.messages,
+                          tokensBefore=fitted.before.estimated_input_tokens,
+                          tokensAfter=fitted.after.estimated_input_tokens)
+            if summarized:
+                self._transcribe(run_id, {
+                    "kind": "compacted", "at": time.time(), "iteration": iteration, "reason": reason,
+                    "tokensBefore": fitted.before.estimated_input_tokens,
+                    "tokensAfter": fitted.after.estimated_input_tokens,
+                    "summary": _clip(fitted.compaction.summary, 4_000),
+                })
+            logger.info(
+                f"[SubagentManager] [{run_id[:8]}] request {'summarized' if summarized else 'compacted'} "
+                f"({reason}): {fitted.before.estimated_input_tokens} → "
+                f"{fitted.after.estimated_input_tokens} estimated tokens (limit {fitted.after.input_limit})"
+            )
+        await self._progress(run_id, activity)
+        return fitted
+
+    async def _call_model(
+        self, run_id: str, state: ChildState, *, tools: list[dict[str, Any]] | None, model: str,
+        iteration: int, max_tokens: int, timeout: float, activity: dict[str, Any],
+    ) -> LLMResponse:
+        """One model call of the run, made the way the main agent makes one
+        (``AgentLoop._call_provider_with_context_recovery``).
+
+        The request is fitted first (``_fit_request``); one that cannot be
+        made to fit is not sent. A context-overflow rejection teaches the
+        shared service the provider's input ceiling (``input_too_large``),
+        the request is fitted harder and sent once more — only if that
+        changed it. Every call's tokens count toward the run.
+        """
+        fitted = await self._fit_request(run_id, state, tools, model, iteration,
+                                         overflow=False, activity=activity)
+        if not fitted.fits:
+            return self._unfit_response(run_id, fitted)
+
+        async def dispatch() -> LLMResponse:
+            response = await self.provider.chat(messages=state.messages, tools=tools, model=model,
+                                                max_tokens=max_tokens, timeout=timeout)
+            await self._count_usage(run_id, response.usage)
+            return response
+
+        response = await dispatch()
+        if response.finish_reason != "error":
+            return response
+        category = classify_response(response)
+        if category not in {ErrorCategory.CONTEXT_OVERFLOW, ErrorCategory.INPUT_TOO_LARGE}:
+            return response
+        if category is ErrorCategory.INPUT_TOO_LARGE:
+            ceiling = extract_input_limit_tokens(response)
+            if ceiling is None:
+                # The rejected payload bounds the ceiling from above.
+                ceiling = int(self._requests.budget(state.messages, tools, model, pinned=_PINNED_BRIEF)
+                              .estimated_input_tokens * 0.9)
+            self.compaction.note_observed_input_limit(
+                model, ceiling, reason="subagent provider input_too_large rejection",
+            )
+        rejected = request_fingerprint(state.messages)
+        recovered = await self._fit_request(run_id, state, tools, model, iteration,
+                                            overflow=True, activity=activity)
+        if not recovered.fits or request_fingerprint(state.messages) == rejected:
+            logger.warning(
+                f"[SubagentManager] [{run_id[:8]}] {category.value}: no safely smaller request "
+                f"({recovered.failure or 'unchanged'})"
+            )
+            return response
+        logger.warning(
+            f"[SubagentManager] [{run_id[:8]}] {category.value} — retrying once after reducing "
+            f"the context ({recovered.before.estimated_input_tokens} → "
+            f"{recovered.after.estimated_input_tokens} estimated tokens)"
+        )
+        return await dispatch()
+
+    @staticmethod
+    def _unfit_response(run_id: str, fitted: RequestFit) -> LLMResponse:
+        """The answer for a request that was not sent because it did not fit.
+
+        A summary that failed may work on another attempt: that is an
+        ordinary transient error (retried with the run's error budget). Any
+        other failure is structural and ends as ``input_too_large``, as for
+        the main agent.
+        """
+        if fitted.retryable:
+            logger.warning(f"[SubagentManager] [{run_id[:8]}] context compaction failed: {fitted.failure}")
+            return LLMResponse(content="Error: compacting the run's context failed.",
+                               finish_reason="error", error_info=LLMErrorInfo(code="compaction_failed"))
+        return request_too_large_response(fitted.failure or "request does not fit")
 
     async def _child_run(
         self,
@@ -1407,7 +1480,6 @@ class SubagentManager:
         error_str: str | None = None
         error_code: str | None = None
         tools = self._child_tools(run_id, label)
-        trim = self._trim_for(model)
 
         if restored is None:
             # Build messages with subagent-specific prompt
@@ -1488,16 +1560,17 @@ class SubagentManager:
                 if state.iteration >= max_iterations or state.stalled:
                     break
                 # Messages the main agent sent since the last step, and the
-                # compaction the step needs — recorded so a restart rebuilds
-                # the same list.
+                # old tool results the step cuts (the main loop's schedule) —
+                # recorded so a restart rebuilds the same list.
                 mail = self._take_inbox_entries(run_id)
-                budget = _subagent_context_budget(model)
-                apply_step(state, state.iteration + 1, [m["text"] for m in mail], budget,
-                           _strip_subagent_tool_results, trim)
+                strip = iteration_strip_passes(state.iteration + 1)
+                apply_step(state, state.iteration + 1, [m["text"] for m in mail], strip)
                 self._log(run_id, "step", iteration=state.iteration,
-                          notes=[m["text"] for m in mail], mail=[m["id"] for m in mail], budget=budget)
+                          notes=[m["text"] for m in mail], mail=[m["id"] for m in mail],
+                          strip=[list(p) for p in strip])
             iteration = state.iteration
-            await self._progress(run_id, {"phase": "thinking", "iteration": iteration})
+            thinking = {"phase": "thinking", "iteration": iteration}
+            await self._progress(run_id, thinking)
             _heartbeat(
                 f"subagent {label}: iteration {iteration}/{max_iterations}",
                 None,
@@ -1523,14 +1596,11 @@ class SubagentManager:
                 sources=tools.get_discovery_sources(),
                 intent_text=task,
             )
-            response = await self.provider.chat(
-                messages=state.messages,
-                tools=list(tool_disclosure.definitions),
-                model=model,
-                max_tokens=subagent_output_budget(model),
-                timeout=_llm_call_timeout,
+            response = await self._call_model(
+                run_id, state, tools=list(tool_disclosure.definitions), model=model,
+                iteration=iteration, max_tokens=self._output_budget(model),
+                timeout=_llm_call_timeout, activity=thinking,
             )
-            await self._count_usage(run_id, response.usage)
             state.awaiting_model = False
 
             if response.has_tool_calls:
@@ -1733,11 +1803,10 @@ class SubagentManager:
                     # P1.4 — route by error category. Rate limits get
                     # long jittered waits (anti thundering-herd);
                     # context overflow and auth are not retryable
-                    # (retrying the same prompt / bad key is pointless);
-                    # everything else falls through to short jitter.
-                    from flowly.agent.error_classifier import (
-                        classify_response, backoff_for, ErrorCategory,
-                    )
+                    # (_call_model already compacted and retried once;
+                    # a bad key stays bad); everything else falls through
+                    # to short jitter.
+                    from flowly.agent.error_classifier import backoff_for
                     _category = classify_response(response)
                     _delay = backoff_for(
                         _category,
@@ -1749,30 +1818,6 @@ class SubagentManager:
                         ),
                     )
                     _err_snippet = (response.content or "")[:100]
-
-                    # One-shot overflow recovery. Giving up here throws
-                    # away everything the subagent has already done, when
-                    # the fix is usually just old tool output it no longer
-                    # needs. Trim hard and retry once; a second overflow
-                    # means the task really is too big.
-                    if (
-                        _category in {
-                            ErrorCategory.CONTEXT_OVERFLOW,
-                            ErrorCategory.INPUT_TOO_LARGE,
-                        }
-                        and not state.input_budget_recovered
-                    ):
-                        state.input_budget_recovered = True
-                        _before = len(state.messages)
-                        state.messages = _strip_subagent_tool_results(
-                            state.messages, keep_last=1, max_old_chars=60,
-                        )
-                        self._log(run_id, "recovery", iteration=iteration)
-                        logger.warning(
-                            f"[SubagentManager] [{run_id[:8]}] input budget exceeded — "
-                            f"trimmed tool history ({_before} messages) and retrying once"
-                        )
-                        continue
 
                     if _delay is None:
                         logger.error(
@@ -1900,14 +1945,13 @@ class SubagentManager:
             _heartbeat(f"subagent {label}: generating summary", None)
             await self._progress(run_id, {"phase": "summarizing"})
             try:
-                summary_response = await self.provider.chat(
-                    messages=state.messages,
+                summary_response = await self._call_model(
+                    run_id, state,
                     tools=None,  # CRITICAL: prevent another tool loop
-                    model=model,
-                    max_tokens=4096,
-                    timeout=60,
+                    model=model, iteration=state.iteration,
+                    max_tokens=min(_GRACE_MAX_OUTPUT_TOKENS, self._output_budget(model)),
+                    timeout=60, activity={"phase": "summarizing"},
                 )
-                await self._count_usage(run_id, summary_response.usage)
                 if summary_response.finish_reason != "error" and summary_response.content and summary_response.content.strip():
                     final_result = summary_response.content
                     status, error_str, error_code = "ok", None, None

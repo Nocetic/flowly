@@ -1036,6 +1036,20 @@ class AgentLoop:
         # State dir (must be set before SubagentManager)
         self._state_dir = state_dir or (workspace / ".flowly_state")
 
+        # Compaction service (subagents share it: same thresholds, learned
+        # input ceilings and summaries as the main agent)
+        self.compaction = CompactionService(
+            provider=provider,
+            model=self.model,
+            config=compaction_config,
+            # The canonical sessions are profile-global, so their lock and
+            # breaker records must live beside that store. A workspace-local
+            # lock would let two processes opened from different cwd values
+            # both believe they owned the same conversation.
+            state_dir=self.sessions.sessions_dir,
+        )
+        self._provider_requests = ProviderRequestCoordinator(self.compaction)
+
         from flowly.agent.subagent_registry import SubagentRegistry
         self._subagent_registry = SubagentRegistry()
         self.subagents = SubagentManager(
@@ -1048,6 +1062,7 @@ class AgentLoop:
             registry=self._subagent_registry,
             state_dir=self._state_dir,
             max_iterations=self.max_iterations,
+            compaction=self.compaction,
         )
         # Which results a conversation's saved turns handled: the delivery
         # commit point a restart checks before announcing one again.
@@ -1055,19 +1070,6 @@ class AgentLoop:
         # A finished subagent's report runs as a live turn on the surface the
         # owner is watching (register_report_turn_submitter), else the bus.
         self.subagents.report_submitter = self._submit_report_turn
-
-        # Compaction service
-        self.compaction = CompactionService(
-            provider=provider,
-            model=self.model,
-            config=compaction_config,
-            # The canonical sessions are profile-global, so their lock and
-            # breaker records must live beside that store. A workspace-local
-            # lock would let two processes opened from different cwd values
-            # both believe they owned the same conversation.
-            state_dir=self.sessions.sessions_dir,
-        )
-        self._provider_requests = ProviderRequestCoordinator(self.compaction)
 
         # Trello config
         self.trello_config = trello_config
