@@ -261,7 +261,7 @@ run_started ─▶ [agent delta | iteration_step | tool_progress | agent_note | 
   message from the main agent the subagent read at a step; `noteKind: "task"`
   when it is a task the main agent gave the running turn (its report covers
   it). `content` is as the model got it (`[Message from the main agent]` /
-  `[Task from the main agent]` and the text).
+  `[Another task from the main agent]` and the text).
 - `compaction {phase, compactionId, tokensBefore, tokensAfter,
   messagesRemoved, sessionKey: K, runId: R}`: a summary fitting the
   subagent's context (§5's lifecycle).

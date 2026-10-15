@@ -25,7 +25,7 @@ are gone (`test_delegation_rule.py` pins the current contract).
 
 | File | Role |
 |---|---|
-| `flowly/agent/subagent.py` | `SubagentManager`: spawn, follow-ups (`followup`), closing (`close_threads`), the child loop, messaging (`send_to_child`, `message_thread`, `_carry_over`), waiting, delivery (announce), cancel, recovery, metrics hook |
+| `flowly/agent/subagent.py` | `SubagentManager`: spawn, follow-ups (`followup`), closing (`close_threads`), the child loop, messaging (`send_to_child`, `message_thread`, `_stash_unread`, `_start_pending_tasks`), waiting, delivery (announce), cancel, recovery, metrics hook |
 | `flowly/agent/subagent_registry.py` | `SubagentRunRecord` + `SubagentRegistry` (`runs.json` index and `threads.json` edges under one lock, result files, transcripts, pruning, `claim`, the thread cap, idle close, `close_thread`, `queue_mail`, `forget_parent`, `maintain`), `ThreadCapReached`, `add_usage`, `append_jsonl` |
 | `flowly/agent/subagent_threads.py` | Threads (§16): `SubagentThreadRecord`, `decode_thread`, `thread_view`, `thread_history` / `repair_thread_history` (a thread's history as its next turn's model gets it), `SubagentThreadStore` (the thread conversations: `SessionManager` in `<home>/subagents/sessions`, raw outputs in `<home>/subagents/spill/<threadId>`, `commit_turn`, `turn_context`, `persist_context`, `display_rows`, `delete`, `prune`), the cap / idle / retention / pending-mail constants |
 | `flowly/session/keys.py` | `is_subagent_thread`, `require_rpc_subagent_access` (a subagent conversation is read only, §16), `SUBAGENT_THREAD_READABLE_METHODS` |
@@ -619,14 +619,17 @@ metrics outlive the 30-day run pruning. `subagents.stats` returns, for the last 
   then the labeled task), saved, reported (`task 2`, `agent_id`) and counted (metrics,
   `byTrigger`); the owner-quote label; a follow-up while running enters the turn
   (`noteKind: "task"` live and in history) and one report covers it; a task that arrives as the
-  turn ends starts the next turn; a closed subagent (agent, deleted parent, idle) refuses tasks and
+  turn ends starts the next turn, is kept across a restart and starts then, and is dropped when
+  the turn was stopped (owner stop, cancel) while its messages are kept; turn numbers are
+  decided under the registry lock; a closed subagent (agent, deleted parent, idle) refuses tasks and
   messages with the reason; `agent_close` stops a working one with no report and tells clients;
   spawns and follow-ups of one parent turn report together; the running limits; a message kept for
   the next task; `agent_read` by `agent_id`, `sessions_list`; the new tool descriptions hold no
   steering; history repair (unit, a turn stopped mid-call, an older conversation with a call left
   open mid-history) against a strict provider-ordering check; checkpoint v3 — the golden replay at
   every model call of a follow-up turn on top of the thread's history, across a cut and a summary
-  that is then kept and that turn 3 starts from; a long thread whose next task's first request is
+  that is then kept and that turn 3 starts from; a kept summary after a stopped turn keeps the
+  saved rows active (not copies); a long thread whose next task's first request is
   over the window; a restart mid follow-up (no call runs twice, exact list, one notice), a changed
   history (`resume_unsupported`), a crash after the turn was saved (no model call), a version-2
   checkpoint; a follow-up turn's stream (`run_started` with `trigger: "followup"`, `turn: 2`).
@@ -910,7 +913,7 @@ before threads has no conversation and takes no task.
 
 | Tool | Does |
 |---|---|
-| `agent_followup(to, task, owner_request?, model?)` | `SubagentManager.followup`. **Idle and open:** registers a run of the thread (`register` appends it to `runs`, sets `active_run_id`, moves `pending_mail` into the run's `notes` in the same write) and starts it; returns `{status:"started", run_id, agent_id, turn, title, model, message}` (the spawn's wording). **Working:** the task goes to the running turn's inbox as a task (`send_to_child(kind="task")`, durable `mail` line), read at its next step as `[Task from the main agent]` (`agent_note`, `noteKind: "task"`); returns `{status:"added_to_running_task", run_id, agent_id, turn, message}`. **Closed:** `{status:"closed", agent_id, title, error: closed_text}` — a fact per reason (`agent`, `owner`, `idle`, `cap`, `parent_deleted` — the last always refused, its conversation is gone). Also `rejected` (the limits), `busy` (recorded running with no process here, or another task just started). |
+| `agent_followup(to, task, owner_request?, model?)` | `SubagentManager.followup`. **Idle and open:** registers a run of the thread (`register` appends it to `runs`, sets `active_run_id`, moves `pending_mail` into the run's `notes` in the same write) and starts it; returns `{status:"started", run_id, agent_id, turn, title, model, message}` (the spawn's wording). **Working:** the task goes to the running turn's inbox as a task (`send_to_child(kind="task")`, durable `mail` line), read at its next step as `[Another task from the main agent]` (`agent_note`, `noteKind: "task"`; a label of its own, so the turn's own task — `[Task from the main agent]` — is never mistaken for a note repeating it); returns `{status:"added_to_running_task", run_id, agent_id, turn, message}`. **Closed:** `{status:"closed", agent_id, title, error: closed_text}` — a fact per reason (`agent`, `owner`, `idle`, `cap`, `parent_deleted` — the last always refused, its conversation is gone). Also `rejected` (the limits), `busy` (recorded running with no process here, or another task just started). |
 | `agent_close(to: id \| [ids] \| "all")` | `close_threads`: `registry.close_thread(reason="agent")` (drops `pending_mail`, moves the thread's runs' revisions), then a running task is cancelled (`cancelled`, no report, its turn saved `aborted`) and the runs' views go out again. `already_closed` with its reason when it was. |
 | `agent_message` | Extended (§5): idle → `queued`, closed → `closed`. |
 | `agent_read(run_id \| agent_id)` | `agent_id`: the thread's latest ended run's result (`agent_id`, `task_number` in the reply). |
@@ -930,6 +933,9 @@ run's origin.
 **Model.** The owner's named model, else the turn's model (as `spawn`), so a provider switch
 moves later turns along; the thread's `model` follows its latest turn.
 
+**Turn numbers** are decided in `register`, under the registry lock (`len(thread.runs)`), so two
+processes sharing a home never give one thread the same turn twice.
+
 **Limits.** `_admission_error` is shared by spawn and follow-up: shutdown, 8 running in the process,
 3 running per conversation. A follow-up opens no thread, so the 16-open cap does not apply.
 
@@ -938,11 +944,18 @@ follow-ups started in one turn report in one notice (§6); the header names `age
 `task N`. A task given to a running turn is covered by that turn's report.
 
 **Late tasks and messages.** A task or message that reaches a turn too late to be read (the turn's
-last step, its summary call, or after its answer) is not lost: when the run's task ends
-(`_start_run_task`'s cleanup, not for a run suspended by a shutdown — its unread mail is in its
-checkpoint), `_carry_over` keeps messages as the thread's `pending_mail` and starts the next turn
-with the tasks (the first starts it, later ones join it), with the batch and origin each was given
-under. Nothing is carried for a closed thread.
+last step, its summary call, or after its answer) is not lost. Once the run's end is recorded and
+**before its checkpoint is dropped** (its `mail` lines were the only durable record),
+`_stash_unread` moves it to the thread's `pending_mail` (a task as `{kind: "task", batch,
+origin}`); a run suspended by a shutdown keeps it in its checkpoint instead. A task is kept only
+when the turn ended on its own (`ok`, `error`, `timeout`): a turn stopped on request, by the
+owner stopping the conversation (`cancel_children` → `interrupted`) or by a shutdown had its work
+stopped too, so its unread tasks are dropped (messages are still kept). Kept tasks start as the
+thread's next turn (`_start_pending_tasks`: `take_pending_tasks` under the lock, the first starts
+a follow-up with its batch and origin, the rest join it), scheduled when any task of the
+conversation ends and at startup (`resume_pending`, gateway only); one that cannot start (limits,
+shutdown) is kept again (`requeue_tasks`). A follow-up's `register` takes only the waiting
+*messages* as its notes. Nothing is kept for a closed thread.
 
 **The turn's input** (`_child_run`, follow-up): `SubagentThreadStore.turn_context(threadId)` →
 the saved `systemPrompt` (`meta.subagent`; rebuilt with `_build_subagent_prompt` when the first
@@ -971,7 +984,9 @@ summarized (`ChildState.summarized`, set by `apply_compacted(summarized=True)`, 
 `compacted.summarized`), `_save_turn` keeps it after saving the turn:
 `SubagentThreadStore.persist_context` rewrites the working context `<key>.jsonl` to
 `[summary, *kept]` — `kept` = the messages after the summary at the turn's end plus its closing
-reply — with the owner's compaction machinery (`prepare_compaction_archive` marks the replaced
+reply; each is matched to the saved row it is (`_match_saved_rows`: from the end, like the
+archive's matching, but a message the projection made up — a repaired call, a stopped turn's
+closing text — consumes no row, so the rows before it still match) — with the owner's compaction machinery (`prepare_compaction_archive` marks the replaced
 rows compacted in the append-only display log, `append_compaction_summary` archives the summary and
 any kept message that is not a saved row as hidden derived copies, `mark_full_synced`, the pending
 transaction / boundary markers, then `finalize_compaction_archive` / `finalize_context_boundary`
@@ -991,7 +1006,8 @@ task; the content is the labeled first message); a task given to a running turn 
 
 **Deviations from the design.**
 * `agent_message` to an idle subagent queues in `threads.json` (`pending_mail`, ≤ 32) as designed;
-  a message or task that arrives too late for a running turn is carried over (not in the design).
+  a message or task that arrives too late for a running turn is kept durably for the next turn
+  (not in the design); a task given to a running turn has its own label.
 * No `subagents.close` RPC (owner decision, §16); `owner` stays a valid reason with no path.
 * The 16-open cap keeps closing the idle-longest thread (owner decision); it is not a refusal.
 * A restart that cannot continue a turn saves a minimal turn for it (`_save_settled_turn`), so

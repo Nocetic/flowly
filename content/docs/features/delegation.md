@@ -38,7 +38,7 @@ A turn that keeps getting results it already has — re-reading the same finishe
 A subagent keeps its conversation after it reports, so the agent can give the same subagent another task with `agent_followup` — when you ask ("ask the same agent to also check B") or when it judges that worth it. The subagent picks up with everything it did before in view: its earlier tasks, the tool results it read and the reports it wrote. Nothing in Flowly pushes the agent toward a follow-up or a new subagent; it is the agent's call, or yours.
 
 - **If the subagent has nothing running**, the task starts a new turn of its conversation in the background. It counts toward the same limits as a new subagent (3 running per conversation, 8 overall) and reports back the same way — together with anything else started in the same turn. Its report says which task it is ("task 2").
-- **If the subagent is working**, the task reaches its running turn at its next step, like a message, and that turn's report covers it. A task that arrives just as the turn is finishing starts the subagent's next turn instead.
+- **If the subagent is working**, the task reaches its running turn at its next step, like a message, and that turn's report covers it. A task that arrives just as the turn is finishing starts the subagent's next turn instead — it is kept even if Flowly restarts meanwhile — unless that turn was stopped, by you or by the agent.
 - **When you asked for it**, the agent quotes your words and Flowly checks them, as for a new subagent; the task is then shown as started at your request.
 - A message from the agent to a subagent with nothing running (`agent_message`) is kept for its next task; it starts nothing on its own.
 
