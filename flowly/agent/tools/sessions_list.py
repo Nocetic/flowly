@@ -164,9 +164,12 @@ class SessionsListTool(Tool):
             ended = [by_id[rid] for rid in thread.runs if rid in by_id and by_id[rid].ended_at is not None]
             if ended:
                 last = ended[-1]
-                preview = " ".join((last.result_preview or last.error or "").split())[:160]
-                if preview:
-                    line += f"; latest result: {preview}"
+                if last.outcome == "cancelled" and getattr(last, "stopped_by", "") == "owner":
+                    line += "; its latest task was stopped by the owner, with no result"
+                else:
+                    preview = " ".join((last.result_preview or last.error or "").split())[:160]
+                    if preview:
+                        line += f"; latest result: {preview}"
             lines.append(line)
         lines.append("")
         return lines

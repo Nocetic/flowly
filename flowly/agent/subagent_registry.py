@@ -149,6 +149,10 @@ class SubagentRunRecord:
     # it (the thread's pending mail, taken when the turn was recorded): its
     # first message carries them before the task.
     notes: list[str] = field(default_factory=list)
+    # Who stopped a cancelled run: "owner" (from a client) or "agent" (its
+    # main agent, or closing its subagent). The main agent is told of an
+    # owner's stop; its own it already knows.
+    stopped_by: str = ""
 
 
 
@@ -774,10 +778,11 @@ class SubagentRegistry:
 
     def finish(self, run_id: str, outcome: str, *, result: str = "",
                error: str | None = None, error_code: str | None = None,
-               report: bool = False) -> None:
+               report: bool = False, stopped_by: str = "") -> None:
         """Record a run's end. A cancelled or interrupted run needs no
         delivery — unless ``report``: a run a restart could not continue is
-        interrupted, and its conversation must hear so once."""
+        interrupted, and one its owner stopped is cancelled, and its
+        conversation must hear so once."""
         with self._lock:
             self._read_locked()
             record = self._runs.get(run_id)
@@ -788,6 +793,7 @@ class SubagentRegistry:
             self.update(run_id, ended_at=time.time(), outcome=outcome, error=error,
                         error_code=error_code, result_preview=result[:1200],
                         result_chars=len(result), result_available=bool(result),
+                        **({"stopped_by": stopped_by} if stopped_by else {}),
                         delivery_state=(
                             "not_required" if outcome in ("cancelled", "interrupted") and not report
                             else record.delivery_state

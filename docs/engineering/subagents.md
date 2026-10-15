@@ -329,6 +329,35 @@ save** as the turn, and only then `mark_delivered` (`pending | queued | taken �
 * The owner's chat Stop stops the main agent's turn only, as in Codex: subagents keep running
   (they usually outlive the turn that started them). Each subagent is stopped on its own (its
   sidebar / notch "Stop", or by asking the agent).
+* **Who stopped it.** `cancel(run_id, by=...)` records `stopped_by` on the run: `"owner"` from a
+  client (`subagents.cancel` in `feature_rpc`, which every transport and the profile host reach;
+  a Board card's cancel), `"agent"` otherwise (`sessions_list` cancel, `agent_close`). A stop the
+  agent made it already knows: its run needs no delivery (`not_required`), as before. **An
+  owner's stop is reported** (`_finish_stopped`: `report=True`, so `delivery_state` stays
+  `pending`). Without that the main agent went on telling the owner that subagents the owner had
+  stopped were "still running", and a batch the owner stopped entirely ended in silence.
+  - **Notice.** `_announce` treats an owner-stopped run as a member to tell: its section reads
+    `[Subagent '<title>' was stopped by the owner before it finished …] run_id=…` with the
+    result `(none: the owner stopped it)`, so `notice_already_handled` and `mark_delivered` see
+    it like a result. It follows the batch rules: held while a sibling still works (an owner
+    stop never starts the hold clock), reported with the last sibling's result. A notice with
+    only stops says so, asks for a brief word to the owner, and says not to start them again or
+    do their work unless the owner asks; one with results adds a line naming the stopped ones.
+    The summary reads "— stopped".
+  - **A turn already running.** Before each model call (`_run_llm_tool_loop`) the loop asks
+    `take_owner_stops(session_key, turn_id, known)` and appends what it returns as an ephemeral
+    note (`_EPHEMERAL_NUDGE`, never saved): "While this turn ran, the owner stopped the
+    subagent(s) … There is no result …". The runs it names are taken by that turn exactly as an
+    `agent_wait` result is (`delivery_state="taken"`, `_taken[run_id] = (session, turn_id)`):
+    the turn's save delivers them (`turn_reports` → `mark_delivered`), an unsaved turn gives them
+    back (`release_taken` → announced again), and the notice already queued behind the turn is
+    skipped as handled. A run the turn's own messages already report (its notice) is left to
+    that notice (`known`). `_owner_stops` keeps, per conversation, the run ids not yet told, so
+    a step with nothing new costs a dict lookup, not a registry read.
+  - **Tools.** `agent_message` to a subagent whose last task the owner stopped says "(the owner
+    stopped its last task)"; `sessions_list` lists such a subagent with "its latest task was
+    stopped by the owner, with no result".
+  Tests: `tests/test_subagent_reporting.py` ("The owner's own stop").
 
 ## 8. Registry, transcripts, results
 

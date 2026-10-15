@@ -438,3 +438,128 @@ async def test_a_run_stopped_on_request_is_left_out_of_its_batchs_report(tmp_pat
     children.gates["A"].set()
     notice = await asyncio.wait_for(bus.consume_inbound(), 3)
     assert "Result of A." in notice.content and f"run_id={b}" not in notice.content
+
+
+# ── The owner's own stop ────────────────────────────────────────────────────
+# The owner stopped every subagent from the client while the agent spawned
+# them; nothing reached the agent, which went on telling the owner "the other
+# two are still running". A stop the agent makes itself stays silent (above).
+
+@pytest.mark.asyncio
+async def test_the_owner_stopping_a_whole_batch_is_reported_once(tmp_path):
+    bus, children = MessageBus(), _Children()
+    children.gates = {name: asyncio.Event() for name in "ABC"}
+    manager = _manager(tmp_path, children, bus)
+    runs = [await _start(manager, name, "turn-1") for name in "ABC"]
+    for run_id in runs[:2]:
+        await manager.cancel(run_id, by="owner")
+        await _no_notice(bus, 0.1)  # C still runs: held for the batch
+    await manager.cancel(runs[2], by="owner")
+
+    notice = await asyncio.wait_for(bus.consume_inbound(), 3)
+    for name, run_id in zip("ABC", runs):
+        assert f"[Subagent '{name}' was stopped by the owner before it finished" in notice.content
+        assert f"run_id={run_id}" in notice.content
+        assert manager.registry.get(run_id).stopped_by == "owner"
+    assert "The owner stopped 'A', 'B', 'C' before they finished" in notice.content
+    assert "Don't start them again" in notice.content
+    assert "own report" not in notice.content
+    await _no_notice(bus)
+    manager.mark_delivered(CHAT, runs)
+    assert manager.notice_already_handled(notice.content) is True
+    assert manager.pending_for_goal(CHAT) == []
+
+
+@pytest.mark.asyncio
+async def test_a_result_and_an_owner_stop_of_the_same_batch_report_together(tmp_path):
+    bus, children = MessageBus(), _Children()
+    children.gates = {"A": asyncio.Event(), "B": asyncio.Event()}
+    manager = _manager(tmp_path, children, bus)
+    await _start(manager, "A", "turn-1")
+    b = await _start(manager, "B", "turn-1")
+    await manager.cancel(b, by="owner")
+    await _no_notice(bus)
+    children.gates["A"].set()
+    notice = await asyncio.wait_for(bus.consume_inbound(), 3)
+    assert "Result of A." in notice.content
+    assert f"run_id={b}" in notice.content
+    assert "The owner stopped 'B' before it finished" in notice.content
+    await _no_notice(bus)
+
+
+@pytest.mark.asyncio
+async def test_a_turn_running_when_the_owner_stops_a_subagent_learns_it_once(tmp_path):
+    bus, children = MessageBus(), _Children()
+    children.gates = {"A": asyncio.Event(), "B": asyncio.Event()}
+    manager = _manager(tmp_path, children, bus)
+    manager.mark_busy(CHAT)
+    a = await _start(manager, "A", "turn-1")
+    b = await _start(manager, "B", "turn-1")
+    await manager.cancel(a, by="owner")
+
+    note = manager.take_owner_stops(CHAT, "turn-x")
+    assert "the owner stopped the subagent 'A' before it finished" in note
+    assert manager.registry.get(a).delivery_state == "taken"
+    assert manager.take_owner_stops(CHAT, "turn-x") == ""  # never twice
+
+    # The turn's own notice already reports a stop: left to it.
+    await manager.cancel(b, by="owner")
+    assert manager.take_owner_stops(CHAT, "turn-x", lambda run_id: run_id == b) == ""
+    assert manager.registry.get(b).delivery_state in ("pending", "queued")
+
+    # Its save delivers what it was told.
+    assert manager.turn_reports(CHAT, None, "turn-x") == [a]
+    manager.mark_delivered(CHAT, [a])
+    assert manager.registry.get(a).delivery_state == "delivered"
+    manager.mark_idle(CHAT)
+
+
+@pytest.mark.asyncio
+async def test_an_unsaved_turn_gives_an_owner_stop_back_to_be_reported(tmp_path):
+    bus, children = MessageBus(), _Children()
+    children.gates = {"A": asyncio.Event()}
+    manager = _manager(tmp_path, children, bus)
+    manager.mark_busy(CHAT)
+    a = await _start(manager, "A", "")
+    await manager.cancel(a, by="owner")
+    assert "'A'" in manager.take_owner_stops(CHAT, "turn-x")
+    manager.mark_idle(CHAT)
+    manager.release_taken(CHAT, "turn-x")
+    notice = await asyncio.wait_for(bus.consume_inbound(), 3)
+    assert "[Subagent 'A' was stopped by the owner before it finished" in notice.content
+
+
+@pytest.mark.asyncio
+async def test_the_agents_tools_say_who_stopped_a_subagent(tmp_path):
+    from flowly.agent.tools.sessions_list import SessionsListTool
+
+    bus, children = MessageBus(), _Children()
+    children.gates = {"A": asyncio.Event()}
+    manager = _manager(tmp_path, children, bus)
+    a = await _start(manager, "A", "")
+    await manager.cancel(a, by="owner")
+    thread = manager.registry.thread_of(a)
+    reply = await manager.message_thread(thread, "Go on with what you know.")
+    assert reply["status"] == "queued"
+    assert "the owner stopped its last task" in reply["note"]
+    tool = SessionsListTool(registry=manager.registry, manager=manager)
+    with tool_execution_scope(CHAT):
+        listing = await tool.execute(action="list", status="all")
+    assert "its latest task was stopped by the owner" in listing
+
+
+@pytest.mark.asyncio
+async def test_a_stop_from_a_client_is_the_owners(tmp_path, monkeypatch):
+    from flowly.channels import feature_rpc
+
+    bus, children = MessageBus(), _Children()
+    children.gates = {"A": asyncio.Event()}
+    manager = _manager(tmp_path, children, bus)
+    monkeypatch.setattr(feature_rpc, "_registry_provider", lambda: manager.registry)
+    monkeypatch.setattr(feature_rpc, "_subagent_manager_provider", lambda: manager)
+    a = await _start(manager, "A", "")
+    reply, _ = await feature_rpc.dispatch("subagents.cancel", {"runId": a})
+    assert reply["status"] == "cancelled"
+    assert manager.registry.get(a).stopped_by == "owner"
+    notice = await asyncio.wait_for(bus.consume_inbound(), 3)
+    assert "stopped by the owner" in notice.content

@@ -106,6 +106,7 @@ from flowly.agent.run_steering import ProviderSteeredError, RunSteeringControlle
 from flowly.agent.delegation import (
     DelegationTurn,
     conversation_from_history,
+    current_turn,
     delegation_turn_scope,
 )
 from flowly.agent.tool_result_spill import build_spill_pointer, spill_tool_result
@@ -6083,6 +6084,12 @@ class AgentLoop:
                     )
                 messages.append({"role": "user", "content": nudge, _EPHEMERAL_NUDGE: True})
 
+            # Subagents of this conversation its owner stopped while the turn
+            # runs: a fact the turn has no other way to learn.
+            owner_stops = self._owner_stops_note(session_key, messages)
+            if owner_stops:
+                messages.append({"role": "user", "content": owner_stops, _EPHEMERAL_NUDGE: True})
+
             tool_defs, policy_blocked_tools = self._apply_turn_tool_policy(
                 self._routed_tool_definitions(
                     tool_platform or outbound_channel,
@@ -7894,6 +7901,30 @@ class AgentLoop:
         if subagents is None or not hasattr(subagents, "turn_reports"):
             return list(notice_run_ids or [])
         return subagents.turn_reports(session_key, notice_run_ids, turn.turn_id if turn else None)
+
+    def _owner_stops_note(self, session_key: str, messages: list[dict[str, Any]]) -> str:
+        """The subagents the owner stopped since this turn last looked, as a note; or "".
+
+        Taken by this turn (``SubagentManager.take_owner_stops``): its save
+        delivers them, so no later notice repeats them. A run the turn's own
+        notice already reports is left to it.
+        """
+        subagents = getattr(self, "subagents", None)
+        turn = current_turn()
+        if subagents is None or turn is None or not hasattr(subagents, "take_owner_stops"):
+            return ""
+
+        def known(run_id: str) -> bool:
+            return any(
+                m.get("role") == "user" and run_id in str(m.get("content") or "")
+                for m in messages
+            )
+
+        try:
+            return subagents.take_owner_stops(turn.session_key or session_key, turn.turn_id, known)
+        except Exception:
+            logger.exception("Could not read which subagents the owner stopped")
+            return ""
 
     def _release_subagent_results(self, msg: InboundMessage) -> None:
         bound = getattr(self, "_subagent_turns", {}).pop(id(msg), None)

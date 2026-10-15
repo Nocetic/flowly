@@ -1221,7 +1221,7 @@ class GatewayServer:
             card = self.board_store.get_card(card_id) if card_id else None
             if card is not None and card.run_id:
                 try:
-                    await self._subagent_manager.cancel(card.run_id)
+                    await self._subagent_manager.cancel(card.run_id, by="owner")
                 except Exception as exc:
                     logger.warning("[board] legacy subagent cancel failed: {}", exc)
         return await apply_board_action(

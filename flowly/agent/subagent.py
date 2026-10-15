@@ -219,6 +219,11 @@ _NOTICE_RUN_ID_RE = re.compile(
 )
 
 
+def _owner_stopped(record: SubagentRunRecord) -> bool:
+    """A run its owner stopped from a client, which its main agent must hear of."""
+    return record.outcome == "cancelled" and record.stopped_by == "owner"
+
+
 def _created_artifact_id(payload: Any, tool_args: dict[str, Any]) -> str | None:
     """The id of an artifact a ``create`` call actually stored, else None.
 
@@ -487,6 +492,11 @@ class SubagentManager:
         self._on_event = on_event  # async callback(event_name, data)
         self._events = TaskEvents(self._deliver_event)
         self._cancel_outcomes: dict[str, str] = {}
+        # Who asked for a cancel in flight ("owner" or "agent"), and the runs
+        # of each conversation its owner stopped that it was not told of yet
+        # (a cheap check for every step of its turns; the registry decides).
+        self._cancel_by: dict[str, str] = {}
+        self._owner_stops: dict[str, set[str]] = {}
         self._state_dir = state_dir or (workspace / ".flowly_state")
         self._web_search_proxy_url = web_search_proxy_url
         self._web_search_server_id = web_search_server_id
@@ -600,6 +610,44 @@ class SubagentManager:
                 continue
             self._registry.update(run_id, delivery_state="pending", announced=False)
             self._spawn_announce(run_id, self._stored_result(record), record.outcome or "unknown")
+
+    def take_owner_stops(self, parent_session_key: str, turn_id: str | None,
+                         known: Callable[[str], bool] = lambda _run_id: False) -> str:
+        """A note for a running turn of this conversation: subagents its owner just stopped.
+
+        Without it the turn goes on as if they still worked ("the other two
+        are still running"). Read before each model call; "" when there is
+        nothing new. A run the turn already has (``known``: its own notice
+        reports it) is left to that notice. What the note tells is the
+        turn's as a result agent_wait took: delivered when the turn is
+        saved, announced again if it is not (release_taken), never twice.
+        """
+        pending = self._owner_stops.get(parent_session_key)
+        if not pending:
+            return ""
+        fresh: list[SubagentRunRecord] = []
+        for run_id in list(pending):
+            record = self._registry.get(run_id)
+            if record is None or not _owner_stopped(record) or record.delivery_state not in ("pending", "queued"):
+                pending.discard(run_id)
+            elif not known(run_id):
+                fresh.append(record)
+        for record in fresh:
+            pending.discard(record.run_id)
+            self._registry.update(record.run_id, delivery_state="taken", announced=True)
+            self._taken[record.run_id] = (parent_session_key, turn_id)
+        if not pending:
+            self._owner_stops.pop(parent_session_key, None)
+        if not fresh:
+            return ""
+        fresh.sort(key=lambda r: r.created_at)
+        names = ", ".join(f"'{r.display_name or r.label}'" for r in fresh)
+        one = len(fresh) == 1
+        return (
+            f"[While this turn ran, the owner stopped the subagent{'' if one else 's'} {names} "
+            f"before {'it' if one else 'they'} finished. There is no result from "
+            f"{'it' if one else 'them'}, and nothing more will come from {'it' if one else 'them'}.]"
+        )
 
     def _spawn_announce(self, run_id: str, result: str, status: str) -> None:
         task = asyncio.ensure_future(self._announce(run_id, result, status))
@@ -1298,9 +1346,11 @@ class SubagentManager:
                 return sent
         kept, why = self._registry.queue_mail(thread.thread_id, text)
         if kept is not None:
+            last = self._registry.get(kept.runs[-1]) if kept.runs else None
+            stopped = " (the owner stopped its last task)" if last is not None and _owner_stopped(last) else ""
             return {"agent_id": thread.thread_id, "status": "queued", "note": (
-                f"'{thread.title}' has no task running; it reads this when it gets its next "
-                "task (agent_followup). No task was started."
+                f"'{thread.title}' has no task running{stopped}; it reads this when it gets its "
+                "next task (agent_followup). No task was started."
             )}
         if why == "closed":
             current = self._registry.get_thread(thread.thread_id) or thread
@@ -1469,6 +1519,7 @@ class SubagentManager:
                 suspended = _task.cancelled() and self._suspends(_rid)
                 self._settle_stream(_rid, suspended=suspended)
                 self._cancel_outcomes.pop(_rid, None)
+                self._cancel_by.pop(_rid, None)
                 self._running_tasks.pop(_rid, None)
                 if suspended:
                     # Its unread mail is in its checkpoint; the restart reads it.
@@ -1513,8 +1564,26 @@ class SubagentManager:
                 run_id, outcome, error_code="shutdown", report=True,
                 error="Flowly shut down while this task ran, and it could not be continued.",
             )
+        elif outcome == "cancelled":
+            self._finish_stopped(run_id, record, self._cancel_by.get(run_id, "agent"))
         else:
             self._registry.finish(run_id, outcome, error="Task interrupted", error_code="cancelled")
+
+    def _finish_stopped(self, run_id: str, record: SubagentRunRecord | None, by: str) -> None:
+        """Record a run stopped on request, and by whom.
+
+        The main agent knows of a stop it made itself. One its owner made
+        from a client it does not: that is reported (a notice once nothing
+        of its batch runs any more, or a note in a turn already running), so
+        it never tells the owner a stopped run is still working.
+        """
+        owner = by == "owner" and record is not None and record.origin != "system"
+        self._registry.finish(run_id, "cancelled", error="Task interrupted", error_code="cancelled",
+                              report=owner, stopped_by=by)
+        if owner:
+            current = self._registry.get(run_id)
+            if current is not None and current.delivery_state in ("pending", "queued"):
+                self._owner_stops.setdefault(current.parent_session_key, set()).add(run_id)
 
     def _suspends(self, run_id: str) -> bool:
         """True while a clean shutdown stops this run to continue it later."""
@@ -3174,6 +3243,9 @@ class SubagentManager:
             "error": "failed",
             "timeout": "timed out",
         }.get(status, status)
+        if _owner_stopped(record):
+            status_text = "was stopped by the owner before it finished"
+            result = "(none: the owner stopped it)"
         duration = ""
         # A later task of the same subagent says which one it is.
         which = f"task {record.turn}" if record.thread_id and record.turn > 1 else ""
@@ -3281,25 +3353,32 @@ class SubagentManager:
             members.sort(key=lambda r: r.created_at)
         if record.batch_id and record.announced and len(members) == 1:
             return
-        # Siblings the owner (or the agent) stopped: named once, so the
-        # agent does not wait for them or wonder where their results went.
+        # Siblings the agent stopped: named once, so it does not wait for
+        # them or wonder where their results went. One its owner stopped is
+        # a member of its own (below).
+        member_ids = {m.run_id for m in members}
         stopped = [] if not record.batch_id else [
             r for r in self._registry.all()
             if r.batch_id == record.batch_id and r.parent_session_key == record.parent_session_key
             and r.outcome == "cancelled" and not r.announced and r.run_id != run_id
+            and r.run_id not in member_ids
         ]
         for member in [*members, *stopped]:
             self._registry.update(member.run_id, announced=True)
 
         # Results the main agent already took with agent_wait are not
-        # handed over again, and a run stopped on request has nothing to
-        # report: whoever stopped it already knows.
+        # handed over again, and a run the agent stopped has nothing to
+        # report: it already knows. One its owner stopped is reported (with
+        # no result), or the agent would go on as if it still worked.
         to_tell = [
             m for m in members
-            if m.delivery_state not in ("delivered", "taken") and m.outcome != "cancelled"
+            if m.delivery_state not in ("delivered", "taken")
+            and (m.outcome != "cancelled" or _owner_stopped(m))
         ]
         if not to_tell:
             return
+        owner_stops = [m for m in to_tell if _owner_stopped(m)]
+        results = [m for m in to_tell if not _owner_stopped(m)]
         sections = []
         limit = _ANNOUNCE_RESULT_CHARS if len(to_tell) == 1 else max(
             2_000, _ANNOUNCE_BATCH_CHARS // len(to_tell),
@@ -3342,22 +3421,40 @@ class SubagentManager:
                 )
         # A fact about what is left of them: an open subagent keeps its
         # conversation and can be given another task, or closed.
-        keeps = [m for m in to_tell if m.thread_id and (
+        keeps = [m for m in results if m.thread_id and (
             (t := self._registry.get_thread(m.thread_id)) is not None and t.status == "open")]
         kept = ""
-        if keeps and len(to_tell) == 1:
+        if keeps and len(results) == 1:
             kept = (" The subagent keeps its conversation: agent_followup gives it another task, "
                     "agent_close ends it.")
         elif keeps:
             kept = (" Each subagent keeps its conversation: agent_followup gives one another task, "
                     "agent_close ends it.")
-        if len(to_tell) == 1:
+        stops = ""
+        if owner_stops:
+            names = ", ".join(f"'{m.display_name or m.label}'" for m in owner_stops)
+            one = len(owner_stops) == 1
+            stops = (
+                f"\n\nThe owner stopped {names} before {'it' if one else 'they'} finished; "
+                f"there is no result from {'it' if one else 'them'}. Don't start "
+                f"{'it' if one else 'them'} again or do {'its' if one else 'their'} work "
+                "unless the owner asks."
+            )
+        if not results:
             announce_content = (
-                f"{sections[0]}\n\n"
-                "This is the subagent's own report: check what matters before relying "
+                "\n\n---\n\n".join(sections)
+                + stops.removeprefix("\n\n")
+                + " Tell the owner briefly, in your own words; don't show run ids or agent ids."
+                + waiting
+            )
+        elif len(results) == 1:
+            announce_content = (
+                "\n\n---\n\n".join(sections)
+                + "\n\nThis is the subagent's own report: check what matters before relying "
                 "on it, and don't redo its work. Tell the owner what it means for their "
                 "request in your own words; don't show run ids or agent ids."
                 + kept
+                + stops
                 + waiting
             )
         else:
@@ -3365,15 +3462,17 @@ class SubagentManager:
                 else "were started together and have finished"
             announce_content = (
                 "\n\n---\n\n".join(sections)
-                + f"\n\nThese {len(to_tell)} subagents {together}. These are their own "
+                + f"\n\nThese {len(results)} subagents {together}. These are their own "
                 "reports: check what matters before relying on them, and don't redo their "
                 "work. Answer the owner's request as a whole, in your own words; don't "
                 "show run ids or agent ids."
                 + kept
+                + stops
                 + waiting
             )
         titles = ", ".join(m.display_name or m.label for m in to_tell)
-        await self._deliver_to_parent(record, announce_content, summary=f"{titles} — finished")
+        ended = "finished" if results else "stopped"
+        await self._deliver_to_parent(record, announce_content, summary=f"{titles} — {ended}")
         # Only a result still waiting becomes "queued": one that needs no
         # delivery (cancelled, interrupted) or that the main agent already
         # took with agent_wait keeps its state, so the notice is not handled
@@ -3634,8 +3733,12 @@ Do not create, patch, install, or manage skills. Do not edit project files or ru
             )
         return count
 
-    async def cancel(self, run_id_prefix: str) -> str:
+    async def cancel(self, run_id_prefix: str, *, by: str = "agent") -> str:
         """Cancel a running subagent by run_id (prefix match).
+
+        ``by`` is who asked: "owner" (a client's stop) or "agent" (the main
+        agent's own tools). Only an owner's stop is reported to the main
+        agent (_finish_stopped).
 
         A run still marked running that no live process works on (a restart
         left it and this process does not continue runs) is ended here.
@@ -3646,15 +3749,19 @@ Do not create, patch, install, or manage skills. Do not edit project files or ru
                        if r.ended_at is None and r.run_id.startswith(run_id_prefix)]
             if len(orphans) == 1 and self._adopt(orphans[0], {}) is not None:
                 run_id = orphans[0].run_id
-                self._registry.finish(run_id, "cancelled", error="Task interrupted", error_code="cancelled")
+                self._finish_stopped(run_id, orphans[0], by)
                 self._record_metric(run_id)
                 self._publish_event("subagent.completed", run_id)
+                ended = self._registry.get(run_id)
+                if ended is not None and ended.delivery_state == "pending":
+                    self._spawn_announce(run_id, "", "cancelled")
                 return json.dumps({"status": "cancelled", "run_id": run_id})
         if len(matches) != 1:
             return json.dumps({"status": "error", "error": "Task ID is missing, unknown or ambiguous"})
         run_id = matches[0]
         task = self._running_tasks[run_id]
         self._cancel_outcomes[run_id] = "cancelled"
+        self._cancel_by[run_id] = by
         task.cancel()
         try:
             await task

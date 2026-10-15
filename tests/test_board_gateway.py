@@ -191,7 +191,7 @@ async def test_action_cancel_calls_subagent_manager(store):
     data = _body(resp)
     assert data["ok"] is True
     assert data["card"]["status"] == "cancelled"
-    mgr.cancel.assert_awaited_once_with("run-42")
+    mgr.cancel.assert_awaited_once_with("run-42", by="owner")
 
 
 @pytest.mark.asyncio

@@ -4689,7 +4689,10 @@ async def subagents_cancel(params: dict) -> dict:
         manager = _subagent_delegate_provider() if _subagent_delegate_provider else None
     if manager is None:
         raise FeatureRpcError("UNAVAILABLE", "This task cannot be stopped here")
-    result = json.loads(await manager.cancel(record.run_id))
+    # A client's stop is the owner's: the main agent is told of it.
+    stopping = manager.cancel(record.run_id) if record.kind == "delegate" \
+        else manager.cancel(record.run_id, by="owner")
+    result = json.loads(await stopping)
     if result.get("status") == "error":
         raise FeatureRpcError("CONFLICT", result.get("error", "Task state changed"))
     return {"ok": True, "runId": record.run_id, "run_id": record.run_id[:8], "status": record.outcome or result.get("status")}
