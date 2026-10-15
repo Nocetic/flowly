@@ -145,6 +145,7 @@ class ObjectiveTool(Tool):
                 stage=args.get("stage") or "",
                 cadence=args.get("cadence") or "",
                 target=args.get("target"),
+                current=args.get("current"),
                 unit=args.get("unit") or "",
                 ends_at=ends_at,
                 session_key=key,

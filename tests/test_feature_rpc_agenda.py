@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from flowly.agenda.store import get_agenda_store
+from flowly.agenda.rpc import RESUMED_CHECK_IN_NOTE
+from flowly.agenda.store import RESUME_CHECK_IN_DELAY_MS, get_agenda_store
+from flowly.agenda.store import _now_ms as agenda_now
 from flowly.channels import feature_rpc
 from flowly.objectives.store import get_objective_store
 from flowly.profile import get_flowly_home
@@ -54,11 +56,61 @@ async def test_the_owner_pausing_or_ending_a_goal_cancels_its_check_in(action, s
 
 
 @pytest.mark.asyncio
-async def test_a_resumed_goal_waits_for_the_agent_to_plan_its_next_check_in():
+@pytest.mark.parametrize("action", ["pause", "done"])
+async def test_a_resumed_goal_gets_back_the_check_in_its_pause_or_finish_took(action):
+    # Resume and Undo used to leave a goal with no check-in at all until the
+    # agent happened to plan one.
     goal = _goal_with_check_in()
+    await _rpc("objectives.update", {"id": goal["id"], "action": action})
+    resumed = await _rpc("objectives.update", {"id": goal["id"], "action": "resume"})
+    assert resumed["objective"]["status"] == "active"
+    assert resumed["objective"]["nextCheckAt"] == 4_000_000_000_000
+    [item] = get_agenda_store().pending()
+    assert (item["objectiveId"], item["note"], item["sessionKey"]) == (goal["id"], "Day 1", CHAT)
+
+
+@pytest.mark.asyncio
+async def test_a_resumed_goal_whose_check_in_time_passed_is_checked_on_later():
+    goal = get_objective_store().create(title="Read daily", category="learning", session_key=CHAT)
+    agenda = get_agenda_store()
+    agenda.schedule(kind="objective", due_at=agenda_now() + 60_000, note="Chapter 3",
+                    session_key=CHAT, objective_id=goal["id"])
+    await _rpc("objectives.update", {"id": goal["id"], "action": "pause"})
+    data = agenda._read()
+    data["history"][-1]["dueAt"] = agenda_now() - 60_000  # the pause outlived it
+    agenda._transaction(lambda d: d.update(history=data["history"]))
+    before = agenda_now()
+    resumed = await _rpc("objectives.update", {"id": goal["id"], "action": "resume"})
+    due = resumed["objective"]["nextCheckAt"]
+    assert before + RESUME_CHECK_IN_DELAY_MS <= due <= agenda_now() + RESUME_CHECK_IN_DELAY_MS
+    assert agenda.pending()[0]["note"] == "Chapter 3"
+
+
+@pytest.mark.asyncio
+async def test_a_resumed_goal_that_never_had_a_check_in_gets_one_that_asks():
+    goal = get_objective_store().create(title="Learn Spanish", category="learning", session_key=CHAT)
     await _rpc("objectives.update", {"id": goal["id"], "action": "pause"})
     resumed = await _rpc("objectives.update", {"id": goal["id"], "action": "resume"})
-    assert resumed["objective"]["status"] == "active" and resumed["objective"]["nextCheckAt"] is None
+    assert resumed["objective"]["nextCheckAt"] is not None
+    assert get_agenda_store().pending()[0]["note"] == RESUMED_CHECK_IN_NOTE
+
+
+@pytest.mark.asyncio
+async def test_resuming_keeps_a_check_in_the_goal_already_has():
+    goal = _goal_with_check_in()
+    await _rpc("objectives.update", {"id": goal["id"], "action": "pause"})
+    get_agenda_store().schedule(kind="objective", due_at=4_100_000_000_000, note="Planned again",
+                                session_key=CHAT, objective_id=goal["id"])
+    await _rpc("objectives.update", {"id": goal["id"], "action": "resume"})
+    assert [i["note"] for i in get_agenda_store().pending()] == ["Planned again"]
+
+
+@pytest.mark.asyncio
+async def test_a_resumed_goal_outside_an_owner_conversation_gets_no_check_in():
+    goal = get_objective_store().create(title="Ship it", category="career", session_key="cron:nightly")
+    await _rpc("objectives.update", {"id": goal["id"], "action": "pause"})
+    resumed = await _rpc("objectives.update", {"id": goal["id"], "action": "resume"})
+    assert resumed["objective"]["nextCheckAt"] is None and get_agenda_store().pending() == []
 
 
 @pytest.mark.asyncio

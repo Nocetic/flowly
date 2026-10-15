@@ -5654,7 +5654,7 @@ class GatewayServer:
             # readers have the full tool events already.
             if event_type in ("directory", "tool.activity") and subscription.directory:
                 targets.add(client_id)
-            elif event_type in {"connection", "error", "needsInput"} and (
+            elif event_type in {"connection", "error", "needsInput", "objectives.changed"} and (
                 subscription.directory
                 or profile in subscription.profiles
                 or any(

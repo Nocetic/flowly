@@ -5436,6 +5436,7 @@ def system_capabilities() -> dict:
     method itself, so its mere presence already signals a capable bot.
     """
     from flowly import __version__
+    from flowly.objectives import events as objective_events
     from flowly.runtime_capabilities import resolve_runtime_capabilities
 
     runtime = resolve_runtime_capabilities()
@@ -5463,6 +5464,10 @@ def system_capabilities() -> dict:
         # 1: a subagent's running turn streams to whoever ``subagents.watch``es
         # it (docs/chat-wire-protocol.md §4.8).
         "subagentStreamVersion": 1,
+        # 1: ``objectives.changed`` is raised when the goals change
+        # (``flowly/objectives/events.py``); a goals screen then reads again
+        # on it and polls only as a fallback.
+        "objectivesEventsVersion": 1 if objective_events.announcing() else 0,
         "runtime": {
             "role": runtime.role.value,
             "profile": runtime.profile_name,

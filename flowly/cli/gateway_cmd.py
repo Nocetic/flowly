@@ -2676,6 +2676,23 @@ Respond to the user now:"""
 
                     _manager_task = asyncio.create_task(_watch_desktop_manager())
             await cron.start()
+
+            # A change to the goals is announced, not polled for
+            # (flowly/objectives/events.py): to this runtime's own clients
+            # (a named agent's host observes them and carries it on as a
+            # profile event), to the apps showing this host's agents when this
+            # is the host, and to relay sessions reading the goals directly.
+            from flowly.objectives import events as _objective_events
+
+            async def _announce_objectives(data: dict) -> None:
+                await gateway_server.broadcast_event(_objective_events.EVENT, data)
+                if gateway_server.profile_host is not None:
+                    await gateway_server.profile_host.announce_primary_objectives(data)
+                _web = channels.get_channel("web")
+                if _web is not None and hasattr(_web, "send_objectives_event"):
+                    await _web.send_objectives_event(data)
+
+            _objective_events.set_broadcaster(_announce_objectives)
             await agenda.start()
             if not local_runtime:
                 await heartbeat.start(run_on_start=True)
@@ -2912,6 +2929,9 @@ Respond to the user now:"""
             # event loop and agent are torn down.
             await cron.shutdown()
             agenda.stop()
+            from flowly.objectives import events as _objective_events_done
+
+            _objective_events_done.set_broadcaster(None)
             await gateway_server.stop()
             heartbeat.stop()
             if delegate is not None and hasattr(delegate, "cancel_all"):
