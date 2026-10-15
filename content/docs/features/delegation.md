@@ -39,8 +39,15 @@ The agent can message its running subagents at any time with `agent_message` —
 
 ### Limits
 
-- Each subagent run is bounded by a **30-minute** wall-clock timeout and **30** model calls, with a 120-second per-tool timeout.
-- If you stop the conversation's turn, its running subagents are stopped too.
+- A subagent has the same limits as the agent itself: the same number of steps per run and no overall time limit. Each model call and each tool call has its own timeout, and a subagent that keeps getting results it already has wraps up with a summary of what it found.
+- Stopping the conversation's turn stops the agent, not its subagents — they usually outlive the turn that started them. Stop a subagent on its own from its sidebar or the menu bar, or ask the agent ("stop them all").
+- If one subagent is slow, the others don't wait for it forever: five minutes after the first of them finished, the results so far reach the agent, which hears which ones are still working; theirs follow when they finish. A subagent you stopped is mentioned, not waited for.
+
+### Tokens and statistics
+
+Every subagent counts the tokens it uses — input, output and cache reads — as it works. The count is shown live while it runs and stays with it when it ends. Flowly shows tokens, not prices.
+
+Each run that ends also leaves a short record — when it ran, who started it, how it ended, how long it took and its tokens; never its brief or result — which outlives the 30-day run history. The bot's subagent statistics (runs, outcomes, durations and tokens, day by day) come from these records.
 
 ### No stored specialists
 
