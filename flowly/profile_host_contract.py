@@ -51,6 +51,8 @@ PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     "subagents.get": 15_000,
     "subagents.result": 15_000,
     "subagents.transcript": 15_000,
+    # A subagent's conversation, page by page (read only).
+    "subagents.history": 15_000,
     # The owner stopping one subagent from its pill, sidebar or the notch.
     "subagents.cancel": 30_000,
     "subagents.stats": 15_000,
@@ -160,7 +162,7 @@ def is_internal_profile_session(value: Any) -> bool:
     return isinstance(value, str) and value.startswith(_INTERNAL_PROFILE_SESSION_PREFIXES)
 
 
-def _validate_session_key(value: Any, *, required: bool = False) -> None:
+def _validate_session_key(value: Any, *, required: bool = False, method: str = "") -> None:
     if value is None and not required:
         return
     if (
@@ -174,6 +176,18 @@ def _validate_session_key(value: Any, *, required: bool = False) -> None:
             "INVALID_PARAMS",
             "Profile conversation identity is invalid.",
         )
+    from flowly.session.keys import (
+        SUBAGENT_THREAD_READ_ONLY,
+        SUBAGENT_THREAD_READ_ONLY_MESSAGE,
+        SUBAGENT_THREAD_READABLE_METHODS,
+        is_subagent_thread,
+    )
+
+    if is_subagent_thread(value):
+        # A named agent's subagent conversation may be read, never written.
+        if method in SUBAGENT_THREAD_READABLE_METHODS:
+            return
+        raise ProfileHostError(SUBAGENT_THREAD_READ_ONLY, SUBAGENT_THREAD_READ_ONLY_MESSAGE)
     if (
         not value.startswith(REMOTE_SESSION_PREFIXES)
         or is_internal_profile_session(value)
@@ -440,13 +454,19 @@ def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]
         "sessions.model.set",
     }
     if method in session_key_methods:
-        _validate_session_key(value.get("sessionKey"), required=True)
+        _validate_session_key(value.get("sessionKey"), required=True, method=method)
     elif "sessionKey" in value:
-        _validate_session_key(value.get("sessionKey"))
+        _validate_session_key(value.get("sessionKey"), method=method)
     if method == "sessions.delete":
         if "key" in value and "sessionKey" in value and value["key"] != value["sessionKey"]:
             raise ProfileHostError("INVALID_PARAMS", "Conversation targets do not match.")
-        _validate_session_key(value.get("sessionKey") or value.get("key"), required=True)
+        _validate_session_key(value.get("sessionKey") or value.get("key"), required=True, method=method)
+    from flowly.session.keys import SubagentThreadReadOnlyError, require_rpc_subagent_access
+
+    try:
+        require_rpc_subagent_access(method, value)
+    except SubagentThreadReadOnlyError as exc:
+        raise ProfileHostError(exc.code, exc.message) from None
     if method == "media.read":
         media_id = value.get("mediaId")
         offset = value.get("offset", 0)

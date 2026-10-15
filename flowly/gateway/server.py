@@ -1559,6 +1559,7 @@ class GatewayServer:
 
     async def _dispatch_ws_rpc(self, ws: web.WebSocketResponse, client_id: str, data: dict) -> None:
         """Dispatch an RPC call to the appropriate handler."""
+        from flowly.session.keys import SubagentThreadReadOnlyError, require_rpc_subagent_access
         from flowly.session.ownership import SessionAccessError, require_rpc_session
 
         method = data.get("method", "")
@@ -1576,6 +1577,10 @@ class GatewayServer:
                 return
 
         try:
+            # A subagent's conversation is read-only to every client: only a
+            # read may name one (chat.send, chat.steer, chat.compact,
+            # sessions.delete, sessions.model.set… are refused).
+            require_rpc_subagent_access(method, params)
             require_rpc_session(method, params, sessions_dir=self.sessions.sessions_dir if self.sessions else None)
             if not method.startswith("profiles.") and isinstance(params, dict) and "expectedBotId" in params:
                 from flowly.session.commands import validate_chat_target
@@ -1819,6 +1824,8 @@ class GatewayServer:
 
             else:
                 await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", f"Unknown method: {method}")
+        except SubagentThreadReadOnlyError as error:
+            await self._ws_rpc_error(ws, rpc_id, error.code, error.message)
         except SessionAccessError as error:
             await self._ws_rpc_error(ws, rpc_id, error.code, error.message)
         except Exception as e:
@@ -2814,6 +2821,33 @@ class GatewayServer:
             await self._ws_rpc_reply(ws, rpc_id, {"sessionKey": session_key, "messages": []})
             return
 
+        from flowly.session.history_page import HistoryPageError, history_page
+        from flowly.session.history_rows import history_row, project_rows
+        from flowly.session.keys import is_subagent_thread
+
+        if is_subagent_thread(session_key):
+            # A subagent's conversation lives in its own store and is only
+            # read here: nothing is created or cached for it.
+            try:
+                rows, _thread = feature_rpc.subagent_thread_rows(session_key)
+                rows, page_info = history_page(rows, session_key, params)
+            except feature_rpc.FeatureRpcError as exc:
+                await self._ws_rpc_error(ws, rpc_id, exc.code, exc.message)
+                return
+            except HistoryPageError as exc:
+                await self._ws_rpc_error(ws, rpc_id, exc.code, str(exc))
+                return
+            await self._ws_rpc_reply(ws, rpc_id, {
+                "sessionKey": session_key,
+                "sessionId": session_key,
+                "messages": project_rows([history_row(m) for m in rows]),
+                "thinkingLevel": None,
+                "modelOverride": None,
+                "readOnly": True,
+                **page_info,
+            })
+            return
+
         session = self.sessions.get_or_create(session_key)
         # Return full messages (not just role/content) for richer UI rendering.
         # We also pass the tool-protocol fields (tool_calls on assistant turns,
@@ -2827,100 +2861,25 @@ class GatewayServer:
         # latter is the compacted LLM working context (just [summary]+recent
         # after a /compact), which would drop the early turns from the chat UI.
         source_messages = self.sessions.get_full_messages(session_key)
-        from flowly.session.history_page import HistoryPageError, history_page
         try:
             source_messages, page_info = history_page(source_messages, session_key, params)
         except HistoryPageError as exc:
             await self._ws_rpc_error(ws, rpc_id, exc.code, str(exc))
             return
-        messages = []
-        for m in source_messages:
-            msg: dict[str, Any] = {"role": m["role"]}
-            # Normalise content into array format expected by the iOS/desktop protocol.
-            content_raw = m.get("content", "")
-            if isinstance(content_raw, str):
-                msg["content"] = [{"type": "text", "text": content_raw}]
-            elif isinstance(content_raw, list):
-                msg["content"] = content_raw
-            else:
-                msg["content"] = [{"type": "text", "text": str(content_raw)}]
-            if m.get("tool_calls"):
-                msg["tool_calls"] = m["tool_calls"]
-            if m.get("tool_call_id"):
-                msg["tool_call_id"] = m["tool_call_id"]
-            if m.get("name"):
-                msg["name"] = m["name"]
-            # Context-boundary rows (a compaction happened here). Typed fields
-            # ride alongside the legacy text so a client can render the divider
-            # without matching a string — the relay's Firestore row carries the
-            # same pair, so both transports look identical to a client.
-            if m.get("kind"):
-                msg["kind"] = m["kind"]
-            if m.get("kind") == "voice" and isinstance(m.get("voice"), dict):
-                msg["voice"] = m["voice"]
-            if m.get("kind") == "agent_setup_card" and isinstance(m.get("setupCard"), dict):
-                msg["setupCard"] = m["setupCard"]
-            if isinstance(m.get("goal_cards"), list) and m["goal_cards"]:
-                msg["goalCards"] = m["goal_cards"]
-            if m.get("boundaryKind"):
-                msg["boundaryKind"] = m["boundaryKind"]
-            if m.get("compactionId"):
-                msg["compactionId"] = m["compactionId"]
-            # Reconstruct attachment previews from the media paths saved on the
-            # user turn. Images get a small base64 JPEG thumbnail (not the full
-            # original — that could be 25 MB) so the desktop shows the same
-            # bubble preview it did live, with no Firestore and no bloated
-            # history payload. Best-effort per file.
-            # Media on this turn — user-attached inbound files AND media the agent
-            # produced (image_generate / screenshot, saved on the assistant turn).
-            # Use the inline-thumbnail shape so a remote client (iOS / desktop)
-            # renders the preview from history with no fetch — matching the live
-            # reply path. (mediaId is still set for clients that want full-res.)
-            media_paths = m.get("media")
-            if isinstance(media_paths, list) and media_paths:
-                # Descriptors persisted with the turn. Without them a reopened
-                # chat would have to re-probe every file to learn a clip's
-                # duration — and on a host with no ffmpeg it could not, so the
-                # video would come back from history poorer than it was live.
-                atts = _reply_media_attachments(
-                    media_paths, _assets_index(m.get("media_assets"))
-                )
-                if atts:
-                    msg["attachments"] = atts
-            if "timestamp" in m:
-                msg["timestamp"] = m["timestamp"]
-            if "usage" in m:
-                msg["usage"] = m["usage"]
-            if m.get("aborted") is True:
-                msg["aborted"] = True
-            if m.get("id"):
-                msg["id"] = m["id"]
-            if m.get("steering_run_id"):
-                msg["steeringRunId"] = m["steering_run_id"]
-            for source, target in (
-                ("steering_sequence", "steeringSequence"),
-                ("steering_source_run_id", "steeringSourceRunId"),
-                ("steering_message_id", "steeringMessageId"),
-                ("steering_iteration_idx", "steeringIterationIdx"),
-                ("steering_previous_iteration_idx", "steeringPreviousIterationIdx"),
-                ("steering_tool_call_ids", "steeringToolCallIds"),
-            ):
-                if source in m:
-                    msg[target] = m[source]
-            run_id = m.get("run_id")
-            if isinstance(run_id, str) and run_id:
-                msg["runId"] = run_id
-            duration_ms = m.get("duration_ms")
-            if isinstance(duration_ms, (int, float)) and not isinstance(duration_ms, bool):
-                msg["durationMs"] = max(0, int(duration_ms))
-            messages.append(msg)
+
+        # Reconstruct attachment previews from the media paths saved on the
+        # turn. Images get a small base64 JPEG thumbnail (not the full original
+        # — that could be 25 MB) so the desktop shows the same bubble preview
+        # it did live, with no Firestore and no bloated history payload. The
+        # descriptors persisted with the turn spare re-probing every file (on
+        # a host with no ffmpeg a clip's duration could not be learned again).
+        def attachments(media_paths: list, media_assets: Any) -> list[dict]:
+            return _reply_media_attachments(media_paths, _assets_index(media_assets))
 
         # ``messages`` is a transport DTO, not provider history. Flatten any
         # deferred-call wrappers here so a reopened Desktop/iOS conversation
         # renders the same effective tool identity it showed while streaming.
-        from flowly.tool_activity import project_tool_messages_for_ui
-
-        messages = project_tool_messages_for_ui(messages)
+        messages = project_rows([history_row(m, attachments=attachments) for m in source_messages])
 
         await self._ws_rpc_reply(
             ws,

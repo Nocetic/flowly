@@ -4372,7 +4372,8 @@ def subagents_list(params: dict) -> dict:
 
     _validate_subagent_event_version(params)
 
-    records = _subagent_registry().all()
+    registry = _subagent_registry()
+    records = registry.all()
     status = params.get("status")
     filters = {
         "running": lambda r: r.ended_at is None,
@@ -4405,15 +4406,15 @@ def subagents_list(params: dict) -> dict:
     if page and len(page) < len(records):
         last = page[-1]
         next_cursor = base64.urlsafe_b64encode(json.dumps([last.created_at, last.run_id]).encode()).decode()
-    return {"schemaVersion": 2, "tasks": [run_view(r) for r in page],
+    return {"schemaVersion": 2, "tasks": [run_view(r, thread=_thread_of(registry, r)) for r in page],
             "counts": counts, "nextCursor": next_cursor}
 
 
 def subagents_get(params: dict) -> dict:
     from flowly.agent.subagent_observation import run_view
     _validate_subagent_event_version(params)
-    _, record = _subagent_record(params)
-    return {"schemaVersion": 2, "task": run_view(record, detail=True)}
+    registry, record = _subagent_record(params)
+    return {"schemaVersion": 2, "task": run_view(record, detail=True, thread=_thread_of(registry, record))}
 
 
 def _validate_subagent_event_version(params: dict) -> None:
@@ -4456,7 +4457,120 @@ def subagents_transcript(params: dict) -> dict:
     except OSError as exc:
         raise FeatureRpcError("UNAVAILABLE", "The task transcript could not be read") from exc
     from flowly.agent.subagent_observation import run_view
-    return {"schemaVersion": 2, "task": run_view(record), **page}
+    return {"schemaVersion": 2, "task": run_view(record, thread=_thread_of(registry, record)), **page}
+
+
+def _thread_of(registry, record):
+    getter = getattr(registry, "get_thread", None)
+    if not record.thread_id or getter is None:
+        return None
+    return getter(record.thread_id)
+
+
+def _subagent_thread(params: dict):
+    """The thread a ``subagents.history`` call names (``threadId`` or ``runId``)."""
+    from flowly.agent.subagent_threads import is_thread_id
+
+    thread_id, run_id = params.get("threadId"), params.get("runId")
+    if thread_id is None and run_id is None:
+        raise FeatureRpcError("INVALID", "threadId or runId is required")
+    for value in (thread_id, run_id):
+        if value is not None and not is_thread_id(value):
+            raise FeatureRpcError("INVALID", "threadId and runId must be subagent ids")
+    registry = _subagent_registry()
+    record = registry.get(run_id) if run_id is not None else None
+    if run_id is not None and record is None:
+        raise FeatureRpcError("NOT_FOUND", "Task not found")
+    if record is not None:
+        if thread_id is not None and record.thread_id != thread_id:
+            raise FeatureRpcError("INVALID", "runId is not a run of threadId")
+        thread_id = record.thread_id or None
+        if thread_id is None:
+            if record.kind == "subagent" and record.origin != "system":
+                # From before subagents kept their conversation: its
+                # transcript (subagents.transcript) is what there is.
+                raise FeatureRpcError(
+                    "SUBAGENT_THREAD_LEGACY",
+                    "This subagent ran before its conversation was kept; its transcript is available.",
+                )
+            raise FeatureRpcError("NOT_FOUND", "This task has no conversation")
+    thread = registry.get_thread(thread_id)
+    if thread is None:
+        legacy = registry.get(thread_id)
+        if legacy is not None and not legacy.thread_id and legacy.kind == "subagent" and legacy.origin != "system":
+            raise FeatureRpcError(
+                "SUBAGENT_THREAD_LEGACY",
+                "This subagent ran before its conversation was kept; its transcript is available.",
+            )
+        raise FeatureRpcError("NOT_FOUND", "Subagent not found")
+    _require_parent_visible(thread.parent_session_key)
+    return registry, thread
+
+
+def _require_parent_visible(parent_session_key: str) -> None:
+    """A subagent's conversation is readable by whoever may read the one that started it."""
+    from flowly.session.ownership import require_session_file
+    from flowly.utils.helpers import safe_filename
+
+    if any(char in parent_session_key for char in ('/', '\\', '\x00')):
+        raise FeatureRpcError("NOT_FOUND", "Subagent not found")
+    path = get_flowly_home() / "sessions" / (safe_filename(parent_session_key.replace(':', '_')) + '.jsonl')
+    require_session_file(path, parent_session_key)
+
+
+def subagent_thread_rows(session_key: str):
+    """``(display rows, thread)`` of the subagent conversation ``subagent:<threadId>``; read only."""
+    from flowly.agent.subagent_threads import THREAD_KEY_PREFIX
+
+    thread_id = session_key.strip()[len(THREAD_KEY_PREFIX):]
+    registry, thread = _subagent_thread({"threadId": thread_id})
+    try:
+        rows = registry.thread_store.display_rows(thread.thread_id)
+    except OSError as exc:
+        raise FeatureRpcError("UNAVAILABLE", "The subagent's conversation could not be read") from exc
+    return rows, thread
+
+
+def subagents_history(params: dict) -> dict:
+    """A subagent's conversation, page by page (read only).
+
+    Params: ``threadId`` or ``runId`` (a run of the thread); ``limit``
+    (1–200, default 50); ``before`` — the cursor of the page last returned,
+    for the one before it. Rows are ``chat.history`` rows, oldest first, plus
+    what a subagent turn says (``kind: "subagent_task" | "agent_note"``,
+    ``author``, ``turn``, tool ``status``, a turn's ``outcome``). A turn
+    appears once its run has ended; the running one is ``chat.inflight``'s.
+    A subagent from before conversations were kept answers
+    ``SUBAGENT_THREAD_LEGACY`` (its transcript is still there).
+    """
+    from flowly.agent.subagent_observation import run_view
+    from flowly.agent.subagent_threads import thread_view
+    from flowly.session.history_page import HistoryPageError, history_page
+    from flowly.session.history_rows import project_rows, subagent_history_row
+
+    registry, thread = _subagent_thread(params)
+    page_params: dict = {"limit": params.get("limit", 50)}
+    if params.get("before") is not None:
+        page_params["before"] = params["before"]
+    try:
+        rows = registry.thread_store.display_rows(thread.thread_id)
+    except OSError as exc:
+        raise FeatureRpcError("UNAVAILABLE", "The subagent's conversation could not be read") from exc
+    try:
+        page, info = history_page(rows, thread.child_session_key, page_params)
+    except HistoryPageError as exc:
+        raise FeatureRpcError(exc.code, str(exc)) from exc
+    runs = [run_view(run, thread=thread) for run in registry.runs_of_thread(thread)]
+    return {
+        "schemaVersion": 1,
+        "thread": thread_view(thread, runs),
+        "sessionKey": thread.child_session_key,
+        "readOnly": True,
+        "messages": project_rows([subagent_history_row(m) for m in page]),
+        "historyPageVersion": info.get("historyPageVersion", 1),
+        "hasOlder": bool(info.get("hasOlder")),
+        "before": info.get("before"),
+    }
 
 
 def subagents_stats(params: dict) -> dict:
@@ -5432,6 +5546,7 @@ _DISPATCH: dict[str, tuple] = {
     "subagents.get": (subagents_get, True, False),
     "subagents.result": (subagents_result, True, False),
     "subagents.transcript": (subagents_transcript, True, False),
+    "subagents.history": (subagents_history, True, False),
     "subagents.cancel": (subagents_cancel, True, False),
     "subagents.stats": (subagents_stats, True, False),
     "subagents.assistants": (subagents_assistants_retired, True, False),
@@ -5693,8 +5808,16 @@ async def dispatch(method: str, params: dict) -> tuple[dict, bool]:
                 "This feature is owned by the primary Flowly runtime.",
             )
     fn, wants_params, restart = entry
+    from flowly.session.keys import SubagentThreadReadOnlyError, require_rpc_subagent_access
     from flowly.session.ownership import SessionAccessError, require_rpc_session
 
+    try:
+        # A subagent's conversation is written only by the agent that
+        # started it: any call but a read naming one is refused here, the
+        # one door every transport's feature RPCs pass.
+        require_rpc_subagent_access(method, params)
+    except SubagentThreadReadOnlyError as error:
+        raise FeatureRpcError(error.code, error.message) from None
     try:
         require_rpc_session(method, params)
         result = fn(params) if wants_params else fn()

@@ -2099,6 +2099,18 @@ class WebChannel(BaseChannel):
         params = msg.get("params", {})
         session_id = msg.get("sessionId", "")
 
+        from flowly.session.keys import SubagentThreadReadOnlyError, require_rpc_subagent_access
+        try:
+            # A subagent's conversation is read-only to every client: only a
+            # read may name one.
+            require_rpc_subagent_access(method, params)
+        except SubagentThreadReadOnlyError as error:
+            await ws.send(json.dumps({
+                "type": "rpc", "id": rpc_id, "sessionId": session_id,
+                "error": {"code": error.code, "message": error.message, "retryable": False},
+            }))
+            return
+
         if method == "chat.send":
             from flowly.session.commands import validate_chat_target
             try:
