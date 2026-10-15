@@ -280,7 +280,9 @@ channels close: Desktop kills a foreground gateway 3 s after SIGTERM (`flowlyai-
 named agent's runtime 5 s after (`profile-runtime-supervisor.ts`), so subagents cannot wait for
 the rest to close first. `stop_all` (also from `AgentLoop.stop()`) refuses new spawns; a
 `resumable` run gets `suspended_at` and `activity {"phase": "suspended", "reason"}` in the
-registry *before* its task is cancelled, and its handler writes `suspended` to the checkpoint and
+registry *before* its task is cancelled — and a `subagent.progress` event, so clients still
+connected show it waiting at once (`shutdown` flushes the event queue for up to 0.5 s after the
+handlers) — and its handler writes `suspended` to the checkpoint and
 re-raises — no `finish`, no notice, no metric; the done callback leaves it too. It stays
 `running`, as Desktop requires (a finished run never comes back to running). Any other run is
 interrupted as before — except one a conversation waits for in a process that continues runs but

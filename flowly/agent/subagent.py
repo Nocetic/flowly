@@ -2587,6 +2587,9 @@ Do not create, patch, install, or manage skills. Do not edit project files or ru
                 try:
                     self._registry.update(run_id, activity={"phase": "suspended", "reason": reason},
                                           suspended_at=now)
+                    # Clients still connected hear it now, rather than only
+                    # noticing when the connection drops.
+                    self._publish_event("subagent.progress", run_id)
                 except Exception:
                     logger.exception("Could not record a suspended subagent")
             task.cancel()
@@ -2611,6 +2614,13 @@ Do not create, patch, install, or manage skills. Do not edit project files or ru
         count = self.stop_all(reason)
         if tasks and wait_seconds > 0:
             await asyncio.wait(tasks, timeout=wait_seconds)
+            # The "suspended" views go out while the gateway can still send.
+            events = getattr(self, "_events", None)
+            if events is not None:
+                try:
+                    await asyncio.wait_for(events.flush(), timeout=0.5)
+                except Exception:
+                    logger.debug("[SubagentManager] suspend events not all sent before shutdown")
         return count
 
     def cancel_children(self, parent_session_key: str) -> int:

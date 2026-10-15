@@ -437,11 +437,22 @@ async def test_a_clean_shutdown_suspends_and_the_next_start_continues(tmp_path, 
         _call("c1", "exec", command="make build"), _call("c2", "read_file", path=str(tmp_path / "x")),
     ], usage={"prompt_tokens": 50, "completion_tokens": 5})])
     first = _manager(home, tmp_path, first_provider, first_bus)
+    heard: list[tuple[str, dict]] = []
+
+    async def hear(event: str, data: dict) -> None:
+        heard.append((event, data))
+
+    first._on_event = hear
     started = json.loads(await first.spawn(task="Build it", origin_channel="web", origin_chat_id="chat-1",
                                            parent_session_key=CHAT, origin="agent"))
     run_id = started["run_id"]
     await asyncio.wait_for(started_exec.wait(), 3)
     assert await first.shutdown(wait_seconds=1.5) == 1
+    # Connected clients hear the suspension before the gateway goes, not
+    # only when their connection drops.
+    suspended = [d for e, d in heard if e == "subagent.progress" and d["runId"] == run_id
+                 and d["activity"].get("phase") == "suspended"]
+    assert suspended and suspended[-1]["status"] == "running"
 
     record = SubagentRegistry(home / "runs.json").get(run_id)
     assert record.ended_at is None and record.suspended_at is not None
