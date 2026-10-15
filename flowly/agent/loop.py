@@ -50,6 +50,7 @@ from flowly.agent.tools.process import ProcessTool
 from flowly.exec.process_registry import get_registry as _get_process_registry
 from flowly.exec.process_checkpoint import ProcessCheckpoint
 from flowly.agent.subagent import SUBAGENT_REPORTS_KEY, SubagentManager, record_subagent_reports
+from flowly.agent.report_turn import REPORT_TURN, REPORT_TURN_ORIGIN
 from flowly.session.manager import (
     ConcurrentSessionWriteError,
     SessionBusyError,
@@ -1119,6 +1120,9 @@ class AgentLoop:
         # Which results a conversation's saved turns handled: the delivery
         # commit point a restart checks before announcing one again.
         self.subagents.committed_reports = self._committed_subagent_reports
+        # A finished subagent's report runs as a live turn on the surface the
+        # owner is watching (register_report_turn_submitter), else the bus.
+        self.subagents.report_submitter = self._submit_report_turn
 
         # Compaction service
         self.compaction = CompactionService(
@@ -3829,7 +3833,7 @@ class AgentLoop:
             # partial live for the entire turn so a relay client re-entering
             # mid-stream can restore the bubble + tool panel. Keyed by the same
             # session_key/run_id the WebChannel's begin() used.
-            if msg.channel == "web":
+            if msg.channel == "web" or msg.metadata.get(REPORT_TURN):
                 run_id = msg.metadata.get("run_id")
                 if run_id:
                     try:
@@ -3841,8 +3845,14 @@ class AgentLoop:
     def _failed_turn_outbound(self, msg: InboundMessage) -> OutboundMessage:
         """Keep unexpected execution errors attached to their real turn."""
         text = 'The agent could not finish this turn. Please try again.'
-        return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=text, metadata={
+        channel, chat_id = msg.channel, msg.chat_id
+        if msg.metadata.get(REPORT_TURN) and ":" in msg.chat_id:
+            # A report turn's runner waits for its terminal on the surface the
+            # notice is addressed to; "system" has no adapter to carry it.
+            channel, chat_id = msg.chat_id.split(":", 1)
+        return OutboundMessage(channel=channel, chat_id=chat_id, content=text, metadata={
             'session_key': msg.session_key, 'stream_run_id': msg.metadata.get('run_id'),
+            **({'turnOrigin': REPORT_TURN_ORIGIN} if msg.metadata.get(REPORT_TURN) else {}),
             'goal_run': bool(msg.metadata.get('goal_run')),
             'error': {'code': 'AGENT_INTERNAL_ERROR', 'title': 'The turn could not finish',
                       'message': text, 'retryable': True},
@@ -4021,6 +4031,67 @@ class AgentLoop:
         if direct:
             return registry.get("direct")
         return registry.get(channel)
+
+    def register_report_turn_submitter(self, key: str, submitter: Any) -> None:
+        """Register a surface's chat runner for subagent report turns.
+
+        ``key`` is ``"direct"`` (the gateway's own runner) or a channel name
+        (``"web"``). ``submitter(session_key, notice)`` starts the turn and
+        returns True, or returns False when nobody is watching that
+        conversation on the surface; ``notice`` is ``{"content",
+        "sender_id", "chat_id"}``. A report turn started this way streams
+        exactly like a typed turn (see flowly/agent/report_turn.py).
+        """
+        if not hasattr(self, "_report_turn_submitters"):
+            self._report_turn_submitters: dict[str, Any] = {}
+        self._report_turn_submitters[key] = submitter
+
+    async def _submit_report_turn(
+        self, session_key: str, channel: str, chat_id: str, content: str,
+    ) -> bool:
+        """Start a subagent's notice as a live turn; False = use the bus.
+
+        The surface that serves the conversation is tried first: the relay
+        for a conversation started there, the direct gateway otherwise.
+        Each surface declines when nobody is watching the conversation on it.
+        The notice keeps the authority it would have had on the bus: the
+        conversation's owner, captured the same way the bus captures it.
+        """
+        registry = getattr(self, "_report_turn_submitters", None) or {}
+        if not registry:
+            return False
+        from flowly.live_voice.authority import (
+            VoiceAuthorityError,
+            current_request_owner,
+            request_owner_scope,
+        )
+        from flowly.live_voice.events import EventAccess, current_event_access, event_access_scope
+
+        # Same capture as bind_bus_message: the producer's access, else the
+        # conversation's own; an owned conversation without a known owner is
+        # not ours to run here (the bus applies the same refusal).
+        access = current_event_access()
+        if access is None:
+            access = EventAccess.capture(session_key)
+            try:
+                if access.producer().uid is not None and current_request_owner() is None:
+                    return False
+            except VoiceAuthorityError:
+                return False
+        try:
+            owner = access.producer()
+        except VoiceAuthorityError:
+            return False
+        if not access.permits(owner):
+            return False
+        order = ("web", "direct") if channel == "web" else ("direct", "web")
+        notice = {"content": content, "sender_id": "subagent", "chat_id": f"{channel}:{chat_id}"}
+        with request_owner_scope(owner), event_access_scope(access):
+            for key in order:
+                submitter = registry.get(key)
+                if submitter is not None and await submitter(session_key, dict(notice)):
+                    return True
+        return False
 
     def goal_turn_metadata(
         self,
@@ -7826,6 +7897,9 @@ class AgentLoop:
                 not binding.is_active
                 or binding.session_key != msg.session_key
                 or (binding.run_id and binding.run_id != run_id)
+                # A system notice (a subagent's report) acts for nobody else:
+                # the same turn over the bus never had collaboration authority.
+                or msg.channel == "system"
             ):
                 binding = None
             host = getattr(self, "_profile_collaboration_host", None)
@@ -7858,6 +7932,14 @@ class AgentLoop:
                             or self.goal_user_epoch(msg.session_key) != base_epoch):
                         skipped_goal()
                         return None
+                if msg.metadata.get(REPORT_TURN) and self._notice_already_handled(msg):
+                    # The main agent already took this result with agent_wait.
+                    # Decided before the run announces itself, so a client
+                    # never adopts a run that ends with nothing.
+                    logger.info("Subagent notice already handled in its turn; skipping")
+                    if commands is not None:
+                        commands.settle(msg.session_key, run_id, 'aborted')
+                    return None
                 if commands is not None:
                     commands.begin_execution(msg.session_key, run_id, before_goal)
                 outcome = 'error'
@@ -7924,6 +8006,15 @@ class AgentLoop:
                 if binding is not None:
                     binding.close()
                 PROFILE_RUN_BINDING.reset(token)
+
+    def _notice_already_handled(self, msg: InboundMessage) -> bool:
+        """True when a subagent's notice was already taken inside a turn."""
+        subagents = getattr(self, "subagents", None)
+        return (
+            msg.sender_id == "subagent"
+            and subagents is not None
+            and subagents.notice_already_handled(msg.content or "")
+        )
 
     def _committed_subagent_reports(self, session_key: str) -> set[str]:
         """Subagent results the saved turns of ``session_key`` handled."""
@@ -9527,6 +9618,21 @@ class AgentLoop:
             if not msg.session_key.startswith("system:")
             else f"{origin_channel}:{origin_chat_id}"
         )
+        # A subagent's report run by a surface's chat runner streams like the
+        # owner's turn: deltas, tool steps and tool progress go to the
+        # runner's callbacks, and the runner sends the one final. Without a
+        # runner (the bus) the reply is delivered after the turn, as before.
+        live_report = bool(msg.metadata.get(REPORT_TURN)) and msg.sender_id == "subagent"
+        # Filled only for a live report: its runner turns a provider failure
+        # into the native error event, as for the owner's turn.
+        provider_error: dict[str, Any] = {}
+        report_turn = msg.sender_id == "subagent" and not msg.metadata.get(_AGENDA_ITEM)
+        run_id = str(msg.metadata.get("run_id") or "")
+        turn_started_at = time.monotonic()
+        if report_turn:
+            # Compaction before the turn, as the owner's turn has it: a long
+            # conversation fits before the results land in it. Stop ends it.
+            await self._compact_before_report(session_key, origin_channel, origin_chat_id, run_id)
         session = self.sessions.get_or_create(session_key)
         
         # Update tool contexts
@@ -9605,7 +9711,14 @@ class AgentLoop:
             origin_channel=origin_channel,
             origin_chat_id=origin_chat_id,
             session_key=session_key,
-            should_yield=lambda: self.goal_user_epoch(session_key) != owner_epoch,
+            # Not steerable: the turn is the agent's own and its trigger is a
+            # hidden system notice. What the owner writes meanwhile is their
+            # next turn; its arrival ends any waiting here (the epoch moves
+            # before that turn queues for the lock), and so does Stop.
+            should_yield=lambda: (
+                self.goal_user_epoch(session_key) != owner_epoch
+                or (bool(run_id) and self.is_run_aborted(run_id))
+            ),
             steerable=False,
         )
         self._bind_subagent_turn(msg, session_key, system_turn)
@@ -9624,7 +9737,15 @@ class AgentLoop:
                 turn_messages_out=turn_messages,
                 provider_state=provider_state,
                 provider_state_out=provider_state_out,
+                **({
+                    "stream_callback": msg.metadata.get("stream_callback"),
+                    "on_iteration": msg.metadata.get("on_iteration"),
+                    "on_tool_progress": msg.metadata.get("on_tool_progress"),
+                    "error_out": provider_error,
+                } if live_report else {}),
             )
+        turn_aborted = bool(run_id) and self.is_run_aborted(run_id)
+        turn_duration_ms = max(0, int((time.monotonic() - turn_started_at) * 1000))
 
         # An agenda wake-up speaks only when its reply starts with [SEND]
         # (flowly/agenda/prompts.py). Otherwise nothing of it stays in the
@@ -9660,19 +9781,35 @@ class AgentLoop:
         # ``extend_with_turn_messages`` so a subagent's tool work is
         # visible to the parent agent on the next turn.
         turn_start_index = len(session.messages)
+        # A report delivered by the local push below gets a run identity of
+        # its own, saved with the reply and carried by the push, so a client
+        # that showed the push recognises the saved row instead of adding it
+        # a second time.
+        local_push = bool(final_content) and not live_report and origin_channel in (
+            "cli", "tui", "desktop", "ios", "android",
+        )
+        saved_run_id = run_id or (uuid.uuid4().hex if local_push and report_turn else "")
+        if provider_error:
+            # Like the owner's turn: the error text stays in history but is
+            # not an assistant completion with a run identity.
+            saved_run_id = ""
         session.extend_with_turn_messages(
             goal_cards=agenda_cards or None,
             user_content=f"[System: {msg.sender_id}] {msg.content}",
             new_messages=turn_messages,
             final_content=final_content,
-            usage=system_usage,
+            # A stopped report keeps its usage for accounting only, like the
+            # owner's turn: it may describe an earlier request of the turn.
+            usage=system_usage if not turn_aborted and not provider_error else None,
+            **({"accounting_usage": system_usage} if turn_aborted or provider_error else {}),
             reply_media=reply_media or None,
             reply_media_assets=reply_media_assets or None,
             # System triggers (subagent/board/memory announces) drive this turn
             # and stay in the LLM context, but must never render in the chat as a
             # user message — only the assistant's summary is user-facing.
             user_display_hidden=True,
-            run_id=(msg.metadata.get("run_id") or None),
+            run_id=(saved_run_id or None),
+            **({"aborted": turn_aborted, "duration_ms": turn_duration_ms} if live_report else {}),
         )
         self._commit_provider_continuity(
             session,
@@ -9705,21 +9842,46 @@ class AgentLoop:
         # so the reply actually shows up. Request-scoped replies don't come
         # through here, so there's no double delivery; remote channels
         # (Telegram/…) are delivered by their adapter via the return below.
-        if final_content and origin_channel in ("cli", "tui", "desktop", "ios", "android"):
+        #
+        # A report a surface's runner started is not pushed: the runner sends
+        # its final, under the run id it streamed.
+        if local_push:
             gw = getattr(self, "_gateway_server", None)
             if gw is not None and hasattr(gw, "push_session_message"):
+                push_metadata: dict[str, Any] = {}
+                if agenda_cards:
+                    push_metadata["goalCards"] = agenda_cards
+                if report_turn and saved_run_id:
+                    push_metadata["stream_run_id"] = saved_run_id
                 try:
+                    # The conversation's own key: a desktop chat's is not
+                    # channel:chat_id, and clients match the event by it.
                     await gw.push_session_message(
-                        f"{origin_channel}:{origin_chat_id}", final_content,
-                        **({"metadata": {"goalCards": agenda_cards}} if agenda_cards else {}),
+                        session_key if report_turn else f"{origin_channel}:{origin_chat_id}",
+                        final_content,
+                        **({"metadata": push_metadata} if push_metadata else {}),
                     )
                 except Exception as exc:
                     logger.warning(f"[board] local push failed: {exc}")
+                if report_turn and hasattr(gw, "_schedule_offline_chat_push"):
+                    # Nobody is watching (that is why the bus carried it): a
+                    # phone that registered for pushes hears about the reply.
+                    try:
+                        gw._schedule_offline_chat_push(session_key, final_content, run_id=saved_run_id)
+                    except Exception as exc:  # noqa: BLE001 — a push never fails a turn
+                        logger.debug(f"[subagent] offline push skipped: {exc}")
 
         if agenda_item and getattr(self, "agenda", None) is not None:
             self.agenda.turn_finished(
                 agenda_item, delivered=True, text=final_content or "", session_key=session_key,
             )
+
+        if report_turn:
+            # After-turn bookkeeping the owner's turn has: the provider's own
+            # count for the compaction trigger, and a background compaction
+            # if this report pushed the conversation over budget.
+            self._after_report_turn(session_key, session, system_usage, origin_channel,
+                                    origin_chat_id, aborted=turn_aborted or bool(provider_error))
 
         return OutboundMessage(
             channel=origin_channel,
@@ -9738,8 +9900,122 @@ class AgentLoop:
                 # that chat, whose key is not channel:chat_id.
                 **({"session_key": session_key}
                    if session_key != f"{origin_channel}:{origin_chat_id}" and not agenda_item else {}),
+                # The runner's final carries what the owner's turn's does: the
+                # run it streamed under, usage, context occupancy, Stop.
+                **(self._report_turn_metadata(
+                    session_key, session, system_usage, turn_messages,
+                    run_id=run_id, aborted=turn_aborted, duration_ms=turn_duration_ms,
+                    provider_error=provider_error,
+                ) if live_report else {}),
             },
         )
+
+    def _report_turn_metadata(
+        self,
+        session_key: str,
+        session: Any,
+        usage: dict[str, Any] | None,
+        turn_messages: list[dict[str, Any]],
+        *,
+        run_id: str,
+        aborted: bool,
+        duration_ms: int,
+        provider_error: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Outbound metadata a live report turn's runner needs for its final.
+
+        The same fields the owner's turn returns (see _process_message_inner):
+        the run the deltas streamed under (``stream_run_id``), the
+        conversation's key, usage and context occupancy for the context
+        ring, Stop and duration, and the tool steps the relay persists.
+        """
+        from flowly.tool_activity import project_tool_messages_for_ui
+
+        telemetry = self._context_usage_telemetry(
+            session_key, session, usage, provider_error=bool(provider_error), aborted=aborted,
+        )
+        tool_messages = project_tool_messages_for_ui([
+            {k: v for k, v in m.items() if k in ("role", "content", "tool_calls", "tool_call_id", "name")}
+            for m in turn_messages if m.get("tool_calls") or m.get("role") == "tool"
+        ])
+        return {
+            "session_key": session_key,
+            "stream_run_id": run_id or None,
+            "turnOrigin": REPORT_TURN_ORIGIN,
+            "usage": usage if not aborted and not provider_error else {},
+            "model": self.model,
+            # The runner's native error contract (state:"error" / failed).
+            "error": provider_error or None,
+            "contextTokens": telemetry["tokens"],
+            "contextTokensStale": telemetry["stale"],
+            "contextTokensSource": telemetry["source"],
+            **({"contextTokensMeasuredAt": telemetry["measured_at"]} if telemetry.get("measured_at") else {}),
+            "contextWindow": self._effective_context_window(),
+            "tool_messages": tool_messages,
+            "aborted": aborted,
+            "duration_ms": duration_ms,
+        }
+
+    async def _compact_before_report(
+        self, session_key: str, channel: str, chat_id: str, run_id: str,
+    ) -> None:
+        """The pre-turn compaction check for a subagent's report turn.
+
+        The owner's turn checks before it builds its request; a report turn
+        skipped it, so a long conversation could take a large report on top
+        of a history already over budget. This runs the same pass the
+        background post-turn check runs (same signal, lock and commit path),
+        awaited, inside the turn lock, and ended by Stop. Any failure leaves
+        the history as it is: the per-request guard still fits the request.
+        """
+        probe = ConversationInboundMessage(
+            channel=channel, sender_id="subagent", chat_id=chat_id,
+            content="", conversation_key=session_key,
+        )
+
+        def cancelled() -> bool:
+            return bool(run_id) and self.is_run_aborted(run_id)
+
+        try:
+            await asyncio.wait_for(
+                self._post_turn_compaction(probe, settle=False, should_cancel=cancelled),
+                timeout=POST_TURN_COMPACTION_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — compaction never fails the report
+            logger.warning(f"Compaction before a report turn skipped: {exc}")
+
+    def _after_report_turn(
+        self,
+        session_key: str,
+        session: Any,
+        usage: dict[str, Any] | None,
+        channel: str,
+        chat_id: str,
+        *,
+        aborted: bool,
+    ) -> None:
+        """Record the report turn's size and schedule the after-turn compaction."""
+        try:
+            telemetry = self._context_usage_telemetry(
+                session_key, session, usage, provider_error=False, aborted=aborted,
+            )
+            from types import SimpleNamespace
+
+            self._note_turn_usage(session_key, SimpleNamespace(metadata={
+                "contextTokens": telemetry["tokens"],
+                "contextTokensStale": telemetry["stale"],
+                "contextTokensSource": telemetry["source"],
+                "contextTokensMeasuredAt": telemetry.get("measured_at"),
+                "model": self.model,
+            }))
+            self._schedule_post_turn_compaction(ConversationInboundMessage(
+                channel=channel, sender_id="subagent", chat_id=chat_id,
+                content="", conversation_key=session_key,
+            ))
+        except Exception as exc:  # noqa: BLE001 — never fail the turn
+            logger.debug(f"Post-report compaction scheduling skipped: {exc}")
 
     @staticmethod
     def _turn_message_ts(session: Any, role: str, key: str) -> str:
@@ -9987,14 +10263,27 @@ class AgentLoop:
         if extra_metadata:
             metadata.update(extra_metadata)
 
-        msg = InboundMessage(
-            channel=channel,
-            sender_id="user",
-            chat_id=chat_id,
-            content=content,
-            media=media or [],
-            metadata=metadata,
-        )
+        notice = metadata.get(REPORT_TURN)
+        if isinstance(notice, dict):
+            # A subagent's report, started by the surface's chat runner: the
+            # same system notice the bus would carry, in its conversation.
+            msg: InboundMessage = ConversationInboundMessage(
+                channel="system",
+                sender_id=str(notice.get("sender_id") or "subagent"),
+                chat_id=str(notice.get("chat_id") or session_key),
+                content=content,
+                metadata=metadata,
+                conversation_key=session_key,
+            )
+        else:
+            msg = InboundMessage(
+                channel=channel,
+                sender_id="user",
+                chat_id=chat_id,
+                content=content,
+                media=media or [],
+                metadata=metadata,
+            )
 
         try:
             response = await self._process_message(msg)
@@ -11267,13 +11556,22 @@ class AgentLoop:
         except Exception as e:  # noqa: BLE001 — already logged inside the pass
             logger.debug(f"Post-turn compaction ended with: {e}")
 
-    async def _post_turn_compaction(self, msg: InboundMessage) -> None:
+    async def _post_turn_compaction(
+        self,
+        msg: InboundMessage,
+        *,
+        settle: bool = True,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> None:
         """Background twin of the pre-turn compaction block.
 
         Same signal, same lock, same commit path — the only differences are
         WHEN it runs (after the reply, off the user's critical path) and that
         there is no run to cancel it from. Every failure mode ends in "leave
         the session untouched": the pre-turn check still guards the next turn.
+
+        A subagent's report turn awaits it before it starts
+        (``_compact_before_report``): no settle, and its Stop cancels.
         """
         session_key = msg.session_key
         # Hoisted so the outermost failure path can close the cycle it opened
@@ -11288,7 +11586,7 @@ class AgentLoop:
         # answer), so an early "started" is wiped the instant the reply lands:
         # observed live as a 15-second compaction with no visible shimmer.
         # It also reads better — the answer, then the summarising notice.
-        if POST_TURN_SETTLE_SECONDS > 0:
+        if settle and POST_TURN_SETTLE_SECONDS > 0:
             await asyncio.sleep(POST_TURN_SETTLE_SECONDS)
         try:
             session = self.sessions.get_or_create(session_key)
@@ -11380,6 +11678,7 @@ class AgentLoop:
                         history,
                         session_key=session_key,
                         history_budget=self.compaction.history_budget(overhead),
+                        **({"should_cancel": should_cancel} if should_cancel is not None else {}),
                     )
                 except Exception as e:
                     logger.error(f"Post-turn compaction failed: {e}")

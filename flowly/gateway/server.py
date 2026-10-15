@@ -3357,6 +3357,75 @@ class GatewayServer:
         )
         return True
 
+    async def run_report_turn(self, session_key: str, notice: dict[str, Any]) -> bool:
+        """Run a subagent's report as its conversation's own streamed turn.
+
+        Nobody typed it, so it starts like a goal's next turn: a fresh run id,
+        a command record (``turnOrigin: "subagent"``) and this runner, so it
+        streams, shows its tool steps, resumes on re-entry and stops like a
+        typed turn. The notice itself stays hidden: no user row, no in-flight
+        user text. Returns False when no client watches the conversation, so
+        the caller delivers it over the bus instead. The turn runs in its own
+        task (like ``chat.send``): the caller is a subagent's completion and
+        must not wait for the conversation's turn lock.
+        """
+        from flowly.agent.report_turn import REPORT_TURN, REPORT_TURN_ORIGIN, report_notice
+
+        ws = next((target for target in self._session_targets(session_key) if not target.closed), None)
+        if ws is None or self.on_chat_message is None:
+            return False
+        if getattr(self.on_chat_message, 'supports_turn_start', False) is not True:
+            # A host without the turn boundary (or the turn markers) would run
+            # the notice as a visible owner message. The bus serves it instead.
+            return False
+        content = str(notice.get("content") or "")
+        run_id = str(uuid.uuid4())
+
+        async def stream_callback(delta: str) -> None:
+            await self._session_send(
+                session_key,
+                ws,
+                {
+                    "type": "event",
+                    "event": "agent",
+                    "data": {
+                        "runId": run_id,
+                        "sessionKey": session_key,
+                        "turnOrigin": REPORT_TURN_ORIGIN,
+                        "stream": "assistant",
+                        "data": {"text": delta},
+                    },
+                },
+            )
+
+        self.chat_commands.accept(session_key, run_id, {"turnOrigin": REPORT_TURN_ORIGIN})
+        task = asyncio.create_task(self._run_chat(
+            ws,
+            "",
+            session_key,
+            content,
+            run_id,
+            stream_callback,
+            extra_metadata={
+                REPORT_TURN: report_notice(
+                    str(notice.get("sender_id") or "subagent"),
+                    str(notice.get("chat_id") or session_key),
+                ),
+                "turn_origin": REPORT_TURN_ORIGIN,
+            },
+        ))
+        self._active_tasks[run_id] = task
+
+        def finished(completed: asyncio.Task) -> None:
+            self._active_tasks.pop(run_id, None)
+            if completed.cancelled():
+                self.chat_commands.settle(session_key, run_id, 'aborted')
+            elif completed.exception() is not None:
+                self.chat_commands.settle(session_key, run_id, 'error')
+
+        task.add_done_callback(finished)
+        return True
+
     async def run_agent_introduction(self, run_id: str, prompt: str) -> bool:
         """Run a named agent's first message as an ordinary streamed turn.
 
@@ -3439,14 +3508,26 @@ class GatewayServer:
         # re-enters mid-stream must restore only the agent's words.
         from flowly.agent_home import AGENT_INTRODUCTION
 
-        hidden_prompt = bool((extra_metadata or {}).get(AGENT_INTRODUCTION))
+        from flowly.agent.report_turn import REPORT_TURN, report_turn_fields, run_started_event
+
+        # A subagent's report is the agent's own turn: its notice is hidden,
+        # every event says whose run it is, and it opens with run_started.
+        report_turn = bool((extra_metadata or {}).get(REPORT_TURN))
+        hidden_prompt = bool((extra_metadata or {}).get(AGENT_INTRODUCTION)) or report_turn
+        turn_fields = report_turn_fields(session_key) if report_turn else {}
 
         async def on_turn_started(text: str) -> None:
             nonlocal turn_started
             self.chat_commands.settle(session_key, run_id, 'running')
             inflight.begin(session_key, run_id, "" if hidden_prompt else text,
-                           goal_run=bool((extra_metadata or {}).get('goal_run')))
+                           goal_run=bool((extra_metadata or {}).get('goal_run')),
+                           turn_origin=turn_fields.get("turnOrigin"))
             turn_started = True
+            if report_turn:
+                await self._session_send(
+                    session_key, ws,
+                    {"type": "event", "event": "chat", "data": run_started_event(run_id, session_key)},
+                )
 
         if supports_turn_start:
             extra_metadata = {**(extra_metadata or {}), '_on_turn_started': on_turn_started}
@@ -3469,13 +3550,13 @@ class GatewayServer:
         # run id the loop used.
         async def iteration_callback(event: dict) -> None:
             if event.get("state") == "tool_progress":
-                wrapped = {**event, "runId": run_id}
+                wrapped = {**event, "runId": run_id, **turn_fields}
                 inflight.append_tool_progress(session_key, run_id, wrapped)
                 await self._session_send(
                     session_key, ws, {"type": "event", "event": "chat", "data": wrapped}
                 )
                 return
-            wrapped = {**event, "state": "iteration_step", "runId": run_id}
+            wrapped = {**event, "state": "iteration_step", "runId": run_id, **turn_fields}
             # Persist the tool-turn event so a client that re-enters mid-stream
             # can rebuild the live tool-call panel (chat.inflight returns these),
             # not just the assistant text. Store BEFORE the send so a dropped
@@ -3545,7 +3626,9 @@ class GatewayServer:
                 pending = self.on_chat_message(*call_args)
             result = await pending
             if supports_turn_start and not turn_started:
-                if (extra_metadata or {}).get('_goal_continuation_goal_id'):
+                if (extra_metadata or {}).get('_goal_continuation_goal_id') or report_turn:
+                    # (A report whose results were already taken in a turn
+                    # ends here too: nothing was announced, nothing to say.)
                     # A superseded autonomous prompt was rejected inside the
                     # turn lock. It never owned the stream and has no reply.
                     self.chat_commands.settle(session_key, run_id, 'aborted')
@@ -3607,6 +3690,7 @@ class GatewayServer:
                             "errorMessage": str(provider_error.get("message") or response),
                             "retryable": bool(provider_error.get("retryable", False)),
                             **context_wire,
+                            **turn_fields,
                         },
                     },
                 )
@@ -3652,6 +3736,7 @@ class GatewayServer:
                 "completedAt": datetime.now(timezone.utc).isoformat(),
                 "message": final_message,
                 **context_wire,
+                **turn_fields,
             }
             goal_snapshot = (metadata or {}).get("goal")
             if isinstance(goal_snapshot, dict):
@@ -3695,7 +3780,7 @@ class GatewayServer:
                     fallback_ws=ws,
                 )
             await self._notify_chat_delivered(session_key, response, metadata or {})
-            if not final_data.get("aborted"):
+            if not final_data.get("aborted") and (response or not report_turn):
                 self._schedule_offline_chat_push(
                     session_key,
                     response,
@@ -3710,7 +3795,7 @@ class GatewayServer:
                 {
                     "type": "event",
                     "event": "chat",
-                    "data": {"state": "aborted", "runId": run_id, "sessionKey": session_key},
+                    "data": {"state": "aborted", "runId": run_id, "sessionKey": session_key, **turn_fields},
                 },
             )
         except Exception as e:
@@ -3733,6 +3818,7 @@ class GatewayServer:
                         "errorTitle": "The agent hit an unexpected error",
                         "errorMessage": "Try again. If this continues, restart the bot.",
                         "retryable": True,
+                        **turn_fields,
                     },
                 },
             )

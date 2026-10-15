@@ -2145,6 +2145,12 @@ Respond to the user now:"""
     if _web_channel is not None and hasattr(_web_channel, "run_autonomous_turn"):
         _web_channel.supports_turn_start = True
         agent.register_goal_turn_submitter("web", _web_channel.run_autonomous_turn)
+    # A finished subagent's report is its conversation's own turn and streams
+    # through the same runners (flowly/agent/report_turn.py). A surface with
+    # nobody watching declines, and the report goes over the bus as before.
+    agent.register_report_turn_submitter("direct", gateway_server.run_report_turn)
+    if _web_channel is not None and hasattr(_web_channel, "run_report_turn"):
+        agent.register_report_turn_submitter("web", _web_channel.run_report_turn)
 
     # Mirror relay/web chat liveness to local desktop gateway clients. This
     # lets the desktop UI react when another client (iOS/web) talks to this

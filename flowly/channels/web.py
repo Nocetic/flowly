@@ -19,6 +19,14 @@ from loguru import logger
 from flowly.gateway_logs.notable import notable
 
 from flowly.browser_annotations import append_browser_annotation_context
+from flowly.agent.report_turn import (
+    REPORT_TURN,
+    REPORT_TURN_ORIGIN,
+    report_notice,
+    report_turn_fields,
+    run_started_event,
+)
+from flowly.bus.events import ConversationInboundMessage
 from flowly.bus.events import InboundMessage as _Base
 from flowly.bus.events import OutboundMessage
 from flowly.bus.queue import MessageBus
@@ -1073,6 +1081,11 @@ class WebChannel(BaseChannel):
                         if iter_event.get("goalRun") is True
                         else {}
                     ),
+                    **(
+                        {"turnOrigin": iter_event["turnOrigin"]}
+                        if isinstance(iter_event.get("turnOrigin"), str)
+                        else {}
+                    ),
                 },
             }
             await self._send_or_queue(json.dumps(event_msg))
@@ -1172,6 +1185,9 @@ class WebChannel(BaseChannel):
             data_block["goalRun"] = True
         if msg.metadata.get("goalTerminal") is True:
             data_block["goalNotice"] = True
+        if isinstance(msg.metadata.get("turnOrigin"), str):
+            # A run the server started (a subagent's report): whose run it is.
+            data_block["turnOrigin"] = msg.metadata["turnOrigin"]
         usage_meta = msg.metadata.get("usage")
         if isinstance(usage_meta, dict) and usage_meta:
             data_block["usage"] = {
@@ -2586,14 +2602,17 @@ class WebChannel(BaseChannel):
 
         asyncio.create_task(_run())
 
-    def _make_stream_callback(self, session_id: str, session_key: str, run_id: str):
+    def _make_stream_callback(self, session_id: str, session_key: str, run_id: str,
+                              turn_fields: dict[str, Any] | None = None):
         """The per-delta fan-out every relay turn uses.
 
         ``sessionKey`` is what makes the relay route a delta to the
         CONVERSATION rather than to the socket that started the turn — so a
         client that reconnected mid-turn (or never started one, as with an
-        autonomous goal turn) still receives the live reply.
+        autonomous goal turn) still receives the live reply. ``turn_fields``
+        mark a run the server started (a subagent's report).
         """
+        fields = dict(turn_fields or {})
 
         async def stream_callback(delta: str) -> None:
             from flowly.agent import inflight
@@ -2604,6 +2623,7 @@ class WebChannel(BaseChannel):
                 "runId": run_id,
                 "sessionKey": session_key,
                 "delta": delta,
+                **fields,
             }
             await self._send_or_queue(json.dumps({
                 "type": "event",
@@ -2621,6 +2641,7 @@ class WebChannel(BaseChannel):
                     "sessionKey": session_key,
                     "source": "relay",
                     "data": {"text": delta},
+                    **fields,
                 },
             ))
 
@@ -2698,6 +2719,42 @@ class WebChannel(BaseChannel):
         self._track_chat_publish(task, session_key, run_id)
         return True
 
+    async def run_report_turn(self, session_key: str, notice: dict[str, Any]) -> bool:
+        """Run a subagent's report as the conversation's own relay turn.
+
+        The relay twin of ``GatewayServer.run_report_turn``: a fresh run id, a
+        command record (``turnOrigin: "subagent"``), the same streaming
+        callback and agent-queue entry ``chat.send`` uses, and the notice kept
+        hidden. Returns False when the conversation has no relay session yet,
+        so the caller delivers it over the bus (queued for the relay).
+        """
+        if getattr(self, 'supports_turn_start', False) is not True:
+            # Without the turn boundary the run could not announce itself
+            # inside the turn lock; the bus serves the notice instead.
+            return False
+        session_id = self._session_key_to_relay_id.get(session_key) or ""
+        if not session_id and session_key.startswith("web:"):
+            session_id = session_key.split(":", 1)[1]
+        if not session_id:
+            return False
+        run_id = str(uuid.uuid4())
+        self.chat_commands.accept(session_key, run_id, {"turnOrigin": REPORT_TURN_ORIGIN})
+        # The reply goes to the relay session the conversation has now, which
+        # may not be the one the subagent was started from.
+        metadata = {
+            REPORT_TURN: report_notice(str(notice.get("sender_id") or "subagent"), f"web:{session_id}"),
+        }
+        task = asyncio.create_task(self._process_message(
+            session_id,
+            session_key,
+            str(notice.get("content") or ""),
+            run_id,
+            self._make_stream_callback(session_id, session_key, run_id, report_turn_fields(session_key)),
+            extra_metadata=metadata,
+        ))
+        self._track_chat_publish(task, session_key, run_id)
+        return True
+
     def _track_chat_publish(self, task: asyncio.Task, session_key: str, run_id: str) -> None:
         self._active_tasks[run_id] = task
 
@@ -2738,17 +2795,29 @@ class WebChannel(BaseChannel):
         }
         if extra_metadata:
             metadata.update(extra_metadata)
+        # A subagent's report: hidden notice, its events marked, and it
+        # announces itself once it holds the conversation's turn lock.
+        report_turn = isinstance(metadata.get(REPORT_TURN), dict)
+        turn_fields = report_turn_fields(session_key) if report_turn else {}
         if getattr(self, 'supports_turn_start', False) is True:
             from flowly.agent import inflight
 
             async def on_turn_started(text: str) -> None:
                 self.chat_commands.settle(session_key, run_id, 'running')
-                inflight.begin(session_key, run_id, text, goal_run=bool(metadata.get('goal_run')))
+                inflight.begin(session_key, run_id, "" if report_turn else text,
+                               goal_run=bool(metadata.get('goal_run')),
+                               turn_origin=turn_fields.get("turnOrigin"))
+                if report_turn:
+                    data = run_started_event(run_id, session_key)
+                    await self._send_or_queue(json.dumps({
+                        "type": "event", "sessionId": session_id, "event": "chat", "data": data,
+                    }))
+                    asyncio.create_task(self._emit_local_event("chat", {**data, "source": "relay"}))
 
             metadata['_on_turn_started'] = on_turn_started
 
             async def on_iteration(event: dict) -> None:
-                wrapped = {**event, 'runId': run_id, 'state': 'iteration_step'}
+                wrapped = {**event, 'runId': run_id, 'state': 'iteration_step', **turn_fields}
                 inflight.append_iteration(session_key, run_id, wrapped)
                 await self.send(OutboundMessage(
                     channel='web', chat_id=session_id, content='',
@@ -2761,15 +2830,28 @@ class WebChannel(BaseChannel):
         if render_capabilities:
             metadata["render_capabilities"] = render_capabilities
 
-        inbound_with_session = _WebInboundMessage(
-            channel="web",
-            sender_id=session_id,
-            chat_id=session_id,
-            content=content,
-            media=media or [],
-            metadata=metadata,
-            _session_key=session_key,
-        )
+        if report_turn:
+            # The same system notice the bus would carry, in its conversation:
+            # the agent processes it as a subagent's report under the turn lock.
+            notice = metadata[REPORT_TURN]
+            inbound_with_session: _Base = ConversationInboundMessage(
+                channel="system",
+                sender_id=str(notice.get("sender_id") or "subagent"),
+                chat_id=str(notice.get("chat_id") or f"web:{session_id}"),
+                content=content,
+                metadata=metadata,
+                conversation_key=session_key,
+            )
+        else:
+            inbound_with_session = _WebInboundMessage(
+                channel="web",
+                sender_id=session_id,
+                chat_id=session_id,
+                content=content,
+                media=media or [],
+                metadata=metadata,
+                _session_key=session_key,
+            )
 
         try:
             await self.bus.publish_inbound(inbound_with_session)

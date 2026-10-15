@@ -8,7 +8,7 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
@@ -451,6 +451,11 @@ class SubagentManager:
         # Reads the run ids a conversation's saved turns handled (the
         # session's SUBAGENT_REPORTS_KEY). AgentLoop sets it; None = unknown.
         self.committed_reports: Callable[[str], set[str]] | None = None
+        # Runs a notice as its conversation's own streamed turn on the
+        # surface the owner is watching (AgentLoop sets it). Called with the
+        # conversation's key, the delivery address and the notice; False
+        # means no surface took it and the notice goes over the bus.
+        self.report_submitter: Callable[[str, str, str, str], Awaitable[bool]] | None = None
         self._shutting_down = False
         # Set by a clean shutdown: resumable runs are suspended, not ended.
         self._suspending = False
@@ -2024,6 +2029,18 @@ class SubagentManager:
         run_id = record.run_id
 
         async def _send(content: str) -> None:
+            submit = self.report_submitter
+            if submit is not None:
+                # The surface the owner is watching runs the turn like a
+                # typed one: streamed, stoppable, resumable. Nobody watching
+                # (or no surface at all): the bus, as before.
+                try:
+                    if await submit(parent_session_key, record.parent_channel,
+                                    record.parent_chat_id, content):
+                        logger.debug(f"[SubagentManager] [{run_id[:8]}] reported to {parent_session_key} as a live turn")
+                        return
+                except Exception:
+                    logger.exception("Could not start a live report turn; delivering over the bus")
             await self.bus.publish_inbound(ConversationInboundMessage(
                 channel="system",
                 sender_id="subagent",
