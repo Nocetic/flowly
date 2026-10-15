@@ -580,6 +580,16 @@ fatal tool again would otherwise loop forever).
   whoever watches it (§16a); the `subagent.*` events above are unchanged.
 * Through the profile host (another local bot): list, get, result, transcript, history, watch,
   unwatch, cancel, stats. Spawn and set_model are not exposed there.
+* `profiles.rpc {…, ifRunning: true}` reads a named agent only while it runs: `_target_rpc` checks
+  `_runtime_is_open` (as `chat.abort` does) and raises `PROFILE_NOT_RUNNING` instead of calling
+  `_ensure_runtime`, so a stopped or never-started agent is not woken by what follows it in the
+  background (a client's subagent list, stats, and a conversation's watch renewed every ~90 s).
+  Default `false`; a non-boolean is `INVALID_PARAMS`. The default profile goes through the
+  primary socket, which is always up. A host that has it says so: `profiles.capabilities()`
+  `rpcIfRunning: true`, so a client sends the option only there (an older host ignores unknown
+  keys and would start the agent). `subagents.unwatch` is answered by the host before any of this
+  and never forwarded. Test: `tests/test_profile_host.py`
+  (`test_a_read_if_running_never_starts_a_stopped_agent`).
 
 ## 13. Metrics (`flowly/agent/subagent_metrics.py`)
 

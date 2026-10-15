@@ -496,6 +496,9 @@ class ProfileHost:
             ],
             "profileRpcMethods": sorted(PROFILE_RPC_TIMEOUTS),
             "rpcIdentityGuard": True,
+            # profiles.rpc {ifRunning: true}: read an agent only while it is
+            # up, never start it (PROFILE_NOT_RUNNING otherwise).
+            "rpcIfRunning": True,
             "events": ["profile.event", "profile.room"],
             "storageMode": "profile-local",
             "processIsolation": "per-profile-gateway",
@@ -651,6 +654,9 @@ class ProfileHost:
                 _required_string(params, "runId"),
             )
         if method == "profiles.rpc":
+            if_running = params.get("ifRunning", False)
+            if not isinstance(if_running, bool):
+                raise ProfileHostError("INVALID_PARAMS", "ifRunning must be true or false.")
             return await self.rpc(
                 _required_string(params, "name").strip(),
                 params.get("method"),
@@ -658,6 +664,7 @@ class ProfileHost:
                 params.get("timeoutMs"),
                 expected_host_id=params.get("expectedHostId"),
                 expected_bot_id=params.get("expectedBotId"),
+                if_running=if_running,
             )
         if method in self._rooms.methods:
             result = await self._rooms.dispatch(method, params)
@@ -1036,7 +1043,15 @@ class ProfileHost:
         *,
         expected_host_id: Any = None,
         expected_bot_id: Any = None,
+        if_running: bool = False,
     ) -> Any:
+        """Run one allowed method on an agent of this host.
+
+        ``if_running`` reads an agent only when it is already up: a stopped
+        or not-yet-started agent answers PROFILE_NOT_RUNNING instead of being
+        started. What follows agents in the background (a subagent's live
+        conversation, renewed every minute or so) must never wake one.
+        """
         _validate_profile_selector(name)
         method, safe = validate_profile_rpc(method, params)
         if method == "subagents.unwatch":
@@ -1079,9 +1094,11 @@ class ProfileHost:
             safe.pop("allowedTools", None)
             safe.pop("disabledTools", None)
             safe["turnOrigin"] = "user"
-        identity_options = {"expected_bot_id": expected_bot_id} if guarded else {}
+        target_options: dict[str, Any] = {"expected_bot_id": expected_bot_id} if guarded else {}
+        if if_running:
+            target_options["if_running"] = True
         result = await self._target_rpc(
-            name, method, safe, bounded_timeout(method, timeout_ms), **identity_options
+            name, method, safe, bounded_timeout(method, timeout_ms), **target_options
         )
         if expected_bot_id is not None and ensure_profile_bot_id(name).bot_id != expected_bot_id:
             raise ProfileHostError('PROFILE_IDENTITY_CHANGED', 'The selected agent has changed.')
@@ -1099,7 +1116,7 @@ class ProfileHost:
                         break
                     more = await self._target_rpc(
                         name, method, {**safe, "before": cursor}, bounded_timeout(method, timeout_ms),
-                        **identity_options,
+                        **target_options,
                     )
                     if not isinstance(more, dict) or not isinstance(more.get("sessions"), list):
                         break
@@ -2783,6 +2800,7 @@ class ProfileHost:
         timeout: float,
         *,
         expected_bot_id: str | None = None,
+        if_running: bool = False,
     ) -> Any:
         expected = params.get('expectedBotId')
         if expected is not None and ensure_profile_bot_id(target).bot_id != expected:
@@ -2802,6 +2820,11 @@ class ProfileHost:
             if not self._runtime_is_open(target_runtime):
                 # Stop is never a reason to start or restart an agent.
                 return {"aborted": False}
+        elif if_running:
+            target_runtime = self._runtimes.get(target)
+            if not self._runtime_is_open(target_runtime):
+                # A read that follows an agent in the background never wakes it.
+                raise ProfileHostError("PROFILE_NOT_RUNNING", "The agent is not running.")
         else:
             target_runtime = await self._ensure_runtime(target)
         # Runtime startup can yield while a profile is deleted/re-created.
