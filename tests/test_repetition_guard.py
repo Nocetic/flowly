@@ -100,3 +100,21 @@ def test_the_same_text_from_different_tools_is_not_a_repeat():
     guard = RepetitionGuard()
     assert guard.observe("process", "ok") is False
     assert guard.observe("write_file", "ok") is False
+
+
+def test_a_result_that_only_moves_its_clock_is_a_repeat():
+    guard = RepetitionGuard()
+    assert guard.observe("process", "Still running. Checked at 2026-10-15T14:02:31Z (took 1.2s).") is False
+    assert guard.observe("process", "Still running. Checked at 2026-10-15T14:02:41Z (took 0.9s).") is True
+    assert guard.observe("process", "Still running. Last log 14:03:02, elapsed 95 seconds") is False
+    assert guard.observe("process", "Still running. Last log 14:03:12, elapsed 105 seconds") is True
+    assert guard.observe("process", '{"status": "running", "updatedAt": 1791977567.88}') is False
+    assert guard.observe("process", '{"status": "running", "updatedAt": 1791977577.12}') is True
+
+
+def test_real_changes_are_never_set_aside():
+    guard = RepetitionGuard()
+    assert guard.observe("read_file", "line 1: total 3 files") is False
+    assert guard.observe("read_file", "line 1: total 4 files") is False
+    assert guard.observe("web_search", "Page 2 of results") is False
+    assert guard.observe("web_search", "Page 3 of results") is False

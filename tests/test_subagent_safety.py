@@ -680,7 +680,7 @@ class TestMaxIterationsGraceCall:
         registry = SubagentRegistry(path=tmp_path / "runs.json")
         mgr = SubagentManager(
             provider=provider, workspace=tmp_path, bus=MessageBus(),
-            registry=registry, state_dir=tmp_path,
+            registry=registry, state_dir=tmp_path, max_iterations=30,
         )
         result = await mgr.spawn(
             "loop forever", "grace", "cli", "s",

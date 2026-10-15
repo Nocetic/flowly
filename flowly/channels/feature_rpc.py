@@ -4459,6 +4459,32 @@ def subagents_transcript(params: dict) -> dict:
     return {"schemaVersion": 2, "task": run_view(record), **page}
 
 
+def subagents_stats(params: dict) -> dict:
+    """How this bot's subagents went over a period: runs, outcomes, time, tokens.
+
+    Params: ``days`` (1–365, default 30); ``includeSystem`` (default false —
+    the agent's own upkeep, such as self-review, is left out). Read from the
+    metric lines each ended run leaves (flowly/agent/subagent_metrics.py),
+    which outlive the runs themselves.
+    """
+    from pathlib import Path
+
+    from flowly.agent.subagent_metrics import metrics_path, read_metrics, summarize
+
+    days = params.get("days", 30)
+    if type(days) is not int or not 1 <= days <= 365:
+        raise FeatureRpcError("INVALID", "days must be a whole number from 1 to 365")
+    include_system = params.get("includeSystem", False)
+    if not isinstance(include_system, bool):
+        raise FeatureRpcError("INVALID", "includeSystem must be true or false")
+    registry = _subagent_registry()
+    try:
+        rows = read_metrics(metrics_path(Path(registry._path)))
+    except OSError as exc:
+        raise FeatureRpcError("UNAVAILABLE", "Subagent metrics could not be read") from exc
+    return {"schemaVersion": 1, **summarize(rows, days=days, include_system=include_system)}
+
+
 async def subagents_cancel(params: dict) -> dict:
     _, record = _subagent_record(params, allow_prefix=True)
     if record.ended_at is not None:
@@ -5407,6 +5433,7 @@ _DISPATCH: dict[str, tuple] = {
     "subagents.result": (subagents_result, True, False),
     "subagents.transcript": (subagents_transcript, True, False),
     "subagents.cancel": (subagents_cancel, True, False),
+    "subagents.stats": (subagents_stats, True, False),
     "subagents.assistants": (subagents_assistants_retired, True, False),
     "subagents.set_model": (agents_feature_retired, True, False),
     "subagents.spawn": (subagents_spawn, True, False),

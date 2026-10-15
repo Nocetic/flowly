@@ -76,6 +76,13 @@ def run_view(record: SubagentRunRecord, *, detail: bool = False) -> dict[str, An
         "resultAvailable": record.result_available, "artifactIds": list(record.artifact_ids),
         "deliveryState": record.delivery_state,
         "origin": record.origin, "mark": deepcopy(record.mark),
+        # Tokens so far (live while it runs), never a price.
+        "usage": {
+            "inputTokens": int(record.usage.get("input", 0)),
+            "outputTokens": int(record.usage.get("output", 0)),
+            "cacheReadTokens": int(record.usage.get("cacheRead", 0)),
+            "totalTokens": int(record.usage.get("total", 0)),
+        },
         "childSessionKey": record.child_session_key,
     }
     if detail:

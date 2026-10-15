@@ -1114,6 +1114,7 @@ class AgentLoop:
             exec_config=self.exec_config,
             registry=self._subagent_registry,
             state_dir=self._state_dir,
+            max_iterations=self.max_iterations,
         )
 
         # Compaction service

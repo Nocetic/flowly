@@ -82,7 +82,35 @@ class SubagentRunRecord:
     mark: dict[str, Any] = field(default_factory=dict)
     # Runs started in the same turn share it and report back together.
     batch_id: str = ""
+    # Tokens the run has used so far: {"input", "output", "cacheRead", "total"}.
+    usage: dict[str, int] = field(default_factory=dict)
 
+
+
+_USAGE_KEYS = ("input", "output", "cacheRead", "total")
+
+
+def add_usage(totals: dict[str, int], usage: dict[str, Any]) -> dict[str, int]:
+    """A run's token totals after one more model call.
+
+    Providers report ``prompt_tokens`` / ``completion_tokens`` (and, for
+    some, cache reads apart from the prompt); the total is what they say, or
+    the sum when they do not say.
+    """
+    def count(key: str) -> int:
+        try:
+            return max(0, int(usage.get(key) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    prompt, completion, cache_read = count("prompt_tokens"), count("completion_tokens"), count("cache_read_tokens")
+    total = count("total_tokens") or prompt + completion
+    merged = {key: int(totals.get(key, 0)) for key in _USAGE_KEYS}
+    merged["input"] += prompt
+    merged["output"] += completion
+    merged["cacheRead"] += cache_read
+    merged["total"] += total
+    return merged
 
 
 class SubagentRegistry:
@@ -148,6 +176,10 @@ class SubagentRegistry:
             raise ValueError("invalid run mark")
         if not isinstance(record.batch_id, str):
             raise ValueError("invalid run batch")
+        if not isinstance(record.usage, dict) or any(
+            not isinstance(k, str) or type(v) is not int or v < 0 for k, v in record.usage.items()
+        ):
+            raise ValueError("invalid run usage")
         return record
 
     def _read_locked(self) -> None:

@@ -26,7 +26,8 @@ from flowly.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileT
 from flowly.agent.tools.shell import ExecTool
 from flowly.exec.types import ExecConfig
 from flowly.agent.tools.web import WebSearchTool, WebFetchTool, WebExtractTool
-from flowly.agent.subagent_registry import SubagentRegistry, SubagentRunRecord
+from flowly.agent.subagent_metrics import append_metric, metrics_path
+from flowly.agent.subagent_registry import SubagentRegistry, SubagentRunRecord, add_usage
 from flowly.agent.delegation import MAX_CHILDREN_PER_CONVERSATION, assign_mark
 from flowly.agent.tools.agent_tools import ChildAgentMessageTool
 from flowly.agent.subagent_observation import TaskEvents, run_view
@@ -96,15 +97,14 @@ _BLOCKED_SUBAGENT_TOOLS: frozenset[str] = frozenset({
 })
 
 
-# System-wide wall-clock cap for every subagent run. Not per-run
-# configurable — keeping the user-facing config minimal is worth more
-# than letting operators tune this. 30 min covers a long research or
-# coding task (30 iterations × 30-60s); anything over this ceiling is
-# almost always a genuine hang that the per-tool (120s) / per-LLM-call
-# (300s) / heartbeat guards failed to catch.
-_SUBAGENT_WALL_CLOCK_TIMEOUT = 1_800
-# A subagent exists for work too big to share a turn with: give it room.
-_SUBAGENT_MAX_ITERATIONS = 30
+# A subagent is another Flowly working on one task: it gets the main agent's
+# own iteration limit (AgentLoop.max_iterations) and, like the main agent, no
+# wall clock. What bounds a run is the same as for the main agent: the
+# per-tool and per-model-call timeouts, the repetition guard, and the
+# iteration limit. A caller may still pass timeout_seconds (tests).
+_DEFAULT_MAX_ITERATIONS = 100
+# Each model call's timeout when no wall clock divides the run's time.
+_MODEL_CALL_TIMEOUT_SECONDS = 300.0
 _MAX_CONCURRENT_SUBAGENTS = 8
 # A finished run's result that the conversation has not handled in this long
 # no longer holds a goal (see pending_for_goal).
@@ -119,6 +119,9 @@ _REPLY_WAIT_SECONDS = 300
 _ANNOUNCE_RESULT_CHARS = 8_000
 # What one notice carries in all when several runs report together.
 _ANNOUNCE_BATCH_CHARS = 24_000
+# How long a finished run's result is held for siblings still working before
+# it is delivered anyway (with the siblings named as still running).
+_BATCH_HOLD_SECONDS = 300
 
 
 class SubagentToolRegistry(ToolRegistry):
@@ -358,8 +361,11 @@ class SubagentManager:
         web_search_proxy_url: str | None = None,
         web_search_server_id: str | None = None,
         web_search_auth_token: str | None = None,
+        max_iterations: int = _DEFAULT_MAX_ITERATIONS,
     ):
         self.provider = provider
+        # The main agent's own limit; AgentLoop passes it in.
+        self.max_iterations = max(1, int(max_iterations))
         self.workspace = workspace
         self.bus = bus
         self.model = model or provider.get_default_model()
@@ -367,6 +373,8 @@ class SubagentManager:
         self.exec_config = exec_config or ExecConfig()
         self._registry = registry or SubagentRegistry()
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
+        # Pending deliveries of held batch results, by parent and batch.
+        self._batch_flushes: dict[str, asyncio.Task[None]] = {}
         # parent_session_key -> set of run_ids currently spawned by that
         # parent. Used by cancel_children() so AIAgent.interrupt(session_key)
         # can cascade into background subagents without killing everyone
@@ -515,6 +523,7 @@ class SubagentManager:
                 record.run_id, "error", error_code="process_restarted",
                 error="Process restarted before task completed",
             )
+            self._record_metric(record.run_id)
             if record.delivery_state == "not_required":
                 continue
             # Track recovery announce tasks (audit: was fire-and-forget)
@@ -662,7 +671,16 @@ class SubagentManager:
                     self._registry.finish(_rid, outcome,
                                           error_code="cancelled" if _task.cancelled() else "worker_failed",
                                           error="Task interrupted" if _task.cancelled() else "Task could not finish")
+                    self._record_metric(_rid)
                     self._publish_event("subagent.completed", _rid)
+                    ended = self._registry.get(_rid)
+                    # Its siblings may be holding their results for it, and a
+                    # failure is still news to the conversation.
+                    if ended and (ended.batch_id or ended.delivery_state in ("pending", "queued")):
+                        report = asyncio.ensure_future(self._announce(_rid, ended.error or "", outcome))
+                        report.add_done_callback(
+                            lambda t: t.exception() if not t.cancelled() and t.exception() else None
+                        )
             except Exception:
                 logger.exception("Could not persist task cleanup")
             finally:
@@ -846,7 +864,7 @@ class SubagentManager:
             })
 
             # Run agent loop (limited iterations)
-            max_iterations = _SUBAGENT_MAX_ITERATIONS
+            max_iterations = self.max_iterations
             iteration = 0
             _tool_search_result_sets: dict[tuple[str, ...], int] = {}
             final_result: str | None = None
@@ -876,19 +894,15 @@ class SubagentManager:
                 except Exception:
                     pass
 
-            # Wall-clock cap is a system-wide constant — callers may
-            # override (typically for tests) by passing a positive
-            # timeout_seconds, but normal runs all land on the same
-            # value. Kept as a last-resort hang trap below max_iter +
-            # per-call + heartbeat.
-            _total_timeout: float = float(
-                timeout_seconds if (timeout_seconds and timeout_seconds > 0)
-                else _SUBAGENT_WALL_CLOCK_TIMEOUT
+            # No wall clock unless a caller asked for one: each model call
+            # then gets the fixed timeout below, as the main agent's do.
+            _total_timeout: float | None = (
+                float(timeout_seconds) if (timeout_seconds and timeout_seconds > 0) else None
             )
             _start_time = time.time()
             logger.info(
                 f"[SubagentManager] [{run_id[:8]}] total timeout: "
-                f"{_total_timeout:.0f}s, max_iter={max_iterations}"
+                f"{f'{_total_timeout:.0f}s' if _total_timeout else 'none'}, max_iter={max_iterations}"
             )
 
             repetition = RepetitionGuard()
@@ -919,7 +933,7 @@ class SubagentManager:
                     _remaining_iters = max(1, max_iterations - iteration + 1)
                     _llm_call_timeout = max(60.0, min(_remaining, _remaining / _remaining_iters * 1.5))
                 else:
-                    _llm_call_timeout = 300.0
+                    _llm_call_timeout = _MODEL_CALL_TIMEOUT_SECONDS
 
                 # Context management: strip old tool results to save tokens
                 # (keep recent, compact old)
@@ -950,6 +964,7 @@ class SubagentManager:
                     max_tokens=subagent_output_budget(model),
                     timeout=_llm_call_timeout,
                 )
+                await self._count_usage(run_id, response.usage)
 
                 if response.has_tool_calls:
                     _consecutive_errors = 0  # Successful LLM call — reset error counter
@@ -1324,6 +1339,7 @@ class SubagentManager:
                         max_tokens=4096,
                         timeout=60,
                     )
+                    await self._count_usage(run_id, summary_response.usage)
                     if summary_response.finish_reason != "error" and summary_response.content and summary_response.content.strip():
                         final_result = summary_response.content
                         status, error_str, error_code = "ok", None, None
@@ -1673,7 +1689,30 @@ class SubagentManager:
 
     async def _emit_event(self, event_name: str, run_id: str, label: str,
                           outcome: str, error: str | None = None) -> None:
+        if event_name == "subagent.completed":
+            self._record_metric(run_id)
         self._publish_event(event_name, run_id)
+
+    def _record_metric(self, run_id: str) -> None:
+        """Keep the ended run's numbers (subagent_metrics) past its pruning."""
+        record = self._registry.get(run_id)
+        path = getattr(self._registry, "_path", None)
+        if record is None or record.ended_at is None or path is None:
+            return
+        append_metric(metrics_path(Path(path)), record)
+
+    async def _count_usage(self, run_id: str, usage: dict[str, Any] | None) -> None:
+        """Add one model call's tokens to the run, for the owner to see live."""
+        if not isinstance(usage, dict) or not usage:
+            return
+        record = self._registry.get(run_id)
+        if record is None:
+            return
+        totals = add_usage(record.usage, usage)
+        if totals == record.usage:
+            return
+        self._registry.update(run_id, usage=totals)
+        self._publish_event("subagent.progress", run_id)
 
     async def _progress(self, run_id: str, activity: dict) -> None:
         self._registry.update(run_id, activity=activity)
@@ -1736,7 +1775,7 @@ class SubagentManager:
             return "(task was interrupted)"
         return record.error or record.result_preview or ""
 
-    async def _announce(self, run_id: str, result: str, status: str) -> None:
+    async def _announce(self, run_id: str, result: str, status: str, *, flush: bool = False) -> None:
         """Hand a finished run's result to the conversation that started it.
 
         Runs started in the same turn report back together: while one of
@@ -1744,11 +1783,17 @@ class SubagentManager:
         one to finish delivers every held result in a single notice — one
         turn that can answer the owner's request as a whole, instead of a
         reply per part. A run alone in its turn reports at once.
+
+        A held result never waits on a slow sibling for long: _BATCH_HOLD_SECONDS
+        after the first one was held, every result held so far is delivered
+        (``flush``), saying which siblings are still working; theirs follow in
+        a notice of their own.
         """
         record = self._registry.get(run_id)
         if not record:
             return
         members = [record]
+        still_running: list[SubagentRunRecord] = []
         if record.batch_id:
             batch = [
                 r for r in self._registry.all()
@@ -1756,22 +1801,31 @@ class SubagentManager:
                 and r.parent_session_key == record.parent_session_key
                 and r.origin != "system"
             ]
-            if any(r.ended_at is None for r in batch if r.run_id != run_id):
+            still_running = [r for r in batch if r.ended_at is None and r.run_id != run_id]
+            if still_running and not flush:
                 logger.info(
                     f"[SubagentManager] [{run_id[:8]}] finished; held until the rest of its batch ends"
                 )
+                self._arm_batch_flush(record)
                 return
             # Claim before any await: the last two runs of a batch can finish
             # together, and only one of them may deliver.
             members = [
                 r for r in batch
-                if r.run_id == run_id
-                or (not r.announced and r.delivery_state in ("pending", "queued"))
+                if (r.run_id == run_id and not flush)
+                or (r.ended_at is not None and not r.announced and r.delivery_state in ("pending", "queued"))
             ]
             members.sort(key=lambda r: r.created_at)
         if record.batch_id and record.announced and len(members) == 1:
             return
-        for member in members:
+        # Siblings the owner (or the agent) stopped: named once, so the
+        # agent does not wait for them or wonder where their results went.
+        stopped = [] if not record.batch_id else [
+            r for r in self._registry.all()
+            if r.batch_id == record.batch_id and r.parent_session_key == record.parent_session_key
+            and r.outcome == "cancelled" and not r.announced and r.run_id != run_id
+        ]
+        for member in [*members, *stopped]:
             self._registry.update(member.run_id, announced=True)
 
         # Results the main agent already took with agent_wait are not
@@ -1788,26 +1842,41 @@ class SubagentManager:
             2_000, _ANNOUNCE_BATCH_CHARS // len(to_tell),
         )
         for member in to_tell:
-            if member.run_id == run_id:
+            if member.run_id == run_id and not flush:
                 sections.append(self._notice_section(member, result, status, limit))
             else:
                 sections.append(self._notice_section(
                     member, self._stored_result(member), member.outcome or "unknown", limit,
                 ))
+        waiting = ""
+        if stopped:
+            names = ", ".join(f"'{r.display_name or r.label}'" for r in stopped)
+            waiting += f"\n\nStopped before finishing, on request: {names}. There is no result from them."
+        if still_running:
+            names = ", ".join(f"'{r.display_name or r.label}'" for r in still_running)
+            waiting += (
+                f"\n\nStill working, started in the same turn: {names}. Their results "
+                "reach you in a message of their own when they finish; don't wait for "
+                "them or redo their work."
+            )
         if len(to_tell) == 1:
             announce_content = (
                 f"{sections[0]}\n\n"
                 "This is the subagent's own report: check what matters before relying "
                 "on it, and don't redo its work. Tell the owner what it means for their "
                 "request in your own words; don't show run ids."
+                + waiting
             )
         else:
+            together = "were started together and have all finished" if not still_running \
+                else "were started together and have finished"
             announce_content = (
                 "\n\n---\n\n".join(sections)
-                + f"\n\nThese {len(to_tell)} subagents were started together and have all "
-                "finished. These are their own reports: check what matters before relying "
-                "on them, and don't redo their work. Answer the owner's request as a whole, "
-                "in your own words; don't show run ids."
+                + f"\n\nThese {len(to_tell)} subagents {together}. These are their own "
+                "reports: check what matters before relying on them, and don't redo their "
+                "work. Answer the owner's request as a whole, in your own words; don't "
+                "show run ids."
+                + waiting
             )
         titles = ", ".join(m.display_name or m.label for m in to_tell)
         await self._deliver_to_parent(record, announce_content, summary=f"{titles} — finished")
@@ -1819,6 +1888,42 @@ class SubagentManager:
             current = self._registry.get(member.run_id)
             if current and current.delivery_state == "pending":
                 self._registry.update(member.run_id, delivery_state="queued")
+
+    def _arm_batch_flush(self, record: SubagentRunRecord) -> None:
+        """Deliver this batch's held results if its other runs are still going later."""
+        key = f"{record.parent_session_key}\0{record.batch_id}"
+        current = self._batch_flushes.get(key)
+        if current is not None and not current.done():
+            return
+
+        async def flush_later() -> None:
+            await asyncio.sleep(_BATCH_HOLD_SECONDS)
+            held = sorted(
+                (
+                    r for r in self._registry.all()
+                    if r.batch_id == record.batch_id
+                    and r.parent_session_key == record.parent_session_key
+                    and r.origin != "system" and r.ended_at is not None and not r.announced
+                    and r.delivery_state in ("pending", "queued") and r.outcome != "cancelled"
+                ),
+                key=lambda r: r.created_at,
+            )
+            if held:
+                logger.info(
+                    f"[SubagentManager] batch {record.batch_id[:8]}: delivering {len(held)} held "
+                    "result(s) while the rest still run"
+                )
+                await self._announce(held[0].run_id, "", held[0].outcome or "unknown", flush=True)
+
+        def settled(task: asyncio.Task[None]) -> None:
+            if self._batch_flushes.get(key) is task:
+                del self._batch_flushes[key]
+            if not task.cancelled() and task.exception() is not None:
+                logger.error(f"[SubagentManager] held batch delivery failed: {task.exception()}")
+
+        task = asyncio.create_task(flush_later())
+        self._batch_flushes[key] = task
+        task.add_done_callback(settled)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1927,6 +2032,8 @@ Do not create, patch, install, or manage skills. Do not edit project files or ru
             if not task.done():
                 task.cancel()
                 count += 1
+        for flush in list(self._batch_flushes.values()):
+            flush.cancel()
         if count:
             logger.info(f"[SubagentManager] shutdown: cancelled {count} running subagent(s)")
         return count

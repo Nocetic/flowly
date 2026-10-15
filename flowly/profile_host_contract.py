@@ -51,6 +51,9 @@ PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     "subagents.get": 15_000,
     "subagents.result": 15_000,
     "subagents.transcript": 15_000,
+    # The owner stopping one subagent from its pill, sidebar or the notch.
+    "subagents.cancel": 30_000,
+    "subagents.stats": 15_000,
     "memory.editor.list": 30_000,
     "memory.editor.document": 30_000,
     "memory.editor.save": 30_000,

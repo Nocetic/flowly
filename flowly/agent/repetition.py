@@ -5,18 +5,39 @@ same answer each time — re-reading three finished subagent results thirty
 times in a row, polling something that has stopped changing. Nothing failed,
 so error-based checks see a healthy turn and say "keep going".
 
-The guard watches results, not arguments: a result identical to one this
-turn has already received is marked as such for the model, and once several
-results in a row bring nothing new, the next model call is made without
-tools so the turn ends with an answer instead of another lap.
+The guard watches results, not arguments: a result that says the same as one
+this turn has already received — identical once clock readings, dates and
+elapsed times are set aside — is marked as such for the model, and once
+several results in a row bring nothing new, the next model call is made
+without tools so the turn ends with an answer instead of another lap.
 """
 
 from __future__ import annotations
 
 import hashlib
+import re
 
 # Results in a row that repeat an earlier one before the turn must answer.
 STALL_AFTER = 4
+
+# What changes on every call without the result saying anything new: clock
+# readings, dates, elapsed times. Replaced before results are compared, so a
+# poll that only reports "checked at 14:02:31 (1.2s)" again is a repeat.
+_VOLATILE = [
+    re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?"),
+    re.compile(r"\b\d{4}-\d{2}-\d{2}\b"),
+    re.compile(r"\b\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:\s?[AP]M)?\b", re.IGNORECASE),
+    re.compile(r"\b\d+(?:\.\d+)?\s?(?:ms|milliseconds?|s|secs?|seconds?|mins?|minutes?)\b", re.IGNORECASE),
+    re.compile(r"\b1[6-9]\d{8}(?:\.\d+)?\b"),  # Unix time in seconds
+    re.compile(r"\b1[6-9]\d{11}\b"),  # ... and in milliseconds
+]
+
+
+def _comparable(text: str) -> str:
+    for pattern in _VOLATILE:
+        text = pattern.sub("\u2027", text)
+    return text
+
 
 ANSWER_NOW = (
     "Your last {count} tool calls returned results you already had in this "
@@ -39,7 +60,8 @@ class RepetitionGuard:
         if not isinstance(result, str):
             self._in_a_row = 0
             return False
-        key = (tool_name, hashlib.sha256(result.encode("utf-8", "replace")).hexdigest())
+        comparable = _comparable(result)
+        key = (tool_name, hashlib.sha256(comparable.encode("utf-8", "replace")).hexdigest())
         if key in self._seen:
             self._in_a_row += 1
             return True
