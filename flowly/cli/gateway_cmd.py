@@ -2443,6 +2443,16 @@ Respond to the user now:"""
 
     agent.subagents._on_event = _on_subagent_event
 
+    # A subagent's running turn streams live to whoever watches its thread
+    # (subagents.watch): direct sockets here, relay sessions over the web
+    # channel. A named agent's gateway does the same for its host's socket,
+    # which forwards it as profile.event.
+    from flowly.agent.subagent_stream import SubagentStreamHub
+
+    agent.subagents.stream_sink = SubagentStreamHub(
+        lambda: (gateway_server, channels.get_channel("web")),
+    )
+
     # Board completion also wakes authenticated Desktop clients. Deliberately
     # broadcast no card content or identifiers: clients can refresh the Board
     # through its existing authorized RPC after receiving this signal.

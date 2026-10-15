@@ -33,18 +33,25 @@ _control_scopes: dict[str, tuple[str, SessionControlScope]] = {}
 _MAX_ITERATIONS = 600
 
 
+# What a run's entry may describe beyond the stream (``begin(fields=...)``):
+# a subagent's turn names its task and thread (flowly.agent.subagent_stream).
+_EXTRA_FIELDS = ("prompt", "promptAuthor", "subagent")
+
+
 def _fresh(run_id: str, user: str = "", goal_run: bool | None = None,
-           turn_origin: str | None = None) -> dict:
+           turn_origin: str | None = None, fields: dict | None = None) -> dict:
+    extra = {key: fields[key] for key in _EXTRA_FIELDS if fields and key in fields}
     return {
         "runId": run_id, "text": "", "user": user or "",
         "iterations": [], "updatedAt": time.time(),
         **({'goalRun': goal_run} if goal_run is not None else {}),
         **({'turnOrigin': turn_origin} if turn_origin else {}),
+        **({'extra': extra} if extra else {}),
     }
 
 
 def begin(session_key: str, run_id: str, user: str = "", *, goal_run: bool | None = None,
-          turn_origin: str | None = None) -> None:
+          turn_origin: str | None = None, fields: dict | None = None) -> None:
     """Start tracking a run for this session, clearing any stale entry.
 
     ``user`` is the message that triggered the run. We keep it so a client that
@@ -57,11 +64,16 @@ def begin(session_key: str, run_id: str, user: str = "", *, goal_run: bool | Non
     ``turn_origin`` names a run the server started on its own (``"subagent"``
     for a subagent's report): a client re-entering mid-run adopts it as that
     kind of run (no user row, no guidance into it).
+
+    ``fields`` describe the run beyond its stream, returned by ``get`` as
+    they are: ``prompt`` / ``promptAuthor`` (a task someone other than the
+    owner gave, shown instead of a user row) and ``subagent`` (the thread a
+    subagent's turn belongs to). Other keys are ignored.
     """
     if not session_key or not run_id:
         return
     scope = SessionControlScope.capture(session_key)
-    _runs[session_key] = _fresh(run_id, user, goal_run, turn_origin)
+    _runs[session_key] = _fresh(run_id, user, goal_run, turn_origin, fields)
     _control_scopes[session_key] = (run_id, scope)
 
 
@@ -185,4 +197,6 @@ def get(session_key: str) -> dict | None:
 
         **({'goalRun': cur['goalRun']} if 'goalRun' in cur else {}),
         **({'turnOrigin': cur['turnOrigin']} if cur.get('turnOrigin') else {}),
+        **{key: (dict(value) if isinstance(value, dict) else value)
+           for key, value in (cur.get('extra') or {}).items()},
     }

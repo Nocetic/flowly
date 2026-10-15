@@ -39,7 +39,12 @@ from flowly.live_voice.relay_events import RelayOutbound, RelayRecipients
 from flowly.live_voice.relay_transport import CAPABILITY as RELAY_VOICE_CAPABILITY
 from flowly.live_voice.relay_transport import RelayBrowserVerifier, RelayMessage, RelayPrincipal
 from flowly.profile import get_flowly_home
-from flowly.profile_host_contract import ProfileHostError, profile_rpc_session_key, validate_profile_rpc
+from flowly.profile_host_contract import (
+    ProfileHostError,
+    profile_rpc_session_key,
+    profile_rpc_unwatched_key,
+    validate_profile_rpc,
+)
 from flowly.profile_rooms import PROFILE_ROOM_METHODS
 from flowly.render_capabilities import normalize_render_capabilities
 
@@ -62,6 +67,10 @@ _OUTBOUND_QUEUE_LIMIT = 50  # cap pending replays to avoid unbounded growth
 _PROFILE_BINDING_LIMIT = 1024
 _PROFILE_DIRECTORY_BINDING_LIMIT = 256
 _PROFILE_BINDING_TTL_SECONDS = 6 * 60 * 60
+# subagents.watch bounds: subagent conversations one relay session watches at
+# once (the oldest lease gives way), and conversations watched in all.
+_SUBAGENT_WATCHES_PER_SESSION = 32
+_SUBAGENT_WATCHED_CONVERSATIONS = 1024
 _PROFILE_RUN_BINDING_LIMIT = 2048
 #: OutboundMessage metadata: the conversation a message the agent wrote first
 #: belongs to; the relay opens a session for it (``_agent_first_session``).
@@ -333,6 +342,9 @@ class WebChannel(BaseChannel):
         self._subagent_event_versions: dict[str, int] = {}
         self._profile_subagent_observers: dict[tuple[str, str], tuple[int, float]] = {}
         self._profile_subagent_reads: dict[object, str] = {}
+        # subagent:<threadId> → {relay session: lease expiry (monotonic)}: who
+        # watches a subagent's running turns (subagents.watch).
+        self._subagent_stream_watchers: dict[str, dict[str, float]] = {}
         # Map session_key (e.g. "web:FirestoreId") → relay session_id (browser UUID)
         self._session_key_to_relay_id: dict[str, str] = {}
         # Replies to ``conversation.open``, by request id.
@@ -799,6 +811,10 @@ class WebChannel(BaseChannel):
             # A home call binds its conversation too: the introduction it
             # starts streams there, before any history read binds it.
             inner_session_key = profile_rpc_session_key(validated_method, validated_params)
+            released = profile_rpc_unwatched_key(validated_method, validated_params)
+            if released:
+                # This session no longer follows that subagent's turns.
+                self._unbind_profile_conversation(profile, released, session_id)
             if inner_session_key:
                 # Bind before dispatch: chat.send may emit its first event
                 # immediately after the acknowledgement on a fast local model.
@@ -927,6 +943,7 @@ class WebChannel(BaseChannel):
         self._clear_profile_subscriptions()
         self._subagent_observers.clear()
         self._subagent_event_versions.clear()
+        self._clear_subagent_stream_watchers()
         self._relay_principals.clear()
         self._relay_recipients.clear()
         self._relay_authority = None
@@ -1771,6 +1788,7 @@ class WebChannel(BaseChannel):
             self._subagent_observers.clear()
             self._subagent_event_versions.clear()
             self._clear_profile_subagent_observers()
+            self._clear_subagent_stream_watchers()
             self._ws = ws
             self._relay_authority = None
             self._relay_authority_enabled = False
@@ -1835,6 +1853,7 @@ class WebChannel(BaseChannel):
                     self._clear_profile_subscriptions()
                     self._subagent_observers.clear()
                     self._subagent_event_versions.clear()
+                    self._clear_subagent_stream_watchers()
                     self._relay_principals.clear()
                     self._relay_recipients.clear()
                     self._relay_authority = None
@@ -1991,6 +2010,7 @@ class WebChannel(BaseChannel):
             self._subagent_observers.pop(session_id, None)
             self._subagent_event_versions.pop(session_id, None)
             self._clear_profile_subagent_observers(session_id)
+            self._clear_subagent_stream_watchers(session_id)
             self._remove_profile_relay_session(session_id)
 
         elif msg_type == "rpc":
@@ -2522,6 +2542,11 @@ class WebChannel(BaseChannel):
                 )
             )
             return
+        if method == "subagents.watch" and session_id:
+            # Same step as the snapshot in the reply: nothing falls between.
+            self._watch_subagent_stream(session_id, str(result.get("sessionKey") or ""))
+        elif method == "subagents.unwatch" and session_id:
+            self._unwatch_subagent_stream(session_id, str(result.get("sessionKey") or ""))
         if method in {"subagents.list", "subagents.get"} and session_id:
             now = time.monotonic()
             self._prune_subagent_observers(now)
@@ -2580,6 +2605,91 @@ class WebChannel(BaseChannel):
         self._subagent_observers = {key: expiry for key, expiry in self._subagent_observers.items() if expiry > now}
         self._subagent_event_versions = {key: version for key, version in self._subagent_event_versions.items()
                                         if key in self._subagent_observers}
+
+    # ── A subagent's running turn, live (flowly.agent.subagent_stream) ──────
+
+    def _stream_watchers(self) -> dict[str, dict[str, float]]:
+        watchers = self.__dict__.get("_subagent_stream_watchers")
+        if watchers is None:
+            watchers = self.__dict__["_subagent_stream_watchers"] = {}
+        return watchers
+
+    def _watch_subagent_stream(self, session_id: str, session_key: str) -> None:
+        """Bind a relay session to a subagent's conversation for one lease."""
+        from flowly.agent.subagent_stream import WATCH_LEASE_SECONDS
+        from flowly.session.keys import is_subagent_thread
+
+        if not session_id or len(session_id) > 256 or not is_subagent_thread(session_key):
+            return
+        watchers = self._stream_watchers()
+        now = time.monotonic()
+        mine = [key for key, sessions in watchers.items() if session_id in sessions]
+        if session_key not in mine and len(mine) >= _SUBAGENT_WATCHES_PER_SESSION:
+            oldest = min(mine, key=lambda key: watchers[key][session_id])
+            self._unwatch_subagent_stream(session_id, oldest)
+        if session_key not in watchers and len(watchers) >= _SUBAGENT_WATCHED_CONVERSATIONS:
+            for key, sessions in list(watchers.items()):
+                for candidate, expiry in list(sessions.items()):
+                    if expiry <= now:
+                        self._unwatch_subagent_stream(candidate, key)
+            if len(watchers) >= _SUBAGENT_WATCHED_CONVERSATIONS:
+                return
+        watchers.setdefault(session_key, {})[session_id] = now + WATCH_LEASE_SECONDS
+
+    def _unwatch_subagent_stream(self, session_id: str, session_key: str) -> None:
+        watchers = self._stream_watchers()
+        sessions = watchers.get(session_key)
+        if sessions is None:
+            return
+        sessions.pop(session_id, None)
+        if not sessions:
+            watchers.pop(session_key, None)
+
+    def _clear_subagent_stream_watchers(self, session_id: str | None = None) -> None:
+        watchers = self._stream_watchers()
+        if session_id is None:
+            watchers.clear()
+            return
+        for key in [key for key, sessions in watchers.items() if session_id in sessions]:
+            self._unwatch_subagent_stream(session_id, key)
+
+    def subagent_stream_watched(self, session_key: str) -> bool:
+        """Whether any relay session watches this subagent conversation (cheap)."""
+        return bool(self._stream_watchers().get(session_key))
+
+    def prepare_subagent_stream(self, event: str, session_key: str, data: dict):
+        """The delivery of one event to the relay sessions watching now, or None.
+
+        Each goes as ``{"type": "event", "event": "subagent.stream",
+        "sessionId", "data": {"sessionKey", "event", "data"}}``: the relay
+        hands an event name it does not know to that session alone and stores
+        nothing of it — a plain ``chat`` event would be written into the
+        conversation of the session that receives it. No offline replay.
+        """
+        from flowly.agent.subagent_stream import RELAY_STREAM_EVENT
+
+        sessions = self._stream_watchers().get(session_key)
+        if not sessions or self._ws is None:
+            return None
+        now = time.monotonic()
+        pending: list[RelayOutbound] = []
+        for session_id, expiry in list(sessions.items()):
+            if expiry <= now:
+                self._unwatch_subagent_stream(session_id, session_key)
+                continue
+            frame = json.dumps({
+                "type": "event", "event": RELAY_STREAM_EVENT, "sessionId": session_id,
+                "data": {"sessionKey": session_key, "event": event, "data": data},
+            })
+            pending.append(RelayOutbound(frame, self._outbound_event_access(frame)))
+        if not pending:
+            return None
+
+        async def deliver() -> None:
+            await asyncio.gather(*(asyncio.wait_for(self._deliver_relay_outbound(item), timeout=5)
+                                   for item in pending), return_exceptions=True)
+
+        return deliver
 
     async def send_subagent_event(self, event_name: str, data: dict) -> None:
         """Live updates for successful task-history readers; no offline replay.

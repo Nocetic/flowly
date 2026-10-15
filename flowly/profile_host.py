@@ -1038,6 +1038,15 @@ class ProfileHost:
     ) -> Any:
         _validate_profile_selector(name)
         method, safe = validate_profile_rpc(method, params)
+        if method == "subagents.unwatch":
+            # The agent's runtime knows one watcher for every client of this
+            # host: the host's own socket. Releasing it for one client would
+            # cut the others; each client's own binding is released by its
+            # transport, and the runtime's lease runs out once nobody renews it.
+            from flowly.agent.subagent_threads import thread_session_key
+
+            return {"schemaVersion": 1, "ok": True, "watching": False,
+                    "threadId": safe["threadId"], "sessionKey": thread_session_key(safe["threadId"])}
         if method in {"subagents.list", "subagents.get"}:
             # The shared runtime socket carries canonical events internally.
             # Each external gateway/relay reader selects its own wire version.
@@ -2268,6 +2277,16 @@ class ProfileHost:
         payload = data if isinstance(data, dict) else {}
         run_id = str(payload.get("runId") or "")
         session_key = str(payload.get("sessionKey") or "")
+        from flowly.session.keys import is_subagent_thread
+
+        if is_subagent_thread(session_key):
+            # A subagent's running turn, live, for whoever watches it: not the
+            # agent's own turn (no busy state, no waits it settles, no roster
+            # activity, no attention refresh) and never a group's.
+            if runtime is not None:
+                runtime.last_used_at = time.time()
+            await self._emit(profile, event, payload)
+            return
         if event == "cron.completed" and profile != "default":
             # Push belongs to the primary host, independently of phone sockets
             # or Desktop windows. Keep network I/O off the runtime reader.

@@ -58,6 +58,7 @@ from flowly.providers.base import LLMErrorInfo, LLMResponse
 from flowly.agent.delegation import MAX_CHILDREN_PER_CONVERSATION, assign_mark
 from flowly.agent.tools.agent_tools import ChildAgentMessageTool
 from flowly.agent.subagent_observation import TaskEvents, run_view
+from flowly.agent.subagent_stream import ChildStream, child_event_access
 from flowly.agent.subagent_announce_queue import AnnounceItem, get_or_create_queue
 
 
@@ -441,6 +442,13 @@ class SubagentManager:
         # background self-review writer otherwise bypasses it — different
         # tool registry). None = governance disabled.
         self.governance_post_tool: Callable[[Any], None] | None = None
+        # Where a thread's running turn streams its live events
+        # (flowly.agent.subagent_stream.SubagentStreamHub; the gateway sets
+        # it). None: the turn still keeps its in-flight entry for
+        # chat.inflight, and nothing is sent.
+        self.stream_sink: Any | None = None
+        # The live stream of each running thread turn, by run id.
+        self._streams: dict[str, ChildStream] = {}
 
     # ------------------------------------------------------------------
     # Busy tracking (called by AgentLoop around message processing)
@@ -1030,6 +1038,7 @@ class SubagentManager:
             finally:
                 if not _task.cancelled():
                     _task.exception()
+                self._settle_stream(_rid, suspended=_task.cancelled() and self._suspends(_rid))
                 self._cancel_outcomes.pop(_rid, None)
                 self._running_tasks.pop(_rid, None)
                 self._inboxes.pop(_rid, None)
@@ -1161,11 +1170,15 @@ class SubagentManager:
             self._save_turn(run_id, turn, result=durable_result, outcome=status)
             self._registry.finish(run_id, status, result=durable_result,
                                   error=error_str, error_code=error_code)
+            # Watchers get the terminal once the turn is saved: a reload of
+            # the conversation then has it.
+            self._end_stream(run_id, status, durable_result, error_code)
 
         except asyncio.TimeoutError:
             logger.warning(f"[SubagentManager] [{run_id[:8]}] timed out")
             self._save_turn(run_id, turn, result="(task timed out)", outcome="timeout")
             self._registry.finish(run_id, "timeout", error="Task timed out", error_code="timeout")
+            self._end_stream(run_id, "timeout", "Task timed out", "timeout")
             final_result = "(task timed out)"
             status = "timeout"
 
@@ -1176,6 +1189,8 @@ class SubagentManager:
                 suspended = True
                 logger.info(f"[SubagentManager] [{run_id[:8]}] suspended for the restart")
                 self._log(run_id, "suspended", durable=True, reason=self._suspend_reason)
+                # It goes on after the restart (its watchers re-enter then).
+                self._settle_stream(run_id, suspended=True)
                 raise
             # Cancelled via cancel_children (parent interrupt cascade) or
             # cancel() (explicit user cancel). Persist the outcome and
@@ -1186,6 +1201,7 @@ class SubagentManager:
             outcome = self._cancel_outcomes.get(run_id, "interrupted")
             self._save_turn(run_id, turn, result="", outcome=outcome, aborted=True)
             self._finish_cancelled(run_id, outcome)
+            self._end_stream(run_id, outcome, "")
             self._transcribe(run_id, {"kind": "result", "status": outcome, "content": ""})
             if not skip_announce:
                 try:
@@ -1202,6 +1218,7 @@ class SubagentManager:
             logger.error(f"[SubagentManager] [{run_id[:8]}] failed: {e}")
             self._save_turn(run_id, turn, result="Error: Task could not finish.", outcome="error")
             self._registry.finish(run_id, "error", error="Task could not finish", error_code="execution_failed")
+            self._end_stream(run_id, "error", "Error: Task could not finish.", "execution_failed")
             final_result = "Error: Task could not finish."
             status = "error"
             error_str = final_result
@@ -1220,6 +1237,81 @@ class SubagentManager:
         finally:
             await self._emit_event("subagent.completed", run_id, label, status, error_str)
         return final_result
+
+    # ------------------------------------------------------------------
+    # A thread turn's live events (flowly.agent.subagent_stream)
+    # ------------------------------------------------------------------
+
+    async def _open_stream(self, run_id: str, state: ChildState, *, resumed: bool) -> ChildStream | None:
+        """Start the live events of a thread's turn; None for a run with no thread.
+
+        System work and delegated tasks have no conversation, and a run whose
+        conversation was deleted has nothing left to show.
+        """
+        record = self._registry.get(run_id)
+        if record is None or not record.thread_id:
+            return None
+        thread = self._registry.get_thread(record.thread_id)
+        if thread is None or thread.closed_reason == "parent_deleted":
+            return None
+        try:
+            access = child_event_access(record.parent_session_key)
+        except Exception:  # noqa: BLE001 — never stream without knowing whose it is
+            from flowly.live_voice.events import EventAccess
+
+            access = EventAccess(blocked=True)
+        stream = ChildStream(
+            self.stream_sink, run_id=run_id, session_key=thread.child_session_key,
+            thread_id=thread.thread_id, parent_session_key=record.parent_session_key,
+            turn=record.turn, trigger=record.trigger, title=record.display_name or thread.title,
+            mark=record.mark, model=record.model or self.model, brief=record.task,
+            with_conversation=bool(state.first_message) and state.first_message != record.task,
+            access=access, started_at=record.started_at,
+        )
+        self._streams[run_id] = stream
+        await stream.start(state.journal, resumed=resumed)
+        return stream
+
+    async def _stream_sync(self, run_id: str, state: ChildState) -> None:
+        stream = self._streams.get(run_id)
+        if stream is not None:
+            await stream.sync(state.journal)
+
+    def _end_stream(self, run_id: str, outcome: str, result: str, error_code: str | None = None) -> None:
+        """The turn's one terminal event, once its result is recorded."""
+        stream = self._streams.pop(run_id, None)
+        if stream is None:
+            return
+        record = self._registry.get(run_id)
+        duration_ms = None
+        if record is not None and record.started_at is not None:
+            end = record.ended_at or time.time()
+            duration_ms = int(max(0.0, end - record.started_at - (record.suspended_seconds or 0.0)) * 1000)
+        try:
+            stream.end(outcome, result, usage=dict(record.usage) if record is not None else {},
+                       error_code=error_code, duration_ms=duration_ms)
+        except Exception:  # noqa: BLE001 — the stream never fails the run
+            logger.debug(f"[SubagentManager] [{run_id[:8]}] stream terminal failed", exc_info=True)
+
+    def _settle_stream(self, run_id: str, *, suspended: bool = False) -> None:
+        """A run's task is over: a stream it left open ends now.
+
+        Suspended for a restart: the entry goes, no terminal (the run goes
+        on). Otherwise the run ended some way its own path did not report
+        (a worker failure): its recorded outcome is the terminal.
+        """
+        stream = self._streams.get(run_id)
+        if stream is None:
+            return
+        if suspended:
+            self._streams.pop(run_id, None)
+            stream.close()
+            return
+        record = self._registry.get(run_id)
+        outcome = (record.outcome if record is not None and record.outcome else "error")
+        text = ((record.result_preview if outcome == "ok" else record.error)
+                if record is not None else None) or ""
+        self._end_stream(run_id, outcome, text, record.error_code if record is not None else None)
 
     def _save_turn(self, run_id: str, turn: dict[str, Any], *, result: str, outcome: str,
                    aborted: bool = False) -> None:
@@ -1477,12 +1569,21 @@ class SubagentManager:
         keep_recent_full, truncate_chars = micro.keep_recent_full, micro.truncate_chars
         original = state.messages
         calls: list[dict[str, Any]] = []
+        # A thread's watchers see a summary as the conversation's compaction:
+        # announced when the summary call starts (a cut alone is no compaction).
+        stream = self._streams.get(run_id)
+        fit_options: dict[str, Any] = {}
+        if stream is not None:
+            async def summary_started() -> None:
+                stream.compaction("started", tokens_before=before.estimated_input_tokens)
+
+            fit_options["on_summary_start"] = summary_started
         try:
             with collect_summary_usage() as calls:
                 fitted = await requests.fit(
                     original, tools, model, session_key=f"subagent:{run_id}",
                     force_reduction=overflow, pinned=_PINNED_BRIEF,
-                    custom_instructions=CHILD_SUMMARY_INSTRUCTIONS,
+                    custom_instructions=CHILD_SUMMARY_INSTRUCTIONS, **fit_options,
                 )
         except Exception as exc:  # noqa: BLE001 — fitting fails closed, never the run
             logger.warning(f"[SubagentManager] [{run_id[:8]}] request fitting failed: {exc}")
@@ -1491,6 +1592,13 @@ class SubagentManager:
         finally:
             for usage in calls:
                 await self._count_usage(run_id, usage)
+        if stream is not None:
+            if fitted.fits and fitted.compaction is not None:
+                stream.compaction("completed", tokens_before=fitted.before.estimated_input_tokens,
+                                  tokens_after=fitted.after.estimated_input_tokens,
+                                  messages_removed=max(0, len(original) - len(fitted.messages)))
+            else:
+                stream.compaction("failed", tokens_before=before.estimated_input_tokens)
         if fitted.fits and fitted.changed:
             summarized = fitted.compaction is not None
             if not summarized and microcompact_tool_results(
@@ -1666,6 +1774,15 @@ class SubagentManager:
                 final = state.final
                 return (final["result"] or "Task completed but no final response was generated.",
                         final["status"], final["error"], final["errorCode"])
+        # The turn streams live to whoever watches its thread from here on.
+        try:
+            stream = await self._open_stream(run_id, state, resumed=restored is not None)
+        except Exception:  # noqa: BLE001 — the stream never fails the run
+            logger.debug(f"[SubagentManager] [{run_id[:8]}] live stream unavailable", exc_info=True)
+            stream = self._streams.pop(run_id, None)
+            if stream is not None:
+                stream.close()
+            stream = None
 
         max_iterations = state.max_iterations
         final_result: str | None = None
@@ -1710,6 +1827,8 @@ class SubagentManager:
                 self._log(run_id, "step", iteration=state.iteration,
                           notes=[m["text"] for m in mail], mail=[m["id"] for m in mail],
                           strip=[list(p) for p in strip])
+                if mail:
+                    await self._stream_sync(run_id, state)
             iteration = state.iteration
             thinking = {"phase": "thinking", "iteration": iteration}
             await self._progress(run_id, thinking)
@@ -1787,6 +1906,8 @@ class SubagentManager:
 
                 # Execute tools
                 for tool_call in response.tool_calls:
+                    # What the model said and the results so far, live.
+                    await self._stream_sync(run_id, state)
                     protocol_tool_name = tool_call.name
                     effective_tool_name = protocol_tool_name
                     tool_args = dict(tool_call.arguments)
@@ -1871,6 +1992,8 @@ class SubagentManager:
                               protocolName=protocol_tool_name,
                               toolClass=tool_class(effective_tool_name, tool_args))
                     self._current_call[run_id] = tool_call.id
+                    if stream is not None:
+                        await stream.tool_started(tool_call.id, effective_tool_name, tool_args)
                     try:
                         if (
                             effective_tool_name == "artifact"
@@ -1939,6 +2062,7 @@ class SubagentManager:
                         "status": _tool_status,
                         "content": _clip(result, 2_000),
                     })
+                await self._stream_sync(run_id, state)
             else:
                 # Error response (timeout, provider error)
                 if response.finish_reason == "error":
@@ -2038,8 +2162,11 @@ class SubagentManager:
                     # produced: read it before finishing, never drop it.
                     append_message(state, {"role": "assistant", "content": response.content})
                     self._log(run_id, "text", iteration=iteration, content=response.content)
+                    await self._stream_sync(run_id, state)
                     continue
                 final_result = response.content
+                if stream is not None:
+                    stream.answer(final_result)
                 break
 
         # Graceful summary grace-call. Two paths into this block:
@@ -2098,6 +2225,8 @@ class SubagentManager:
                 if summary_response.finish_reason != "error" and summary_response.content and summary_response.content.strip():
                     final_result = summary_response.content
                     status, error_str, error_code = "ok", None, None
+                    if stream is not None:
+                        stream.answer(final_result)
                 elif _hit_max_iter:
                     status, error_code = "error", "summary_failed"
                     final_result = (

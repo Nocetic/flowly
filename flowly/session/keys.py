@@ -53,6 +53,8 @@ SUBAGENT_THREAD_READABLE_METHODS = frozenset({
     'chat.history',
     'chat.inflight',
     'subagents.history',
+    'subagents.watch',
+    'subagents.unwatch',
     # What a chat view reads beside its history; never a write.
     'goal.get',
     'plan.get',

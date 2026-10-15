@@ -13,7 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
@@ -200,6 +200,7 @@ class ProviderRequestCoordinator:
         should_cancel: Callable[[], bool] | None = None,
         pinned: int = 0,
         custom_instructions: str | None = None,
+        on_summary_start: Callable[[], Awaitable[None]] | None = None,
     ) -> RequestFit:
         """Return a bounded provider working copy or a fail-closed result.
 
@@ -210,7 +211,9 @@ class ProviderRequestCoordinator:
         ``pinned`` messages after the leading system instructions (and any
         earlier summary) are kept verbatim and placed after a new summary;
         ``custom_instructions`` replaces what the summary is asked to keep.
-        The main agent passes neither.
+        The main agent passes neither. ``on_summary_start`` is awaited just
+        before a summary call (not for a cut alone); a failure in it is
+        ignored.
         """
         original = list(messages)
         before = self.budget(original, tools, model, pinned=pinned)
@@ -264,6 +267,11 @@ class ProviderRequestCoordinator:
         target_history_budget = (
             force_target if force_reduction else before.compactable_budget
         )
+        if on_summary_start is not None:
+            try:
+                await on_summary_start()
+            except Exception:  # noqa: BLE001 — a notice never fails the request
+                logger.debug("on_summary_start failed (non-fatal)", exc_info=True)
         try:
             result = await self.compaction.compact(
                 micro,

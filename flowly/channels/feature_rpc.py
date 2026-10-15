@@ -902,6 +902,11 @@ def chat_inflight(params: dict) -> dict:
         raise FeatureRpcError('TASK_TARGET_CHANGED', str(exc)) from exc
 
     session_key = (params.get("sessionKey") or "").strip()
+    if _subagent_conversation_hidden(session_key):
+        # A subagent's running turn is read by whoever may read the
+        # conversation that started it; a conversation with no thread has none.
+        return {"inflight": None, "plan": None, "compaction": None, "goal": None,
+                "approvals": [], "clarifies": []}
     cur = _inflight_get(session_key) if session_key else None
     result: dict = {"inflight": cur}
     # Attach the current plan snapshot so a client that re-enters mid-turn
@@ -939,6 +944,29 @@ def chat_inflight(params: dict) -> dict:
     # open approvals and questions, serialized exactly like those events.
     result["approvals"], result["clarifies"] = _pending_prompts(session_key)
     return result
+
+
+def _subagent_conversation_hidden(session_key: str) -> bool:
+    """For ``subagent:<threadId>``: True when there is no such thread to read.
+
+    Its readers are those of the conversation that started it: anyone else
+    gets NOT_FOUND (raised). Any other key: False.
+    """
+    from flowly.agent.subagent_threads import THREAD_KEY_PREFIX, is_thread_id
+    from flowly.session.keys import is_subagent_thread
+
+    if not is_subagent_thread(session_key):
+        return False
+    thread_id = session_key[len(THREAD_KEY_PREFIX):]
+    if not is_thread_id(thread_id):
+        return True
+    try:
+        _subagent_thread({"threadId": thread_id})
+    except FeatureRpcError as error:
+        if error.code in ("NOT_FOUND", "SUBAGENT_THREAD_LEGACY", "UNAVAILABLE"):
+            return True
+        raise
+    return False
 
 
 def _pending_prompts(session_key: str) -> tuple[list[dict], list[dict]]:
@@ -4573,6 +4601,59 @@ def subagents_history(params: dict) -> dict:
     }
 
 
+def subagents_watch(params: dict) -> dict:
+    """Receive a subagent's running turns live, and what its running turn did so far.
+
+    Params: ``threadId``. Allowed to whoever may read the conversation that
+    started it (as ``subagents.history``). The transport binds the caller
+    for ``leaseSeconds``: calling again renews it (clients do so about every
+    90 s), ``subagents.unwatch`` or a disconnect ends it. While bound, every
+    turn of the thread streams to the caller as its own chat events under
+    ``sessionKey`` (``subagent:<threadId>``) — on the relay inside
+    ``subagent.stream`` envelopes (docs/chat-wire-protocol.md §4.8).
+
+    ``inflight`` is the running turn so far (``chat.inflight``'s entry: the
+    task as ``prompt``, text, steps, tool progress), taken in the same step as
+    the binding, so the stream continues exactly where it ends; null when
+    nothing runs. ``compaction`` is a summary in progress, as in
+    ``chat.inflight``.
+    """
+    import time as _time
+
+    from flowly.agent import compaction_status
+    from flowly.agent.inflight import get as _inflight_get
+    from flowly.agent.subagent_stream import STREAM_VERSION, WATCH_LEASE_SECONDS
+
+    if params.get("threadId") is None:
+        raise FeatureRpcError("INVALID", "threadId is required")
+    _, thread = _subagent_thread({"threadId": params.get("threadId")})
+    key = thread.child_session_key
+    return {
+        "schemaVersion": 1,
+        "ok": True,
+        "watching": True,
+        "threadId": thread.thread_id,
+        "sessionKey": key,
+        "status": thread.status,
+        "activeRunId": thread.active_run_id,
+        "leaseSeconds": int(WATCH_LEASE_SECONDS),
+        "streamVersion": STREAM_VERSION,
+        "inflight": _inflight_get(key),
+        "compaction": compaction_status.get(key, _time.time()),
+    }
+
+
+def subagents_unwatch(params: dict) -> dict:
+    """Stop receiving a subagent's turns live (``subagents.watch``). Idempotent."""
+    from flowly.agent.subagent_threads import is_thread_id, thread_session_key
+
+    thread_id = params.get("threadId")
+    if not is_thread_id(thread_id):
+        raise FeatureRpcError("INVALID", "threadId must be a subagent id")
+    return {"schemaVersion": 1, "ok": True, "watching": False, "threadId": thread_id,
+            "sessionKey": thread_session_key(thread_id)}
+
+
 def subagents_stats(params: dict) -> dict:
     """How this bot's subagents went over a period: runs, outcomes, time, tokens.
 
@@ -5376,6 +5457,9 @@ def system_capabilities() -> dict:
         # Clients send ``limit`` only to a bot that says so: an old gateway
         # cut its list at ``limit`` and returned no way to the rest.
         "sessionsListVersion": 2,
+        # 1: a subagent's running turn streams to whoever ``subagents.watch``es
+        # it (docs/chat-wire-protocol.md §4.8).
+        "subagentStreamVersion": 1,
         "runtime": {
             "role": runtime.role.value,
             "profile": runtime.profile_name,
@@ -5547,6 +5631,8 @@ _DISPATCH: dict[str, tuple] = {
     "subagents.result": (subagents_result, True, False),
     "subagents.transcript": (subagents_transcript, True, False),
     "subagents.history": (subagents_history, True, False),
+    "subagents.watch": (subagents_watch, True, False),
+    "subagents.unwatch": (subagents_unwatch, True, False),
     "subagents.cancel": (subagents_cancel, True, False),
     "subagents.stats": (subagents_stats, True, False),
     "subagents.assistants": (subagents_assistants_retired, True, False),

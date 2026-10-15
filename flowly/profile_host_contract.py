@@ -53,6 +53,9 @@ PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     "subagents.transcript": 15_000,
     # A subagent's conversation, page by page (read only).
     "subagents.history": 15_000,
+    # A subagent's running turns, live (the caller is bound to them).
+    "subagents.watch": 15_000,
+    "subagents.unwatch": 15_000,
     # The owner stopping one subagent from its pill, sidebar or the notch.
     "subagents.cancel": 30_000,
     "subagents.stats": 15_000,
@@ -366,14 +369,35 @@ def profile_rpc_session_key(method: str, params: dict[str, Any]) -> str:
 
     Every ``agent.home.*`` call is about the agent's home conversation, though
     none carries its key: the introduction it starts streams there, and the
-    caller must be watching it before the first words are sent.
+    caller must be watching it before the first words are sent. A
+    ``subagents.watch`` is about the subagent's conversation, whose events the
+    caller then receives (``subagents.unwatch`` binds nothing: see
+    :func:`profile_rpc_unwatched_key`).
     """
     if method.startswith("agent.home."):
         from flowly.agent_home import HOME_SESSION
 
         return HOME_SESSION
+    if method == "subagents.watch":
+        return _subagent_watch_key(params)
+    if method == "subagents.unwatch":
+        return ""
     session_key = params.get("sessionKey")
     return session_key if isinstance(session_key, str) else ""
+
+
+def profile_rpc_unwatched_key(method: str, params: Any) -> str:
+    """The subagent conversation a validated ``subagents.unwatch`` releases, or ""."""
+    if method != "subagents.unwatch" or not isinstance(params, dict):
+        return ""
+    return _subagent_watch_key(params)
+
+
+def _subagent_watch_key(params: dict[str, Any]) -> str:
+    from flowly.agent.subagent_threads import is_thread_id, thread_session_key
+
+    thread_id = params.get("threadId")
+    return thread_session_key(thread_id) if is_thread_id(thread_id) else ""
 
 
 def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]:
@@ -407,6 +431,11 @@ def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]
             event_version(value)
         except ValueError as exc:
             raise ProfileHostError("INVALID_PARAMS", str(exc)) from exc
+    if method in {"subagents.watch", "subagents.unwatch"}:
+        from flowly.agent.subagent_threads import is_thread_id
+
+        if set(value) - {"threadId"} or not is_thread_id(value.get("threadId")):
+            raise ProfileHostError("INVALID_PARAMS", "A subagent's thread id is required.")
     if method == 'goal.get' and 'goalId' in value:
         goal_id = value['goalId']
         if (not isinstance(goal_id, str) or not 1 <= len(goal_id) <= 512

@@ -7,6 +7,7 @@ import ipaddress
 import json
 import mimetypes
 import secrets
+import time
 import uuid
 from collections import OrderedDict
 from contextvars import ContextVar
@@ -53,7 +54,12 @@ from flowly.profile_collaboration import (
 from flowly.profile_collaboration import (
     ProfileRunBinding as _ProfileRunBinding,
 )
-from flowly.profile_host_contract import ProfileHostError, profile_rpc_session_key, validate_profile_rpc
+from flowly.profile_host_contract import (
+    ProfileHostError,
+    profile_rpc_session_key,
+    profile_rpc_unwatched_key,
+    validate_profile_rpc,
+)
 from flowly.profile_rooms import PROFILE_ROOM_METHODS
 from flowly.render_capabilities import normalize_render_capabilities
 from flowly.session.manager import SessionManager
@@ -261,6 +267,10 @@ _PROFILE_CLIENT_SUBSCRIPTION_LIMIT = 128
 _PROFILE_PROFILES_PER_CLIENT_LIMIT = 64
 _PROFILE_CONVERSATIONS_PER_CLIENT_LIMIT = 256
 _PROFILE_RUN_SUBSCRIPTION_LIMIT = 2048
+# subagents.watch bounds: subagent conversations one socket watches at once
+# (the oldest lease gives way), and conversations watched in all.
+_SUBAGENT_WATCHES_PER_SOCKET = 32
+_SUBAGENT_WATCHED_CONVERSATIONS = 1024
 
 
 def _loopback_peer(request: Any) -> bool:
@@ -660,6 +670,9 @@ class GatewayServer:
         # (transport-rebind, mirroring the reference gateway).
         self._session_ws: dict[str, web.WebSocketResponse] = {}
         self._agent_home_ws: set[web.WebSocketResponse] = set()
+        # subagent:<threadId> → {socket: lease expiry (monotonic)}: who
+        # watches a subagent's running turns (subagents.watch).
+        self._subagent_stream_watchers: dict[str, dict[Any, float]] = {}
         # Tick task for periodic health pings to connected clients.
         self._tick_task: asyncio.Task | None = None
         # Browser provider tracking. Chrome extensions and the desktop's
@@ -1455,6 +1468,7 @@ class GatewayServer:
             # anyway; _ws_send already no-ops on a closed socket).
             for _sk in [k for k, v in self._session_ws.items() if v is ws]:
                 self._session_ws.pop(_sk, None)
+            self._forget_subagent_stream_socket(ws)
             getattr(self, "_agent_home_ws", set()).discard(ws)
             if is_current_connection and client_id in self._extension_clients:
                 cancelled = self._unregister_browser_provider(client_id)
@@ -4135,6 +4149,97 @@ class GatewayServer:
         target = self._session_ws.get(session_key) or fallback_ws
         return [target] if target is not None else []
 
+    # ------------------------------------------------------------------
+    # A subagent's running turn, live (flowly.agent.subagent_stream)
+    # ------------------------------------------------------------------
+
+    def _stream_watchers(self) -> dict[str, dict[Any, float]]:
+        watchers = self.__dict__.get("_subagent_stream_watchers")
+        if watchers is None:
+            watchers = self.__dict__["_subagent_stream_watchers"] = {}
+        return watchers
+
+    def _watch_subagent_stream(self, ws: Any, session_key: str) -> None:
+        """Bind ``ws`` to a subagent's conversation for one lease (renewed by watching again)."""
+        from flowly.agent.subagent_stream import WATCH_LEASE_SECONDS
+        from flowly.session.keys import is_subagent_thread
+
+        if not is_subagent_thread(session_key) or getattr(ws, "closed", False):
+            return
+        watchers = self._stream_watchers()
+        now = time.monotonic()
+        mine = [key for key, sockets in watchers.items() if ws in sockets]
+        if session_key not in mine and len(mine) >= _SUBAGENT_WATCHES_PER_SOCKET:
+            # The oldest lease of this socket gives way.
+            oldest = min(mine, key=lambda key: watchers[key][ws])
+            self._unwatch_subagent_stream(ws, oldest)
+        if session_key not in watchers and len(watchers) >= _SUBAGENT_WATCHED_CONVERSATIONS:
+            self._prune_subagent_stream_watchers(now)
+            if len(watchers) >= _SUBAGENT_WATCHED_CONVERSATIONS:
+                return
+        watchers.setdefault(session_key, {})[ws] = now + WATCH_LEASE_SECONDS
+
+    def _unwatch_subagent_stream(self, ws: Any, session_key: str) -> None:
+        watchers = self._stream_watchers()
+        sockets = watchers.get(session_key)
+        if sockets is None:
+            return
+        sockets.pop(ws, None)
+        if not sockets:
+            watchers.pop(session_key, None)
+
+    def _forget_subagent_stream_socket(self, ws: Any) -> None:
+        for key in [key for key, sockets in self._stream_watchers().items() if ws in sockets]:
+            self._unwatch_subagent_stream(ws, key)
+
+    def _prune_subagent_stream_watchers(self, now: float) -> None:
+        for key, sockets in list(self._stream_watchers().items()):
+            for socket, expiry in list(sockets.items()):
+                if expiry <= now or getattr(socket, "closed", False):
+                    self._unwatch_subagent_stream(socket, key)
+
+    def _subagent_stream_targets(self, session_key: str) -> list:
+        now = time.monotonic()
+        targets: list = []
+        sockets = self._stream_watchers().get(session_key)
+        if sockets:
+            for socket, expiry in list(sockets.items()):
+                if expiry <= now or getattr(socket, "closed", False):
+                    self._unwatch_subagent_stream(socket, session_key)
+                elif socket not in targets:
+                    targets.append(socket)
+        # A chat.inflight re-entry on the conversation binds its socket too.
+        bound = self.__dict__.get("_session_ws", {}).get(session_key)
+        if bound is not None and not getattr(bound, "closed", False) and bound not in targets:
+            targets.append(bound)
+        return targets
+
+    def subagent_stream_watched(self, session_key: str) -> bool:
+        """Whether any socket would receive this subagent conversation's events (cheap)."""
+        return bool(self._stream_watchers().get(session_key)) or (
+            session_key in self.__dict__.get("_session_ws", {})
+        )
+
+    def prepare_subagent_stream(self, event: str, session_key: str, data: dict):
+        """The delivery of one event to the sockets watching now, or None.
+
+        Plain ``chat`` / ``agent`` / ``compaction`` events under the subagent's
+        own ``sessionKey`` — a client shows them only in that conversation's
+        view. Authority is the event's own (the hub sets it), checked per
+        recipient by ``_ws_send``.
+        """
+        if not self.subagent_stream_watched(session_key):
+            return None
+        targets = self._subagent_stream_targets(session_key)
+        if not targets:
+            return None
+        frame = self._scoped_event({"type": "event", "event": event, "data": data}, session_key=session_key)
+
+        async def deliver() -> None:
+            await asyncio.gather(*(self._ws_send(ws, frame) for ws in targets), return_exceptions=True)
+
+        return deliver
+
     def bind_session_ws(self, session_key: str, ws: web.WebSocketResponse) -> None:
         """Point a session's live stream at ``ws`` (transport-rebind)."""
         if session_key:
@@ -4244,6 +4349,11 @@ class GatewayServer:
             self._subagent_event_versions[ws] = event_version(params)
         if method == "chat.inflight":
             self.bind_session_ws(str(params.get("sessionKey") or ""), ws)
+        if method == "subagents.watch":
+            # Same step as the snapshot in the reply: nothing falls between.
+            self._watch_subagent_stream(ws, str(result.get("sessionKey") or ""))
+        elif method == "subagents.unwatch":
+            self._unwatch_subagent_stream(ws, str(result.get("sessionKey") or ""))
         if method == "agent.home.get":
             self.bind_session_ws(str(result.get("sessionKey") or ""), ws)
         if method == "system.capabilities" and self._profile_host is not None:
@@ -5490,6 +5600,14 @@ class GatewayServer:
                 if isinstance(validated_params, dict)
                 else ""
             )
+            released = (
+                profile_rpc_unwatched_key(_inner_method, validated_params)
+                if isinstance(validated_params, dict)
+                else ""
+            )
+            if released:
+                # This client no longer follows that subagent's turns.
+                subscription.conversations.discard((profile, released))
             if session_key and len(session_key) <= 256 and "\x00" not in session_key:
                 binding = (profile, session_key)
                 if (
