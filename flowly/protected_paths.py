@@ -62,6 +62,7 @@ def _hardcoded_protected_roots() -> tuple[Path, ...]:
         # them either)
         home / ".flowly" / "credentials",
         home / ".flowly" / "sessions",
+        home / ".flowly" / "subagents" / "sessions",
         home / ".flowly" / "config.json",
         home / ".flowly" / "electron-api.json",
         home / ".flowly" / "desktop-client-id",

@@ -2238,6 +2238,11 @@ class AgentLoop:
             finally:
                 if pending:
                     await asyncio.gather(*pending, return_exceptions=True)
+            # Its subagents' conversations hold what it said (the forked
+            # conversation) and what they did: they go with it.
+            subagents = getattr(self, "subagents", None)
+            if subagents is not None:
+                subagents.forget_conversation(session_key)
             return deleted
 
     def _should_save_trajectories(self) -> bool:

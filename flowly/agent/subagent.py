@@ -27,13 +27,15 @@ from flowly.agent.tools.shell import ExecTool
 from flowly.exec.types import ExecConfig
 from flowly.agent.tools.web import WebSearchTool, WebFetchTool, WebExtractTool
 from flowly.agent.subagent_metrics import append_metric, metrics_path
-from flowly.agent.subagent_registry import SubagentRegistry, SubagentRunRecord, add_usage
+from flowly.agent.subagent_registry import SubagentRegistry, SubagentRunRecord, ThreadCapReached, add_usage
+from flowly.agent.subagent_threads import MAX_OPEN_THREADS_PER_CONVERSATION, SubagentThreadRecord
 from flowly.agent import subagent_owner
 from flowly.agent.subagent_checkpoint import (
     ChildState,
     GRACE_PROMPT,
     ResumeRefusal,
     SubagentCheckpoint,
+    append_message,
     apply_compacted,
     apply_microcompact,
     apply_step,
@@ -630,6 +632,11 @@ class SubagentManager:
         except (OSError, ValueError):
             logger.exception("Subagent history recovery unavailable")
             return
+        try:
+            # Threads idle past their time close, expired ones are removed.
+            self._registry.maintain()
+        except Exception:
+            logger.exception("Subagent thread upkeep unavailable")
         owners: dict[str, str] = {}
         now = time.time()
         continued: list[tuple[SubagentRunRecord, ChildState]] = []
@@ -922,7 +929,32 @@ class SubagentManager:
                 and not (wait or silent) and not timeout_seconds
             ),
         )
-        self._registry.register(record)
+        # Every subagent working for the owner is a thread (subagent_threads):
+        # its own conversation, readable by every client, written only by its
+        # runs. System bookkeeping (self-review, Board) holds the owner's
+        # conversation and memory and gets none.
+        thread = None
+        if record.origin != "system":
+            record.thread_id = run_id
+            thread = SubagentThreadRecord(
+                thread_id=run_id, parent_session_key=parent_session_key,
+                child_session_key=child_session_key, created_at=record.created_at,
+                origin=record.origin, title=resolved_display, mark=dict(record.mark),
+                model=resolved_model,
+            )
+        try:
+            made_room = self._registry.register(
+                record, thread=thread,
+                open_cap=MAX_OPEN_THREADS_PER_CONVERSATION if thread is not None else None,
+            )
+        except ThreadCapReached:
+            return json.dumps({
+                "status": "rejected",
+                "error": (
+                    f"{MAX_OPEN_THREADS_PER_CONVERSATION} subagents of this conversation are "
+                    "open and all of them are working; one must finish before another can start."
+                ),
+            })
 
         logger.info(f"[SubagentManager] Spawned [{run_id[:8]}]: {resolved_display}")
 
@@ -937,19 +969,29 @@ class SubagentManager:
 
         # The parent keeps working; the result arrives as a message. The
         # wording stops a parent from answering from memory meanwhile.
+        message = (
+            f"'{resolved_display}' is running in the background. When everything "
+            "you started in this turn has finished, the results reach you "
+            "together as a new message and you continue from there. Don't wait "
+            "for them, don't redo their tasks and don't guess their results: do "
+            "any work that does not depend on them, then tell the owner briefly "
+            "what is running and end your turn."
+        )
+        if made_room:
+            # A fact about the conversation's subagents, not advice.
+            names = ", ".join(f"'{t.title}'" for t in made_room)
+            whose = "Its" if len(made_room) == 1 else "Their"
+            message += (
+                f" This conversation keeps at most {MAX_OPEN_THREADS_PER_CONVERSATION} "
+                f"subagents open; starting this one closed {names}, idle the longest. "
+                f"{whose} history stays readable."
+            )
         return json.dumps({
             "status": "started",
             "run_id": run_id,
             "title": resolved_display,
             "model": resolved_model,
-            "message": (
-                f"'{resolved_display}' is running in the background. When everything "
-                "you started in this turn has finished, the results reach you "
-                "together as a new message and you continue from there. Don't wait "
-                "for them, don't redo their tasks and don't guess their results: do "
-                "any work that does not depend on them, then tell the owner briefly "
-                "what is running and end your turn."
-            ),
+            "message": message,
         })
 
     # ------------------------------------------------------------------
@@ -1076,11 +1118,13 @@ class SubagentManager:
             [dict(step) for step in record.tool_trace] if restored is not None and record else []
         )
         suspended = False
+        # The run's state, for saving its turn into its thread however it ends.
+        turn: dict[str, Any] = {}
 
         try:
             run = self._child_run(
                 run_id, task, label, origin_channel, origin_chat_id, model,
-                timeout_seconds, context, tool_trace, restored,
+                timeout_seconds, context, tool_trace, restored, turn,
             )
             # Wall-clock guard is opt-in: positive timeout_seconds enforces
             # a hard cap; 0 / None runs unbounded (rely on max_iter +
@@ -1111,11 +1155,16 @@ class SubagentManager:
             # a crash in between finishes the run with it, no model call.
             self._log(run_id, "final", durable=True, status=status, error=error_str,
                       errorCode=error_code, result=durable_result)
+            # The thread's conversation has the turn before the registry has
+            # the result: a crash in between records the result again from the
+            # checkpoint, and the turn is not saved twice.
+            self._save_turn(run_id, turn, result=durable_result, outcome=status)
             self._registry.finish(run_id, status, result=durable_result,
                                   error=error_str, error_code=error_code)
 
         except asyncio.TimeoutError:
             logger.warning(f"[SubagentManager] [{run_id[:8]}] timed out")
+            self._save_turn(run_id, turn, result="(task timed out)", outcome="timeout")
             self._registry.finish(run_id, "timeout", error="Task timed out", error_code="timeout")
             final_result = "(task timed out)"
             status = "timeout"
@@ -1135,6 +1184,7 @@ class SubagentManager:
             # cancelled and doesn't treat it as a "completed" future.
             logger.info(f"[SubagentManager] [{run_id[:8]}] cancelled")
             outcome = self._cancel_outcomes.get(run_id, "interrupted")
+            self._save_turn(run_id, turn, result="", outcome=outcome, aborted=True)
             self._finish_cancelled(run_id, outcome)
             self._transcribe(run_id, {"kind": "result", "status": outcome, "content": ""})
             if not skip_announce:
@@ -1150,6 +1200,7 @@ class SubagentManager:
 
         except Exception as e:
             logger.error(f"[SubagentManager] [{run_id[:8]}] failed: {e}")
+            self._save_turn(run_id, turn, result="Error: Task could not finish.", outcome="error")
             self._registry.finish(run_id, "error", error="Task could not finish", error_code="execution_failed")
             final_result = "Error: Task could not finish."
             status = "error"
@@ -1169,6 +1220,85 @@ class SubagentManager:
         finally:
             await self._emit_event("subagent.completed", run_id, label, status, error_str)
         return final_result
+
+    def _save_turn(self, run_id: str, turn: dict[str, Any], *, result: str, outcome: str,
+                   aborted: bool = False) -> None:
+        """Save what the run did as a turn of its thread's conversation.
+
+        Called once the run's result is decided, before the registry records
+        it, whatever the outcome; a stopped run is saved as ``aborted``. A run
+        with no thread (system work, delegated tasks) or whose conversation was
+        deleted saves nothing. Saving never fails the run.
+        """
+        state = turn.get("state")
+        record = self._registry.get(run_id)
+        if state is None or record is None or not record.thread_id:
+            return
+        thread = self._registry.get_thread(record.thread_id)
+        if thread is None or thread.closed_reason == "parent_deleted":
+            return
+        duration_ms = None
+        if record.started_at is not None:
+            duration_ms = int(max(0.0, time.time() - record.started_at
+                                  - (record.suspended_seconds or 0.0)) * 1000)
+        try:
+            self._registry.thread_store.commit_turn(
+                thread, run_id=run_id, turn=record.turn, trigger=record.trigger,
+                system_prompt=state.system_prompt, first_message=state.first_message,
+                brief=record.task, journal=state.journal, result=result, outcome=outcome,
+                usage=dict(record.usage), duration_ms=duration_ms, aborted=aborted,
+            )
+        except Exception:
+            logger.exception(f"[SubagentManager] [{run_id[:8]}] could not save the turn into its thread")
+
+    def _cap_tool_result(self, run_id: str, tool_name: str, result: str) -> str:
+        """What the model gets of a tool result: the main agent's per-tool limit.
+
+        Past it the text is cut and the full output spilled — into the run's
+        thread (kept as long as its conversation) or, for a run with none,
+        the shared temp spill dir — with a pointer read_file can follow. A
+        read_file result points back at its own offset/limit instead.
+        """
+        from flowly.agent.loop import _DEFAULT_MAX_CHARS, _TOOL_MAX_CHARS
+        from flowly.agent.tool_result_spill import build_spill_pointer, spill_tool_result
+
+        max_chars = _TOOL_MAX_CHARS.get(tool_name, _DEFAULT_MAX_CHARS)
+        if len(result) <= max_chars:
+            return result
+        total = len(result)
+        if tool_name == "read_file":
+            return result[:max_chars] + (
+                f"\n[... truncated from {total} chars — re-call read_file "
+                f"with offset/limit to read a smaller section.]"
+            )
+        directory = None
+        record = self._registry.get(run_id)
+        if record is not None and record.thread_id and self._registry.get_thread(record.thread_id):
+            try:
+                directory = self._registry.thread_store.spill_dir(record.thread_id)
+            except (OSError, ValueError):
+                directory = None
+        path = spill_tool_result(result, tool_name, directory=directory)
+        if path is None:
+            return result[:max_chars] + f"\n[... truncated from {total} chars]"
+        return result[:max_chars] + build_spill_pointer(path, total, result.count("\n") + 1)
+
+    def forget_conversation(self, parent_session_key: str) -> int:
+        """A conversation was deleted: close its subagents' threads and remove their conversations.
+
+        Their records stay (closed, ``parent_deleted``) until pruned; their
+        conversations and raw outputs go now. A run still working for it
+        finishes as before, but its turn is no longer saved. Returns how many
+        threads were removed.
+        """
+        try:
+            thread_ids = self._registry.forget_parent(parent_session_key)
+        except Exception:
+            logger.exception("Could not close the subagents of a deleted conversation")
+            return 0
+        for thread_id in thread_ids:
+            self._registry.thread_store.delete(thread_id)
+        return len(thread_ids)
 
     def _child_tools(self, run_id: str, label: str) -> SubagentToolRegistry:
         """The restricted tools one child run gets.
@@ -1302,12 +1432,12 @@ class SubagentManager:
                      content: str, *, status: str = "ok", guard: dict[str, Any] | None = None,
                      search: bool = False) -> None:
         """Give the model one tool message, and checkpoint exactly that."""
-        state.messages.append({
+        append_message(state, {
             "role": "tool",
             "tool_call_id": call_id,
             "name": protocol_name,
             "content": content,
-        })
+        }, status=status)
         self._log(run_id, "tool", callId=call_id, protocolName=protocol_name, content=content,
                   status=status, guard=guard, search=search)
 
@@ -1474,8 +1604,14 @@ class SubagentManager:
         context: str | None,
         tool_trace: list[dict[str, Any]],
         restored: ChildState | None,
+        turn: dict[str, Any] | None = None,
     ) -> tuple[str, str, str | None, str | None]:
-        """The child's own loop. Returns (result, status, error, error_code)."""
+        """The child's own loop. Returns (result, status, error, error_code).
+
+        ``turn`` (a dict the caller holds) receives the run's ``state`` as
+        soon as it exists, so a run that ends any way — finished, failed,
+        stopped — can still save what it did into its thread.
+        """
         status: str = "ok"
         error_str: str | None = None
         error_code: str | None = None
@@ -1506,6 +1642,8 @@ class SubagentManager:
                     {"role": "user", "content": first_message},
                 ],
                 max_iterations=self.max_iterations,
+                system_prompt=system_prompt,
+                first_message=first_message,
             )
             self._log(
                 run_id, "header", durable=True, runId=run_id, coreVersion=_core_version(),
@@ -1518,6 +1656,10 @@ class SubagentManager:
             })
         else:
             state = restored
+        if turn is not None:
+            # The caller saves the run's journal into its thread at the end.
+            turn["state"] = state
+        if restored is not None:
             if state.final is not None:
                 # The result was decided before the restart; only recording
                 # it was left. No model call.
@@ -1625,7 +1767,7 @@ class SubagentManager:
                     "content": response.content or "",
                     "tool_calls": tool_call_dicts,
                 }
-                state.messages.append(assistant)
+                append_message(state, assistant)
                 # Written before any of its tools runs: a restart knows every
                 # call this reply made, and which of them had started.
                 self._log(run_id, "model", durable=True, iteration=iteration, message=assistant,
@@ -1778,9 +1920,10 @@ class SubagentManager:
                         except (TypeError, ValueError):
                             pass
                     await self._progress(run_id, {"phase": "thinking", "iteration": iteration})
-                    # Truncate long tool results to prevent context bloat
-                    if len(result) > 4000:
-                        result = result[:4000] + f"\n[... truncated from {len(result)} chars]"
+                    # A long result is cut to the main agent's per-tool limit;
+                    # the full output is kept in the thread's spill dir and
+                    # the text ends with a pointer read_file can follow.
+                    result = self._cap_tool_result(run_id, effective_tool_name, result)
                     repeated = state.repetition.observe(effective_tool_name, result)
                     if repeated:
                         result = mark_repeated(effective_tool_name, result)
@@ -1893,7 +2036,7 @@ class SubagentManager:
                 if self._inboxes.get(run_id) and iteration < max_iterations:
                     # The main agent wrote while this answer was being
                     # produced: read it before finishing, never drop it.
-                    state.messages.append({"role": "assistant", "content": response.content})
+                    append_message(state, {"role": "assistant", "content": response.content})
                     self._log(run_id, "text", iteration=iteration, content=response.content)
                     continue
                 final_result = response.content
@@ -1926,7 +2069,7 @@ class SubagentManager:
                     ("repeating itself" if state.stalled else "max iterations")
                     if _hit_max_iter else "LLM errors exhausted"
                 )
-                state.messages.append({"role": "user", "content": GRACE_PROMPT})
+                append_message(state, {"role": "user", "content": GRACE_PROMPT}, _display_hidden=True)
                 state.grace = {"reason": _reason, "hitMaxIter": _hit_max_iter, "preserved": final_result,
                                "status": status, "errorCode": error_code}
                 self._log(run_id, "phase", phase="grace", **state.grace)
@@ -2243,7 +2386,8 @@ class SubagentManager:
         try:
             record = self._registry.get(run_id)
             if record:
-                data = run_view(record, detail=event == "subagent.completed")
+                thread = self._registry.get_thread(record.thread_id) if record.thread_id else None
+                data = run_view(record, detail=event == "subagent.completed", thread=thread)
                 data.update(outcome=record.outcome, running=len(self._registry.pending()))
                 self._events.publish(event, data)
         except Exception:

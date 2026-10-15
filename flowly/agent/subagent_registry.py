@@ -17,6 +17,16 @@ from typing import Any
 from filelock import FileLock
 from loguru import logger
 
+from flowly.agent.subagent_threads import (
+    THREAD_IDLE_CLOSE_SECONDS,
+    THREAD_RETENTION_SECONDS,
+    SubagentThreadRecord,
+    SubagentThreadStore,
+    decode_thread,
+    is_thread_id,
+    last_active,
+)
+
 
 def _default_registry_path() -> Path:
     from flowly.profile import get_flowly_home
@@ -127,6 +137,13 @@ class SubagentRunRecord:
     suspended_at: float | None = None
     suspended_seconds: float = 0.0
     resumed_at: float | None = None
+    # The thread this run is a turn of (subagent_threads): its id is the
+    # thread's first run_id. Empty for system runs, delegated tasks and runs
+    # recorded before threads existed. ``turn`` counts from 1 (the spawn);
+    # ``trigger`` is "spawn" or "followup".
+    thread_id: str = ""
+    turn: int = 1
+    trigger: str = "spawn"
 
 
 
@@ -156,6 +173,14 @@ def add_usage(totals: dict[str, int], usage: dict[str, Any]) -> dict[str, int]:
     return merged
 
 
+class ThreadCapReached(RuntimeError):
+    """Every open thread of the conversation has a task running."""
+
+    def __init__(self, open_threads: int) -> None:
+        super().__init__(f"{open_threads} open subagent threads, none idle")
+        self.open_threads = open_threads
+
+
 class SubagentRegistry:
     """Atomic, locked snapshots; result bodies live outside the list index.
 
@@ -174,6 +199,16 @@ class SubagentRegistry:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = FileLock(str(self._path) + ".lock", timeout=5)
         self._runs: dict[str, SubagentRunRecord] = {}
+        # Subagent threads (threads.json), written under the same lock as
+        # the runs. A threads file that cannot be read is never overwritten
+        # and nothing is pruned on its account; runs keep working without
+        # threads until it is repaired.
+        self._threads: dict[str, SubagentThreadRecord] = {}
+        self._threads_unavailable = False
+        self._threads_disk: bytes | None = None
+        # The thread ids the thread files were last pruned against.
+        self._pruned_for: frozenset[str] | None = None
+        self.thread_store = SubagentThreadStore(self._path.parent)
         try:
             self._load_from_disk()
         except (OSError, ValueError):
@@ -236,6 +271,10 @@ class SubagentRegistry:
         if (type(record.suspended_seconds) not in (int, float) or not math.isfinite(record.suspended_seconds)
                 or record.suspended_seconds < 0):
             raise ValueError("invalid run downtime")
+        if not isinstance(record.thread_id, str) or (record.thread_id and not is_thread_id(record.thread_id)):
+            raise ValueError("invalid run thread")
+        if type(record.turn) is not int or record.turn < 1 or record.trigger not in ("spawn", "followup"):
+            raise ValueError("invalid run turn")
         return record
 
     def _read_locked(self) -> None:
@@ -263,6 +302,87 @@ class SubagentRegistry:
                 self._runs[key].__dict__.update(rec.__dict__)
                 records[key] = self._runs[key]
         self._runs = records
+        self._read_threads_locked(now)
+
+    @property
+    def _threads_path(self) -> Path:
+        return self._path.with_name("threads.json")
+
+    def _read_threads_locked(self, now: float) -> None:
+        """Load threads.json and bring it up to date with the runs.
+
+        Like the runs' pruning, what this decides is kept in memory and
+        written with the next change: a thread whose run is gone or ended
+        no longer has a task running; an open thread idle for
+        THREAD_IDLE_CLOSE_SECONDS is closed (``idle``); a thread closed
+        THREAD_RETENTION_SECONDS ago whose results were all delivered is
+        dropped (its files go with the next write).
+        """
+        threads: dict[str, SubagentThreadRecord] = {}
+        raw_bytes: bytes | None = None
+        path = self._threads_path
+        try:
+            if path.exists():
+                raw_bytes = path.read_bytes()
+                raw = json.loads(raw_bytes)
+                if not isinstance(raw, list):
+                    raise ValueError("Invalid subagent threads")
+                for item in raw:
+                    try:
+                        thread = decode_thread(item)
+                    except ValueError:
+                        logger.warning("Skipping invalid subagent thread record")
+                        continue
+                    threads[thread.thread_id] = thread
+        except (OSError, ValueError):
+            if not self._threads_unavailable:
+                logger.exception("Subagent threads are unavailable; runs continue without them")
+            self._threads_unavailable = True
+            self._threads = {}
+            self._threads_disk = None
+            return
+        self._threads_unavailable = False
+        self._threads_disk = raw_bytes
+        for thread in threads.values():
+            active = self._runs.get(thread.active_run_id) if thread.active_run_id else None
+            if thread.active_run_id and (active is None or active.ended_at is not None):
+                if active is not None:
+                    self._close_out_run(thread, active)
+                else:
+                    thread.active_run_id = None
+            if (thread.status == "open" and thread.active_run_id is None
+                    and now - last_active(thread) >= THREAD_IDLE_CLOSE_SECONDS):
+                closed_at = last_active(thread) + THREAD_IDLE_CLOSE_SECONDS
+                thread.status, thread.closed_at, thread.closed_reason = "closed", closed_at, "idle"
+                thread.updated_at = closed_at
+                thread.revision += 1
+        kept: dict[str, SubagentThreadRecord] = {}
+        for thread_id, thread in threads.items():
+            expired = (
+                thread.status == "closed" and thread.active_run_id is None
+                and (thread.closed_at or thread.created_at) + THREAD_RETENTION_SECONDS <= now
+            )
+            # A result of the thread still waiting to be delivered keeps it.
+            waiting = any(
+                (run := self._runs.get(run_id)) is not None
+                and (run.ended_at is None or not (run.announced or run.delivery_state in _SETTLED_DELIVERY))
+                for run_id in thread.runs
+            )
+            if not expired or waiting:
+                kept[thread_id] = thread
+        self._threads = kept
+
+    @staticmethod
+    def _close_out_run(thread: SubagentThreadRecord, run: SubagentRunRecord) -> None:
+        """A run of the thread ended: nothing runs on it now; its tokens count."""
+        if thread.active_run_id != run.run_id:
+            return
+        thread.active_run_id = None
+        thread.last_run_ended_at = run.ended_at
+        thread.usage = {k: int(thread.usage.get(k, 0)) + int(run.usage.get(k, 0))
+                        for k in ("input", "output", "cacheRead", "total")}
+        thread.updated_at = run.ended_at
+        thread.revision += 1
 
     @staticmethod
     def _atomic_write(path: Path, data: bytes) -> None:
@@ -285,8 +405,25 @@ class SubagentRegistry:
             tmp.unlink(missing_ok=True)
 
     def _write_locked(self) -> None:
+        if not self._threads_unavailable:
+            # Threads first: a crash between the two writes leaves a thread
+            # whose run is missing (it reads as idle), never a run pointing
+            # at a thread that was never written.
+            threads = json.dumps([asdict(t) for t in self._threads.values()],
+                                 ensure_ascii=False).encode("utf-8")
+            if threads != self._threads_disk and (self._threads or self._threads_disk is not None):
+                self._atomic_write(self._threads_path, threads)
+                self._threads_disk = threads
         data = json.dumps([asdict(r) for r in self._runs.values()], ensure_ascii=False)
         self._atomic_write(self._path, data.encode("utf-8"))
+        if not self._threads_unavailable:
+            keep = frozenset(self._threads)
+            if keep != self._pruned_for:
+                try:
+                    self.thread_store.prune(set(keep))
+                    self._pruned_for = keep
+                except OSError:
+                    logger.warning("Could not prune expired subagent conversations")
         # Only our own hashed files are eligible; never follow arbitrary paths.
         keep = {self._result_path(r.run_id).name for r in self._runs.values()}
         if self._result_dir.exists():
@@ -425,12 +562,44 @@ class SubagentRegistry:
         return {"runId": run_id, "items": items, "nextSeq": last,
                 "more": more, "done": record.ended_at is not None}
 
-    def register(self, record: SubagentRunRecord) -> None:
+    def register(self, record: SubagentRunRecord, *, thread: SubagentThreadRecord | None = None,
+                 open_cap: int | None = None) -> list[SubagentThreadRecord]:
+        """Record a new run — and, with ``thread``, the new thread it starts.
+
+        ``open_cap`` bounds the open threads of the thread's conversation: at
+        the cap, the ones idle longest are closed (``cap``) to make room, and
+        returned. :class:`ThreadCapReached` when every open thread is busy.
+        A run whose ``thread_id`` names an existing open thread becomes its
+        next turn. Threads unavailable (threads.json unreadable): the run is
+        recorded without one.
+        """
         with self._lock:
             self._read_locked()
             if record.run_id in self._runs:
                 raise ValueError("Duplicate subagent run ID")
+            if self._threads_unavailable:
+                record.thread_id, thread = "", None
             self._decode(asdict(record))
+            evicted: list[SubagentThreadRecord] = []
+            now = time.time()
+            if thread is not None:
+                if thread.thread_id in self._threads or thread.thread_id != record.thread_id:
+                    raise ValueError("Invalid subagent thread")
+                thread.runs = [record.run_id]
+                thread.active_run_id = record.run_id
+                thread.revision, thread.updated_at = 1, record.created_at
+                decode_thread(asdict(thread))
+                if open_cap is not None:
+                    evicted = self._make_room_locked(thread.parent_session_key, open_cap, now)
+                self._threads[thread.thread_id] = thread
+            elif record.thread_id:
+                existing = self._threads.get(record.thread_id)
+                if existing is None or existing.status != "open" or existing.active_run_id is not None:
+                    raise ValueError("This subagent's thread cannot take a new run")
+                existing.runs.append(record.run_id)
+                existing.active_run_id = record.run_id
+                existing.revision += 1
+                existing.updated_at = record.created_at
             record.updated_at = record.created_at
             record.revision = 1
             self._runs[record.run_id] = record
@@ -439,6 +608,23 @@ class SubagentRegistry:
             except Exception:
                 self._read_locked()
                 raise
+            return evicted
+
+    def _make_room_locked(self, parent_session_key: str, cap: int, now: float) -> list[SubagentThreadRecord]:
+        open_threads = [t for t in self._threads.values()
+                        if t.parent_session_key == parent_session_key and t.status == "open"]
+        if len(open_threads) < cap:
+            return []
+        idle = sorted((t for t in open_threads if t.active_run_id is None), key=last_active)
+        excess = len(open_threads) - cap + 1
+        if len(idle) < excess:
+            raise ThreadCapReached(len(open_threads))
+        evicted = idle[:excess]
+        for thread in evicted:
+            thread.status, thread.closed_at, thread.closed_reason = "closed", now, "cap"
+            thread.revision += 1
+            thread.updated_at = now
+        return evicted
 
     def update(self, run_id: str, **changes: Any) -> None:
         with self._lock:
@@ -459,6 +645,9 @@ class SubagentRegistry:
                     if entry.get("status") == "running":
                         entry.update(status=record.outcome or "interrupted", ended_at=record.ended_at)
                 record.activity = {"phase": "finished"}
+                thread = self._threads.get(record.thread_id) if record.thread_id else None
+                if thread is not None:
+                    self._close_out_run(thread, record)
             record.updated_at = time.time()
             record.revision += 1
             try:
@@ -557,3 +746,63 @@ class SubagentRegistry:
     def _load_from_disk(self) -> None:
         with self._lock:
             self._read_locked()
+
+    # ── Threads ─────────────────────────────────────────────────────────
+
+    def get_thread(self, thread_id: str) -> SubagentThreadRecord | None:
+        return self._threads.get(thread_id)
+
+    def threads(self) -> list[SubagentThreadRecord]:
+        self._load_from_disk()
+        return list(self._threads.values())
+
+    def thread_of(self, run_id: str) -> SubagentThreadRecord | None:
+        record = self._runs.get(run_id)
+        if record is None or not record.thread_id:
+            return None
+        return self._threads.get(record.thread_id)
+
+    def threads_for_parent(self, parent_session_key: str) -> list[SubagentThreadRecord]:
+        """A conversation's threads, oldest first."""
+        return sorted((t for t in self.threads() if t.parent_session_key == parent_session_key),
+                      key=lambda t: t.created_at)
+
+    def runs_of_thread(self, thread: SubagentThreadRecord) -> list[SubagentRunRecord]:
+        """The thread's runs still in the registry, oldest first."""
+        return [run for run_id in thread.runs if (run := self._runs.get(run_id)) is not None]
+
+    def forget_parent(self, parent_session_key: str) -> list[str]:
+        """The conversation was deleted: its threads close (``parent_deleted``).
+
+        Returns every thread id of that conversation, open or closed, so the
+        caller removes their conversations and raw outputs now; the records
+        stay (closed) for their retention period.
+        """
+        with self._lock:
+            self._read_locked()
+            if self._threads_unavailable:
+                return []
+            now = time.time()
+            owned = [t for t in self._threads.values() if t.parent_session_key == parent_session_key]
+            for thread in owned:
+                if thread.status == "open":
+                    thread.status, thread.closed_at, thread.closed_reason = "closed", now, "parent_deleted"
+                    thread.revision += 1
+                    thread.updated_at = now
+            if owned:
+                try:
+                    self._write_locked()
+                except Exception:
+                    self._read_locked()
+                    raise
+            return [t.thread_id for t in owned]
+
+    def maintain(self) -> None:
+        """Persist what reading decided: idle closes, expired threads and their files."""
+        with self._lock:
+            self._read_locked()
+            try:
+                self._write_locked()
+            except Exception:
+                self._read_locked()
+                raise

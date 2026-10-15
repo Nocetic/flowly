@@ -127,7 +127,7 @@ async def _run(manager: SubagentManager, provider: _Scripted, task: str = "Look 
 
 @pytest.mark.asyncio
 async def test_replaying_the_checkpoint_gives_the_provider_list_at_every_step(tmp_path):
-    (tmp_path / "big.txt").write_text("B" * 6_000)
+    (tmp_path / "big.txt").write_text("B" * 9_000)
     (tmp_path / "a.txt").write_text("same content every time")
 
     async def main_agent_writes(provider: _Scripted) -> LLMResponse:
@@ -186,7 +186,8 @@ async def test_replaying_the_checkpoint_gives_the_provider_list_at_every_step(tm
     assert first_reply["tool_calls"][0]["extra_content"] == {"google": {"thought_signature": "sig-1"}}
     assert json.loads(first_reply["tool_calls"][0]["function"]["arguments"])["content"] == "x" * 3_000
     big = provider.sent[1][4]["content"]
-    assert big.startswith("B" * 4_000) and "truncated from" in big
+    # Cut to the main agent's read_file limit, pointing back at offset/limit.
+    assert big.startswith("B" * 8_000) and "truncated from 9000 chars" in big and "B" * 8_001 not in big
     assert "[Message from the main agent]\nAlso check the year 2024." in [
         m.get("content") for m in provider.sent[4]]
     # The checkpoint is gone once the result is recorded.

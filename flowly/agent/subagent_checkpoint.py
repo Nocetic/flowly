@@ -49,7 +49,12 @@ per step and a one-off overflow trim) is not continued: its runs end
 ``resume_unsupported``.
 
 ``restore_child_state`` replays the lines through the same functions the
-live loop uses, so the rebuilt list is the live one, step for step.
+live loop uses, so the rebuilt list is the live one, step for step. The same
+replay rebuilds the run's journal (``ChildState.journal``): every message the
+run added, as the model first got it and never cut, which the thread's
+conversation saves when the run ends (flowly.agent.subagent_threads). The
+format is unchanged by it: a checkpoint written before journals existed
+rebuilds one too.
 """
 
 from __future__ import annotations
@@ -58,6 +63,7 @@ import json
 import os
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -240,6 +246,14 @@ class ChildState:
     unread_mail: list[dict[str, str]] = field(default_factory=list)
     suspended: bool = False
     resumes: int = 0
+    # The prompt and the first message the run was started with (the
+    # header's), and every message the run added since, in order — never
+    # cut by a step or a fitting, unlike ``messages``. Rows carry a
+    # ``timestamp`` and, where it says more than the protocol, ``kind`` /
+    # ``author`` / ``status``; the model never sees those fields.
+    system_prompt: str = ""
+    first_message: str = ""
+    journal: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -316,8 +330,26 @@ def main_agent_note(text: str) -> dict[str, Any]:
     return {"role": "user", "content": f"[Message from the main agent]\n{text}"}
 
 
+def append_message(state: ChildState, message: dict[str, Any], *, at: float | None = None,
+                   **extra: Any) -> None:
+    """Give the model one more message, and add it to the run's journal.
+
+    ``extra`` fields (``kind``, ``author``, ``status``, ``_display_hidden``)
+    go to the journal only; the model gets ``message`` as it is.
+    """
+    state.messages.append(message)
+    row = dict(message)
+    row.update(extra)
+    try:
+        stamp = datetime.fromtimestamp(at if at is not None else time.time())
+    except (OverflowError, OSError, ValueError):
+        stamp = datetime.now()
+    row["timestamp"] = stamp.isoformat()
+    state.journal.append(row)
+
+
 def apply_step(state: ChildState, iteration: int, notes: list[str],
-               strip: list[tuple[int, int]]) -> None:
+               strip: list[tuple[int, int]], *, at: float | None = None) -> None:
     """Begin iteration ``iteration``: read the inbox, cut old tool results.
 
     ``strip`` is the ``(keep_last, max_old_chars)`` passes the step applies
@@ -327,7 +359,7 @@ def apply_step(state: ChildState, iteration: int, notes: list[str],
     """
     state.iteration = iteration
     for note in notes:
-        state.messages.append(main_agent_note(note))
+        append_message(state, main_agent_note(note), at=at, kind="agent_note", author="main_agent")
     for keep_last, max_old_chars in strip:
         state.messages = strip_old_tool_results(state.messages, keep_last=keep_last,
                                                 max_old_chars=max_old_chars)
@@ -363,6 +395,11 @@ def observe_tool_result(state: ChildState, guard: dict[str, Any] | None, content
         state.stalled = state.repetition.stalled
 
 
+def _record_time(record: dict[str, Any]) -> float | None:
+    value = record.get("t")
+    return float(value) if type(value) in (int, float) else None
+
+
 def restore_child_state(
     records: list[dict[str, Any]],
     *,
@@ -389,6 +426,8 @@ def restore_child_state(
                 {"role": "user", "content": str(header["firstMessage"])},
             ],
             max_iterations=max(1, int(header["maxIterations"])),
+            system_prompt=str(header["systemPrompt"]),
+            first_message=str(header["firstMessage"]),
         )
         mail: dict[str, str] = {}
         consumed: set[str] = set()
@@ -401,7 +440,8 @@ def restore_child_state(
                 mail[str(record["id"])] = str(record["text"])
             elif kind == "step":
                 apply_step(state, int(record["iteration"]), [str(n) for n in record.get("notes", [])],
-                           [(int(keep), int(chars)) for keep, chars in record.get("strip", [])])
+                           [(int(keep), int(chars)) for keep, chars in record.get("strip", [])],
+                           at=_record_time(record))
                 consumed.update(str(i) for i in record.get("mail", []))
                 calls = {}
             elif kind == "microcompact":
@@ -413,7 +453,9 @@ def restore_child_state(
                 apply_compacted(state, messages)
             elif kind == "model":
                 message = record["message"]
-                state.messages.append(message)
+                if not isinstance(message, dict):
+                    raise TypeError("model message")
+                append_message(state, message, at=_record_time(record))
                 state.awaiting_model = False
                 calls = {
                     str(call["id"]): OpenCall(
@@ -423,7 +465,8 @@ def restore_child_state(
                     for call in message.get("tool_calls") or []
                 }
             elif kind == "text":
-                state.messages.append({"role": "assistant", "content": str(record["content"])})
+                append_message(state, {"role": "assistant", "content": str(record["content"])},
+                               at=_record_time(record))
                 state.awaiting_model = False
             elif kind == "tool_start":
                 call = calls.get(str(record["callId"]))
@@ -436,10 +479,10 @@ def restore_child_state(
             elif kind == "tool":
                 call_id = str(record["callId"])
                 content = str(record["content"])
-                state.messages.append({
+                append_message(state, {
                     "role": "tool", "tool_call_id": call_id,
                     "name": str(record["protocolName"]), "content": content,
-                })
+                }, at=_record_time(record), status=str(record.get("status") or "ok"))
                 if record.get("status") not in ("interrupted", "not_run"):
                     # A result a restart wrote never carried a reply to the model.
                     answered.add(call_id)
@@ -455,7 +498,8 @@ def restore_child_state(
                     "status": record.get("status"),
                     "errorCode": record.get("errorCode"),
                 }
-                state.messages.append({"role": "user", "content": GRACE_PROMPT})
+                append_message(state, {"role": "user", "content": GRACE_PROMPT},
+                               at=_record_time(record), _display_hidden=True)
                 state.awaiting_model = False
             elif kind == "final":
                 state.final = {
