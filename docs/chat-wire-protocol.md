@@ -69,6 +69,7 @@ Discriminated by `data.state`.
 | `iteration_step` | One tool-protocol step inside the turn. | `iterationIdx`, `role`, `content`, `tool_calls?`, `tool_call_id?`, `name?` |
 | `tool_progress` | A call's state changed (queued, running, ended). Not a step. | `iterationIdx`, `revision`, `call` |
 | `agent_note` | A subagent's turn only (§4.8): the main agent's message (or, `noteKind: "task"`, a task) it read. Not a step. | `iterationIdx`, `author`, `content`, `noteKind?` |
+| `stream_reset` | A subagent's turn only (§4.8): a streamed reply was taken back (it failed and is made again, or the run ends). The live text is `text` from here on. Not a step, not a terminal. | `text` |
 | `final` | **Terminal.** The turn's durable assistant message. | `message.content[]`, `model`, `usage`, `completedAt`, `durationMs`, `aborted?`, `attachments?`, `toolMessages?` |
 | `aborted` | Legacy early terminal. The authoritative `final, aborted:true` still follows. | — |
 | `error` | **Terminal.** Provider/agent failure as a product state. | `errorCode`, `errorTitle`, `errorMessage`, `retryable` |
@@ -235,7 +236,7 @@ While a turn of it runs (run id `R`), the server sends that turn's events —
 only to clients that watch the thread:
 
 ```
-run_started ─▶ [agent delta | iteration_step | tool_progress | agent_note | compaction]* ─▶ final | error
+run_started ─▶ [agent delta | stream_reset | iteration_step | tool_progress | agent_note | compaction]* ─▶ final | error
 ```
 
 - Every event carries `sessionKey: K`, `runId: R` and
@@ -251,10 +252,19 @@ run_started ─▶ [agent delta | iteration_step | tool_progress | agent_note | 
   number and the follow-up task as `prompt`; a client starts it as a new turn
   of the same view, after the turns `subagents.history` already shows.
   There is no `state:"user"` event.
-- `agent {stream:"assistant", data:{text}}`: what the model said, one delta
-  per reply (token streaming may later send several). As in an owner's turn,
-  an `iteration_step` with `tool_calls` (an empty list included) moves the
-  text before it out of the live bubble.
+- `agent {stream:"assistant", data:{text}}`: what the model said, as
+  incremental deltas — token by token (at most about every 50 ms) while the
+  thread is watched and the provider streams, else one delta per reply. As in
+  an owner's turn, a client appends each delta to the live bubble, and an
+  `iteration_step` with `tool_calls` (an empty list included) moves the text
+  before it out of the live bubble. `chat.inflight` / the watch snapshot's
+  `text` is the partial reply since the last such step.
+- `chat {state:"stream_reset", text}`: a streamed reply failed (a provider
+  error, a timeout, an empty reply) and is not recorded; the bubble's text is
+  `text` from here on (what it held before that reply — usually empty). The
+  call is then made again (its deltas follow) or the run ends with its
+  terminal. A client that ignores this event shows the failed text glued to
+  the retry until the next step boundary or the terminal.
 - `iteration_step` / `tool_progress`: an owner's turn's shapes. A tool step
   not `ok` adds `status` (`error`, `timeout`, `interrupted`, `not_run`).
 - `chat {state:"agent_note", iterationIdx, author:"main_agent", content}`: a

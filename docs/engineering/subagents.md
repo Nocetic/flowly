@@ -651,6 +651,18 @@ metrics outlive the 30-day run pruning. `subagents.stats` returns, for the last 
   suspend, two processes, version skew both ways, crash loop, long downtime, batches, goals, unread
   messages, orphans), `test_subagent_resume_process.py` (real processes, real SIGKILL mid-tool and
   mid-model-call, two recovering processes, a fatal call).
+* Token streaming (§16a): `test_subagent_token_streaming.py` — streamed deltas assemble to exactly
+  the recorded reply (checkpoint `model` record with `extra_content`, journal, saved rows, terminal)
+  and a streamed run records what a blocking run of the same replies records (requests, `model`
+  records, rows, tokens, replay); a tool-call boundary takes the streamed text out of the bubble and
+  the in-flight entry; a watcher arriving mid-reply gets every character once; nobody watching →
+  the blocking call and the same events offered as before; a provider without streaming keeps one
+  delta per reply; a stream that fails before any text falls back (no stream, a rejected key) or
+  not (no credits); a reply that fails after some text is taken back (`stream_reset`) and the retry
+  streams cleanly; the whole-reply timeout; a stop mid-reply; a crash mid-stream (nothing of the
+  partial on disk, the restart redoes the call once with the exact list, one closing row, tokens
+  once); coalescing, the deferred flush, a slow watcher never holding the run (queue ≤ 3, nothing
+  dropped), the size cap; `StreamedReply` against a blocking call's fields.
 * Live model: `tests/test_agent_behavior_real.py` (`-m real_llm`, `FLOWLY_EVAL_CONFIG`,
   `FLOWLY_EVAL_ONLY=a,b`). Checks what the agent *did*: explanations answered without tools,
   "don't search" respected, a detailed single task done itself, explicit delegation starts
@@ -820,7 +832,8 @@ parent's report turn keeps `turnOrigin: "subagent"` under the parent's key):
 | Event | When | Data |
 |---|---|---|
 | `chat` `run_started` | The run's loop begins (a run continued after a restart: again, `resumed: true`) | `hiddenPrompt: false`, `steerable: false`, `prompt` (the brief; a follow-up's task), `promptAuthor: "main_agent"`, `threadId`, `turn`, `trigger` (`spawn` \| `followup`), `parentSessionKey`, `title`, `mark`, `model`, `withConversation` (first turn only), `startedAt` (ms), `resumed?` |
-| `agent` | Each model reply that has text (step granularity; the closing reply too) | `stream: "assistant"`, `data: {text}` |
+| `agent` | The model's text: token by token while somebody watches and the provider streams (coalesced, §16a "Token streaming"), else one delta per reply that has text (the closing reply too) | `stream: "assistant"`, `data: {text}` — incremental, the owner's turn's convention |
+| `chat` `stream_reset` | A streamed reply failed (error, timeout, an empty reply) and is not recorded; the call is made again or the run ends | `text`: the live text from here on (what it was before that reply) |
 | `chat` `iteration_step` | Each reply with tool calls, each tool result | The main loop's shape (`flowly.tool_activity.iteration_event_payload`): `iterationIdx`, `role`, `content`, `tool_calls?`, `tool_call_id?`, `name?`, `tool_activity?`; a tool result not `ok` adds `status` (`error`, `timeout`, `interrupted`, `not_run`). A reply without calls mid-run (the main agent wrote meanwhile) is a step with `tool_calls: []` |
 | `chat` `tool_progress` | A call is queued, runs, ends | `ToolProgress`'s shape: `iterationIdx`, `revision`, `call {id, index, name, arguments, state, …}` |
 | `chat` `agent_note` | The child read a message from the main agent at a step | `iterationIdx`, `author: "main_agent"`, `content` (as saved), `noteKind: "task"` for a task given to the running turn |
@@ -839,7 +852,69 @@ the turn saves) it has not seen into events: the live turn and the saved one are
 far), after the calls and after a mid-run reply; `tool_started` marks a call running; `answer`
 sends the closing reply. A continued run replays the restored journal into the in-flight entry
 without sending it (watchers re-enter through `chat.inflight` / `subagents.watch`), then streams
-from there. Token streaming (phase 6) feeds `ChildStream.delta`.
+from there. Token streaming (phase 6, below) feeds `ChildStream.delta` through its coalescer.
+
+**Token streaming** (phase 6; `SubagentManager._call_model` → `_stream_model`,
+`ChildStream.begin_reply` / `stream_text` / `end_reply` / `discard_reply`,
+`flowly/providers/streamed_reply.py`).
+
+* **When.** Decided per model call, when it is dispatched (after fitting, §4.1): the run has a
+  live stream, the provider streams (its class overrides `LLMProvider.chat_stream`;
+  `_streams_tokens`) and somebody watches the thread now (`ChildStream.watched` →
+  `SubagentStreamHub.watched`: each transport's `subagent_stream_watched`, one dict lookup).
+  Otherwise the call is exactly the blocking `provider.chat(…, max_tokens, timeout)` it was —
+  nobody watching costs one watch check per model call (≈0.4 µs measured with the gateway and the
+  relay channel as transports) and nothing else; its reply goes out as one delta, as before. A
+  watcher arriving during a blocking call gets that reply whole when it is recorded; one leaving
+  during a streamed call changes nothing (the deltas reach nobody).
+* **Why only when watched.** Exact replay holds either way: the checkpoint's `model` record is
+  the assembled reply, written after the whole reply arrived and before any tool runs (a crash
+  mid-stream leaves `step` without `model`, so the call is made again on resume — as for a
+  blocking call; partial text is never written anywhere). The deciding difference is the call
+  itself: the providers' blocking `chat` takes the run's per-call `timeout` and rotates a rejected
+  key, their streams do not. Unwatched runs — almost all of them — keep today's call unchanged.
+* **The main agent's path.** `provider.chat_stream(messages, tools, model, max_tokens)` consumed
+  with `StreamedReply` — the class `AgentLoop._chat_with_stream` now uses too (extracted from it,
+  same behavior) — so the reply is assembled exactly as the main agent's: the accumulated text, the
+  final chunk's tool calls (`extra_content` included), finish reason, usage, provider state; error
+  text never becomes reply text. A failed stream's response carries the provider's error text (not
+  the partial reply) so `classify_response` routes it as for a blocking call. `timeout` bounds the
+  whole reply (`asyncio.timeout`), as it bounds a blocking call; past it the call is a transient
+  error.
+* **Fallback.** A stream that failed before any text went out falls back to one blocking call when
+  that may succeed (the main loop's rule — a retryable category: a model or route that does not
+  stream, a transient fault, a rate limit — plus a rejected key, which the blocking call rotates).
+  A request too large, no credits or an unreadable image are not repeated (`_call_model` handles
+  the first as before). After some text went out there is no fallback: the run's own error
+  handling (backoff, retry, error budget) takes the reply as it takes any failed call.
+* **The wire.** `agent {runId, sessionKey, turnOrigin, stream: "assistant", data: {text}}` with
+  incremental text, as an owner's turn. `inflight.text` accumulates it (`chat.inflight` /
+  `subagents.watch` snapshots hold the partial reply); `delta` changes the entry and publishes in
+  one synchronous step, so a watcher whose snapshot is taken mid-reply gets every character once
+  (snapshot, then the deltas after it). A recorded reply is *committed* (`_commit`): its text
+  streamed already, so nothing more is sent (a recorded text that differs — never with the shared
+  assembly — is corrected by a `stream_reset` and the text); a reply that did not stream goes out
+  whole. Then the step's `iteration_step` with `tool_calls` (an empty list included) moves the text
+  out of the live bubble and resets `inflight.text`, exactly as before. A streamed reply that is
+  not recorded — an error, a timeout, an empty or blank reply the run retries, an empty summary —
+  is taken back: `chat {state: "stream_reset", text}` with the live text before that reply, and the
+  in-flight text set to it in the same step. A run stopped mid-reply sends nothing more of it; its
+  one terminal follows.
+* **Coalescing and backpressure.** `stream_text` buffers tokens in the run; a delta goes out at most
+  every 50 ms (`_DELTA_INTERVAL_SECONDS`; the first token at once), and while the conversation's
+  queue still holds events (`SubagentStreamHub.backlog`) the tokens wait in the run — up to
+  16,384 characters (`_DELTA_MAX_CHARS`) — so however slow a watcher is, the hub's queue holds
+  about one delta of a long reply, never one event per token, and does not reach its 1,024 limit
+  on text. A timer sends what is left when tokens pause; `end_reply` sends the rest when the call
+  returns. `stream_text` is synchronous: the run never waits for a socket. Measured: 9 µs per token
+  in the run's task (assembly 1.8 µs, the rest the coalescer and amortized deltas), a 1,000-token
+  reply at 500 tokens/s → 54 deltas; a 20,000-token burst → 11 deltas.
+* **Tokens.** The usage of the final chunk, counted once per call through `_count_usage` (both
+  calls when a stream fell back), as the main agent; a stream cut short counts nothing (no usage
+  arrived), as a blocking call that failed.
+* **Unchanged.** Fitting before the call (§4.1), the overflow retry (a failed streamed attempt is
+  taken back before the retry streams), the checkpoint records and replay, the journal, saved turns,
+  the terminal, compaction events, report turns, follow-ups.
 
 **In flight.** `inflight.begin(K, R, user="", turn_origin="subagent_task", fields=…)`:
 `chat.inflight {sessionKey: K}` returns `{runId, text, user: "", iterations, toolProgress?,
