@@ -546,6 +546,8 @@ class Session:
         duration_ms: int | None = None,
         run_id: str | None = None,
         goal_cards: list[dict[str, Any]] | None = None,
+        user_extras: dict[str, Any] | None = None,
+        carry_keys: tuple[str, ...] = (),
     ) -> None:
         """Append a completed turn — user message + all assistant/tool
         messages the loop produced — to the session.
@@ -613,6 +615,14 @@ class Session:
             (:mod:`flowly.objectives.cards`), kept on the closing assistant
             record so a reopened conversation shows the same card as the live
             reply. Display-only; projected away for the LLM.
+        user_extras:
+            Extra fields stored on the turn's first (user) row, e.g. a
+            subagent's ``kind: "subagent_task"``. Projected away for the LLM.
+        carry_keys:
+            Extra fields of ``new_messages`` rows to keep beyond the fixed
+            tool-protocol and steering set (a subagent turn's ``kind``,
+            ``author``, tool ``status``, ``_display_hidden``). Empty for the
+            main agent's turns, whose rows are saved exactly as before.
         """
         # Persist the media file paths alongside the user message so chat
         # history can reconstruct attachment previews (the direct gateway has
@@ -624,12 +634,12 @@ class Session:
         # transcript as a "user" message. The ``_``-prefixed key is stripped
         # before the provider (get_history / _strip_internal_keys), so the LLM
         # sees exactly what it saw before; only flush_full skips it.
-        user_extras: dict[str, Any] = {}
+        first_extras: dict[str, Any] = dict(user_extras or {})
         if media:
-            user_extras["media"] = list(media)
+            first_extras["media"] = list(media)
         if user_display_hidden:
-            user_extras["_display_hidden"] = True
-        self.add_message("user", user_content, **user_extras)
+            first_extras["_display_hidden"] = True
+        self.add_message("user", user_content, **first_extras)
 
         # Find the index of the closing plain-text assistant message,
         # if any. Only this message's content is overridden by
@@ -659,6 +669,7 @@ class Session:
                     "run_id", "aborted", "steering_source_run_id", "steering_message_id", "steering_iteration_idx",
                     "steering_previous_iteration_idx", "steering_tool_call_ids", "steering_sequence",
                     PROVIDER_REPLAY_KEY,
+                    *carry_keys,
                 )
                 if k in new_msg
             }
@@ -888,9 +899,14 @@ class SessionManager:
     Uses LRU cache to limit memory usage.
     """
 
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, sessions_dir: Path | None = None):
         self.workspace = workspace
-        self.sessions_dir = ensure_dir(get_flowly_home() / "sessions")
+        # The owner's conversations live in ``<home>/sessions``. A subagent's
+        # thread uses the same machinery from its own directory
+        # (flowly.agent.subagent_threads), so no reader of the owner's
+        # conversations — listing, search, MCP — ever sees it.
+        self.sessions_dir = ensure_dir(sessions_dir if sessions_dir is not None
+                                       else get_flowly_home() / "sessions")
         self._cache: OrderedDict[str, Session] = OrderedDict()
         self._indexer: Any | None = None  # lazy-set by AgentLoop
 
@@ -1741,6 +1757,10 @@ class SessionManager:
         except Exception as e:
             logger.warning(f"Failed to load session {key}: {e}")
             return None
+
+    def evict(self, key: str) -> None:
+        """Drop a session from the in-memory cache (the disk is untouched)."""
+        self._cache.pop(key, None)
 
     def read(self, key: str) -> Session | None:
         """Read one canonical snapshot without creating or caching a session."""
