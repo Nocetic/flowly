@@ -18,7 +18,11 @@ and checks what the agent *did*, not how its prose reads:
   change that makes the agent start subagents more often shows up;
 * after starting subagents the agent does the part that is still its own,
   then ends its turn — it does not wait for them, re-read them or poll a
-  task list. ``FLOWLY_EVAL_ONLY=a,b`` runs only the named scenarios.
+  task list;
+* asked to give the subagent that already reported another task ("ask the
+  same agent to also check X"), it gives that subagent the task
+  (``agent_followup``) instead of starting a new one. ``FLOWLY_EVAL_ONLY=a,b``
+  runs only the named scenarios.
 
 Subagents are recorded, not run, so a scenario costs one conversation turn.
 Each run writes ``agent-behavior-report.json`` (path in ``FLOWLY_EVAL_OUT``,
@@ -49,6 +53,8 @@ class Scenario:
     name: str
     message: str
     check: Callable[["Observed"], str | None]  # returns a failure reason or None
+    # Earlier conversation rows (oldest first) the turn continues.
+    history: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -56,6 +62,7 @@ class Observed:
     final: str = ""
     tools: list[str] = field(default_factory=list)
     spawn_results: list[dict[str, Any]] = field(default_factory=list)
+    followups: list[dict[str, Any]] = field(default_factory=list)
     model_calls: int = 0
     seconds: float = 0.0
 
@@ -125,6 +132,39 @@ def _self_or_ends_turn(o: Observed) -> str | None:
     return _answered(o) if not o.spawn_started else _ends_turn_after_starting(o)
 
 
+# A subagent that already reported in this conversation (the follow-up scenario).
+_EARLIER_AGENT = "5d0c6b1e-2f4a-4c3b-9a7e-1b2c3d4e5f60"
+_EARLIER_HISTORY = [
+    {"role": "user", "content": "Anthropic'in kuruluş yılını bir agent'la araştır."},
+    {"role": "assistant", "content": "Bir alt ajan başlattım; sonucu gelince söyleyeceğim."},
+    {"role": "user", "_display_hidden": True, "content": (
+        "[System: subagent] [Subagent 'Anthropic kuruluş yılı' completed successfully "
+        f"(runtime: 14s)] run_id={_EARLIER_AGENT} agent_id={_EARLIER_AGENT}\n"
+        "Tools used (2 calls): web_search, web_fetch\n\n"
+        "Brief: Find the year Anthropic was founded, with a source.\n\n"
+        "Result:\nAnthropic was founded in 2021 (source: https://www.anthropic.com/company).\n\n"
+        "This is the subagent's own report: check what matters before relying on it, and don't "
+        "redo its work. Tell the owner what it means for their request in your own words; don't "
+        "show run ids or agent ids. The subagent keeps its conversation: agent_followup gives it "
+        "another task, agent_close ends it."
+    )},
+    {"role": "assistant", "content": "Anthropic 2021'de kuruldu (kaynak: anthropic.com)."},
+]
+
+
+def _followed_up_the_same_agent(o: Observed) -> str | None:
+    if o.spawn_started:
+        return f"started {o.spawn_started} new subagent(s) instead of asking the same one"
+    if len(o.followups) != 1:
+        return f"expected one follow-up to the same subagent, got {len(o.followups)}"
+    if not str(o.followups[0].get("to") or "").startswith(_EARLIER_AGENT[:8]):
+        return f"gave the task to {o.followups[0].get('to')!r}, not the subagent that reported"
+    waited = [t for t in o.tools if t in _WAITING_TOOLS]
+    if waited:
+        return f"waited on the subagent instead of ending the turn: {waited}"
+    return _answered(o)
+
+
 SCENARIOS = [
     Scenario("explain-screenshot", "Screenshot nedir? Kısaca açıkla.", _explanation),
     Scenario("explain-send", "What does 'send' mean in an email client? One sentence.", _explanation),
@@ -146,6 +186,9 @@ SCENARIOS = [
              "Anthropic, Mistral AI ve Cohere'in kuruluş yıllarını birer agent'la araştır; "
              "OpenAI'ın kuruluş yılını da sen kendin araştır.",
              _three_and_its_own_part),
+    Scenario("followup-same-agent",
+             "Aynı agent'a Mistral AI'ın kuruluş yılını da araştırt.",
+             _followed_up_the_same_agent, history=_EARLIER_HISTORY),
 ]
 
 
@@ -194,6 +237,21 @@ async def _observe(config, provider, scenario: Scenario, home: Path) -> Observed
                            "title": kwargs.get("display_name") or ""})
 
     loop.subagents.spawn = recorded_spawn  # type: ignore[method-assign]
+
+    async def recorded_followup(target: str, task: str, **kwargs: Any) -> dict[str, Any]:
+        observed.followups.append({"to": target, "task": task})
+        return {"status": "started", "run_id": f"eval-followup-{len(observed.followups)}",
+                "agent_id": target, "turn": 2, "title": "Anthropic kuruluş yılı",
+                "message": "It is working on this task in the background."}
+
+    loop.subagents.followup = recorded_followup  # type: ignore[method-assign]
+    session_key = f"eval:{scenario.name}"
+    if scenario.history:
+        session = loop.sessions.get_or_create(session_key)
+        for row in scenario.history:
+            session.add_message(row["role"], row["content"],
+                                **{k: v for k, v in row.items() if k not in ("role", "content")})
+        loop.sessions.save(session)
     original_execute = loop.tools.execute
 
     async def recording_execute(name: str, args: dict[str, Any], **kwargs: Any) -> str:
@@ -210,7 +268,7 @@ async def _observe(config, provider, scenario: Scenario, home: Path) -> Observed
     started = time.monotonic()
     try:
         observed.final = await loop.process_direct(
-            scenario.message, session_key=f"eval:{scenario.name}",
+            scenario.message, session_key=session_key,
         ) or ""
     finally:
         observed.seconds = round(time.monotonic() - started, 2)
