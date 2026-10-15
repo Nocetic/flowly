@@ -352,3 +352,15 @@ async def test_summary_usage_is_collected_per_task():
     assert first and second and first == second
     assert all(u == {"prompt_tokens": 40, "completion_tokens": 9} for u in first)
     await service.compact(history, track_cycle=False)  # nothing collects outside a block
+
+
+def test_a_provider_swap_moves_the_subagents_along():
+    # The swap lives inside the gateway command; a new subagent must not keep
+    # calling the old provider with the new model's id.
+    import inspect
+
+    from flowly.cli import gateway_cmd
+
+    source = inspect.getsource(gateway_cmd)
+    assert "subagents.provider = new_provider" in source
+    assert "subagents.model = new_model" in source

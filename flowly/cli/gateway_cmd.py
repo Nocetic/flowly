@@ -1856,6 +1856,14 @@ Respond to the user now:"""
         # the previous model.
         agent.provider = new_provider
         agent.model = new_model
+        # Subagents are started on the agent's provider and model, and their
+        # summaries already go through the compaction service below: a swap
+        # that left the manager behind sent a new subagent's calls to the old
+        # provider with the new model's id.
+        subagents = getattr(agent, "subagents", None)
+        if subagents is not None:
+            subagents.provider = new_provider
+            subagents.model = new_model
         # Keep the compaction service in lockstep: it holds its own
         # provider/model refs (summarization, the flowly-proxy window clamp
         # and the model's real context window all read them) — a hot-swap
