@@ -187,12 +187,13 @@ async def test_a_report_turn_streams_on_the_direct_gateway_like_an_owner_turn(tm
         server.push_session_message.assert_not_called()
 
         # The command record says what ran, and it finished.
-        assert server.chat_commands.lookup(CHAT, run_id)["status"] == "completed"
+        await _until(lambda: server.chat_commands.lookup(CHAT, run_id)["status"] == "completed")
         # In flight, a re-entering client got the run without the notice.
         live = [entry for entry in provider.seen_inflight if entry]
         assert live and all(e["runId"] == run_id and e["user"] == "" for e in live)
         assert all(e["turnOrigin"] == REPORT_TURN_ORIGIN for e in live)
-        assert inflight.get(CHAT) is None
+        # Retired just after the final goes out, as for an owner's turn.
+        await _until(lambda: inflight.get(CHAT) is None)
 
         # Delivered once, in the same save as the turn; the notice is hidden.
         assert agent.subagents.registry.get(child).delivery_state == "delivered"
@@ -422,10 +423,10 @@ async def test_a_report_turn_streams_on_the_relay_and_closes_by_its_stream_run(t
         assert final["message"]["content"][0]["text"] == "It was 2021."
         assert final.get("toolMessages")  # the relay persists the tool steps
         assert not any(e["state"] == "user" for e in events)
-        assert server.chat_commands.lookup("web:chat", run_id)["status"] == "completed"
+        await _until(lambda: server.chat_commands.lookup("web:chat", run_id)["status"] == "completed")
         live = [entry for entry in provider.seen_inflight if entry]
         assert live and all(e["user"] == "" and e["turnOrigin"] == REPORT_TURN_ORIGIN for e in live)
-        assert inflight.get("web:chat") is None
+        await _until(lambda: inflight.get("web:chat") is None)
     finally:
         agent.stop()
 
@@ -450,7 +451,7 @@ async def test_a_failed_report_turn_still_ends_its_relay_run(tmp_path):
         assert final["state"] == "final" and final["failed"] is True
         assert final["streamRunId"] == msg.metadata["run_id"]
         assert server.chat_commands.lookup("web:chat", msg.metadata["run_id"])["status"] == "error"
-        assert inflight.get("web:chat") is None
+        await _until(lambda: inflight.get("web:chat") is None)
     finally:
         agent.stop()
 
