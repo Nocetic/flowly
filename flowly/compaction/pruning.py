@@ -318,3 +318,131 @@ def prune_history_for_context_share(
         "kept_tokens": estimate_messages_tokens(kept_messages),
         "budget_tokens": budget_tokens,
     }
+
+# ---------------------------------------------------------------------------
+# Tool-result truncation shared by the main loop, the subagent loop and the
+# subagent checkpoint replay. Pure functions of their arguments: a replay
+# that calls them with the recorded parameters rebuilds the same list.
+# ---------------------------------------------------------------------------
+
+# (after iteration, keep_last, max_old_chars): from iteration 6 the old tool
+# results of a long tool loop are cut to 300 chars keeping the last 3 whole,
+# from iteration 9 to 150 keeping 2. Late enough to keep a multi-step browser
+# flow's context.
+ITERATION_STRIP_SCHEDULE: tuple[tuple[int, int, int], ...] = ((5, 3, 300), (8, 2, 150))
+
+
+def iteration_strip_passes(iteration: int) -> list[tuple[int, int]]:
+    """The ``(keep_last, max_old_chars)`` passes a tool loop applies at ``iteration``."""
+    return [(keep, chars) for after, keep, chars in ITERATION_STRIP_SCHEDULE if iteration > after]
+
+
+def microcompact_tool_results(
+    messages: list[dict[str, Any]],
+    *,
+    keep_recent_full: int,
+    truncate_chars: int,
+) -> list[dict[str, Any]]:
+    """Cut every tool result but the newest ``keep_recent_full`` to ``truncate_chars``.
+
+    A spilled tool result carries a file pointer at the END of its text —
+    exactly where truncation cuts — so it is re-appended and the full output
+    stays reachable via read_file. Returns ``messages`` itself when nothing
+    changes, a new list otherwise. Idempotent for the same parameters.
+    """
+    # Lazy import — flowly.agent imports this package at module load.
+    from flowly.agent.tool_result_spill import extract_spill_pointer
+
+    tool_indices = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+    if len(tool_indices) <= keep_recent_full:
+        return messages
+    truncate = set(tool_indices[:-keep_recent_full])
+    result: list[dict[str, Any]] = []
+    changed = False
+    for i, msg in enumerate(messages):
+        content = msg.get("content", "")
+        if i in truncate and isinstance(content, str) and len(content) > truncate_chars:
+            truncated = content[:truncate_chars] + "\n[old tool output truncated]"
+            pointer = extract_spill_pointer(content)
+            if pointer and pointer not in truncated:
+                truncated += pointer
+            if truncated != content:
+                result.append({**msg, "content": truncated})
+                changed = True
+                continue
+        result.append(msg)
+    return result if changed else messages
+
+
+def strip_old_tool_results(
+    messages: list[dict[str, Any]],
+    keep_last: int = 3,
+    max_old_chars: int = 200,
+    keep_last_images: int = 1,
+) -> list[dict[str, Any]]:
+    """Truncate old tool results, keeping only the last N in full.
+
+    Two separate retention windows:
+      - keep_last: how many recent text-only tool results to keep in
+        full. Older ones get truncated to max_old_chars.
+      - keep_last_images: how many recent image-bearing tool results
+        (browser_tab screenshots) to keep visually. Older ones drop
+        the image content block entirely; the text part stays. One
+        screenshot is ~10-15K tokens, so keeping more than 1-2 in
+        context blows past the model's window in a few turns.
+
+    Returns a NEW list to avoid mutating session-shared message dicts (Fix #11).
+    The main loop and the subagent loop both call it (``iteration_strip_passes``),
+    and a subagent checkpoint replays it, so it must stay a pure function.
+    """
+    tool_indices = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+    if not tool_indices:
+        return messages
+
+    # Identify which tool messages carry an image block. For these we
+    # keep only the most recent N visually; older ones lose the image.
+    image_indices = [
+        i for i in tool_indices
+        if isinstance(messages[i].get("content"), list)
+        and any(
+            isinstance(p, dict) and p.get("type") == "image_url"
+            for p in messages[i].get("content", [])
+        )
+    ]
+    image_to_strip = set(image_indices[:-keep_last_images]) if len(image_indices) > keep_last_images else set()
+
+    # Text-truncate window (existing behavior).
+    to_truncate = set(tool_indices[:-keep_last]) if len(tool_indices) > keep_last else set()
+
+    if not to_truncate and not image_to_strip:
+        return messages
+
+    result = list(messages)
+    for i in to_truncate | image_to_strip:
+        msg = result[i]
+        content = msg.get("content", "")
+
+        if i in image_to_strip and isinstance(content, list):
+            # Drop image blocks; keep text. If a text block is also old
+            # enough to truncate, do that to its text in the same pass.
+            new_content_parts: list[dict[str, Any]] = []
+            for p in content:
+                if isinstance(p, dict) and p.get("type") == "image_url":
+                    continue  # drop the image
+                if isinstance(p, dict) and p.get("type") == "text":
+                    txt = p.get("text", "")
+                    if i in to_truncate and len(txt) > max_old_chars:
+                        txt = txt[:max_old_chars] + "\n[earlier result truncated, image dropped]"
+                    new_content_parts.append({"type": "text", "text": txt})
+                else:
+                    new_content_parts.append(p)
+            # If only one text block left, collapse to plain string for
+            # providers that prefer string content on tool messages.
+            if len(new_content_parts) == 1 and new_content_parts[0].get("type") == "text":
+                result[i] = {**msg, "content": new_content_parts[0]["text"]}
+            else:
+                result[i] = {**msg, "content": new_content_parts}
+        elif i in to_truncate and isinstance(content, str) and len(content) > max_old_chars:
+            result[i] = {**msg, "content": content[:max_old_chars] + "\n[earlier result truncated]"}
+
+    return result

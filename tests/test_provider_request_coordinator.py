@@ -443,3 +443,91 @@ async def test_unparseable_413_still_learns_a_conservative_ceiling():
     assert learned is not None
     assert learned >= 4_096
     assert learned < 128_000
+
+
+# ── Options a subagent uses (the main agent passes none) ─────────────────────
+
+def _tool_loop(steps: int = 14, chars: int = 1_400, words: int = 200):
+    """A subagent's history: its brief, then a tool loop whose assistant
+    text (which no cut shortens) outgrows a 4K window on its own."""
+    messages = [{"role": "system", "content": "AUTHORITATIVE SYSTEM POLICY"},
+                {"role": "user", "content": "BRIEF: inspect every shard and report"}]
+    for index in range(steps):
+        messages.append({"role": "assistant", "content": f"step {index} " + "analysis " * words,
+                         "tool_calls": [
+            {"id": f"c{index}", "type": "function",
+             "function": {"name": "read_file", "arguments": "{}"}}]})
+        messages.append({"role": "tool", "tool_call_id": f"c{index}", "name": "read_file",
+                         "content": f"shard {index} " + "evidence " * (chars // 9)})
+    return messages
+
+
+async def test_pinned_messages_are_kept_verbatim_after_the_summary_and_never_summarized():
+    provider = _SummaryProvider()
+    coordinator = ProviderRequestCoordinator(_service(provider))
+    messages = _tool_loop()
+
+    fit = await coordinator.fit(messages, None, "test/model", pinned=1,
+                                custom_instructions="RECORD THE WORK")
+
+    assert fit.fits and fit.compaction is not None
+    assert fit.messages[0] == messages[0] and is_summary_message(fit.messages[1])
+    assert fit.messages[2] == messages[1]
+    prompts = " ".join(str(call["messages"]) for call in provider.calls)
+    assert "BRIEF:" not in prompts and "RECORD THE WORK" in prompts
+    # A second fit keeps one summary: the earlier one is folded in, the pin stays.
+    grown = fit.messages + _tool_loop()[2:]
+    again = await coordinator.fit(grown, None, "test/model", pinned=1)
+    assert again.fits and sum(is_summary_message(m) for m in again.messages) == 1
+    assert again.messages[2] == messages[1]
+
+
+async def test_without_pins_the_budget_and_the_cut_are_unchanged():
+    coordinator = ProviderRequestCoordinator(_service(_SummaryProvider(), window=40_000))
+    messages = _tool_loop(steps=8)
+    plain = coordinator.budget(messages, None, "test/model")
+    pinned = coordinator.budget(messages, None, "test/model", pinned=1)
+    assert plain.messages_tokens == pinned.messages_tokens
+    assert pinned.fixed_prefix_tokens > plain.fixed_prefix_tokens
+    assert pinned.compactable_tokens < plain.compactable_tokens
+
+
+async def test_a_summary_that_fails_is_marked_retryable_and_a_structural_failure_is_not():
+    class _Failing(_SummaryProvider):
+        async def chat(self, **kwargs):
+            self.calls.append(kwargs)
+            return LLMResponse(content="Error calling LLM: upstream 502", finish_reason="error")
+
+    coordinator = ProviderRequestCoordinator(_service(_Failing()))
+    failed = await coordinator.fit(_tool_loop(), None, "test/model", pinned=1)
+    assert not failed.fits and failed.retryable
+    huge_tools = [{"type": "function", "function": {"name": "t", "description": "x " * 8_000}}]
+    structural = await coordinator.fit(_tool_loop(), huge_tools, "test/model", pinned=1)
+    assert not structural.fits and not structural.retryable
+
+
+def test_request_too_large_response_is_classified_input_too_large():
+    from flowly.agent.error_classifier import ErrorCategory, classify_response
+    from flowly.compaction.request_guard import request_too_large_response
+
+    response = request_too_large_response("no room")
+    assert response.finish_reason == "error"
+    assert classify_response(response) is ErrorCategory.INPUT_TOO_LARGE
+    assert AgentLoop._request_too_large_response("no room").error_info == response.error_info
+
+
+def test_microcompact_and_strip_are_pure_and_idempotent():
+    from flowly.compaction.pruning import microcompact_tool_results, strip_old_tool_results
+
+    messages = _tool_loop(steps=8)
+    snapshot = [dict(m) for m in messages]
+    once = microcompact_tool_results(messages, keep_recent_full=5, truncate_chars=200)
+    assert messages == snapshot, "never mutated"
+    assert microcompact_tool_results(once, keep_recent_full=5, truncate_chars=200) is once
+    service = _service(_SummaryProvider())
+    service.config.microcompact.keep_recent_full = 5
+    service.config.microcompact.truncate_chars = 200
+    assert service.microcompact(messages) == once
+    stripped = strip_old_tool_results(messages, keep_last=3, max_old_chars=300)
+    assert strip_old_tool_results(stripped, keep_last=3, max_old_chars=300) == stripped
+    assert sum(m["role"] == "tool" and len(m["content"]) > 400 for m in stripped) == 3

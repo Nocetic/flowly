@@ -17,6 +17,7 @@ from flowly.compaction.coordination import (
 from flowly.compaction.estimator import estimate_messages_tokens
 from flowly.compaction.pruning import (
     compute_adaptive_chunk_ratio,
+    microcompact_tool_results,
     prune_history_for_context_share,
     split_into_turn_blocks,
 )
@@ -769,58 +770,26 @@ class CompactionService:
         """
         Proactively truncate old tool results to delay compaction.
 
-        Keeps the most recent N tool results at full length,
-        truncates older ones to save tokens.
+        Keeps the most recent ``keep_recent_full`` tool results at full
+        length and cuts older ones to ``truncate_chars`` (configured under
+        ``microcompact``), keeping a spilled result's file pointer.
 
         Args:
             messages: Current message history.
 
         Returns:
-            Messages with old tool results truncated (in-place safe, returns new list).
+            Messages with old tool results truncated (never mutated in place).
         """
         cfg = self.config.microcompact
         if not cfg.enabled:
             return messages
-
-        # Lazy import — flowly.agent.loop imports this module at top level,
-        # so importing flowly.agent.* here would create an import cycle.
-        from flowly.agent.tool_result_spill import extract_spill_pointer
-
-        # Find indices of all tool-role messages
-        tool_indices = [
-            i for i, m in enumerate(messages)
-            if m.get("role") == "tool"
-        ]
-
-        if len(tool_indices) <= cfg.keep_recent_full:
-            return messages  # Nothing to truncate
-
-        # Indices to truncate (all except the most recent N)
-        truncate_indices = set(tool_indices[:-cfg.keep_recent_full])
-
-        result = []
-        changed = 0
-        for i, msg in enumerate(messages):
-            if i in truncate_indices:
-                content = msg.get("content", "")
-                if len(content) > cfg.truncate_chars:
-                    truncated = content[:cfg.truncate_chars] + "\n[old tool output truncated]"
-                    # A spilled tool result carries a file pointer at the END
-                    # of its text — exactly where truncation cuts. Re-append
-                    # it so the full output stays reachable via read_file.
-                    pointer = extract_spill_pointer(content)
-                    if pointer and pointer not in truncated:
-                        truncated += pointer
-                    result.append({**msg, "content": truncated})
-                    changed += 1
-                else:
-                    result.append(msg)
-            else:
-                result.append(msg)
-
-        if changed > 0:
-            logger.debug(f"Microcompact: truncated {changed} old tool results")
-
+        result = microcompact_tool_results(
+            messages,
+            keep_recent_full=cfg.keep_recent_full,
+            truncate_chars=cfg.truncate_chars,
+        )
+        if result is not messages:
+            logger.debug("Microcompact: truncated old tool results")
         return result
 
     def _keep_recent_cap(self, history_budget: int) -> int:

@@ -22,7 +22,6 @@ from flowly.bus.events import ConversationInboundMessage, InboundMessage, Outbou
 from flowly.bus.queue import MessageBus
 from flowly.providers.base import (
     PROVIDER_REPLAY_KEY,
-    LLMErrorInfo,
     LLMProvider,
     LLMResponse,
 )
@@ -66,9 +65,14 @@ from flowly.session.archive import (
 )
 from flowly.cron.service import CronService
 from flowly.compaction.service import CompactionService
+from flowly.compaction.pruning import (
+    iteration_strip_passes,
+    strip_old_tool_results as _strip_old_tool_results,
+)
 from flowly.compaction.request_guard import (
     ProviderRequestCoordinator,
     request_fingerprint,
+    request_too_large_response,
 )
 from flowly.compaction.types import (
     CompactionConfig,
@@ -793,78 +797,6 @@ def _drop_ephemeral_nudges(messages: list[dict[str, Any]]) -> list[dict[str, Any
     if not any(m.get(_EPHEMERAL_NUDGE) for m in messages):
         return messages
     return [m for m in messages if not m.get(_EPHEMERAL_NUDGE)]
-
-
-def _strip_old_tool_results(
-    messages: list[dict[str, Any]],
-    keep_last: int = 3,
-    max_old_chars: int = 200,
-    keep_last_images: int = 1,
-) -> list[dict[str, Any]]:
-    """Truncate old tool results, keeping only the last N in full.
-
-    Two separate retention windows:
-      - keep_last: how many recent text-only tool results to keep in
-        full. Older ones get truncated to max_old_chars.
-      - keep_last_images: how many recent image-bearing tool results
-        (browser_tab screenshots) to keep visually. Older ones drop
-        the image content block entirely; the text part stays. One
-        screenshot is ~10-15K tokens, so keeping more than 1-2 in
-        context blows past the model's window in a few turns.
-
-    Returns a NEW list to avoid mutating session-shared message dicts (Fix #11).
-    """
-    tool_indices = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
-    if not tool_indices:
-        return messages
-
-    # Identify which tool messages carry an image block. For these we
-    # keep only the most recent N visually; older ones lose the image.
-    image_indices = [
-        i for i in tool_indices
-        if isinstance(messages[i].get("content"), list)
-        and any(
-            isinstance(p, dict) and p.get("type") == "image_url"
-            for p in messages[i].get("content", [])
-        )
-    ]
-    image_to_strip = set(image_indices[:-keep_last_images]) if len(image_indices) > keep_last_images else set()
-
-    # Text-truncate window (existing behavior).
-    to_truncate = set(tool_indices[:-keep_last]) if len(tool_indices) > keep_last else set()
-
-    if not to_truncate and not image_to_strip:
-        return messages
-
-    result = list(messages)
-    for i in to_truncate | image_to_strip:
-        msg = result[i]
-        content = msg.get("content", "")
-
-        if i in image_to_strip and isinstance(content, list):
-            # Drop image blocks; keep text. If a text block is also old
-            # enough to truncate, do that to its text in the same pass.
-            new_content_parts: list[dict[str, Any]] = []
-            for p in content:
-                if isinstance(p, dict) and p.get("type") == "image_url":
-                    continue  # drop the image
-                if isinstance(p, dict) and p.get("type") == "text":
-                    txt = p.get("text", "")
-                    if i in to_truncate and len(txt) > max_old_chars:
-                        txt = txt[:max_old_chars] + "\n[earlier result truncated, image dropped]"
-                    new_content_parts.append({"type": "text", "text": txt})
-                else:
-                    new_content_parts.append(p)
-            # If only one text block left, collapse to plain string for
-            # providers that prefer string content on tool messages.
-            if len(new_content_parts) == 1 and new_content_parts[0].get("type") == "text":
-                result[i] = {**msg, "content": new_content_parts[0]["text"]}
-            else:
-                result[i] = {**msg, "content": new_content_parts}
-        elif i in to_truncate and isinstance(content, str) and len(content) > max_old_chars:
-            result[i] = {**msg, "content": content[:max_old_chars] + "\n[earlier result truncated]"}
-
-    return result
 
 
 # Field names whose values are likely user-private URLs (CDN links to
@@ -5509,16 +5441,7 @@ class AgentLoop:
     @staticmethod
     def _request_too_large_response(reason: str) -> LLMResponse:
         """Fail closed with machine-routable metadata and user-safe prose."""
-        logger.warning("Provider request blocked before dispatch: {}", reason)
-        return LLMResponse(
-            content="Error calling LLM: request input is too large after compaction",
-            finish_reason="error",
-            error_info=LLMErrorInfo(
-                status_code=413,
-                code="input_too_large",
-                type="request_too_large",
-            ),
-        )
+        return request_too_large_response(reason)
 
     async def _call_provider_with_context_recovery(
         self,
@@ -6319,12 +6242,13 @@ class AgentLoop:
                     if (enforce_action_tools and not successful_tools_were_used)
                     else "auto"
                 )
-            # Mid-turn tool result compaction — prevent context bloat
-            # Fix #22: Less aggressive — start at iteration 5 to preserve multi-step browser context
-            if iteration > 5:
-                messages = _strip_old_tool_results(messages, keep_last=3, max_old_chars=300)
-            if iteration > 8:
-                messages = _strip_old_tool_results(messages, keep_last=2, max_old_chars=150)
+            # Mid-turn tool result compaction — prevent context bloat. The
+            # schedule (from iteration 5, harder from 8, to preserve
+            # multi-step browser context) is shared with the subagent loop.
+            for keep_last, max_old_chars in iteration_strip_passes(iteration):
+                messages = _strip_old_tool_results(
+                    messages, keep_last=keep_last, max_old_chars=max_old_chars,
+                )
 
             logger.debug(
                 "LLM request telemetry: "
