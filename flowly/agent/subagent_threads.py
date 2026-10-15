@@ -310,6 +310,29 @@ def thread_history(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return repair_thread_history(projected)
 
 
+def _match_saved_rows(source: list[dict[str, Any]], kept: list[dict[str, Any]]) -> list[int | None]:
+    """The saved row each kept message is (an index into ``source``), or None.
+
+    Kept messages are a subsequence of the saved rows, in order, except
+    those the history projection made up (a call answered by repair, a
+    stopped turn's closing text) or a step cut: matched from the end like the
+    archive's own matching, but a message with no saved row consumes nothing,
+    so the rows before it still match.
+    """
+    from flowly.session.archive import messages_equivalent
+
+    matches: list[int | None] = [None] * len(kept)
+    cursor = len(source) - 1
+    for position in range(len(kept) - 1, -1, -1):
+        index = cursor
+        while index >= 0 and not messages_equivalent(source[index], kept[position]):
+            index -= 1
+        if index >= 0:
+            matches[position] = index
+            cursor = index - 1
+    return matches
+
+
 @dataclass
 class TurnContext:
     """What a thread's next turn starts from."""
@@ -508,9 +531,7 @@ class SubagentThreadStore:
         from flowly.session.archive import (
             ARCHIVE_SUMMARY_KEY,
             ARCHIVE_TRANSACTION_KEY,
-            EVENT_ID_KEY,
             SUMMARY_COVERS_KEY,
-            match_kept_events,
         )
 
         key = thread.child_session_key
@@ -525,22 +546,23 @@ class SubagentThreadStore:
             if meta.get("contextRun") == run_id:
                 return False
             source = list(session.messages)
-            identities, covers, transaction = sessions.prepare_compaction_archive(
-                session, kept, source_message_count=len(source), compaction_id=compaction_id,
+            matches = _match_saved_rows(source, kept)
+            # Only kept messages that are saved rows stay active in the
+            # display log; the archive is told exactly those.
+            saved = [source[index] for index in matches if index is not None]
+            _identities, covers, transaction = sessions.prepare_compaction_archive(
+                session, saved, source_message_count=len(source), compaction_id=compaction_id,
             )
-            by_id = {str(row.get(EVENT_ID_KEY)): row for row in source if row.get(EVENT_ID_KEY)}
             session.clear()
             session.add_message("system", str(summary.get("content") or ""), **{
                 SUMMARY_METADATA_KEY: True, ARCHIVE_SUMMARY_KEY: True, "_display_hidden": True,
                 SUMMARY_COVERS_KEY: covers, ARCHIVE_TRANSACTION_KEY: transaction,
             })
             sessions.append_compaction_summary(session, dict(session.messages[-1]))
-            matches = match_kept_events(source, kept)
-            for message, identity in zip(kept, matches):
-                row = by_id.get(str((identity or {}).get(EVENT_ID_KEY) or ""))
-                if row is not None:
+            for message, index in zip(kept, matches):
+                if index is not None:
                     # The saved row itself: uncut, with what clients read of it.
-                    session.messages.append(dict(row))
+                    session.messages.append(dict(source[index]))
                     continue
                 extras = {k: message[k] for k in ("tool_calls", "tool_call_id", "name") if k in message}
                 session.add_message(message.get("role", "user"), message.get("content", ""),

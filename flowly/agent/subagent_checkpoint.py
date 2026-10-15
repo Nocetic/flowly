@@ -385,12 +385,16 @@ def interrupted_result(call: OpenCall) -> tuple[str, str]:
 
 
 MESSAGE_LABEL = "[Message from the main agent]"
+# A later turn's own task (its first message) …
 TASK_LABEL = "[Task from the main agent]"
+# … and a task given to a turn already running. The labels differ, so the
+# turn's own task is never mistaken for a note repeating its text (task_index).
+ADDED_TASK_LABEL = "[Another task from the main agent]"
 
 
 def main_agent_note(text: str, kind: str = "message") -> dict[str, Any]:
     """What the model gets of a message — or, ``kind == "task"``, a task — from the main agent."""
-    label = TASK_LABEL if kind == "task" else MESSAGE_LABEL
+    label = ADDED_TASK_LABEL if kind == "task" else MESSAGE_LABEL
     return {"role": "user", "content": f"{label}\n{text}"}
 
 
@@ -413,8 +417,9 @@ def task_index(state: "ChildState") -> int | None:
     """Where the turn's first message (its task) stands in the list the model gets.
 
     The latest user message with that content: the turn's own work never
-    repeats it (notes are labeled), an earlier turn's identical task comes
-    before it. None when a recorded list no longer has it.
+    repeats it (a note has its own label, ADDED_TASK_LABEL or MESSAGE_LABEL;
+    the summary request is fixed text), an earlier turn's identical task
+    comes before it. None when a recorded list no longer has it.
     """
     for index in range(len(state.messages) - 1, -1, -1):
         message = state.messages[index]

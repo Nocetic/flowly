@@ -35,6 +35,7 @@ from flowly.agent.subagent_threads import (
 )
 from flowly.agent import subagent_owner
 from flowly.agent.subagent_checkpoint import (
+    ADDED_TASK_LABEL,
     MESSAGE_LABEL,
     NOT_STARTED_CALL_TEXT,
     STOPPED_CALL_TEXT,
@@ -705,6 +706,12 @@ class SubagentManager:
                 self._settle(record, outcome, code, text)
             except Exception:
                 logger.exception(f"[SubagentManager] [{record.run_id[:8]}] could not be settled")
+        if self.resume_enabled:
+            # Tasks kept for idle subagents before the restart start now.
+            try:
+                self._schedule_pending_tasks(None)
+            except RuntimeError:
+                logger.debug("No event loop to start kept subagent tasks")
         for record, state in continued:
             try:
                 self._resume(record, state)
@@ -1103,7 +1110,7 @@ class SubagentManager:
           spawn, together with whatever else this parent turn started
           (``batch_id``), and counts against the same limits.
         * **A task running on it:** the running turn reads this task at its
-          next step, labeled ``[Task from the main agent]``; its report covers
+          next step, labeled ``[Another task from the main agent]``; its report covers
           it. A task that arrives too late to be read starts the next turn
           when that one ends.
         * **Closed:** refused, with the reason (``closed_text``).
@@ -1288,43 +1295,92 @@ class SubagentManager:
             )}
         return {"agent_id": thread.thread_id, "status": "not_found", "error": "Subagent not found."}
 
-    async def _carry_over(self, run_id: str, entries: list[dict[str, Any]]) -> None:
-        """What reached a turn too late to be read goes to the thread's next turn.
+    def _stash_unread(self, run_id: str) -> None:
+        """What reached a turn too late to be read is kept for the thread's next turn — durably.
 
-        Messages are kept for its next task; tasks start it (the first one) or
-        join it — unless the turn was stopped on request: whoever stopped it
-        stopped its work too. Nothing is carried for a closed thread or a run
-        with none.
+        Called once the run's end is recorded and before its checkpoint goes
+        (whose ``mail`` lines were the only durable record of it): messages
+        and tasks the run never read move to the thread's ``pending_mail``.
+        A task is kept only when the turn ended on its own (ok, error,
+        timeout): a turn stopped — on request, by the owner stopping the
+        conversation, by a shutdown that could not keep it — had its work
+        stopped too. Nothing is kept for a closed thread or a run with none.
+        Entries that cannot be kept yet (the run's end is not recorded) stay
+        in the inbox for the run's cleanup to try again.
         """
+        entries = self._inboxes.pop(run_id, None) or []
+        event = self._inbox_events.get(run_id)
+        if event is not None:
+            event.clear()
+        if not entries:
+            return
         record = self._registry.get(run_id)
         thread = self._registry.get_thread(record.thread_id) if record is not None and record.thread_id else None
         if record is None or thread is None or thread.status != "open":
-            if entries:
-                logger.info(f"[SubagentManager] [{run_id[:8]}] {len(entries)} unread message(s) dropped: "
-                            "the subagent has no open thread")
+            logger.info(f"[SubagentManager] [{run_id[:8]}] {len(entries)} unread message(s) dropped: "
+                        "the subagent has no open thread")
             return
+        keep_tasks = record.ended_at is not None and record.outcome in ("ok", "error", "timeout")
+        left: list[dict[str, Any]] = []
         for entry in entries:
-            if entry.get("kind") != "task":
-                kept, why = self._registry.queue_mail(thread.thread_id, str(entry.get("text") or ""))
-                if kept is None:
-                    logger.warning(f"[SubagentManager] [{run_id[:8]}] an unread message could not be kept ({why})")
-        tasks = [e for e in entries if e.get("kind") == "task"]
-        if tasks and record.outcome == "cancelled":
-            logger.info(f"[SubagentManager] [{run_id[:8]}] {len(tasks)} unread task(s) dropped: "
-                        "the task was stopped on request")
-            tasks = []
-        for entry in tasks:
-            if entry.get("kind") == "task":
-                outcome = await self.followup(
-                    thread.thread_id, str(entry.get("text") or ""),
-                    parent_session_key=record.parent_session_key,
-                    origin=str(entry.get("origin") or "agent"), batch_id=str(entry.get("batch") or ""),
-                    model=record.model, origin_channel=record.parent_channel,
-                    origin_chat_id=record.parent_chat_id,
-                )
-                if outcome.get("status") not in ("started", "added_to_running_task"):
-                    logger.warning(f"[SubagentManager] [{run_id[:8]}] a task that arrived as the run "
-                                   f"ended could not start: {outcome.get('error')}")
+            task = entry.get("kind") == "task"
+            if task and record.ended_at is not None and not keep_tasks:
+                logger.info(f"[SubagentManager] [{run_id[:8]}] an unread task dropped: the task was stopped")
+                continue
+            kept, why = self._registry.queue_mail(
+                thread.thread_id, str(entry.get("text") or ""),
+                kind="task" if task else "message", batch=str(entry.get("batch") or ""),
+                origin=str(entry.get("origin") or "agent"),
+            )
+            if kept is None and why == "running":
+                left.append(entry)
+            elif kept is None:
+                logger.warning(f"[SubagentManager] [{run_id[:8]}] an unread message could not be kept ({why})")
+        if left:
+            self._inboxes[run_id] = left
+
+    def _schedule_pending_tasks(self, parent_session_key: str) -> None:
+        task = asyncio.ensure_future(self._start_pending_tasks(parent_session_key))
+        task.add_done_callback(lambda t: t.exception() if not t.cancelled() and t.exception() else None)
+
+    async def _start_pending_tasks(self, parent_session_key: str | None = None) -> None:
+        """Start the tasks kept for idle subagents (``_stash_unread``) as their next turns.
+
+        The first kept task of a thread starts its turn (a follow-up with the
+        batch and origin it was given under); the rest join it. A task that
+        cannot start now (the limits, a shutdown) is kept again and tried when
+        a task of the conversation ends, or at the next start.
+        """
+        if self._shutting_down:
+            return
+        for thread in self._registry.threads():
+            if parent_session_key is not None and thread.parent_session_key != parent_session_key:
+                continue
+            if thread.status != "open" or thread.active_run_id or not any(
+                m.get("kind") == "task" for m in thread.pending_mail
+            ):
+                continue
+            tasks = self._registry.take_pending_tasks(thread.thread_id)
+            if not tasks:
+                continue
+            last = self._thread_runs(thread)[-1:] or [None]
+            first = tasks[0]
+            outcome = await self.followup(
+                thread.thread_id, str(first.get("text") or ""),
+                parent_session_key=thread.parent_session_key,
+                origin=str(first.get("origin") or "agent"), batch_id=str(first.get("batch") or ""),
+                origin_channel=last[0].parent_channel if last[0] else "",
+                origin_chat_id=last[0].parent_chat_id if last[0] else "",
+            )
+            if outcome.get("status") != "started":
+                self._registry.requeue_tasks(thread.thread_id, tasks)
+                logger.info(f"[SubagentManager] [{thread.thread_id[:8]}] kept task(s) wait: "
+                            f"{outcome.get('error') or outcome.get('status')}")
+                continue
+            for entry in tasks[1:]:
+                await self.send_to_child(outcome["run_id"], str(entry.get("text") or ""), kind="task",
+                                         batch_id=str(entry.get("batch") or ""),
+                                         origin=str(entry.get("origin") or "agent"))
 
     # ------------------------------------------------------------------
     # Internal execution (core loop preserved from original)
@@ -1390,14 +1446,18 @@ class SubagentManager:
                 self._settle_stream(_rid, suspended=suspended)
                 self._cancel_outcomes.pop(_rid, None)
                 self._running_tasks.pop(_rid, None)
-                unread = self._inboxes.pop(_rid, None)
-                if unread and not suspended:
-                    # Arrived too late to be read; a suspended run keeps its
-                    # unread mail in its checkpoint instead.
-                    carried = asyncio.ensure_future(self._carry_over(_rid, list(unread)))
-                    carried.add_done_callback(
-                        lambda t: t.exception() if not t.cancelled() and t.exception() else None
-                    )
+                if suspended:
+                    # Its unread mail is in its checkpoint; the restart reads it.
+                    self._inboxes.pop(_rid, None)
+                else:
+                    # Anything still unread (a run that ended before its
+                    # handler could keep it) is kept now; kept tasks start.
+                    try:
+                        self._stash_unread(_rid)
+                    except Exception:
+                        logger.exception("Could not keep a subagent's unread messages")
+                    self._inboxes.pop(_rid, None)
+                    self._schedule_pending_tasks(_pk)
                 self._inbox_events.pop(_rid, None)
                 self._checkpoints.pop(_rid, None)
                 self._wake(_pk)
@@ -1581,6 +1641,12 @@ class SubagentManager:
 
         finally:
             if not suspended:
+                # What it never read is kept for the thread's next turn before
+                # the checkpoint (its only durable record) goes.
+                try:
+                    self._stash_unread(run_id)
+                except Exception:
+                    logger.exception(f"[SubagentManager] [{run_id[:8]}] could not keep its unread messages")
                 # The result (or the end) is durable in the registry now.
                 self._drop_checkpoint(run_id)
 
@@ -2740,7 +2806,7 @@ class SubagentManager:
             # before then gives them to the child again.
             self._log(run_id, "inbox", callId=call_id, ids=[e["id"] for e in entries])
         # A task that arrives as the reply is still a task.
-        return [f"{TASK_LABEL}\n{e['text']}" if e.get("kind") == "task" else e["text"] for e in entries]
+        return [f"{ADDED_TASK_LABEL}\n{e['text']}" if e.get("kind") == "task" else e["text"] for e in entries]
 
     async def _wait_for_inbox(self, run_id: str, timeout: float) -> list[str]:
         if self._inboxes.get(run_id):

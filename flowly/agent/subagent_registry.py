@@ -607,9 +607,15 @@ class SubagentRegistry:
                     raise ValueError("This subagent's thread cannot take a new run")
                 existing.runs.append(record.run_id)
                 existing.active_run_id = record.run_id
+                # Its number is decided here, under the lock: two processes
+                # sharing a home never give one thread the same turn twice.
+                record.turn = len(existing.runs)
                 existing.model = record.model or existing.model
-                record.notes = [*record.notes, *(str(m["text"]) for m in existing.pending_mail)]
-                existing.pending_mail = []
+                # Messages that waited become its notes; kept tasks wait for
+                # their own turn (SubagentManager._start_pending_tasks).
+                record.notes = [*record.notes, *(str(m["text"]) for m in existing.pending_mail
+                                                 if m.get("kind") != "task")]
+                existing.pending_mail = [m for m in existing.pending_mail if m.get("kind") == "task"]
                 existing.revision += 1
                 existing.updated_at = record.created_at
             record.updated_at = record.created_at
@@ -635,6 +641,42 @@ class SubagentRegistry:
         for thread in evicted:
             self._close_locked(thread, "cap", now)
         return evicted
+
+    def take_pending_tasks(self, thread_id: str) -> list[dict[str, Any]]:
+        """Take the tasks kept for an open, idle thread (oldest first); [] when none or not idle."""
+        with self._lock:
+            self._read_locked()
+            thread = self._threads.get(thread_id)
+            if self._threads_unavailable or thread is None or thread.status != "open" or thread.active_run_id:
+                return []
+            tasks = [m for m in thread.pending_mail if m.get("kind") == "task"]
+            if not tasks:
+                return []
+            thread.pending_mail = [m for m in thread.pending_mail if m.get("kind") != "task"]
+            thread.revision += 1
+            thread.updated_at = time.time()
+            try:
+                self._write_locked()
+            except Exception:
+                self._read_locked()
+                raise
+            return tasks
+
+    def requeue_tasks(self, thread_id: str, tasks: list[dict[str, Any]]) -> None:
+        """Keep again tasks that could not start (ahead of anything kept since); dropped if it closed."""
+        with self._lock:
+            self._read_locked()
+            thread = self._threads.get(thread_id)
+            if self._threads_unavailable or thread is None or thread.status != "open" or not tasks:
+                return
+            thread.pending_mail = [*tasks, *thread.pending_mail][-MAX_PENDING_MAIL:]
+            thread.revision += 1
+            thread.updated_at = time.time()
+            try:
+                self._write_locked()
+            except Exception:
+                self._read_locked()
+                raise
 
     def _close_locked(self, thread: SubagentThreadRecord, reason: str, now: float) -> None:
         """Close ``thread``; its runs' views change (``threadStatus``), so their revisions move."""
@@ -667,8 +709,9 @@ class SubagentRegistry:
                 raise
             return thread
 
-    def queue_mail(self, thread_id: str, text: str) -> tuple[SubagentThreadRecord | None, str]:
-        """Keep a message from the main agent for an open thread's next task.
+    def queue_mail(self, thread_id: str, text: str, *, kind: str = "message", batch: str = "",
+                   origin: str = "agent") -> tuple[SubagentThreadRecord | None, str]:
+        """Keep a message (or, ``kind="task"``, a task) from the main agent for an open thread's next turn.
 
         ``(thread, "")`` when kept; ``(None, why)`` otherwise: ``closed``,
         ``running`` (a task runs: its inbox takes it), ``full``, ``unknown``.
@@ -685,7 +728,10 @@ class SubagentRegistry:
             if len(thread.pending_mail) >= MAX_PENDING_MAIL:
                 return None, "full"
             now = time.time()
-            thread.pending_mail.append({"id": secrets.token_hex(8), "text": text, "at": now})
+            entry: dict[str, Any] = {"id": secrets.token_hex(8), "text": text, "at": now}
+            if kind == "task":
+                entry.update(kind="task", batch=batch, origin=origin)
+            thread.pending_mail.append(entry)
             thread.revision += 1
             thread.updated_at = now
             try:

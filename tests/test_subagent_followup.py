@@ -46,6 +46,7 @@ from flowly.agent import inflight
 from flowly.agent.delegation import DelegationTurn, delegation_turn_scope
 from flowly.agent.subagent import SubagentManager
 from flowly.agent.subagent_checkpoint import (
+    ADDED_TASK_LABEL,
     CHECKPOINT_VERSION,
     NOT_RUN_TEXT,
     TASK_LABEL,
@@ -397,7 +398,7 @@ async def test_a_followup_while_it_works_enters_the_running_turn(tmp_path, home,
     # kept, and it goes on.
     assert len(provider.sent) == 3
     assert provider.sent[-1][-2:] == [{"role": "assistant", "content": "A checked."},
-                                      {"role": "user", "content": f"{TASK_LABEL}\nAlso check B."}]
+                                      {"role": "user", "content": f"{ADDED_TASK_LABEL}\nAlso check B."}]
     rows = _history_rows(manager, first)
     notes = [r for r in rows if r.get("kind") == "agent_note"]
     assert [(n["noteKind"], n["author"]) for n in notes] == [("task", "main_agent")]
@@ -437,6 +438,81 @@ async def test_a_task_that_arrives_as_the_turn_ends_starts_the_next_turn(tmp_pat
     assert provider.sent[-1][-1] == {"role": "user", "content": f"{TASK_LABEL}\nThen do the second part."}
     notices = await _notices(bus)
     assert len(notices) == 2 and "First done." in notices[0] and "Second done." in notices[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["owner_stop", "cancel"])
+async def test_a_stopped_turn_starts_no_task_it_did_not_read_but_keeps_its_messages(tmp_path, home, how):
+    provider = _Scripted([LLMResponse(content="never used")])
+    gate = provider.gate(1)
+    manager = _manager(home, tmp_path, provider)
+    first = await _spawn(manager)
+    await provider.waiting[1].wait()
+    assert (await _follow(manager, first, "Then the second part."))["status"] == "added_to_running_task"
+    with tool_execution_scope(CHAT):
+        await AgentMessageTool(manager).execute(to=first, message="Use 2025 prices.")
+    if how == "owner_stop":
+        manager.cancel_children(CHAT)  # the owner stopped the conversation's turn
+    else:
+        await manager.cancel(first)
+    gate.set()
+    record = await _settle(manager, first)
+    await asyncio.sleep(0.05)
+    assert record.outcome == ("interrupted" if how == "owner_stop" else "cancelled")
+    assert len(manager.registry.all()) == 1 and not manager._running_tasks  # no new turn
+    thread = manager.registry.get_thread(first)
+    assert [(m["text"], m.get("kind")) for m in thread.pending_mail] == [("Use 2025 prices.", None)]
+
+
+@pytest.mark.asyncio
+async def test_a_kept_task_survives_a_restart_and_starts_then(tmp_path, home):
+    provider = _Scripted([LLMResponse(content="First done.")])
+    gate = provider.gate(1)
+    manager = _manager(home, tmp_path, provider, max_iterations=1)
+    first = await _spawn(manager)
+    await provider.waiting[1].wait()
+    assert (await _follow(manager, first, "Then the second part."))["status"] == "added_to_running_task"
+    manager._shutting_down = True  # the kept task cannot start in this process any more
+    gate.set()
+    await _settle(manager, first)
+    await asyncio.sleep(0.05)
+    kept = manager.registry.get_thread(first).pending_mail
+    assert [(m["text"], m["kind"], m["batch"]) for m in kept] == [("Then the second part.", "task", "t2")]
+    from flowly.agent import subagent_owner
+    subagent_owner.forget_instance(manager._instance)
+
+    later = _Scripted([LLMResponse(content="Second done.")])
+    restarted = _manager(home, tmp_path, later)
+    restarted.resume_pending()
+    await _until(lambda: len(restarted.registry.all()) == 2)
+    second = next(r for r in restarted.registry.all() if r.run_id != first)
+    record = await _settle(restarted, second.run_id)
+    assert (record.turn, record.trigger, record.batch_id, record.result_preview) == (
+        2, "followup", "t2", "Second done.")
+    assert later.sent[-1][-1] == {"role": "user", "content": f"{TASK_LABEL}\nThen the second part."}
+    assert restarted.registry.get_thread(first).pending_mail == []
+
+
+def test_a_turn_number_is_decided_under_the_registry_lock(home):
+    registry = SubagentRegistry(home / "subagents" / "runs.json")
+    now = time.time()
+
+    def run(run_id: str, turn: int, thread: str) -> SubagentRunRecord:
+        return SubagentRunRecord(
+            run_id=run_id, child_session_key=f"subagent:{thread}", parent_session_key=CHAT,
+            parent_channel="desktop", parent_chat_id="chat-1", task="t", label="t", model=MODEL,
+            cleanup="keep", created_at=now, origin="agent", thread_id=thread, turn=turn,
+            trigger="spawn" if turn == 1 else "followup")
+
+    from flowly.agent.subagent_threads import SubagentThreadRecord
+    thread_id = "11111111-1111-4111-8111-111111111111"
+    registry.register(run(thread_id, 1, thread_id), thread=SubagentThreadRecord(
+        thread_id=thread_id, parent_session_key=CHAT, child_session_key=f"subagent:{thread_id}",
+        created_at=now))
+    registry.finish(thread_id, "ok", result="r")
+    stale = run("22222222-2222-4222-8222-222222222222", 7, thread_id)  # a stale count
+    registry.register(stale)
+    assert registry.get(stale.run_id).turn == 2
 
 
 # ── Closed subagents ─────────────────────────────────────────────────────────
@@ -913,6 +989,56 @@ async def test_a_long_threads_next_task_fits_from_its_first_request(tmp_path, ho
     assert CompactionServiceBudget(manager).tokens(after) < threshold
     rows = manager.registry.thread_store.display_rows(first)
     assert [r.get("turn") for r in rows if r.get("kind") == "subagent_task"] == [1, 2, 3, 4, 5]
+
+
+@pytest.mark.asyncio
+async def test_a_kept_summary_keeps_saved_rows_active_after_a_stopped_turn(tmp_path, home):
+    """A stopped turn's closing row is said differently to the model; the rows
+    the summary kept are still the saved ones (active in the display log), not
+    copies, and the next task's history has them."""
+    from flowly.session.archive import EVENT_ID_KEY
+
+    provider = _Scripted([LLMResponse(content="never used"), LLMResponse(content="Part two done.")])
+    gate = provider.gate(1)
+    roomy = _manager(home, tmp_path, provider, window=64_000)
+    first = await _spawn(roomy, context=None, task="Part one.")
+    await provider.waiting[1].wait()
+    await roomy.cancel(first)
+    gate.set()
+    await _settle(roomy, first)
+    await _settle(roomy, (await _follow(roomy, first, "Part two."))["run_id"])
+    base = roomy.registry.thread_store.turn_context(first).history
+    assert {"role": "assistant", "content": STOPPED_REPLY_TEXT} in base
+
+    thread = roomy.registry.get_thread(first)
+    store = roomy.registry.thread_store
+    key = thread_session_key(first)
+    saved = store.sessions.read(key).messages
+    third = "33333333-3333-4333-8333-333333333333"
+
+    def add_turn(session: Any) -> None:
+        session.metadata["subagent"]["runs"].append(third)
+        session.add_message("user", "[Task from the main agent]\nPart three.", kind="subagent_task")
+        session.add_message("assistant", "Part three done.")
+
+    store.sessions.mutate(key, add_turn)
+    store.sessions.evict(key)
+    kept = [*base, {"role": "user", "content": "[Task from the main agent]\nPart three."},
+            {"role": "assistant", "content": "Part three done."}]
+    summary = {"role": "system", "content": "[Previous conversation summary]\n\nEarlier parts."}
+    assert store.persist_context(thread, run_id=third, summary=summary, kept=kept)
+    after = store.sessions.read(key)
+    saved_ids = {row.get(EVENT_ID_KEY) for row in saved}
+    kept_rows = after.messages[1:]
+    # Every kept message that is a saved row is that row (same identity, its fields).
+    reused = [row for row in kept_rows if row.get(EVENT_ID_KEY) in saved_ids]
+    assert len(reused) == len(saved) - 1  # all but the stopped closing row, said differently now
+    assert any(row.get("kind") == "subagent_task" and row.get("turn") == 2 for row in reused)
+    derived = [row for row in kept_rows if row.get("_archive_derived_copy")]
+    assert [row["content"] for row in derived] == [STOPPED_REPLY_TEXT]
+    assert store.turn_context(first).history[1:] == kept
+    states = store.sessions.get_archive_snapshot(key).by_id
+    assert all(states[row[EVENT_ID_KEY]].state == "active" for row in reused if row[EVENT_ID_KEY] in states)
 
 
 class CompactionServiceBudget:
