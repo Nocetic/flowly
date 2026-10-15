@@ -2373,6 +2373,24 @@ class SubagentManager:
                 "reach you in a message of their own when they finish; don't wait for "
                 "them or redo their work."
             )
+        elif record.batch_id:
+            # The batch is complete, but part of it reached the agent earlier
+            # (held too long for a slow sibling): this is the moment to answer
+            # the owner's request as a whole, not to report the last part alone.
+            told_ids = {m.run_id for m in to_tell}
+            earlier = [
+                r for r in self._registry.all()
+                if r.batch_id == record.batch_id and r.parent_session_key == record.parent_session_key
+                and r.origin != "system" and r.run_id not in told_ids and r.outcome != "cancelled"
+                and r.ended_at is not None
+            ]
+            if earlier:
+                names = ", ".join(f"'{r.display_name or r.label}'" for r in earlier)
+                waiting += (
+                    f"\n\nThis completes the work started together with {names}, whose "
+                    "results reached you earlier in this conversation. Give the owner one "
+                    "answer that brings all of them together."
+                )
         if len(to_tell) == 1:
             announce_content = (
                 f"{sections[0]}\n\n"
@@ -2412,12 +2430,18 @@ class SubagentManager:
 
         # _BATCH_HOLD_SECONDS after the first result was held. A result held
         # before a restart gives the siblings that continued a fresh moment.
+        # Only a result that will be delivered starts the clock: a run stopped
+        # on request has none, and starting it there delivered the next
+        # result early and alone, apart from siblings about to finish.
         held_since = min(
             (r.ended_at for r in self._registry.all()
              if r.batch_id == record.batch_id and r.parent_session_key == record.parent_session_key
-             and r.ended_at is not None and not r.announced and r.delivery_state in ("pending", "queued")),
-            default=time.time(),
+             and r.ended_at is not None and not r.announced and r.outcome != "cancelled"
+             and r.delivery_state in ("pending", "queued")),
+            default=None,
         )
+        if held_since is None:
+            return
         deadline = held_since + _BATCH_HOLD_SECONDS
         if held_since < self._started_at:
             deadline = max(deadline, time.time() + _RESUMED_BATCH_HOLD_SECONDS)

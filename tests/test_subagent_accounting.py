@@ -250,3 +250,43 @@ def test_other_profiles_can_stop_a_subagent_and_read_stats():
 
     assert "subagents.cancel" in PROFILE_RPC_TIMEOUTS
     assert "subagents.stats" in PROFILE_RPC_TIMEOUTS
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_sibling_does_not_start_the_hold_clock(tmp_path, monkeypatch):
+    # The owner's case: one of three stopped at once, the other two finishing a
+    # few minutes apart. The clock used to start at the stop, so the first result
+    # went out alone just before the last one finished.
+    monkeypatch.setattr(subagent_module, "_BATCH_HOLD_SECONDS", 0.5)
+    bus, children = MessageBus(), _Children()
+    children.gates = {"A": asyncio.Event(), "B": asyncio.Event(), "C": asyncio.Event()}
+    manager = _manager(tmp_path, children, bus)
+    await _start(manager, "A")
+    b = await _start(manager, "B")
+    await _start(manager, "C")
+    await manager.cancel(b)
+    await asyncio.sleep(0.3)
+    children.gates["A"].set()
+    await asyncio.sleep(0.3)  # past the stop + hold, within A + hold
+    children.gates["C"].set()
+    notice = await asyncio.wait_for(bus.consume_inbound(), 3)
+    assert "Result of A." in notice.content and "Result of C." in notice.content
+    assert "Stopped before finishing, on request: 'B'" in notice.content
+    await _no_notice(bus, 0.8)
+
+
+@pytest.mark.asyncio
+async def test_the_last_part_of_a_split_batch_asks_for_one_answer(tmp_path, monkeypatch):
+    monkeypatch.setattr(subagent_module, "_BATCH_HOLD_SECONDS", 0.2)
+    bus, children = MessageBus(), _Children()
+    children.gates = {"A": asyncio.Event(), "C": asyncio.Event()}
+    manager = _manager(tmp_path, children, bus)
+    await _start(manager, "A")
+    await _start(manager, "C")
+    children.gates["A"].set()
+    first = await asyncio.wait_for(bus.consume_inbound(), 3)
+    assert "Result of A." in first.content and "Still working" in first.content
+    children.gates["C"].set()
+    last = await asyncio.wait_for(bus.consume_inbound(), 3)
+    assert "Result of C." in last.content
+    assert "This completes the work started together with 'A'" in last.content
