@@ -12,6 +12,7 @@ from flowly.agent.tools.base import Tool
 if TYPE_CHECKING:
     from flowly.agent.subagent import SubagentManager
     from flowly.agent.subagent_registry import SubagentRegistry, SubagentRunRecord
+    from flowly.agent.subagent_threads import SubagentThreadRecord
 
 _READ_DEFAULT_CHARS = 8_000
 _READ_MAX_CHARS = 20_000
@@ -49,6 +50,42 @@ def resolve_own_run(
     return candidates[0], ""
 
 
+def resolve_own_thread(
+    registry: "SubagentRegistry", target: str, session_key: str | None,
+) -> tuple["SubagentThreadRecord | None", str]:
+    """One of this conversation's subagents, by ``agent_id`` or by the run id of any of its tasks.
+
+    Full ids or unique prefixes of at least 8 characters; another
+    conversation's subagent reads as not found. ``(None, why)`` otherwise —
+    a subagent from before subagents kept their conversation has none.
+    """
+    wanted = (target or "").strip()
+    if session_key is None:
+        return None, "No conversation owns this call, so it has no subagents."
+    if len(wanted) < _MIN_ID_PREFIX:
+        return None, "Give the agent_id (or a run_id) from the subagent's start or completion message."
+    threads = [t for t in registry.threads() if t.parent_session_key == session_key]
+    matches = [t for t in threads if t.thread_id == wanted] or [
+        t for t in threads if t.thread_id.startswith(wanted)
+    ]
+    if len(matches) == 1:
+        return matches[0], ""
+    record, problem = resolve_own_run(registry, wanted, session_key)
+    if record is None:
+        if len(matches) > 1:
+            return None, f"agent_id {wanted} matches several subagents; give the full id."
+        return None, problem
+    if record.thread_id:
+        thread = registry.get_thread(record.thread_id)
+        if thread is not None:
+            return thread, ""
+        return None, f"Subagent {wanted} is no longer kept."
+    if record.kind == "subagent" and record.origin != "system":
+        return None, ("This subagent ran before subagents kept their conversation; "
+                      "it takes no new task or message.")
+    return None, "This task has no conversation to continue."
+
+
 class AgentReadTool(Tool):
     """Read a subagent's status and full result."""
 
@@ -67,7 +104,8 @@ class AgentReadTool(Tool):
             "a result from an earlier turn you no longer have. A result that "
             "already reached you is not new: use it instead of reading it again. "
             "Don't use this to check on running subagents; their results reach "
-            "you as a message."
+            "you as a message. Give a run_id for one task's result, or an "
+            "agent_id for the subagent's latest finished task."
         )
 
     @property
@@ -75,7 +113,11 @@ class AgentReadTool(Tool):
         return {
             "type": "object",
             "properties": {
-                "run_id": {"type": "string", "description": "The subagent's run_id."},
+                "run_id": {"type": "string", "description": "One task's run_id."},
+                "agent_id": {
+                    "type": "string",
+                    "description": "The subagent's agent_id: reads its latest finished task's result.",
+                },
                 "offset": {
                     "type": "integer",
                     "description": "Character offset to read from (default 0).",
@@ -88,16 +130,29 @@ class AgentReadTool(Tool):
                     "maximum": _READ_MAX_CHARS,
                 },
             },
-            "required": ["run_id"],
+            "required": [],
         }
 
     async def execute(
-        self, run_id: str, offset: int = 0, limit: int = _READ_DEFAULT_CHARS, **kwargs: Any,
+        self, run_id: str = "", offset: int = 0, limit: int = _READ_DEFAULT_CHARS,
+        agent_id: str = "", **kwargs: Any,
     ) -> str:
         origin = current_tool_origin()
-        record, problem = resolve_own_run(
-            self._registry, run_id, origin.session_key if origin else None,
-        )
+        session_key = origin.session_key if origin else None
+        if (run_id or "").strip():
+            record, problem = resolve_own_run(self._registry, run_id, session_key)
+        elif (agent_id or "").strip():
+            thread, problem = resolve_own_thread(self._registry, agent_id, session_key)
+            record = None
+            if thread is not None:
+                ended = [r for r in self._registry.runs_of_thread(thread) if r.ended_at is not None]
+                record = ended[-1] if ended else None
+                if record is None:
+                    running = self._registry.get(thread.active_run_id) if thread.active_run_id else None
+                    problem = ("Its first task is still running; its result will reach you as a message."
+                               if running is not None else "This subagent has no finished task kept.")
+        else:
+            record, problem = None, "Give run_id or agent_id."
         if record is None:
             return json.dumps({"error": problem})
         try:
@@ -112,6 +167,8 @@ class AgentReadTool(Tool):
             "status": _status(record),
             "model": record.model,
         }
+        if record.thread_id:
+            view.update(agent_id=record.thread_id, task_number=record.turn)
         if record.error:
             view["error"] = record.error
         if record.result_available:
@@ -135,7 +192,7 @@ _REPLY_WAIT_SECONDS = 300.0  # keep in step with subagent._REPLY_WAIT_SECONDS
 
 
 class AgentMessageTool(Tool):
-    """The main agent's line to the subagents it started, while they run."""
+    """The main agent's line to the subagents it started."""
 
     def __init__(self, manager: "SubagentManager"):
         self._manager = manager
@@ -147,10 +204,12 @@ class AgentMessageTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Send a message to one or more of your running subagents — to steer, "
-            "narrow or answer them. Each reads it at its next step; it does not "
-            "interrupt a tool call in progress. Use to=\"all\" for every subagent "
-            "of this conversation that is still running."
+            "Send a message to one or more of your subagents — to steer, narrow or "
+            "answer them. A subagent working on a task reads it at its next step; "
+            "it does not interrupt a tool call in progress. One with no task running "
+            "keeps it for its next task (agent_followup) — this starts no task and "
+            "brings no report. A closed one takes no message. Use to=\"all\" for "
+            "every subagent of this conversation that is still running."
         )
 
     @property
@@ -159,7 +218,7 @@ class AgentMessageTool(Tool):
             "type": "object",
             "properties": {
                 "to": {
-                    "description": "A run_id, a list of run_ids, or \"all\".",
+                    "description": "An agent_id or run_id, a list of them, or \"all\".",
                     "anyOf": [
                         {"type": "string"},
                         {"type": "array", "items": {"type": "string"}},
@@ -180,23 +239,170 @@ class AgentMessageTool(Tool):
             return json.dumps({"error": "No conversation owns this call, so it has no subagents."})
         registry = self._manager.registry
         if to == "all":
-            targets = [
+            running = [
                 record.run_id for record in registry.all()
                 if record.ended_at is None and record.origin != "system"
                 and record.parent_session_key == session_key
             ]
-            if not targets:
+            if not running:
                 return json.dumps({"error": "No subagent of this conversation is running."})
-        else:
-            wanted = [to] if isinstance(to, str) else list(to or [])
-            targets = []
-            for item in wanted:
-                record, problem = resolve_own_run(registry, str(item), session_key)
-                if record is None:
-                    return json.dumps({"error": problem})
-                targets.append(record.run_id)
-        results = [await self._manager.send_to_child(run_id, text) for run_id in dict.fromkeys(targets)]
+            results = [await self._manager.send_to_child(run_id, text) for run_id in dict.fromkeys(running)]
+            return json.dumps({"sent": results}, ensure_ascii=False)
+        wanted = [to] if isinstance(to, str) else list(to or [])
+        targets: list[tuple[str, Any]] = []
+        for item in wanted:
+            record, problem = resolve_own_run(registry, str(item), session_key)
+            if record is not None and record.ended_at is None and not record.thread_id:
+                targets.append(("run", record.run_id))  # a running task with no thread
+                continue
+            thread, why = resolve_own_thread(registry, str(item), session_key)
+            if thread is not None:
+                targets.append(("thread", thread))
+            elif record is not None:
+                targets.append(("run", record.run_id))  # from before threads: as it was
+            else:
+                return json.dumps({"error": why if "matches several" in why else problem})
+        results = []
+        seen: set[str] = set()
+        for kind, target in targets:
+            key = target if kind == "run" else target.thread_id
+            if key in seen:
+                continue
+            seen.add(key)
+            if kind == "run":
+                results.append(await self._manager.send_to_child(target, text))
+            else:
+                results.append(await self._manager.message_thread(target, text))
         return json.dumps({"sent": results}, ensure_ascii=False)
+
+
+class AgentFollowupTool(Tool):
+    """Give one of this conversation's subagents another task (a new turn of its own conversation)."""
+
+    def __init__(self, manager: "SubagentManager"):
+        self._manager = manager
+
+    @property
+    def name(self) -> str:
+        return "agent_followup"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Give one of your subagents another task. It keeps its conversation, so it "
+            "continues with its earlier tasks, tool results and reports in view. With "
+            "no task running it starts on this one in the background and reports back "
+            "like a new subagent — together with anything else you start in this turn — "
+            "and it counts toward the same limits. If it is working on a task, it reads "
+            "this one at its next step and that task's report covers both. A closed "
+            "subagent takes no new task. When the owner asked for this, pass their "
+            "exact words as owner_request."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "to": {
+                    "type": "string",
+                    "description": "The subagent's agent_id (or the run_id of any of its tasks).",
+                },
+                "task": {
+                    "type": "string",
+                    "description": (
+                        "The new task, complete in itself. The subagent remembers its earlier "
+                        "work in this conversation, not your tool work or what was said here "
+                        "since: state the goal, anything new it needs, and what to return."
+                    ),
+                },
+                "owner_request": {
+                    "type": "string",
+                    "description": (
+                        "Only when the owner asked for this: their exact words asking for "
+                        "it, copied from their message. Omit otherwise."
+                    ),
+                },
+                "model": {
+                    "type": "string",
+                    "description": (
+                        "Only when the owner named a model for this task. Omit to run on "
+                        "your own model."
+                    ),
+                },
+            },
+            "required": ["to", "task"],
+        }
+
+    async def execute(self, to: str, task: str, owner_request: str | None = None,
+                      model: str | None = None, **kwargs: Any) -> str:
+        from flowly.agent.delegation import current_turn, spawn_origin
+
+        origin = current_tool_origin()
+        turn = current_turn()
+        session_key = (origin.session_key if origin else None) or (
+            turn.session_key if turn and turn.session_key else None)
+        chosen_model = (model or "").strip() or (turn.model if turn else None)
+        result = await self._manager.followup(
+            str(to or ""), task,
+            parent_session_key=session_key,
+            # Who asked: the owner when the quote is theirs; this only labels the run.
+            origin=spawn_origin(owner_request, turn),
+            batch_id=turn.turn_id if turn else "",
+            model=chosen_model,
+            origin_channel=(turn.origin_channel if turn else "") or "",
+            origin_chat_id=(turn.origin_chat_id if turn else "") or "",
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+
+class AgentCloseTool(Tool):
+    """Close subagents of this conversation that are no longer needed."""
+
+    def __init__(self, manager: "SubagentManager"):
+        self._manager = manager
+
+    @property
+    def name(self) -> str:
+        return "agent_close"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Close one or more of your subagents. A closed subagent takes no new task "
+            "or message; its conversation stays readable. A task it is working on is "
+            "stopped, with no report. This conversation keeps at most 16 subagents "
+            "open; past that, starting one closes the one idle longest."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "to": {
+                    "description": "An agent_id, a list of them, or \"all\" (every open one).",
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}},
+                    ],
+                },
+            },
+            "required": ["to"],
+        }
+
+    async def execute(self, to: Any, **kwargs: Any) -> str:
+        from flowly.agent.delegation import current_turn
+
+        origin = current_tool_origin()
+        turn = current_turn()
+        session_key = (origin.session_key if origin else None) or (
+            turn.session_key if turn and turn.session_key else None)
+        targets: Any = "all" if to == "all" else ([to] if isinstance(to, str) else list(to or []))
+        if targets != "all" and not targets:
+            return json.dumps({"error": "Name the subagent(s) to close."})
+        result = await self._manager.close_threads(targets, parent_session_key=session_key)
+        return json.dumps(result, ensure_ascii=False)
 
 
 class ChildAgentMessageTool(Tool):

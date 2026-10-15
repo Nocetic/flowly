@@ -92,11 +92,13 @@ def subagent_history_row(m: dict[str, Any]) -> dict[str, Any]:
     """A subagent conversation's row: :func:`history_row` plus what a subagent turn says.
 
     ``kind`` is ``subagent_task`` for the task the main agent gave (``author:
-    "main_agent"``, ``turn``, ``trigger``; on the first turn also the bare
-    ``brief`` and ``withConversation``) and ``agent_note`` for a message from
-    the main agent read mid-run. A tool row carries ``status`` (``ok``,
-    ``error``, ``timeout``, ``interrupted``, ``not_run``); the closing row of a
-    turn its ``outcome``.
+    "main_agent"``, ``turn``, ``trigger``; the bare ``brief`` when the row
+    says more than the task — the first turn's forked conversation
+    (``withConversation``), a later turn's label and the messages that waited
+    for it) and ``agent_note`` for a message from the main agent read mid-run
+    (``noteKind: "task"`` for a task it gave the running turn). A tool row
+    carries ``status`` (``ok``, ``error``, ``timeout``, ``interrupted``,
+    ``not_run``); the closing row of a turn its ``outcome``.
     """
     msg = history_row(m)
     if isinstance(m.get("author"), str):
@@ -105,10 +107,13 @@ def subagent_history_row(m: dict[str, Any]) -> dict[str, Any]:
         msg["turn"] = m["turn"]
     if m.get("trigger") in ("spawn", "followup"):
         msg["trigger"] = m["trigger"]
-    if m.get("kind") == "subagent_task" and m.get("with_conversation") is True:
-        msg["withConversation"] = True
+    if m.get("kind") == "subagent_task":
+        if m.get("with_conversation") is True:
+            msg["withConversation"] = True
         if isinstance(m.get("brief"), str):
             msg["brief"] = m["brief"]
+    if m.get("kind") == "agent_note" and m.get("noteKind") == "task":
+        msg["noteKind"] = "task"
     if m.get("role") == "tool" and isinstance(m.get("status"), str):
         msg["status"] = m["status"]
     if isinstance(m.get("outcome"), str):

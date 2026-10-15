@@ -13,7 +13,8 @@ stream under that key and the run's id (docs/chat-wire-protocol.md §4.8):
   result, in the main loop's shape (``iteration_event_payload``);
 * ``chat {state:"tool_progress"}`` as a call is queued, runs and ends;
 * ``chat {state:"agent_note"}`` for a message from the main agent the
-  subagent read at a step;
+  subagent read at a step (``noteKind: "task"`` for a task it gave the
+  running turn);
 * ``compaction`` when a summary fits its context;
 * one terminal: ``chat {state:"final"}`` (``aborted: true`` when stopped) or
   ``chat {state:"error"}``, with the run's ``outcome``.
@@ -449,6 +450,8 @@ class ChildStream:
                 payload = {"runId": self.run_id, "iterationIdx": index, "state": "agent_note",
                            "author": str(row.get("author") or MAIN_AGENT_AUTHOR),
                            "content": _text(row.get("content"))}
+                if row.get("noteKind") == "task":
+                    payload["noteKind"] = "task"
                 wrapped = {**payload, **self._fields}
                 inflight.append_iteration(self.session_key, self.run_id, wrapped)
                 self._send("chat", wrapped)

@@ -812,9 +812,16 @@ async def test_the_cap_closes_the_thread_idle_longest_and_says_so(tmp_path, home
     assert started["status"] == "started"
     assert (f"This conversation keeps at most {MAX_OPEN_THREADS_PER_CONVERSATION} subagents open; "
             f"starting this one closed '{oldest.display_name}', idle the longest. "
-            "Its history stays readable.") in started["message"]
+            "Its history stays readable. agent_close closes a subagent that is no longer "
+            "needed.") in started["message"]
     closed = registry.get_thread(oldest.run_id)
     assert closed.status == "closed" and closed.closed_reason == "cap"
+    # Its run's view says so, with a newer revision, so clients update it.
+    view = run_view(registry.get(oldest.run_id), thread=closed)
+    assert view["threadStatus"] == "closed"
+    # The closed one takes no new task, and says why.
+    followed = await manager.followup(oldest.run_id, "Also check B", parent_session_key=CHAT)
+    assert followed["status"] == "closed" and "closed to keep at most 16 subagents" in followed["error"]
     assert len([t for t in registry.threads_for_parent(CHAT) if t.status == "open"]) == MAX_OPEN_THREADS_PER_CONVERSATION
     # Another conversation's threads are not counted.
     other = json.loads(await manager.spawn(task="Elsewhere", origin_channel="desktop", origin_chat_id="c2",
@@ -836,7 +843,7 @@ async def test_the_cap_refuses_when_every_open_thread_is_working(tmp_path, home)
                                              parent_session_key=CHAT, origin="agent"))
     assert refused == {"status": "rejected", "error": (
         f"{MAX_OPEN_THREADS_PER_CONVERSATION} subagents of this conversation are open and all of them "
-        "are working; one must finish before another can start.")}
+        "are working; one must finish, or be closed with agent_close, before another can start.")}
     assert len(manager.registry.all()) == MAX_OPEN_THREADS_PER_CONVERSATION
 
 

@@ -523,6 +523,7 @@ def gateway(
         # A scheduled run does its work itself. Background spawners report
         # back on a later turn, which a cron tick never has.
         "spawn",
+        "agent_followup",
         "delegate_to",
         "message_profile",
         # NOTE: Side-effect integrations (google_drive, email, linear, etc.)

@@ -25,7 +25,8 @@ TOOLSET_MEMBERS: dict[str, frozenset[str]] = {
         "browser_plan",
     }),
     "delegation": frozenset({
-        "spawn", "agent_read", "agent_message", "agent_wait", "sessions_list", "delegate_to",
+        "spawn", "agent_read", "agent_message", "agent_followup", "agent_close", "agent_wait",
+        "sessions_list", "delegate_to",
         "codex_session", "message_profile",
     }),
     "sessions": frozenset({"session_search"}),

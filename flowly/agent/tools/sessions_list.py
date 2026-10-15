@@ -40,10 +40,13 @@ class SessionsListTool(Tool):
     def description(self) -> str:
         return (
             "Manage this conversation's background tasks. Actions: "
-            "list (show running/completed/failed tasks), "
+            "list (show this conversation's subagents — open or closed, working "
+            "or idle, how many tasks, the latest result — and its running/"
+            "completed/failed tasks), "
             "cancel (stop a running task by run_id, or run_id=\"all\" to stop "
-            "every task this conversation has running, in one call). Results "
-            "reach you as a message; don't list repeatedly to wait for them."
+            "every task this conversation has running, in one call; the subagent "
+            "stays open). Results reach you as a message; don't list repeatedly "
+            "to wait for them."
         )
 
     @property
@@ -97,6 +100,7 @@ class SessionsListTool(Tool):
 
         if not runs:
             return self._maybe_append_poll_hint("No background tasks found.", recent_calls)
+        subagents = self._subagent_lines(runs) if status == "all" else []
 
         filtered = []
         for r in runs:
@@ -113,7 +117,7 @@ class SessionsListTool(Tool):
                 f"No tasks with status '{status}'.", recent_calls,
             )
 
-        lines = [f"Background tasks ({len(filtered)}):"]
+        lines = [*subagents, f"Background tasks ({len(filtered)}):"]
         for r in sorted(filtered, key=lambda x: x.created_at, reverse=True):
             if r.ended_at is None:
                 state = "⏳ running"
@@ -131,11 +135,41 @@ class SessionsListTool(Tool):
                 secs = int(r.ended_at - r.started_at)
                 duration = f" ({secs}s)"
 
-            lines.append(f"  {state}{duration} — {r.label} [{r.run_id[:8]}]")
+            task = f", task {r.turn}" if r.thread_id and r.turn > 1 else ""
+            lines.append(f"  {state}{duration} — {r.display_name or r.label} [{r.run_id[:8]}{task}]")
             if r.error:
                 lines.append(f"    error: {r.error}")
 
         return self._maybe_append_poll_hint("\n".join(lines), recent_calls)
+
+    def _subagent_lines(self, runs: list[Any]) -> list[str]:
+        """This conversation's subagents (threads): one line each, newest first."""
+        threads_of = getattr(self._registry, "threads", None)
+        if threads_of is None:
+            return []
+        parents = {r.parent_session_key for r in runs}
+        threads = [t for t in threads_of() if t.parent_session_key in parents]
+        if not threads:
+            return []
+        by_id = {r.run_id: r for r in runs}
+        lines = [f"Subagents ({len(threads)}):"]
+        for thread in sorted(threads, key=lambda t: t.created_at, reverse=True):
+            if thread.status == "open":
+                state = "open, working" if thread.active_run_id else "open, idle"
+            else:
+                state = f"closed ({thread.closed_reason or 'closed'})"
+            count = len(thread.runs)
+            line = (f"  '{thread.title}' [agent_id {thread.thread_id[:8]}] — {state}, "
+                    f"{count} task{'s' if count != 1 else ''}")
+            ended = [by_id[rid] for rid in thread.runs if rid in by_id and by_id[rid].ended_at is not None]
+            if ended:
+                last = ended[-1]
+                preview = " ".join((last.result_preview or last.error or "").split())[:160]
+                if preview:
+                    line += f"; latest result: {preview}"
+            lines.append(line)
+        lines.append("")
+        return lines
 
     def _maybe_append_poll_hint(self, body: str, recent_calls: int) -> str:
         """Append an anti-polling hint if the LLM is re-listing in a loop."""

@@ -2071,6 +2071,8 @@ You can keep track of the owner's goals and come back to things on your own.
                 "finished, their results reach you together as one new message, and "
                 "you answer the owner's request from there. Treat a result as the "
                 "subagent's own report: check what matters, don't redo its work.",
+                "A subagent keeps its conversation after it reports: `agent_followup` "
+                "gives it another task, `agent_close` ends it.",
                 "Steer or answer a running subagent with `agent_message`; read the "
                 "rest of a long result with `agent_read`. `agent_wait` is only for "
                 "the rare case where your own work in this turn cannot finish "

@@ -8,12 +8,15 @@ message list can be rebuilt. It exists only while the run is running and is
 deleted once its result is durable; the registry also prunes any file whose
 run is no longer running. System runs keep none.
 
-Every line is ``{"v": 2, "n": <sequence>, "t": <time>, "type": …, …}``:
+Every line is ``{"v": 3, "n": <sequence>, "t": <time>, "type": …, …}``:
 
 ===============  ===========================================================
-``header``       system prompt, first message (brief + forked conversation),
-                 model, iteration limit, core version
-``mail``         a message from the main agent arrived (not yet read)
+``header``       system prompt, first message (brief + forked conversation
+                 on a thread's first turn; a later turn's task), model,
+                 iteration limit, core version; the thread, its turn and the
+                 history the turn started from (``baseCount``, ``baseDigest``)
+``mail``         a message (or, ``mailKind: "task"``, a task) from the main
+                 agent arrived (not yet read)
 ``step``         iteration k began: messages read from the inbox, the
                  old-tool-result passes it applied (``strip``)
 ``microcompact`` the request was fitted by cutting old tool results, with
@@ -48,6 +51,16 @@ computed again, so it is recorded as its result. Version 1 (a context budget
 per step and a one-off overflow trim) is not continued: its runs end
 ``resume_unsupported``.
 
+**A checkpoint covers the running turn only.** A thread's earlier turns are
+in its conversation (flowly.agent.subagent_threads); the header names how
+much of that history the turn started from — ``baseCount`` messages of the
+thread's history as the model gets it, and their ``baseDigest`` — and the
+replay rebuilds ``[system, *history[:baseCount], first message]`` before the
+turn's own lines, so the checkpoint does not grow with the thread. A history
+that no longer matches its digest is not continued (``ResumeRefusal("base")``)
+unless the turn's result is already recorded. Version 2 is version 3 with no
+history (``baseCount`` 0): a run checkpointed by version 2 continues.
+
 ``restore_child_state`` replays the lines through the same functions the
 live loop uses, so the rebuilt list is the live one, step for step. The same
 replay rebuilds the run's journal (``ChildState.journal``): every message the
@@ -72,7 +85,9 @@ from loguru import logger
 from flowly.agent.repetition import RepetitionGuard, mark_repeated
 from flowly.compaction.pruning import microcompact_tool_results, strip_old_tool_results
 
-CHECKPOINT_VERSION = 2
+CHECKPOINT_VERSION = 3
+# Formats this build continues: version 2 is version 3 with no earlier history.
+READABLE_VERSIONS = frozenset({2, CHECKPOINT_VERSION})
 # A run whose checkpoint grows past this stops checkpointing and is not
 # continued after a restart (typically a run writes 0.3–2 MB).
 MAX_CHECKPOINT_BYTES = 16 * 1024 * 1024
@@ -254,13 +269,27 @@ class ChildState:
     system_prompt: str = ""
     first_message: str = ""
     journal: list[dict[str, Any]] = field(default_factory=list)
+    # The thread's history the turn started from: how many messages of it
+    # come between the system prompt and the first message, and their digest
+    # (history_digest). 0 for a thread's first turn.
+    base_count: int = 0
+    base_digest: str = ""
+    # A summary replaced part of the list during this turn: the thread keeps
+    # it for its next turn (SubagentThreadStore.persist_context).
+    summarized: bool = False
+    # Restored only: the history no longer matched the header, and the turn's
+    # result was already recorded; ``messages`` holds no history then.
+    base_mismatch: bool = False
+    # Calls that started (``tool_start``): a stopped turn says which of its
+    # unanswered calls may have had effects.
+    started_calls: set[str] = field(default_factory=set)
 
 
 @dataclass
 class ResumeRefusal:
     """Why a checkpoint cannot be continued."""
 
-    reason: str   # "missing" | "version" | "corrupt"
+    reason: str   # "missing" | "version" | "corrupt" | "base"
     detail: str = ""
 
 
@@ -276,6 +305,35 @@ NOT_RUN_TEXT = (
     "Not run: Flowly restarted before this call started. Nothing was done; "
     "call it again if you still need it."
 )
+
+
+# A call a stopped turn left without a result (the task was stopped on
+# request, or ended some other way while the call ran or before it started).
+STOPPED_CALL_TEXT = (
+    "Stopped: the task was stopped while this call was running. It may or may not have "
+    "taken effect; check before relying on it."
+)
+NOT_STARTED_CALL_TEXT = "Not run: the task was stopped before this call started."
+
+
+def open_call_ids(journal: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    """``(call id, name)`` of the last reply's calls that have no result in ``journal``."""
+    for index in range(len(journal) - 1, -1, -1):
+        row = journal[index]
+        if row.get("role") == "assistant" and row.get("tool_calls"):
+            answered = {str(r.get("tool_call_id") or "") for r in journal[index + 1:] if r.get("role") == "tool"}
+            calls = []
+            for call in row["tool_calls"]:
+                if not isinstance(call, dict):
+                    continue
+                call_id = str(call.get("id") or "")
+                if call_id and call_id not in answered:
+                    function = call.get("function") if isinstance(call.get("function"), dict) else {}
+                    calls.append((call_id, str(function.get("name") or "")))
+            return calls
+        if row.get("role") != "tool":
+            return []
+    return []
 
 
 def interrupted_result(call: OpenCall) -> tuple[str, str]:
@@ -326,8 +384,43 @@ def interrupted_result(call: OpenCall) -> tuple[str, str]:
     return "interrupted", text
 
 
-def main_agent_note(text: str) -> dict[str, Any]:
-    return {"role": "user", "content": f"[Message from the main agent]\n{text}"}
+MESSAGE_LABEL = "[Message from the main agent]"
+TASK_LABEL = "[Task from the main agent]"
+
+
+def main_agent_note(text: str, kind: str = "message") -> dict[str, Any]:
+    """What the model gets of a message — or, ``kind == "task"``, a task — from the main agent."""
+    label = TASK_LABEL if kind == "task" else MESSAGE_LABEL
+    return {"role": "user", "content": f"{label}\n{text}"}
+
+
+def note_entry(note: Any) -> tuple[str, str]:
+    """``(text, kind)`` of a note as a step records it: a plain text is a message."""
+    if isinstance(note, dict):
+        return str(note["text"]), ("task" if note.get("kind") == "task" else "message")
+    return str(note), "message"
+
+
+def history_digest(messages: list[dict[str, Any]]) -> str:
+    """The digest of a thread's history as a turn's model got it (checkpoint ``baseDigest``)."""
+    import hashlib
+
+    raw = json.dumps(messages, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def task_index(state: "ChildState") -> int | None:
+    """Where the turn's first message (its task) stands in the list the model gets.
+
+    The latest user message with that content: the turn's own work never
+    repeats it (notes are labeled), an earlier turn's identical task comes
+    before it. None when a recorded list no longer has it.
+    """
+    for index in range(len(state.messages) - 1, -1, -1):
+        message = state.messages[index]
+        if message.get("role") == "user" and message.get("content") == state.first_message:
+            return index
+    return None
 
 
 def append_message(state: ChildState, message: dict[str, Any], *, at: float | None = None,
@@ -348,9 +441,12 @@ def append_message(state: ChildState, message: dict[str, Any], *, at: float | No
     state.journal.append(row)
 
 
-def apply_step(state: ChildState, iteration: int, notes: list[str],
+def apply_step(state: ChildState, iteration: int, notes: list[Any],
                strip: list[tuple[int, int]], *, at: float | None = None) -> None:
     """Begin iteration ``iteration``: read the inbox, cut old tool results.
+
+    ``notes`` are the main agent's messages read now: a text, or
+    ``{"text", "kind": "task"}`` for a task it gave the running turn.
 
     ``strip`` is the ``(keep_last, max_old_chars)`` passes the step applies
     (``iteration_strip_passes``, the main loop's schedule). The live loop and
@@ -359,7 +455,10 @@ def apply_step(state: ChildState, iteration: int, notes: list[str],
     """
     state.iteration = iteration
     for note in notes:
-        append_message(state, main_agent_note(note), at=at, kind="agent_note", author="main_agent")
+        text, kind = note_entry(note)
+        extra = {"noteKind": "task"} if kind == "task" else {}
+        append_message(state, main_agent_note(text, kind), at=at, kind="agent_note",
+                       author="main_agent", **extra)
     for keep_last, max_old_chars in strip:
         state.messages = strip_old_tool_results(state.messages, keep_last=keep_last,
                                                 max_old_chars=max_old_chars)
@@ -373,10 +472,12 @@ def apply_microcompact(state: ChildState, keep_recent_full: int, truncate_chars:
     )
 
 
-def apply_compacted(state: ChildState, messages: list[dict[str, Any]]) -> None:
+def apply_compacted(state: ChildState, messages: list[dict[str, Any]], *,
+                    summarized: bool = False) -> None:
     """The request was fitted to a recorded list (a summary's, or a cut the
     replay could not redo): that exact list replaces the old one."""
     state.messages = [dict(message) for message in messages]
+    state.summarized = state.summarized or summarized
 
 
 def observe_tool_result(state: ChildState, guard: dict[str, Any] | None, content: str,
@@ -404,32 +505,54 @@ def restore_child_state(
     records: list[dict[str, Any]],
     *,
     annotate: Callable[..., str],
+    base: list[dict[str, Any]] | None = None,
 ) -> ChildState | ResumeRefusal:
     """Replay a checkpoint into the state the run had when it stopped.
 
-    Pure: reads nothing but ``records``. The last model reply's calls that
-    have no tool message come back in ``open_calls`` — started or not — for
-    the caller to answer; none is ever run again.
+    Pure: reads nothing but ``records`` and ``base`` — the thread's history as
+    the model gets it now (SubagentThreadStore.turn_context), of which the
+    turn started from the first ``baseCount`` messages. The last model
+    reply's calls that have no tool message come back in ``open_calls`` —
+    started or not — for the caller to answer; none is ever run again.
     """
     if not records:
         return ResumeRefusal("missing")
-    if any(record.get("v") != CHECKPOINT_VERSION for record in records):
+    if any(record.get("v") not in READABLE_VERSIONS for record in records):
         versions = sorted({str(record.get("v")) for record in records})
         return ResumeRefusal("version", ",".join(versions))
     header = records[0]
     if header.get("type") != "header":
         return ResumeRefusal("corrupt", "no header")
     try:
+        base_count = int(header.get("baseCount") or 0)
+        if base_count < 0:
+            raise ValueError("baseCount")
+        history: list[dict[str, Any]] = []
+        mismatch = False
+        if base_count:
+            prefix = list(base or [])[:base_count]
+            if len(prefix) < base_count or history_digest(prefix) != header.get("baseDigest"):
+                # The history the turn started from changed. Only a turn whose
+                # result is already recorded needs no history to finish.
+                if not any(record.get("type") == "final" for record in records):
+                    return ResumeRefusal("base", "the thread's history changed")
+                mismatch = True
+            else:
+                history = [dict(message) for message in prefix]
         state = ChildState(
             messages=[
                 {"role": "system", "content": str(header["systemPrompt"])},
+                *history,
                 {"role": "user", "content": str(header["firstMessage"])},
             ],
             max_iterations=max(1, int(header["maxIterations"])),
             system_prompt=str(header["systemPrompt"]),
             first_message=str(header["firstMessage"]),
+            base_count=base_count,
+            base_digest=str(header.get("baseDigest") or ""),
+            base_mismatch=mismatch,
         )
-        mail: dict[str, str] = {}
+        mail: dict[str, dict[str, str]] = {}
         consumed: set[str] = set()
         reply_reads: dict[str, list[str]] = {}
         answered: set[str] = set()
@@ -437,9 +560,16 @@ def restore_child_state(
         for record in records[1:]:
             kind = record["type"]
             if kind == "mail":
-                mail[str(record["id"])] = str(record["text"])
+                entry = {"id": str(record["id"]), "text": str(record["text"])}
+                if record.get("mailKind") == "task":
+                    entry.update(kind="task", batch=str(record.get("batch") or ""),
+                                 origin=str(record.get("origin") or "agent"))
+                mail[entry["id"]] = entry
             elif kind == "step":
-                apply_step(state, int(record["iteration"]), [str(n) for n in record.get("notes", [])],
+                notes = [n if isinstance(n, dict) else str(n) for n in record.get("notes", [])]
+                for note in notes:
+                    note_entry(note)  # a note that is neither raises here (corrupt)
+                apply_step(state, int(record["iteration"]), notes,
                            [(int(keep), int(chars)) for keep, chars in record.get("strip", [])],
                            at=_record_time(record))
                 consumed.update(str(i) for i in record.get("mail", []))
@@ -450,7 +580,7 @@ def restore_child_state(
                 messages = record["messages"]
                 if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
                     raise TypeError("compacted messages")
-                apply_compacted(state, messages)
+                apply_compacted(state, messages, summarized=bool(record.get("summarized")))
             elif kind == "model":
                 message = record["message"]
                 if not isinstance(message, dict):
@@ -469,6 +599,7 @@ def restore_child_state(
                                at=_record_time(record))
                 state.awaiting_model = False
             elif kind == "tool_start":
+                state.started_calls.add(str(record["callId"]))
                 call = calls.get(str(record["callId"]))
                 if call is not None:
                     call.started = True
@@ -523,6 +654,6 @@ def restore_child_state(
     for call_id, ids in reply_reads.items():
         if call_id in answered:
             consumed.update(ids)
-    state.unread_mail = [{"id": mid, "text": text} for mid, text in mail.items() if mid not in consumed]
+    state.unread_mail = [entry for mid, entry in mail.items() if mid not in consumed]
     state.open_calls = list(calls.values())
     return state

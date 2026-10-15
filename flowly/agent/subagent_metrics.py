@@ -7,7 +7,8 @@ safe to keep long after the run itself is gone (runs are pruned after 30
 days; these lines are trimmed by size instead).
 
 ``summarize`` turns the lines into what the owner sees: totals, outcomes,
-durations and tokens for a period, day by day.
+durations and tokens for a period, day by day, and how many runs were a
+subagent's first task or a later one (``byTrigger``).
 """
 
 from __future__ import annotations
@@ -53,6 +54,8 @@ def metric_line(record: SubagentRunRecord) -> dict[str, Any]:
         "toolCalls": len(record.tool_trace),
         "tokens": {key: int(record.usage.get(key, 0)) for key in ("input", "output", "cacheRead", "total")},
         "channel": record.parent_channel,
+        # A subagent's first task ("spawn") or a later one ("followup").
+        "trigger": record.trigger,
     }
 
 
@@ -148,5 +151,10 @@ def summarize(
         },
         "tokens": {key: sum(tokens(row, key) for row in picked) for key in ("input", "output", "cacheRead", "total")},
         "toolCalls": sum(int(row.get("toolCalls") or 0) for row in picked),
+        # A line from before follow-ups is a subagent's first task.
+        "byTrigger": {
+            trigger: sum(1 for row in picked if (row.get("trigger") or "spawn") == trigger)
+            for trigger in ("spawn", "followup")
+        },
         "byDay": [days_out[key] for key in sorted(days_out)],
     }

@@ -4,8 +4,9 @@
   never interrupts a tool call in progress — and shows in the transcript;
 * a child can tell or ask the main agent something; the message reaches the
   conversation that started it and the child can wait for the answer;
-* a finished child cannot receive messages, and a conversation cannot reach
-  another conversation's subagents.
+* a subagent with no task running keeps a message for its next task
+  (``queued``, no task starts); a closed one takes none; a conversation
+  cannot reach another conversation's subagents.
 """
 
 from __future__ import annotations
@@ -136,7 +137,7 @@ async def test_a_child_asks_and_waits_for_the_main_agent(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_finished_or_foreign_subagents_cannot_be_messaged(tmp_path):
+async def test_idle_closed_or_foreign_subagents(tmp_path):
     class _Quick(LLMProvider):
         def get_default_model(self):
             return "fake/model"
@@ -151,8 +152,18 @@ async def test_finished_or_foreign_subagents_cannot_be_messaged(tmp_path):
 
     tool = AgentMessageTool(manager)
     with tool_execution_scope("web:c1"):
-        finished = json.loads(await tool.execute(to=run_id, message="hello?"))
-    assert finished["sent"][0]["status"] == "finished"
+        idle = json.loads(await tool.execute(to=run_id, message="hello?"))
+    # Its task ended: the message waits for its next task; none starts.
+    assert idle["sent"][0]["status"] == "queued" and idle["sent"][0]["agent_id"] == run_id
+    assert manager.registry.get_thread(run_id).pending_mail[0]["text"] == "hello?"
+    assert len(manager.registry.all()) == 1 and not manager._running_tasks
+
+    await manager.close_threads([run_id], parent_session_key="web:c1")
+    with tool_execution_scope("web:c1"):
+        closed = json.loads(await tool.execute(to=run_id, message="still there?"))
+    assert closed["sent"][0]["status"] == "closed"
+    assert "was closed with agent_close; it takes no new task or message" in closed["sent"][0]["error"]
+    assert manager.registry.get_thread(run_id).pending_mail == []
 
     with tool_execution_scope("web:other"):
         foreign = json.loads(await tool.execute(to=run_id, message="hello?"))

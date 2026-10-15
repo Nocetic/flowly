@@ -120,6 +120,7 @@ _SAFE_DELEGATED_TOOLS = (
 _PROFILE_TASK_DISABLED_TOOLS = (
     "message_profile",
     "spawn",
+    "agent_followup",
     "delegate_to",
     "board_run",
     "board_update",

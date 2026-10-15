@@ -114,8 +114,9 @@ SIDE_EFFECT_TOOLS: frozenset[str] = frozenset(
         "artifact",
         "image_generate",
         "knowledge_graph",
-        # spawning work = a side effect
+        # spawning work = a side effect (a subagent's next task too)
         "spawn",
+        "agent_followup",
         "delegate",
     }
 )

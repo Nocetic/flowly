@@ -28,9 +28,17 @@ from flowly.exec.types import ExecConfig
 from flowly.agent.tools.web import WebSearchTool, WebFetchTool, WebExtractTool
 from flowly.agent.subagent_metrics import append_metric, metrics_path
 from flowly.agent.subagent_registry import SubagentRegistry, SubagentRunRecord, ThreadCapReached, add_usage
-from flowly.agent.subagent_threads import MAX_OPEN_THREADS_PER_CONVERSATION, SubagentThreadRecord
+from flowly.agent.subagent_threads import (
+    MAX_OPEN_THREADS_PER_CONVERSATION,
+    THREAD_IDLE_CLOSE_SECONDS,
+    SubagentThreadRecord,
+)
 from flowly.agent import subagent_owner
 from flowly.agent.subagent_checkpoint import (
+    MESSAGE_LABEL,
+    NOT_STARTED_CALL_TEXT,
+    STOPPED_CALL_TEXT,
+    TASK_LABEL,
     ChildState,
     GRACE_PROMPT,
     ResumeRefusal,
@@ -39,9 +47,12 @@ from flowly.agent.subagent_checkpoint import (
     apply_compacted,
     apply_microcompact,
     apply_step,
+    history_digest,
     interrupted_result,
+    open_call_ids,
     read_checkpoint,
     restore_child_state,
+    task_index,
     tool_class,
 )
 from flowly.agent.error_classifier import ErrorCategory, classify_response, extract_input_limit_tokens
@@ -99,7 +110,8 @@ from flowly.agent.subagent_announce_queue import AnnounceItem, get_or_create_que
 # the obviously-dangerous names regardless.
 _BLOCKED_SUBAGENT_TOOLS: frozenset[str] = frozenset({
     # recursion / privilege escalation
-    "spawn", "builtin_agent", "delegate_to", "agent_read", "agent_wait",
+    "spawn", "builtin_agent", "delegate_to", "agent_read", "agent_wait", "agent_followup",
+    "agent_close",
     # persistent scheduling / background side effects
     "cron",
     # user-facing communication (only main agent may speak for the user)
@@ -219,6 +231,33 @@ def _created_artifact_id(payload: Any, tool_args: dict[str, Any]) -> str | None:
     artifact = payload.get("artifact")
     candidate = artifact.get("id") if isinstance(artifact, dict) else payload.get("id")
     return candidate if isinstance(candidate, str) and candidate else None
+
+
+def followup_message(task: str, notes: list[str] | None = None) -> str:
+    """A follow-up turn's first message: the messages that waited for it, then the task."""
+    parts = [f"{MESSAGE_LABEL}\n{note}" for note in notes or []]
+    parts.append(f"{TASK_LABEL}\n{task}")
+    return "\n\n".join(parts)
+
+
+def closed_text(thread: SubagentThreadRecord) -> str:
+    """Why a closed subagent takes no new task, as a fact."""
+    title = thread.title or "This subagent"
+    why = {
+        "agent": "was closed with agent_close",
+        "owner": "was closed by the owner",
+        "idle": f"was closed after {THREAD_IDLE_CLOSE_SECONDS // 86_400} days with no task",
+        "cap": (f"was closed to keep at most {MAX_OPEN_THREADS_PER_CONVERSATION} subagents of "
+                "this conversation open"),
+        "parent_deleted": "belonged to a conversation that was deleted",
+    }.get(thread.closed_reason or "", "is closed")
+    kept = "" if thread.closed_reason == "parent_deleted" else " Its history stays readable."
+    return f"'{title}' {why}; it takes no new task or message.{kept}"
+
+
+def _with_conversation(record: SubagentRunRecord, state: ChildState) -> bool:
+    """Whether the turn's first message carries the forked conversation (a thread's first turn only)."""
+    return record.turn == 1 and bool(state.first_message) and state.first_message != record.task
 
 
 def _clip(text: str, limit: int) -> str:
@@ -678,6 +717,8 @@ class SubagentManager:
 
     def _settle(self, record: SubagentRunRecord, outcome: str, code: str, text: str | None) -> None:
         """End a run a restart stopped and could not continue; tell its conversation."""
+        self._save_settled_turn(record, text or "The process restarted before this task completed.",
+                                outcome if text is not None else "error")
         if text is None:
             self._registry.finish(
                 record.run_id, "error", error_code="process_restarted",
@@ -693,6 +734,29 @@ class SubagentManager:
             record.run_id, text or "The process restarted before this task completed.",
             outcome,
         )
+
+    def _save_settled_turn(self, record: SubagentRunRecord, text: str, outcome: str) -> None:
+        """A turn a restart ended without continuing it still takes its place in the thread.
+
+        What it did is not known any more (no usable checkpoint): the turn is
+        its task and a closing row saying how it ended, marked stopped, so a
+        later task's history says it was asked and did not finish.
+        """
+        if not record.thread_id:
+            return
+        thread = self._registry.get_thread(record.thread_id)
+        if thread is None or thread.closed_reason == "parent_deleted":
+            return
+        first = followup_message(record.task, record.notes) if record.trigger == "followup" else record.task
+        try:
+            self._registry.thread_store.commit_turn(
+                thread, run_id=record.run_id, turn=record.turn, trigger=record.trigger,
+                system_prompt="", first_message=first, brief=record.task, journal=[],
+                result=text, outcome=outcome, usage=dict(record.usage), duration_ms=None,
+                aborted=True, with_conversation=False,
+            )
+        except Exception:
+            logger.exception(f"[SubagentManager] [{record.run_id[:8]}] could not save the stopped turn")
 
     def _recover_running(self, record: SubagentRunRecord, owners: dict[str, str], now: float,
                          continued: list[tuple[SubagentRunRecord, ChildState]],
@@ -738,6 +802,12 @@ class SubagentManager:
                 "work saved by the other one. It was stopped where it was; nothing it had "
                 "started was run again."
             )))
+        elif refusal == "base":
+            settled.append((adopted, "interrupted", "resume_unsupported", (
+                "The subagent's saved conversation no longer matches the one this task started "
+                "from, so it cannot be continued. It was stopped where it was; nothing it had "
+                "started was run again."
+            )))
         else:
             settled.append((adopted, "error", "process_restarted", None))
 
@@ -750,7 +820,15 @@ class SubagentManager:
         except OSError:
             logger.exception(f"[SubagentManager] [{record.run_id[:8]}] checkpoint unreadable")
             return None, "unreadable"
-        restored = restore_child_state(records, annotate=annotate_search_repetition)
+        base = None
+        if records and int(records[0].get("baseCount") or 0) > 0 and record.thread_id:
+            # A later turn: the thread's history it started from, as its
+            # model gets it now (checked against the header's digest).
+            try:
+                base = self._registry.thread_store.turn_context(record.thread_id).history
+            except Exception:  # noqa: BLE001 — an unreadable history refuses the replay
+                logger.exception(f"[SubagentManager] [{record.run_id[:8]}] thread history unreadable")
+        restored = restore_child_state(records, annotate=annotate_search_repetition, base=base)
         if isinstance(restored, ResumeRefusal):
             if restored.reason != "missing":
                 logger.warning(
@@ -867,33 +945,11 @@ class SubagentManager:
                 "error": "Subagents cannot spawn other subagents",
             })
 
-        if self._shutting_down:
-            return json.dumps({
-                "status": "rejected",
-                "error": "Flowly is shutting down; no new subagent can start now.",
-            })
         parent_session_key = parent_session_key or f"{origin_channel}:{origin_chat_id}"
-        # Concurrency limits — a runaway parent can't pin the event loop, and
-        # one conversation can't take every slot from the others.
-        if len(self._running_tasks) >= _MAX_CONCURRENT_SUBAGENTS:
-            logger.warning(f"[SubagentManager] Concurrent limit reached ({_MAX_CONCURRENT_SUBAGENTS})")
-            return json.dumps({
-                "status": "rejected",
-                "error": (
-                    f"Maximum {_MAX_CONCURRENT_SUBAGENTS} subagents are running. "
-                    "Wait for one to finish, or do this part yourself."
-                ),
-            })
+        refused = self._admission_error(parent_session_key, origin)
+        if refused:
+            return json.dumps({"status": "rejected", "error": refused})
         siblings = self._running_siblings(parent_session_key)
-        if origin != "system" and len(siblings) >= MAX_CHILDREN_PER_CONVERSATION:
-            return json.dumps({
-                "status": "rejected",
-                "error": (
-                    f"{MAX_CHILDREN_PER_CONVERSATION} subagents are already running "
-                    "for this conversation. Wait for one to finish, or do this part "
-                    "yourself."
-                ),
-            })
 
         run_id = str(uuid.uuid4())
         child_session_key = f"subagent:{run_id}"
@@ -960,9 +1016,12 @@ class SubagentManager:
                 "status": "rejected",
                 "error": (
                     f"{MAX_OPEN_THREADS_PER_CONVERSATION} subagents of this conversation are "
-                    "open and all of them are working; one must finish before another can start."
+                    "open and all of them are working; one must finish, or be closed with "
+                    "agent_close, before another can start."
                 ),
             })
+        # Closed to make room: their runs' views now say so.
+        self._publish_thread_runs(made_room)
 
         logger.info(f"[SubagentManager] Spawned [{run_id[:8]}]: {resolved_display}")
 
@@ -992,19 +1051,308 @@ class SubagentManager:
             message += (
                 f" This conversation keeps at most {MAX_OPEN_THREADS_PER_CONVERSATION} "
                 f"subagents open; starting this one closed {names}, idle the longest. "
-                f"{whose} history stays readable."
+                f"{whose} history stays readable. agent_close closes a subagent that is "
+                "no longer needed."
             )
-        return json.dumps({
-            "status": "started",
-            "run_id": run_id,
-            "title": resolved_display,
-            "model": resolved_model,
-            "message": message,
-        })
+        started: dict[str, Any] = {"status": "started", "run_id": run_id}
+        if record.thread_id:
+            # The subagent itself: agent_followup and agent_close take it.
+            started["agent_id"] = record.thread_id
+        started.update(title=resolved_display, model=resolved_model, message=message)
+        return json.dumps(started)
+
+    # ------------------------------------------------------------------
+    # A subagent's later turns (Codex followup_task), closing, mail
+    # ------------------------------------------------------------------
+
+    def resolve_thread(self, target: str, parent_session_key: str | None
+                       ) -> tuple[SubagentThreadRecord | None, str]:
+        """One of this conversation's subagents, by ``agent_id`` or a run id of any of its tasks."""
+        from flowly.agent.tools.agent_tools import resolve_own_thread
+
+        return resolve_own_thread(self._registry, target, parent_session_key)
+
+    def _thread_runs(self, thread: SubagentThreadRecord) -> list[SubagentRunRecord]:
+        return self._registry.runs_of_thread(thread)
+
+    def _publish_thread_runs(self, threads: list[SubagentThreadRecord] | None) -> None:
+        """A thread's status changed: its ended runs' views (``threadStatus``) go out again."""
+        for thread in threads or []:
+            for run in self._thread_runs(thread):
+                if run.ended_at is not None:
+                    self._publish_event("subagent.completed", run.run_id)
+
+    async def followup(
+        self,
+        target: str,
+        task: str,
+        *,
+        parent_session_key: str | None,
+        origin: str = "agent",
+        batch_id: str = "",
+        model: str | None = None,
+        origin_channel: str = "",
+        origin_chat_id: str = "",
+    ) -> dict[str, Any]:
+        """Give one of this conversation's subagents a new task (Codex ``followup_task``).
+
+        * **Nothing running on it:** a new turn of its thread starts — a run
+          with ``trigger: "followup"`` and the next ``turn`` — from its own
+          history: the model gets the thread's conversation (its earlier tasks,
+          tool calls, results and reports), then this task. It reports like a
+          spawn, together with whatever else this parent turn started
+          (``batch_id``), and counts against the same limits.
+        * **A task running on it:** the running turn reads this task at its
+          next step, labeled ``[Task from the main agent]``; its report covers
+          it. A task that arrives too late to be read starts the next turn
+          when that one ends.
+        * **Closed:** refused, with the reason (``closed_text``).
+
+        ``origin`` labels the run (``owner`` when the agent quoted the owner
+        asking, see delegation); ``model`` is the owner's named model, else
+        the conversation's own (``self.model``).
+        """
+        text = (task or "").strip()
+        if not text:
+            return {"status": "error", "error": "The task is empty."}
+        thread, problem = self.resolve_thread(target, parent_session_key)
+        if thread is None:
+            return {"status": "error", "error": problem}
+        agent_id = thread.thread_id
+        title = thread.title or "subagent"
+        if thread.status != "open":
+            return {"status": "closed", "agent_id": agent_id, "title": title, "error": closed_text(thread)}
+        origin = origin if origin in ("owner", "agent") else "agent"
+        if thread.active_run_id:
+            current = self._registry.get(thread.active_run_id)
+            if current is not None and current.ended_at is None and current.run_id in self._running_tasks:
+                sent = await self.send_to_child(current.run_id, text, kind="task", batch_id=batch_id,
+                                                origin=origin)
+                if sent.get("status") == "delivered":
+                    return {
+                        "status": "added_to_running_task", "run_id": current.run_id,
+                        "agent_id": agent_id, "turn": current.turn, "title": title,
+                        "message": (
+                            f"'{title}' is working on its current task; it reads this task at its "
+                            "next step, and the report of the task it is on covers this one too."
+                        ),
+                    }
+            refreshed = self._registry.get_thread(agent_id)
+            if refreshed is None or refreshed.status != "open":
+                return {"status": "closed", "agent_id": agent_id, "title": title,
+                        "error": closed_text(refreshed or thread)}
+            if refreshed.active_run_id:
+                return {"status": "busy", "agent_id": agent_id, "title": title, "error": (
+                    f"'{title}' is recorded as working on a task that no process here is running "
+                    "(it may be about to continue after a restart); it takes a new task once "
+                    "that one reports."
+                )}
+            thread = refreshed
+        refused = self._admission_error(thread.parent_session_key, origin)
+        if refused:
+            return {"status": "rejected", "agent_id": agent_id, "error": refused}
+        runs = self._thread_runs(thread)
+        last = runs[-1] if runs else None
+        resolved_model = (model or "").strip() or self.model
+        now = time.time()
+        run_id = str(uuid.uuid4())
+        record = SubagentRunRecord(
+            run_id=run_id,
+            child_session_key=thread.child_session_key,
+            parent_session_key=thread.parent_session_key,
+            parent_channel=origin_channel or (last.parent_channel if last else "cli"),
+            parent_chat_id=origin_chat_id or (last.parent_chat_id if last else "direct"),
+            task=text,
+            label=title,
+            display_name=title,
+            model=resolved_model,
+            cleanup="keep",
+            created_at=now,
+            activity={"phase": "queued"},
+            delivery_state="pending",
+            origin=origin,
+            # The mark is the thread's: every turn of it wears the same one.
+            mark=dict(thread.mark),
+            batch_id=batch_id,
+            owner=subagent_owner.process_owner(self._instance),
+            resumable=bool(self.resume_enabled),
+            thread_id=agent_id,
+            turn=len(thread.runs) + 1,
+            trigger="followup",
+        )
+        try:
+            self._registry.register(record)
+        except ValueError:
+            current = self._registry.get_thread(agent_id)
+            if current is not None and current.status != "open":
+                return {"status": "closed", "agent_id": agent_id, "title": title, "error": closed_text(current)}
+            return {"status": "busy", "agent_id": agent_id, "title": title,
+                    "error": f"'{title}' has just started another task; give it this one again."}
+        record = self._registry.get(run_id) or record
+        logger.info(f"[SubagentManager] Follow-up [{run_id[:8]}] task {record.turn} of [{agent_id[:8]}]: {title}")
+        await self._emit_event("subagent.started", run_id, title, "running")
+        self._start_run_task(run_id, record.parent_session_key, self._run_subagent(
+            run_id, text, title, record.parent_channel, record.parent_chat_id, resolved_model, None,
+        ))
+        return {
+            "status": "started", "run_id": run_id, "agent_id": agent_id, "turn": record.turn,
+            "title": title, "model": resolved_model,
+            "message": (
+                f"'{title}' is working on this task in the background (task {record.turn}), with "
+                "its earlier work in its history. When everything you started in this turn has "
+                "finished, the results reach you together as a new message and you continue "
+                "from there. Don't wait for them, don't redo their tasks and don't guess their "
+                "results: do any work that does not depend on them, then tell the owner briefly "
+                "what is running and end your turn."
+            ),
+        }
+
+    async def close_threads(self, targets: list[str] | str, *, parent_session_key: str | None,
+                            reason: str = "agent") -> dict[str, Any]:
+        """Close subagents of this conversation (``agent_close``): ids, or ``"all"`` open ones.
+
+        A closed subagent takes no new task or message; its history stays
+        readable. A task running on it is stopped (outcome ``cancelled``, no
+        report — the caller knows).
+        """
+        if parent_session_key is None:
+            return {"error": "No conversation owns this call, so it has no subagents."}
+        if targets == "all":
+            chosen = [t for t in self._registry.threads()
+                      if t.parent_session_key == parent_session_key and t.status == "open"]
+            if not chosen:
+                return {"closed": [], "note": "No subagent of this conversation is open."}
+        else:
+            chosen = []
+            for target in ([targets] if isinstance(targets, str) else list(targets or [])):
+                thread, problem = self.resolve_thread(str(target), parent_session_key)
+                if thread is None:
+                    return {"error": problem}
+                if thread.thread_id not in {t.thread_id for t in chosen}:
+                    chosen.append(thread)
+        results: list[dict[str, Any]] = []
+        for thread in chosen:
+            entry: dict[str, Any] = {"agent_id": thread.thread_id, "title": thread.title}
+            closed = self._registry.close_thread(thread.thread_id, reason)
+            if closed is None:
+                current = self._registry.get_thread(thread.thread_id) or thread
+                entry.update(status="already_closed", reason=current.closed_reason)
+                results.append(entry)
+                continue
+            entry["status"] = "closed"
+            running = closed.active_run_id
+            if running and running in self._running_tasks:
+                await self.cancel(running)
+                entry["stopped_run_id"] = running
+            elif running:
+                # Recorded running with no process here: ended now.
+                await self.cancel(running)
+            self._publish_thread_runs([closed])
+            logger.info(f"[SubagentManager] Closed [{thread.thread_id[:8]}] ({reason}): {thread.title}")
+            results.append(entry)
+        return {"closed": results}
+
+    async def message_thread(self, thread: SubagentThreadRecord, text: str) -> dict[str, Any]:
+        """A message from the main agent to one of its subagents.
+
+        Running: its running task reads it at its next step (``delivered``).
+        Open with nothing running: kept for its next task, which starts with
+        it (``queued``) — no task starts. Closed: refused.
+        """
+        if thread.status != "open":
+            return {"agent_id": thread.thread_id, "status": "closed", "error": closed_text(thread)}
+        if thread.active_run_id and thread.active_run_id in self._running_tasks:
+            sent = await self.send_to_child(thread.active_run_id, text)
+            if sent.get("status") == "delivered":
+                return sent
+        kept, why = self._registry.queue_mail(thread.thread_id, text)
+        if kept is not None:
+            return {"agent_id": thread.thread_id, "status": "queued", "note": (
+                f"'{thread.title}' has no task running; it reads this when it gets its next "
+                "task (agent_followup). No task was started."
+            )}
+        if why == "closed":
+            current = self._registry.get_thread(thread.thread_id) or thread
+            return {"agent_id": thread.thread_id, "status": "closed", "error": closed_text(current)}
+        if why == "running":
+            current = self._registry.get_thread(thread.thread_id)
+            if current is not None and current.active_run_id in self._running_tasks:
+                return await self.send_to_child(current.active_run_id, text)
+            return {"agent_id": thread.thread_id, "status": "busy", "error": (
+                f"'{thread.title}' is recorded as working on a task that no process here is running; "
+                "it takes messages once that one reports."
+            )}
+        if why == "full":
+            return {"agent_id": thread.thread_id, "status": "full", "error": (
+                f"'{thread.title}' already keeps the most messages it can for its next task."
+            )}
+        return {"agent_id": thread.thread_id, "status": "not_found", "error": "Subagent not found."}
+
+    async def _carry_over(self, run_id: str, entries: list[dict[str, Any]]) -> None:
+        """What reached a turn too late to be read goes to the thread's next turn.
+
+        Messages are kept for its next task; tasks start it (the first one) or
+        join it — unless the turn was stopped on request: whoever stopped it
+        stopped its work too. Nothing is carried for a closed thread or a run
+        with none.
+        """
+        record = self._registry.get(run_id)
+        thread = self._registry.get_thread(record.thread_id) if record is not None and record.thread_id else None
+        if record is None or thread is None or thread.status != "open":
+            if entries:
+                logger.info(f"[SubagentManager] [{run_id[:8]}] {len(entries)} unread message(s) dropped: "
+                            "the subagent has no open thread")
+            return
+        for entry in entries:
+            if entry.get("kind") != "task":
+                kept, why = self._registry.queue_mail(thread.thread_id, str(entry.get("text") or ""))
+                if kept is None:
+                    logger.warning(f"[SubagentManager] [{run_id[:8]}] an unread message could not be kept ({why})")
+        tasks = [e for e in entries if e.get("kind") == "task"]
+        if tasks and record.outcome == "cancelled":
+            logger.info(f"[SubagentManager] [{run_id[:8]}] {len(tasks)} unread task(s) dropped: "
+                        "the task was stopped on request")
+            tasks = []
+        for entry in tasks:
+            if entry.get("kind") == "task":
+                outcome = await self.followup(
+                    thread.thread_id, str(entry.get("text") or ""),
+                    parent_session_key=record.parent_session_key,
+                    origin=str(entry.get("origin") or "agent"), batch_id=str(entry.get("batch") or ""),
+                    model=record.model, origin_channel=record.parent_channel,
+                    origin_chat_id=record.parent_chat_id,
+                )
+                if outcome.get("status") not in ("started", "added_to_running_task"):
+                    logger.warning(f"[SubagentManager] [{run_id[:8]}] a task that arrived as the run "
+                                   f"ended could not start: {outcome.get('error')}")
 
     # ------------------------------------------------------------------
     # Internal execution (core loop preserved from original)
     # ------------------------------------------------------------------
+
+    def _admission_error(self, parent_session_key: str, origin: str) -> str | None:
+        """Why no new task (a spawn or a follow-up) can start now, or None.
+
+        Budget guards, the same for both: a shutdown, the process's limit and
+        the conversation's (system work is not counted against the latter).
+        """
+        if self._shutting_down:
+            return "Flowly is shutting down; no new subagent can start now."
+        # Concurrency limits — a runaway parent can't pin the event loop, and
+        # one conversation can't take every slot from the others.
+        if len(self._running_tasks) >= _MAX_CONCURRENT_SUBAGENTS:
+            logger.warning(f"[SubagentManager] Concurrent limit reached ({_MAX_CONCURRENT_SUBAGENTS})")
+            return (
+                f"Maximum {_MAX_CONCURRENT_SUBAGENTS} subagents are running. "
+                "Wait for one to finish, or do this part yourself."
+            )
+        if origin != "system" and len(self._running_siblings(parent_session_key)) >= MAX_CHILDREN_PER_CONVERSATION:
+            return (
+                f"{MAX_CHILDREN_PER_CONVERSATION} subagents are already running "
+                "for this conversation. Wait for one to finish, or do this part "
+                "yourself."
+            )
+        return None
 
     def _start_run_task(self, run_id: str, parent_session_key: str, run: Any) -> asyncio.Task:
         """Run a child (new or continued) as this process's task for ``run_id``."""
@@ -1038,10 +1386,18 @@ class SubagentManager:
             finally:
                 if not _task.cancelled():
                     _task.exception()
-                self._settle_stream(_rid, suspended=_task.cancelled() and self._suspends(_rid))
+                suspended = _task.cancelled() and self._suspends(_rid)
+                self._settle_stream(_rid, suspended=suspended)
                 self._cancel_outcomes.pop(_rid, None)
                 self._running_tasks.pop(_rid, None)
-                self._inboxes.pop(_rid, None)
+                unread = self._inboxes.pop(_rid, None)
+                if unread and not suspended:
+                    # Arrived too late to be read; a suspended run keeps its
+                    # unread mail in its checkpoint instead.
+                    carried = asyncio.ensure_future(self._carry_over(_rid, list(unread)))
+                    carried.add_done_callback(
+                        lambda t: t.exception() if not t.cancelled() and t.exception() else None
+                    )
                 self._inbox_events.pop(_rid, None)
                 self._checkpoints.pop(_rid, None)
                 self._wake(_pk)
@@ -1265,7 +1621,7 @@ class SubagentManager:
             thread_id=thread.thread_id, parent_session_key=record.parent_session_key,
             turn=record.turn, trigger=record.trigger, title=record.display_name or thread.title,
             mark=record.mark, model=record.model or self.model, brief=record.task,
-            with_conversation=bool(state.first_message) and state.first_message != record.task,
+            with_conversation=_with_conversation(record, state),
             access=access, started_at=record.started_at,
         )
         self._streams[run_id] = stream
@@ -1318,9 +1674,13 @@ class SubagentManager:
         """Save what the run did as a turn of its thread's conversation.
 
         Called once the run's result is decided, before the registry records
-        it, whatever the outcome; a stopped run is saved as ``aborted``. A run
-        with no thread (system work, delegated tasks) or whose conversation was
-        deleted saves nothing. Saving never fails the run.
+        it, whatever the outcome; a stopped run is saved as ``aborted``, and
+        a call it left without a result gets a factual one (it may have run,
+        or it did not start), so the conversation stays well formed. A summary
+        the turn made of its context is kept for the next turn
+        (``persist_context``). A run with no thread (system work, delegated
+        tasks) or whose conversation was deleted saves nothing. Saving never
+        fails the run.
         """
         state = turn.get("state")
         record = self._registry.get(run_id)
@@ -1333,15 +1693,46 @@ class SubagentManager:
         if record.started_at is not None:
             duration_ms = int(max(0.0, time.time() - record.started_at
                                   - (record.suspended_seconds or 0.0)) * 1000)
+        for call_id, name in open_call_ids(state.journal):
+            started = call_id in state.started_calls
+            append_message(state, {
+                "role": "tool", "tool_call_id": call_id, "name": name,
+                "content": STOPPED_CALL_TEXT if started else NOT_STARTED_CALL_TEXT,
+            }, status="interrupted" if started else "not_run")
+        store = self._registry.thread_store
         try:
-            self._registry.thread_store.commit_turn(
+            store.commit_turn(
                 thread, run_id=run_id, turn=record.turn, trigger=record.trigger,
                 system_prompt=state.system_prompt, first_message=state.first_message,
                 brief=record.task, journal=state.journal, result=result, outcome=outcome,
                 usage=dict(record.usage), duration_ms=duration_ms, aborted=aborted,
+                with_conversation=_with_conversation(record, state),
             )
         except Exception:
             logger.exception(f"[SubagentManager] [{run_id[:8]}] could not save the turn into its thread")
+            return
+        if state.summarized and not state.base_mismatch:
+            self._persist_context(thread, run_id, state, result)
+
+    def _persist_context(self, thread: SubagentThreadRecord, run_id: str, state: ChildState,
+                         result: str) -> None:
+        """Keep the summary this turn made, and what came after it, for the thread's next turn."""
+        from flowly.compaction.types import is_summary_message
+
+        messages = state.messages
+        if len(messages) < 2 or not is_summary_message(messages[1]):
+            logger.warning(f"[SubagentManager] [{run_id[:8]}] summarized, but no summary leads its "
+                           "context; the next task fits its history again")
+            return
+        kept = [dict(message) for message in messages[2:]]
+        kept.append({"role": "assistant", "content": result or ""})
+        try:
+            if self._registry.thread_store.persist_context(thread, run_id=run_id, summary=messages[1],
+                                                           kept=kept):
+                logger.info(f"[SubagentManager] [{run_id[:8]}] kept the turn's summary for the "
+                            f"subagent's next task ({len(kept)} message(s) after it)")
+        except Exception:
+            logger.exception(f"[SubagentManager] [{run_id[:8]}] could not keep the turn's summary")
 
     def _cap_tool_result(self, run_id: str, tool_name: str, result: str) -> str:
         """What the model gets of a tool result: the main agent's per-tool limit.
@@ -1541,6 +1932,17 @@ class SubagentManager:
         return subagent_output_budget(self.compaction.effective_context_window_for(model),
                                       self.compaction.effective_reserve_tokens_for(model))
 
+    @staticmethod
+    def _pin(state: ChildState) -> dict[str, Any]:
+        """What a fitting keeps verbatim: the turn's task, where it stands.
+
+        On a thread's first turn that is the message after the system prompt
+        (after a summary, once there is one); on a later turn it follows the
+        thread's history, which may be summarized like any other context.
+        """
+        index = task_index(state)
+        return {"pinned": _PINNED_BRIEF} if index is None else {"pin_at": index}
+
     async def _fit_request(
         self, run_id: str, state: ChildState, tools: list[dict[str, Any]] | None, model: str,
         iteration: int, *, overflow: bool, activity: dict[str, Any],
@@ -1552,7 +1954,8 @@ class SubagentManager:
         window; past it, old tool results are cut (microcompact); if that is
         not enough, the history is summarized — the last resort, a model call.
         After a context-overflow rejection (``overflow``) it reduces harder.
-        The system prompt and the brief are kept verbatim.
+        The system prompt and the turn's task are kept verbatim (``_pin``); a
+        later turn's earlier history is compactable like the rest.
 
         What changed the list is checkpointed before the request goes out: a
         cut with its parameters (``microcompact``), a summary with the list it
@@ -1560,7 +1963,8 @@ class SubagentManager:
         model call. The summary's tokens count toward the run.
         """
         requests = self._requests
-        before = requests.budget(state.messages, tools, model, pinned=_PINNED_BRIEF)
+        pin = self._pin(state)
+        before = requests.budget(state.messages, tools, model, **pin)
         if not overflow and before.estimated_input_tokens <= before.input_limit:
             return RequestFit(state.messages, before, before)
         reason = "overflow" if overflow else "threshold"
@@ -1582,7 +1986,7 @@ class SubagentManager:
             with collect_summary_usage() as calls:
                 fitted = await requests.fit(
                     original, tools, model, session_key=f"subagent:{run_id}",
-                    force_reduction=overflow, pinned=_PINNED_BRIEF,
+                    force_reduction=overflow, **pin,
                     custom_instructions=CHILD_SUMMARY_INSTRUCTIONS, **fit_options,
                 )
         except Exception as exc:  # noqa: BLE001 — fitting fails closed, never the run
@@ -1610,7 +2014,7 @@ class SubagentManager:
             else:
                 # A summary cannot be computed again: the list it produced is
                 # the record (and so is any cut the replay could not redo).
-                apply_compacted(state, fitted.messages)
+                apply_compacted(state, fitted.messages, summarized=summarized)
                 self._log(run_id, "compacted", durable=True, iteration=iteration, reason=reason,
                           summarized=summarized, messages=state.messages,
                           tokensBefore=fitted.before.estimated_input_tokens,
@@ -1664,7 +2068,7 @@ class SubagentManager:
             ceiling = extract_input_limit_tokens(response)
             if ceiling is None:
                 # The rejected payload bounds the ceiling from above.
-                ceiling = int(self._requests.budget(state.messages, tools, model, pinned=_PINNED_BRIEF)
+                ceiling = int(self._requests.budget(state.messages, tools, model, **self._pin(state))
                               .estimated_input_tokens * 0.9)
             self.compaction.note_observed_input_limit(
                 model, ceiling, reason="subagent provider input_too_large rejection",
@@ -1726,41 +2130,62 @@ class SubagentManager:
         tools = self._child_tools(run_id, label)
 
         if restored is None:
-            # Build messages with subagent-specific prompt
-            system_prompt = self._build_subagent_prompt(task, label=label)
-            if build_tool_disclosure(
-                tools.get_definitions(),
-                toolsets=tools.get_toolsets(),
-                sources=tools.get_discovery_sources(),
-                intent_text=task,
-            ).enabled:
-                system_prompt += (
-                    "\n\nSome safe tools are represented by a compact catalog. "
-                    "They may be invoked through tool_call. tool_search is available "
-                    "when a name or compact signature is unclear; its results include "
-                    "complete schemas and valid invocation options."
+            own = self._registry.get(run_id)
+            history: list[dict[str, Any]] = []
+            system_prompt = ""
+            if own is not None and own.trigger == "followup" and own.thread_id:
+                # A later turn of the thread: the same system prompt, the
+                # thread's history as the model gets it, then this task
+                # (with the messages that waited for it).
+                saved = self._registry.thread_store.turn_context(own.thread_id)
+                system_prompt, history = saved.system_prompt, saved.history
+                first_message = followup_message(task, own.notes)
+            else:
+                first_message = (
+                    f"## Conversation so far\n\n{context}\n\n## Your task\n\n{task}"
+                    if context else task
                 )
-            first_message = (
-                f"## Conversation so far\n\n{context}\n\n## Your task\n\n{task}"
-                if context else task
-            )
+            if not system_prompt:
+                # Build messages with subagent-specific prompt
+                system_prompt = self._build_subagent_prompt(task, label=label)
+                if build_tool_disclosure(
+                    tools.get_definitions(),
+                    toolsets=tools.get_toolsets(),
+                    sources=tools.get_discovery_sources(),
+                    intent_text=task,
+                ).enabled:
+                    system_prompt += (
+                        "\n\nSome safe tools are represented by a compact catalog. "
+                        "They may be invoked through tool_call. tool_search is available "
+                        "when a name or compact signature is unclear; its results include "
+                        "complete schemas and valid invocation options."
+                    )
             state = ChildState(
                 messages=[
                     {"role": "system", "content": system_prompt},
+                    *history,
                     {"role": "user", "content": first_message},
                 ],
                 max_iterations=self.max_iterations,
                 system_prompt=system_prompt,
                 first_message=first_message,
+                base_count=len(history),
+                base_digest=history_digest(history) if history else "",
             )
+            thread_fields: dict[str, Any] = {}
+            if own is not None and own.thread_id:
+                thread_fields = {"threadId": own.thread_id, "turn": own.turn, "trigger": own.trigger,
+                                 "sessionKey": own.child_session_key}
             self._log(
                 run_id, "header", durable=True, runId=run_id, coreVersion=_core_version(),
                 model=model, label=label, maxIterations=state.max_iterations,
                 systemPrompt=system_prompt, firstMessage=first_message,
-                tools=sorted(tools.tool_names),
+                tools=sorted(tools.tool_names), baseCount=state.base_count,
+                baseDigest=state.base_digest, **thread_fields,
             )
             self._transcribe(run_id, {
-                "kind": "brief", "content": _clip(task, 8_000), "withConversation": bool(context),
+                "kind": "brief", "content": _clip(task, 8_000),
+                "withConversation": bool(context),
             })
         else:
             state = restored
@@ -1823,9 +2248,14 @@ class SubagentManager:
                 # recorded so a restart rebuilds the same list.
                 mail = self._take_inbox_entries(run_id)
                 strip = iteration_strip_passes(state.iteration + 1)
-                apply_step(state, state.iteration + 1, [m["text"] for m in mail], strip)
+                # A message is its text; a task (agent_followup) says so.
+                notes: list[Any] = [
+                    {"text": m["text"], "kind": "task"} if m.get("kind") == "task" else m["text"]
+                    for m in mail
+                ]
+                apply_step(state, state.iteration + 1, notes, strip)
                 self._log(run_id, "step", iteration=state.iteration,
-                          notes=[m["text"] for m in mail], mail=[m["id"] for m in mail],
+                          notes=notes, mail=[m["id"] for m in mail],
                           strip=[list(p) for p in strip])
                 if mail:
                     await self._stream_sync(run_id, state)
@@ -1992,6 +2422,7 @@ class SubagentManager:
                               protocolName=protocol_tool_name,
                               toolClass=tool_class(effective_tool_name, tool_args))
                     self._current_call[run_id] = tool_call.id
+                    state.started_calls.add(tool_call.id)
                     if stream is not None:
                         await stream.tool_started(tool_call.id, effective_tool_name, tool_args)
                     try:
@@ -2262,11 +2693,14 @@ class SubagentManager:
     # Messages between the main agent and a running subagent
     # ------------------------------------------------------------------
 
-    async def send_to_child(self, run_id: str, text: str) -> dict[str, Any]:
-        """Queue a message from the main agent for a running subagent.
+    async def send_to_child(self, run_id: str, text: str, *, kind: str = "message",
+                            batch_id: str = "", origin: str = "agent") -> dict[str, Any]:
+        """Queue a message — or, ``kind="task"``, a task (agent_followup) — for a running subagent.
 
         The child reads it at its next step — after the tool call it is in,
-        never by interrupting one. A finished run cannot receive messages.
+        never by interrupting one. A finished run cannot receive messages. A
+        task keeps the batch and origin of the turn that gave it, for the
+        follow-up it starts if the run ends before reading it.
         """
         record = self._registry.get(run_id)
         if record is None:
@@ -2275,12 +2709,18 @@ class SubagentManager:
             return {"run_id": run_id, "status": "finished",
                     "error": "This subagent has already finished; it can't receive messages."}
         mail_id = uuid.uuid4().hex[:16]
+        entry: dict[str, str] = {"id": mail_id, "text": text}
+        extra: dict[str, str] = {}
+        if kind == "task":
+            entry.update(kind="task", batch=batch_id, origin=origin)
+            extra = {"mailKind": "task", "batch": batch_id, "origin": origin}
         # Durable before the main agent is told it was delivered: a restart
         # gives the child every message it had not read yet.
-        self._log(run_id, "mail", durable=True, id=mail_id, text=text)
-        self._inboxes.setdefault(run_id, []).append({"id": mail_id, "text": text})
+        self._log(run_id, "mail", durable=True, id=mail_id, text=text, **extra)
+        self._inboxes.setdefault(run_id, []).append(entry)
         self._inbox_events.setdefault(run_id, asyncio.Event()).set()
-        self._transcribe(run_id, {"kind": "message_in", "from": "orchestrator", "content": text})
+        self._transcribe(run_id, {"kind": "message_in", "from": "orchestrator", "content": text,
+                                  **({"task": True} if kind == "task" else {})})
         await self._progress(run_id, {"phase": "message_received"})
         return {"run_id": run_id, "status": "delivered"}
 
@@ -2299,7 +2739,8 @@ class SubagentManager:
             # Read only once that call's result is recorded; a restart
             # before then gives them to the child again.
             self._log(run_id, "inbox", callId=call_id, ids=[e["id"] for e in entries])
-        return [e["text"] for e in entries]
+        # A task that arrives as the reply is still a task.
+        return [f"{TASK_LABEL}\n{e['text']}" if e.get("kind") == "task" else e["text"] for e in entries]
 
     async def _wait_for_inbox(self, run_id: str, timeout: float) -> list[str]:
         if self._inboxes.get(run_id):
@@ -2566,12 +3007,18 @@ class SubagentManager:
             "timeout": "timed out",
         }.get(status, status)
         duration = ""
+        # A later task of the same subagent says which one it is.
+        which = f"task {record.turn}" if record.thread_id and record.turn > 1 else ""
         if record.started_at and record.ended_at:
             # Time it worked: the downtime of a restart it continued across
             # is left out.
             runtime = int(max(0.0, record.ended_at - record.started_at - (record.suspended_seconds or 0.0)))
             continued = ", continued after a restart" if record.resumed_at else ""
-            duration = f" (runtime: {runtime}s{continued})"
+            duration = f" (runtime: {runtime}s{continued}{', ' + which if which else ''})"
+        elif which:
+            duration = f" ({which})"
+        # The subagent itself, which agent_followup and agent_close take.
+        agent = f" agent_id={record.thread_id}" if record.thread_id else ""
 
         # The parent gets enough of the result to act on, and the run id to
         # read the rest — never a preview it cannot get past.
@@ -2602,7 +3049,7 @@ class SubagentManager:
                 "restarted; this result reaches you only now."
             )
         return (
-            f"[Subagent '{title}' {status_text}{duration}] run_id={record.run_id}{tool_summary}{late}\n\n"
+            f"[Subagent '{title}' {status_text}{duration}] run_id={record.run_id}{agent}{tool_summary}{late}\n\n"
             f"Brief: {brief}\n\n"
             f"Result:\n{shown}{more}"
         )
@@ -2725,12 +3172,24 @@ class SubagentManager:
                     "results reached you earlier in this conversation. Give the owner one "
                     "answer that brings all of them together."
                 )
+        # A fact about what is left of them: an open subagent keeps its
+        # conversation and can be given another task, or closed.
+        keeps = [m for m in to_tell if m.thread_id and (
+            (t := self._registry.get_thread(m.thread_id)) is not None and t.status == "open")]
+        kept = ""
+        if keeps and len(to_tell) == 1:
+            kept = (" The subagent keeps its conversation: agent_followup gives it another task, "
+                    "agent_close ends it.")
+        elif keeps:
+            kept = (" Each subagent keeps its conversation: agent_followup gives one another task, "
+                    "agent_close ends it.")
         if len(to_tell) == 1:
             announce_content = (
                 f"{sections[0]}\n\n"
                 "This is the subagent's own report: check what matters before relying "
                 "on it, and don't redo its work. Tell the owner what it means for their "
-                "request in your own words; don't show run ids."
+                "request in your own words; don't show run ids or agent ids."
+                + kept
                 + waiting
             )
         else:
@@ -2741,7 +3200,8 @@ class SubagentManager:
                 + f"\n\nThese {len(to_tell)} subagents {together}. These are their own "
                 "reports: check what matters before relying on them, and don't redo their "
                 "work. Answer the owner's request as a whole, in your own words; don't "
-                "show run ids."
+                "show run ids or agent ids."
+                + kept
                 + waiting
             )
         titles = ", ".join(m.display_name or m.label for m in to_tell)

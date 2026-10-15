@@ -2599,9 +2599,17 @@ class AgentLoop:
         # Spawn tool (for subagents)
         spawn_tool = SpawnTool(manager=self.subagents)
         self.tools.register(spawn_tool)
-        from flowly.agent.tools.agent_tools import AgentMessageTool, AgentReadTool, AgentWaitTool
+        from flowly.agent.tools.agent_tools import (
+            AgentCloseTool,
+            AgentFollowupTool,
+            AgentMessageTool,
+            AgentReadTool,
+            AgentWaitTool,
+        )
         self.tools.register(AgentReadTool(registry=self._subagent_registry))
         self.tools.register(AgentMessageTool(manager=self.subagents))
+        self.tools.register(AgentFollowupTool(manager=self.subagents))
+        self.tools.register(AgentCloseTool(manager=self.subagents))
         self.tools.register(AgentWaitTool(manager=self.subagents))
 
         # Sessions list tool (with cancel capability)

@@ -18,6 +18,7 @@ from filelock import FileLock
 from loguru import logger
 
 from flowly.agent.subagent_threads import (
+    MAX_PENDING_MAIL,
     THREAD_IDLE_CLOSE_SECONDS,
     THREAD_RETENTION_SECONDS,
     SubagentThreadRecord,
@@ -144,6 +145,10 @@ class SubagentRunRecord:
     thread_id: str = ""
     turn: int = 1
     trigger: str = "spawn"
+    # A follow-up turn's messages from the main agent that were waiting for
+    # it (the thread's pending mail, taken when the turn was recorded): its
+    # first message carries them before the task.
+    notes: list[str] = field(default_factory=list)
 
 
 
@@ -275,6 +280,8 @@ class SubagentRegistry:
             raise ValueError("invalid run thread")
         if type(record.turn) is not int or record.turn < 1 or record.trigger not in ("spawn", "followup"):
             raise ValueError("invalid run turn")
+        if not isinstance(record.notes, list) or any(not isinstance(n, str) for n in record.notes):
+            raise ValueError("invalid run notes")
         return record
 
     def _read_locked(self) -> None:
@@ -354,6 +361,7 @@ class SubagentRegistry:
                     and now - last_active(thread) >= THREAD_IDLE_CLOSE_SECONDS):
                 closed_at = last_active(thread) + THREAD_IDLE_CLOSE_SECONDS
                 thread.status, thread.closed_at, thread.closed_reason = "closed", closed_at, "idle"
+                thread.pending_mail = []
                 thread.updated_at = closed_at
                 thread.revision += 1
         kept: dict[str, SubagentThreadRecord] = {}
@@ -570,8 +578,9 @@ class SubagentRegistry:
         the cap, the ones idle longest are closed (``cap``) to make room, and
         returned. :class:`ThreadCapReached` when every open thread is busy.
         A run whose ``thread_id`` names an existing open thread becomes its
-        next turn. Threads unavailable (threads.json unreadable): the run is
-        recorded without one.
+        next turn: the messages waiting for it (``pending_mail``) move into
+        the run's ``notes`` in the same write. Threads unavailable
+        (threads.json unreadable): the run is recorded without one.
         """
         with self._lock:
             self._read_locked()
@@ -598,6 +607,9 @@ class SubagentRegistry:
                     raise ValueError("This subagent's thread cannot take a new run")
                 existing.runs.append(record.run_id)
                 existing.active_run_id = record.run_id
+                existing.model = record.model or existing.model
+                record.notes = [*record.notes, *(str(m["text"]) for m in existing.pending_mail)]
+                existing.pending_mail = []
                 existing.revision += 1
                 existing.updated_at = record.created_at
             record.updated_at = record.created_at
@@ -621,10 +633,67 @@ class SubagentRegistry:
             raise ThreadCapReached(len(open_threads))
         evicted = idle[:excess]
         for thread in evicted:
-            thread.status, thread.closed_at, thread.closed_reason = "closed", now, "cap"
+            self._close_locked(thread, "cap", now)
+        return evicted
+
+    def _close_locked(self, thread: SubagentThreadRecord, reason: str, now: float) -> None:
+        """Close ``thread``; its runs' views change (``threadStatus``), so their revisions move."""
+        thread.status, thread.closed_at, thread.closed_reason = "closed", now, reason
+        thread.pending_mail = []
+        thread.revision += 1
+        thread.updated_at = now
+        for run_id in thread.runs:
+            run = self._runs.get(run_id)
+            if run is not None:
+                run.revision += 1
+                run.updated_at = now
+
+    def close_thread(self, thread_id: str, reason: str) -> SubagentThreadRecord | None:
+        """Close an open thread (``agent_close``: ``agent``); None when it is not open.
+
+        A task still running on it is the caller's to stop. Its history stays
+        readable; it takes no new task or message.
+        """
+        with self._lock:
+            self._read_locked()
+            thread = self._threads.get(thread_id)
+            if self._threads_unavailable or thread is None or thread.status != "open":
+                return None
+            self._close_locked(thread, reason, time.time())
+            try:
+                self._write_locked()
+            except Exception:
+                self._read_locked()
+                raise
+            return thread
+
+    def queue_mail(self, thread_id: str, text: str) -> tuple[SubagentThreadRecord | None, str]:
+        """Keep a message from the main agent for an open thread's next task.
+
+        ``(thread, "")`` when kept; ``(None, why)`` otherwise: ``closed``,
+        ``running`` (a task runs: its inbox takes it), ``full``, ``unknown``.
+        """
+        with self._lock:
+            self._read_locked()
+            thread = self._threads.get(thread_id)
+            if self._threads_unavailable or thread is None:
+                return None, "unknown"
+            if thread.status != "open":
+                return None, "closed"
+            if thread.active_run_id is not None:
+                return None, "running"
+            if len(thread.pending_mail) >= MAX_PENDING_MAIL:
+                return None, "full"
+            now = time.time()
+            thread.pending_mail.append({"id": secrets.token_hex(8), "text": text, "at": now})
             thread.revision += 1
             thread.updated_at = now
-        return evicted
+            try:
+                self._write_locked()
+            except Exception:
+                self._read_locked()
+                raise
+            return thread, ""
 
     def update(self, run_id: str, **changes: Any) -> None:
         with self._lock:
@@ -786,9 +855,7 @@ class SubagentRegistry:
             owned = [t for t in self._threads.values() if t.parent_session_key == parent_session_key]
             for thread in owned:
                 if thread.status == "open":
-                    thread.status, thread.closed_at, thread.closed_reason = "closed", now, "parent_deleted"
-                    thread.revision += 1
-                    thread.updated_at = now
+                    self._close_locked(thread, "parent_deleted", now)
             if owned:
                 try:
                     self._write_locked()

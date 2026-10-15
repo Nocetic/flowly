@@ -23,6 +23,13 @@ already knows, ``subagent:<threadId>`` (``SubagentRunRecord.child_session_key``)
 Only the agent that started a thread writes to it, through its runs; every
 client may read it and none may write (``flowly.session.keys``).
 
+**Later turns.** A follow-up turn starts from the thread's conversation as the
+model gets it (:meth:`SubagentThreadStore.turn_context`): its saved system
+prompt and its history, made acceptable to every provider
+(:func:`repair_thread_history`). A summary a turn made of its context is kept
+for the next turn (:meth:`SubagentThreadStore.persist_context`), with the
+owner's own compaction machinery, so the next turn starts from it.
+
 Lifetime: an open thread with nothing running closes after
 ``THREAD_IDLE_CLOSE_SECONDS``; a conversation keeps at most
 ``MAX_OPEN_THREADS_PER_CONVERSATION`` open; a closed thread, its conversation
@@ -51,15 +58,26 @@ THREAD_IDLE_CLOSE_SECONDS = 7 * 86_400
 THREAD_RETENTION_SECONDS = 30 * 86_400
 
 THREAD_STATUSES = ("open", "closed")
-# Why a thread closed. Phase 1 closes threads for "parent_deleted", "idle"
-# and "cap"; "agent" and "owner" are for agent_close / subagents.close.
+# Why a thread closed: agent_close ("agent"), the owner ("owner", no client
+# path yet), its conversation deleted ("parent_deleted"), a week idle
+# ("idle"), room made for a new one ("cap").
 THREAD_CLOSE_REASONS = ("agent", "owner", "parent_deleted", "idle", "cap", "pruned")
+# Messages from the main agent a thread with no task running keeps for its
+# next task (agent_message to an idle subagent), at most this many.
+MAX_PENDING_MAIL = 32
 THREAD_KEY_PREFIX = "subagent:"
 
 _THREAD_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 # Rows a subagent turn carries beyond the tool protocol (saved, projected away
 # for the model): what a row is, who wrote it, a tool call's outcome, the run's.
-_CARRY_KEYS = ("kind", "author", "status", "outcome", "turn", "_display_hidden")
+_CARRY_KEYS = ("kind", "author", "status", "outcome", "turn", "noteKind", "_display_hidden")
+# What a history row says in place of what a provider would refuse.
+STOPPED_REPLY_TEXT = "[This task was stopped before it finished.]"
+EMPTY_REPLY_TEXT = "[No reply.]"
+UNANSWERED_CALL_TEXT = (
+    "No result: the turn that made this call ended before its result was recorded. "
+    "It may or may not have run; check before relying on it."
+)
 
 
 def is_thread_id(value: Any) -> bool:
@@ -92,6 +110,9 @@ class SubagentThreadRecord:
     usage: dict[str, int] = field(default_factory=dict)  # summed over ended runs
     revision: int = 0
     updated_at: float | None = None
+    # Messages from the main agent while no task ran ({"id", "text", "at"}),
+    # oldest first: the next task starts with them.
+    pending_mail: list[dict[str, Any]] = field(default_factory=list)
 
 
 def last_active(thread: SubagentThreadRecord) -> float:
@@ -142,6 +163,11 @@ def decode_thread(item: Any) -> SubagentThreadRecord:
         raise ValueError("invalid thread usage")
     if type(thread.revision) is not int or thread.revision < 0:
         raise ValueError("invalid thread revision")
+    if not isinstance(thread.pending_mail, list) or len(thread.pending_mail) > MAX_PENDING_MAIL or any(
+        not isinstance(m, dict) or not isinstance(m.get("id"), str) or not isinstance(m.get("text"), str)
+        for m in thread.pending_mail
+    ):
+        raise ValueError("invalid thread mail")
     return thread
 
 
@@ -176,7 +202,120 @@ def thread_view(thread: SubagentThreadRecord, runs: list[dict[str, Any]] | None 
         "runIds": list(thread.runs),
         "runs": list(runs or []),
         "usage": usage_view(thread.usage),
+        "pendingMessages": len(thread.pending_mail),
     }
+
+
+def _call_id(call: Any) -> str:
+    if not isinstance(call, dict):
+        return ""
+    return str(call.get("call_id") or call.get("id") or "")
+
+
+def _call_name(call: Any) -> str:
+    function = call.get("function") if isinstance(call, dict) else None
+    return str((function or {}).get("name") or "") if isinstance(function, dict) else ""
+
+
+def _has_text(content: Any) -> bool:
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        return any(
+            not isinstance(part, dict) or part.get("type") != "text" or str(part.get("text") or "").strip()
+            for part in content
+        )
+    return content is not None
+
+
+def repair_thread_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """A thread's history made acceptable to every provider.
+
+    A turn that was stopped, or that a crash ended, can leave a reply whose
+    calls have no result anywhere in the conversation — not only at its end:
+    the turn's closing row and later turns follow. Providers that require
+    every call to be answered right after the reply that made it refuse the
+    whole request. So:
+
+    * each reply's calls are answered right after it, in the order they were
+      made — a result recorded for it is kept, a call with none gets the
+      factual :data:`UNANSWERED_CALL_TEXT`;
+    * a result that answers no call of the reply before it is dropped;
+    * a reply with neither text nor calls says so (:data:`STOPPED_REPLY_TEXT`
+      for a stopped turn is set by the projection).
+
+    Returns a new list; a well-formed history comes back equal.
+    """
+    result: list[dict[str, Any]] = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        index += 1
+        role = message.get("role")
+        if role == "tool":
+            continue  # answers no call of the reply before it
+        if role == "assistant" and not message.get("tool_calls") and not _has_text(message.get("content")):
+            message = {**message, "content": EMPTY_REPLY_TEXT}
+        result.append(message)
+        calls = [c for c in (message.get("tool_calls") or []) if isinstance(c, dict)] if role == "assistant" else []
+        if not calls:
+            continue
+        declared = [_call_id(call) for call in calls]
+        answers: dict[str, dict[str, Any]] = {}
+        while index < len(messages) and messages[index].get("role") == "tool":
+            answer = messages[index]
+            index += 1
+            call_id = str(answer.get("tool_call_id") or "")
+            if call_id in declared and call_id not in answers:
+                answers[call_id] = answer
+        for call, call_id in zip(calls, declared):
+            result.append(answers.get(call_id) or {
+                "role": "tool", "tool_call_id": call_id, "name": _call_name(call),
+                "content": UNANSWERED_CALL_TEXT,
+            })
+    return result
+
+
+def thread_history(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """What a thread's canonical rows give the model: its history for a later turn.
+
+    The protocol fields only (``role``, ``content``, an assistant's
+    ``tool_calls``, a tool result's ``tool_call_id`` and ``name``), the
+    summary a turn kept (a ``system`` row), nothing a client alone reads; a
+    stopped turn's empty closing row says it was stopped; then
+    :func:`repair_thread_history`.
+    """
+    from flowly.compaction.types import is_summary_message
+
+    projected: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        role = row.get("role")
+        if role == "system":
+            if is_summary_message(row):
+                projected.append({"role": "system", "content": row.get("content", "")})
+            continue
+        if role not in ("user", "assistant", "tool") or row.get("kind") == "context_boundary":
+            continue
+        message: dict[str, Any] = {"role": role, "content": row.get("content", "")}
+        if role == "assistant" and row.get("tool_calls"):
+            message["tool_calls"] = row["tool_calls"]
+        elif role == "assistant" and row.get("aborted") and not _has_text(message["content"]):
+            message["content"] = STOPPED_REPLY_TEXT
+        if role == "tool":
+            message["tool_call_id"] = row.get("tool_call_id")
+            message["name"] = row.get("name")
+        projected.append(message)
+    return repair_thread_history(projected)
+
+
+@dataclass
+class TurnContext:
+    """What a thread's next turn starts from."""
+
+    system_prompt: str            # the thread's own (saved with its first turn); "" if none was saved
+    history: list[dict[str, Any]]  # thread_history of its conversation
 
 
 def _provider_usage(usage: dict[str, int] | None) -> dict[str, int] | None:
@@ -252,6 +391,7 @@ class SubagentThreadStore:
         usage: dict[str, int] | None,
         duration_ms: int | None,
         aborted: bool,
+        with_conversation: bool | None = None,
     ) -> bool:
         """Save one finished run as a turn of the thread's conversation.
 
@@ -278,9 +418,12 @@ class SubagentThreadStore:
             "turn": turn, "trigger": trigger,
         }
         if first_message != brief:
-            # The first turn carries the conversation it was given; the brief
+            # The first turn carries the conversation it was given, a later
+            # one the label (and the messages it found waiting); the brief
             # alone is what a client heads the task with.
-            user_extras.update(brief=brief, with_conversation=True)
+            user_extras["brief"] = brief
+            if with_conversation if with_conversation is not None else turn == 1:
+                user_extras["with_conversation"] = True
 
         def write(session: Any) -> bool:
             meta = session.metadata.get("subagent")
@@ -299,6 +442,10 @@ class SubagentThreadStore:
                     "systemPrompt": system_prompt,
                 }
                 session.metadata["subagent"] = meta
+            elif system_prompt and not meta.get("systemPrompt"):
+                # The first turn ended without its prompt (a restart that
+                # could not continue it); later turns keep this one.
+                meta["systemPrompt"] = system_prompt
             committed = meta.get("runs")
             if not isinstance(committed, list):
                 committed = meta["runs"] = []
@@ -326,6 +473,103 @@ class SubagentThreadStore:
             sessions.evict(key)
         self._make_private(thread.thread_id)
         return saved
+
+    def turn_context(self, thread_id: str) -> TurnContext:
+        """The thread's saved system prompt and its history as its next turn's model gets it.
+
+        Never creates the conversation; a thread with none (its first turn was
+        never saved) has no history.
+        """
+        if not self.has_history(thread_id):
+            return TurnContext("", [])
+        sessions = self.sessions
+        session = sessions.read(thread_session_key(thread_id))
+        if session is None:
+            return TurnContext("", [])
+        meta = session.metadata.get("subagent")
+        prompt = meta.get("systemPrompt") if isinstance(meta, dict) else None
+        return TurnContext(prompt if isinstance(prompt, str) else "", thread_history(session.messages))
+
+    def persist_context(self, thread: SubagentThreadRecord, *, run_id: str,
+                        summary: dict[str, Any], kept: list[dict[str, Any]]) -> bool:
+        """Keep the summary a turn made of its context for the thread's next turn.
+
+        Called once the turn is saved. The thread's working context becomes
+        ``[summary, *kept]`` — ``kept`` the messages the model had after the
+        summary at the turn's end (its task, what it did since, its closing
+        reply) — through the owner's own compaction machinery: the rows the
+        summary replaced are marked compacted in the append-only display log
+        (which still shows every row), the summary and any kept message that
+        is not a saved row are archived hidden, and the display gets the
+        compaction seam. Idempotent per run (``meta.contextRun``). Returns
+        whether it changed the conversation.
+        """
+        from flowly.compaction.types import SUMMARY_METADATA_KEY, extract_summary_text
+        from flowly.session.archive import (
+            ARCHIVE_SUMMARY_KEY,
+            ARCHIVE_TRANSACTION_KEY,
+            EVENT_ID_KEY,
+            SUMMARY_COVERS_KEY,
+            match_kept_events,
+        )
+
+        key = thread.child_session_key
+        sessions = self.sessions
+        compaction_id = f"cmp_{run_id.replace('-', '')[:12]}"
+        prepared: dict[str, str] = {}
+
+        def swap(session: Any) -> bool:
+            meta = session.metadata.get("subagent")
+            if not isinstance(meta, dict) or run_id not in (meta.get("runs") or []):
+                return False  # the turn itself must be saved first
+            if meta.get("contextRun") == run_id:
+                return False
+            source = list(session.messages)
+            identities, covers, transaction = sessions.prepare_compaction_archive(
+                session, kept, source_message_count=len(source), compaction_id=compaction_id,
+            )
+            by_id = {str(row.get(EVENT_ID_KEY)): row for row in source if row.get(EVENT_ID_KEY)}
+            session.clear()
+            session.add_message("system", str(summary.get("content") or ""), **{
+                SUMMARY_METADATA_KEY: True, ARCHIVE_SUMMARY_KEY: True, "_display_hidden": True,
+                SUMMARY_COVERS_KEY: covers, ARCHIVE_TRANSACTION_KEY: transaction,
+            })
+            sessions.append_compaction_summary(session, dict(session.messages[-1]))
+            matches = match_kept_events(source, kept)
+            for message, identity in zip(kept, matches):
+                row = by_id.get(str((identity or {}).get(EVENT_ID_KEY) or ""))
+                if row is not None:
+                    # The saved row itself: uncut, with what clients read of it.
+                    session.messages.append(dict(row))
+                    continue
+                extras = {k: message[k] for k in ("tool_calls", "tool_call_id", "name") if k in message}
+                session.add_message(message.get("role", "user"), message.get("content", ""),
+                                    _display_hidden=True, _archive_derived_copy=True, **extras)
+                sessions.append_compaction_summary(session, dict(session.messages[-1]))
+            sessions.mark_full_synced(session)
+            session.metadata["last_compaction_summary"] = extract_summary_text(summary) or ""
+            session.metadata["last_compaction_coverage"] = covers
+            session.metadata["compaction_count"] = int(session.metadata.get("compaction_count", 0) or 0) + 1
+            session.metadata["_pending_archive_transaction"] = transaction
+            sessions.prepare_context_boundary(session, compaction_id)
+            meta["contextRun"] = run_id
+            prepared["transaction"] = transaction
+            return True
+
+        def finish(session: Any) -> None:
+            sessions.finalize_compaction_archive(session, prepared["transaction"])
+            sessions.finalize_context_boundary(session, compaction_id)
+
+        try:
+            changed = bool(sessions.mutate(key, swap))
+            if changed:
+                # Phase two; a crash before it is finished when the
+                # conversation is next loaded (the markers are saved).
+                sessions.mutate(key, finish)
+        finally:
+            sessions.evict(key)
+        self._make_private(thread.thread_id)
+        return changed
 
     def _make_private(self, thread_id: str) -> None:
         if os.name != "posix":
