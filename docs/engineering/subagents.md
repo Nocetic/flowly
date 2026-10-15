@@ -230,7 +230,19 @@ metrics outlive the 30-day run pruning. `subagents.stats` returns, for the last 
   exactly one, "one agent each" starts one per part, its own part is still done, and after
   starting subagents the agent ends its turn instead of waiting or polling.
 
-## 15. Open items
+## 15. Live steps whose calls are all hidden
+
+Calls to the agent's own bookkeeping (`flowly.tool_activity.INTERNAL_TOOLS`: memory, goals,
+follow-ups) are left out of the live tool panel. A step that said something and then made only
+such calls is still a step boundary: the live `iteration_step` event carries `tool_calls: []`
+(an empty list, `AgentLoop._emit_iteration_event`), and `inflight.append_iteration` resets the
+re-entry text on any assistant event whose `tool_calls` is a list. Clients move the streamed
+text out of the live bubble on that event; without it the sentence showed twice (bubble and work
+log) on relay-connected desktops. Persisted history is unchanged (the projection still drops an
+all-hidden `tool_calls`). Mobile clients must treat an empty `tool_calls` the same way when they
+adopt this branch.
+
+## 16. Open items
 
 * Work running when the gateway restarts is lost (finished as `process_restarted`). Resuming it
   is the last task of this round and gets its own design.

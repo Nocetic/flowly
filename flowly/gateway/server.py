@@ -1639,9 +1639,6 @@ class GatewayServer:
             elif method == "subagents.list":
                 await self._ws_rpc_subagents_list(ws, rpc_id, params)
 
-            elif method == "subagents.cancel":
-                await self._ws_rpc_subagents_cancel(ws, rpc_id, params)
-
             elif method == "exec.approval.resolve":
                 await self._ws_rpc_exec_approval_resolve(ws, rpc_id, params)
 
@@ -2359,26 +2356,6 @@ class GatewayServer:
             )
 
         await self._ws_rpc_reply(ws, rpc_id, {"tasks": tasks})
-
-    # --- RPC: subagents.cancel ---
-
-    async def _ws_rpc_subagents_cancel(
-        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
-    ) -> None:
-        run_id = params.get("runId", "")
-        if not run_id:
-            await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "runId is required")
-            return
-
-        if not self._subagent_manager:
-            await self._ws_rpc_error(ws, rpc_id, "NOT_AVAILABLE", "Subagent manager not available")
-            return
-
-        result_json = await self._subagent_manager.cancel(run_id)
-        import json as _json
-
-        result = _json.loads(result_json)
-        await self._ws_rpc_reply(ws, rpc_id, result)
 
     # --- RPC: coaching.* (meeting coach) ---
 

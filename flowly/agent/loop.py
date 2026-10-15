@@ -5720,6 +5720,12 @@ class AgentLoop:
         }
         if role == "assistant" and ui_message.get("tool_calls"):
             event_payload["tool_calls"] = ui_message["tool_calls"]
+        elif role == "assistant" and message.get("tool_calls"):
+            # Every call was the agent's own bookkeeping (memory, goals) and is
+            # not shown, but this is still a step boundary: the text streamed so
+            # far belongs to this step. An empty list says so, so a client moves
+            # the text out of its live bubble instead of showing it twice.
+            event_payload["tool_calls"] = []
         if role == "tool":
             if ui_message.get("tool_call_id"):
                 event_payload["tool_call_id"] = ui_message["tool_call_id"]

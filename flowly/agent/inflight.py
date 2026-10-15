@@ -94,8 +94,9 @@ def append_iteration(session_key: str, run_id: str, event: dict) -> None:
     # restoring mid-run gets only the text streamed AFTER the last
     # boundary — not every preamble re-glued into one bubble. Guarded on
     # tool_calls: an assistant event without them has no panel entry the
-    # text could have moved into.
-    if event.get("role") == "assistant" and event.get("tool_calls"):
+    # text could have moved into. An empty list is a step whose calls were
+    # all hidden (the agent's own bookkeeping): still a boundary.
+    if event.get("role") == "assistant" and isinstance(event.get("tool_calls"), list):
         cur["text"] = ""
     cur["updatedAt"] = time.time()
 
