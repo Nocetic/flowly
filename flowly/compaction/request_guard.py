@@ -141,22 +141,38 @@ class ProviderRequestCoordinator:
         cls,
         messages: list[dict[str, Any]],
         pinned: int,
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-        """``(fixed, summaries, pins, rest)`` in list order.
+        pin_at: int | None = None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]],
+               list[dict[str, Any]], list[dict[str, Any]]]:
+        """``(fixed, summaries, before, pins, after)`` in list order.
 
         ``fixed`` are the leading system instructions; ``summaries`` the
         compaction summaries that directly follow them (an earlier fit's);
-        ``pins`` the next ``pinned`` messages, authoritative input that is
-        kept verbatim (a subagent's brief); ``rest`` everything after. Only
-        ``summaries`` and ``rest`` are compactable.
+        ``pins`` authoritative input that is kept verbatim (a subagent's
+        task); ``before`` and ``after`` the compactable messages on either
+        side of the pins. With ``pinned`` the pins are the next ``pinned``
+        messages after the summaries (``before`` is empty); with ``pin_at``
+        the pin is the one message at that index of ``messages``, wherever
+        it stands — a subagent's later task follows its earlier turns.
+        Only ``summaries``, ``before`` and ``after`` are compactable.
         """
         fixed, tail = cls._split_fixed_prefix(messages)
+        pin = None if pin_at is None else pin_at - len(fixed)
         index = 0
-        while pinned > 0 and index < len(tail) and is_summary_message(tail[index]):
+        while (
+            (pinned > 0 or pin is not None)
+            and index < len(tail)
+            and (pin is None or index < pin)
+            and is_summary_message(tail[index])
+        ):
             index += 1
         summaries = tail[:index]
+        if pin is not None:
+            if not index <= pin < len(tail):
+                return fixed, summaries, [], [], tail[index:]
+            return fixed, summaries, tail[index:pin], [tail[pin]], tail[pin + 1:]
         pins = tail[index:index + max(0, pinned)]
-        return fixed, summaries, pins, tail[index + len(pins):]
+        return fixed, summaries, [], pins, tail[index + len(pins):]
 
     @classmethod
     def _tool_tokens(cls, tools: list[dict[str, Any]] | None) -> int:
@@ -179,14 +195,15 @@ class ProviderRequestCoordinator:
         model: str,
         *,
         pinned: int = 0,
+        pin_at: int | None = None,
     ) -> RequestBudget:
-        fixed, summaries, pins, rest = self._partition(messages, pinned)
+        fixed, summaries, before, pins, after = self._partition(messages, pinned, pin_at)
         return RequestBudget(
             input_limit=self.compaction.compaction_threshold_for(model),
             messages_tokens=estimate_messages_tokens(messages),
             tool_schema_tokens=self._tool_tokens(tools),
             fixed_prefix_tokens=estimate_messages_tokens([*fixed, *pins]),
-            compactable_tokens=estimate_messages_tokens([*summaries, *rest]),
+            compactable_tokens=estimate_messages_tokens([*summaries, *before, *after]),
         )
 
     async def fit(
@@ -199,6 +216,7 @@ class ProviderRequestCoordinator:
         force_reduction: bool = False,
         should_cancel: Callable[[], bool] | None = None,
         pinned: int = 0,
+        pin_at: int | None = None,
         custom_instructions: str | None = None,
         on_summary_start: Callable[[], Awaitable[None]] | None = None,
     ) -> RequestFit:
@@ -210,17 +228,21 @@ class ProviderRequestCoordinator:
 
         ``pinned`` messages after the leading system instructions (and any
         earlier summary) are kept verbatim and placed after a new summary;
+        ``pin_at`` instead keeps the one message at that index verbatim where
+        it stands: a summary takes its place before it, and what the summary
+        keeps stays on the side of it where it was.
         ``custom_instructions`` replaces what the summary is asked to keep.
         The main agent passes neither. ``on_summary_start`` is awaited just
         before a summary call (not for a cut alone); a failure in it is
         ignored.
         """
         original = list(messages)
-        before = self.budget(original, tools, model, pinned=pinned)
+        before = self.budget(original, tools, model, pinned=pinned, pin_at=pin_at)
         if not force_reduction and before.estimated_input_tokens <= before.input_limit:
             return RequestFit(original, before, before)
 
-        fixed, summaries, pins, rest = self._partition(original, pinned)
+        fixed, summaries, ahead, pins, behind = self._partition(original, pinned, pin_at)
+        rest = [*ahead, *behind]
         compactable = [*summaries, *rest]
         if before.compactable_budget <= 0:
             return RequestFit(
@@ -243,11 +265,12 @@ class ProviderRequestCoordinator:
         # Cheap, loss-bounded first pass. This is especially effective for a
         # long tool loop and avoids spending a summary call when old tool output
         # alone caused the overflow. Summaries and pins hold no tool results,
-        # so the list keeps its order.
+        # so the list keeps its order (a cut keeps every message in place).
         micro_rest = self.compaction.microcompact(rest)
+        micro_ahead, micro_behind = micro_rest[:len(ahead)], micro_rest[len(ahead):]
         micro = [*summaries, *micro_rest]
-        candidate = [*fixed, *summaries, *pins, *micro_rest]
-        micro_budget = self.budget(candidate, tools, model, pinned=pinned)
+        candidate = [*fixed, *summaries, *micro_ahead, *pins, *micro_behind]
+        micro_budget = self.budget(candidate, tools, model, pinned=pinned, pin_at=pin_at)
         micro_changed = request_fingerprint(candidate) != request_fingerprint(original)
         force_target = min(
             before.compactable_budget,
@@ -296,8 +319,15 @@ class ProviderRequestCoordinator:
             "content": build_summary_content(result.summary),
             SUMMARY_METADATA_KEY: True,
         }
-        fitted = [*fixed, summary, *pins, *result.kept_messages]
-        after = self.budget(fitted, tools, model, pinned=pinned)
+        # What the summary kept stays on its side of a pin placed with
+        # ``pin_at`` (kept messages are the very objects it was given).
+        ahead_ids = {id(message) for message in micro_ahead}
+        kept_ahead = [m for m in result.kept_messages if id(m) in ahead_ids]
+        kept_behind = [m for m in result.kept_messages if id(m) not in ahead_ids]
+        fitted = [*fixed, summary, *kept_ahead, *pins, *kept_behind]
+        after = self.budget(fitted, tools, model, pinned=pinned,
+                            pin_at=None if pin_at is None or not pins
+                            else len(fixed) + 1 + len(kept_ahead))
         changed = request_fingerprint(fitted) != request_fingerprint(original)
         if not changed:
             return RequestFit(

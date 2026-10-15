@@ -492,6 +492,62 @@ async def test_without_pins_the_budget_and_the_cut_are_unchanged():
     assert pinned.compactable_tokens < plain.compactable_tokens
 
 
+def _later_turn(turns: int = 6, steps: int = 6, step_words: int = 160):
+    """A subagent's later task: earlier turns (task, work, report), then the
+    task now, then its own tool loop."""
+    filler = "analysis " * 160
+    messages = [{"role": "system", "content": "AUTHORITATIVE SYSTEM POLICY"}]
+    for turn in range(turns):
+        messages.append({"role": "user", "content": f"TASK {turn}: " + filler})
+        messages.append({"role": "assistant", "content": f"REPORT {turn}: " + filler})
+    messages.append({"role": "user", "content": "[Task from the main agent]\nTASK NOW: compare them"})
+    pin = len(messages) - 1
+    for step in range(steps):
+        messages.append({"role": "assistant", "content": f"step {step} " + "analysis " * step_words,
+                         "tool_calls": [
+            {"id": f"n{step}", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]})
+        messages.append({"role": "tool", "tool_call_id": f"n{step}", "name": "read_file",
+                         "content": f"shard {step} " + "evidence " * 160})
+    return messages, pin
+
+
+async def test_a_pin_in_place_stays_verbatim_where_it_stands():
+    provider = _SummaryProvider()
+    coordinator = ProviderRequestCoordinator(_service(provider))
+    messages, pin = _later_turn()
+    task = messages[pin]
+
+    budget = coordinator.budget(messages, None, "test/model", pin_at=pin)
+    plain = coordinator.budget(messages, None, "test/model")
+    assert budget.fixed_prefix_tokens > plain.fixed_prefix_tokens
+    fit = await coordinator.fit(messages, None, "test/model", pin_at=pin, custom_instructions="RECORD")
+
+    assert fit.fits and fit.compaction is not None
+    assert fit.messages[0] == messages[0] and is_summary_message(fit.messages[1])
+    at = fit.messages.index(task)
+    # Whatever the summary kept stays on the side of the task it came from,
+    # in order; the task itself never goes into a summary.
+    ahead, behind = fit.messages[2:at], fit.messages[at + 1:]
+    assert all(messages.index(m) < pin for m in ahead)
+    assert all(messages.index(m) > pin for m in behind if m in messages)
+    assert [messages.index(m) for m in ahead] == sorted(messages.index(m) for m in ahead)
+    prompts = " ".join(str(call["messages"]) for call in provider.calls)
+    assert "TASK NOW" not in prompts and "TASK 0:" in prompts
+    # A pin at the head behaves as ``pinned=1``.
+    head = _tool_loop()
+    assert coordinator.budget(head, None, "test/model", pin_at=1) == coordinator.budget(
+        head, None, "test/model", pinned=1)
+
+
+async def test_a_cut_keeps_every_message_in_place_around_a_pin():
+    coordinator = ProviderRequestCoordinator(_service(_SummaryProvider(), window=4_000))
+    messages, pin = _later_turn(turns=1, steps=16, step_words=2)
+    fit = await coordinator.fit(messages, None, "test/model", pin_at=pin)
+    assert fit.fits and fit.compaction is None and fit.changed
+    assert len(fit.messages) == len(messages) and fit.messages[pin] == messages[pin]
+    assert [m["role"] for m in fit.messages] == [m["role"] for m in messages]
+
+
 async def test_a_summary_that_fails_is_marked_retryable_and_a_structural_failure_is_not():
     class _Failing(_SummaryProvider):
         async def chat(self, **kwargs):
