@@ -33,6 +33,7 @@ are gone (`test_delegation_rule.py` pins the current contract).
 | `flowly/agent/subagent_checkpoint.py` | A running run's checkpoint (`SubagentCheckpoint`), `ChildState` (with the run's journal), `append_message`, `apply_step` / `apply_microcompact` / `apply_compacted`, `restore_child_state`, `tool_class` |
 | `flowly/compaction/` | The main agent's context management, which the child uses as is (§4.1): `CompactionService`, `ProviderRequestCoordinator.fit`, `pruning.iteration_strip_passes` / `strip_old_tool_results` / `microcompact_tool_results`, `summarizer.collect_summary_usage` |
 | `flowly/agent/subagent_observation.py` | `run_view` (the wire shape of a run), `TaskEvents` (coalesced `subagent.*` events) |
+| `flowly/agent/subagent_stream.py` | A thread turn, live (§16a): `ChildStream` (journal → events, the in-flight entry, one terminal), `SubagentStreamHub` (ordered, non-blocking delivery to the transports' watchers), `child_event_access` |
 | `flowly/agent/subagent_metrics.py` | One metric line per ended run (`metrics.jsonl`), `summarize` |
 | `flowly/agent/delegation.py` | `DelegationTurn` (per-turn facts in a context var), owner-quote check, conversation fork, marks |
 | `flowly/agent/tools/spawn.py` | The `spawn` tool |
@@ -40,8 +41,9 @@ are gone (`test_delegation_rule.py` pins the current contract).
 | `flowly/agent/tools/sessions_list.py` | List / cancel this conversation's tasks (`run_id="all"` stops them all) |
 | `flowly/agent/repetition.py` | Repetition guard used by both the main loop and the child loop |
 | `flowly/agent/loop.py` | Turn wiring: `DelegationTurn` binding, system (report) turns, dispatch, plan-guard exemption |
-| `flowly/channels/feature_rpc.py` | `subagents.list/get/result/transcript/history/cancel/stats/spawn` RPCs; the read-only refusal for every feature RPC (§16) |
-| `flowly/profile_host_contract.py` | Which subagent RPCs reach another local bot through the profile host; `subagent:` keys only on reads |
+| `flowly/channels/feature_rpc.py` | `subagents.list/get/result/transcript/history/watch/unwatch/cancel/stats/spawn` RPCs; the read-only refusal for every feature RPC (§16) |
+| `flowly/profile_host_contract.py` | Which subagent RPCs reach another local bot through the profile host; `subagent:` keys only on reads; the conversation a `subagents.watch` binds |
+| `flowly/gateway/server.py`, `flowly/channels/web.py` | The stream's transports (§16a): watchers per subagent conversation, leases, cleanup on disconnect |
 
 ## 3. Starting one: `spawn`
 
@@ -534,9 +536,12 @@ fatal tool again would otherwise loop forever).
   have `threadId: null`.
 * RPCs: `subagents.list`, `.get`, `.result`, `.transcript {runId, after, limit}` →
   `{task, items, nextSeq, more, done}` (unchanged, still written per run), `.history` (§16),
-  `.cancel {runId}`, `.stats {days, includeSystem}`, `.spawn` (manual, origin owner).
-* Through the profile host (another local bot): list, get, result, transcript, history, cancel,
-  stats. Spawn and set_model are not exposed there.
+  `.watch` / `.unwatch {threadId}` (§16a), `.cancel {runId}`, `.stats {days, includeSystem}`,
+  `.spawn` (manual, origin owner).
+* A running thread turn's own chat events (`run_started`, deltas, steps, one terminal) go only to
+  whoever watches it (§16a); the `subagent.*` events above are unchanged.
+* Through the profile host (another local bot): list, get, result, transcript, history, watch,
+  unwatch, cancel, stats. Spawn and set_model are not exposed there.
 
 ## 13. Metrics (`flowly/agent/subagent_metrics.py`)
 
@@ -735,11 +740,7 @@ and RPCs with additive fields, and no new events.
 * `SessionManager.read_run_result` keeps its fixed `<home>/sessions` path: nothing reads a
   thread's result through it (the result is in `runs-results/`).
 
-**What phase 2 must know.** A turn's rows are written only at its end; live steps need `chat` /
-`agent` events and `inflight` on `subagent:<threadId>` (design §7). `chat.inflight` is already a
-permitted read for `subagent:` keys on every path, and the profile host already binds
-`(profile, subagent:K)` for it. Rows already carry `run_id`, so the live run and its saved turn can
-be matched.
+**Phase 2** (live turns) is built: §16a.
 
 **What phase 4 must know.**
 * `_run_turn` builds `[system (meta.systemPrompt), *session.get_history(), task]`; `get_history`
@@ -756,6 +757,98 @@ be matched.
   (`runs.append`, `active_run_id`); `agent_close` / `subagents.close` close reasons `agent` /
   `owner` are already valid. `turn` / `trigger` are on the run record and in `run_view`.
 * A follow-up of a thread closed `parent_deleted` must be refused (its conversation is gone).
+
+## 16a. A thread turn, live (`flowly/agent/subagent_stream.py`)
+
+Design §7 (phase 2). A turn's rows are saved when it ends (§16); while it runs it streams the
+events an owner's turn has, under the thread's conversation key `K = subagent:<threadId>` and the
+run's id `R`, to whoever watches the thread. Wire: `docs/chat-wire-protocol.md` §4.8.
+
+**Events** (every one carries `sessionKey: K`, `runId: R`, `turnOrigin: "subagent_task"`; the
+parent's report turn keeps `turnOrigin: "subagent"` under the parent's key):
+
+| Event | When | Data |
+|---|---|---|
+| `chat` `run_started` | The run's loop begins (a run continued after a restart: again, `resumed: true`) | `hiddenPrompt: false`, `steerable: false`, `prompt` (the brief), `promptAuthor: "main_agent"`, `threadId`, `turn`, `trigger`, `parentSessionKey`, `title`, `mark`, `model`, `withConversation`, `startedAt` (ms), `resumed?` |
+| `agent` | Each model reply that has text (step granularity; the closing reply too) | `stream: "assistant"`, `data: {text}` |
+| `chat` `iteration_step` | Each reply with tool calls, each tool result | The main loop's shape (`flowly.tool_activity.iteration_event_payload`): `iterationIdx`, `role`, `content`, `tool_calls?`, `tool_call_id?`, `name?`, `tool_activity?`; a tool result not `ok` adds `status` (`error`, `timeout`, `interrupted`, `not_run`). A reply without calls mid-run (the main agent wrote meanwhile) is a step with `tool_calls: []` |
+| `chat` `tool_progress` | A call is queued, runs, ends | `ToolProgress`'s shape: `iterationIdx`, `revision`, `call {id, index, name, arguments, state, …}` |
+| `chat` `agent_note` | The child read a message from the main agent at a step | `iterationIdx`, `author: "main_agent"`, `content` (as saved) |
+| `compaction` | A summary fits the run's context (a cut alone is none) | `phase` `started` → `completed` \| `failed`, `compactionId`, `tokensBefore`, `tokensAfter`, `messagesRemoved` |
+| `chat` `final` | Outcome `ok`, or stopped (`cancelled` / `interrupted`: `aborted: true`, empty text) | `outcome`, `message {role, content: [{type: "text", text}], usage}` (the run's tokens), `model`, `durationMs`, `completedAt` |
+| `chat` `error` | Outcome `error` / `timeout` | `outcome`, `errorCode` (the run's), `errorTitle`, `errorMessage` (the result text), `retryable: false`, `usage`, `model`, `durationMs`, `completedAt` |
+
+Exactly one terminal per run, sent after the turn was saved and the registry recorded it (a
+reload of `subagents.history` then has the turn). A run suspended by a clean shutdown sends no
+terminal (it continues after the restart). `iterationIdx` is the row's index in the run's
+journal, so it is stable across a restart and matches the saved rows' order.
+
+**Built from the journal.** `ChildStream.sync` turns the journal rows (`ChildState.journal`, what
+the turn saves) it has not seen into events: the live turn and the saved one are the same rows.
+`_child_run` syncs after a step's notes, before each tool call (what the reply said, the results so
+far), after the calls and after a mid-run reply; `tool_started` marks a call running; `answer`
+sends the closing reply. A continued run replays the restored journal into the in-flight entry
+without sending it (watchers re-enter through `chat.inflight` / `subagents.watch`), then streams
+from there. Token streaming (phase 6) feeds `ChildStream.delta`.
+
+**In flight.** `inflight.begin(K, R, user="", turn_origin="subagent_task", fields=…)`:
+`chat.inflight {sessionKey: K}` returns `{runId, text, user: "", iterations, toolProgress?,
+turnOrigin, prompt, promptAuthor, subagent: {threadId, turn, trigger, parentSessionKey, title,
+mark, model, withConversation}}` — no user row; the task is the brief. `iterations` holds
+`iteration_step` and `agent_note` events in order. `chat.inflight` on a `subagent:` key is
+allowed to whoever may read the parent conversation (else `NOT_FOUND`); a key with no thread
+answers `inflight: null`.
+
+**`subagents.watch {threadId}`** → `{schemaVersion: 1, ok, watching: true, threadId, sessionKey,
+status, activeRunId, leaseSeconds: 120, streamVersion: 1, inflight, compaction}`. Who may: whoever
+may read the conversation that started it (as `subagents.history`). The transport binds the caller
+in the same step as it takes the `inflight` snapshot, so the stream continues exactly where the
+snapshot ends (an event the stream sends is never in the snapshot; through the profile host an
+event may arrive before the reply — apply the snapshot, then the events in order). Calling again
+renews the lease (clients: every ~90 s); `subagents.unwatch {threadId}` (idempotent) or a
+disconnect ends it. Errors as `subagents.history` (`INVALID`, `NOT_FOUND`,
+`SUBAGENT_THREAD_LEGACY`, `UNAVAILABLE`). `system.capabilities` has `subagentStreamVersion: 1`.
+
+**Delivery.** `SubagentManager.stream_sink` is a `SubagentStreamHub` (`gateway_cmd` sets it with the
+gateway server and the web channel as transports). Per event the hub asks each transport,
+synchronously, whom it would send to (`prepare_subagent_stream`), queues the deliveries per
+conversation and sends them in order from its own task: the child never waits for a socket, a
+slow watcher holds back only its conversation's queue (1,024 events; past it new non-terminal
+events are dropped — the in-flight entry has them; a terminal never is), each delivery is bounded
+(10 s). With nobody watching a transport answers from one dict lookup and nothing is sent.
+
+* **Direct gateway** (local Desktop, remote clients): plain `chat` / `agent` / `compaction`
+  events to the sockets watching `K` (leases, at most 32 conversations per socket — the oldest
+  lease gives way — and 1,024 in all) and to a socket `chat.inflight` bound to `K`. A disconnect
+  drops the socket's watches.
+* **Relay**: `{"type": "event", "event": "subagent.stream", "sessionId", "data": {"sessionKey": K,
+  "event": "chat" | "agent" | "compaction", "data": <the event's data>}}` to each watching relay
+  session (same lease and bounds; `browser-disconnected` and a relay reconnect drop them; no
+  offline replay). The relay service hands an event name it does not know to that session only
+  and persists nothing of it (`forwardAgentMessage` → `resolveStreamTargets`: not in
+  `CONVERSATION_EVENT_NAMES`, so the originating socket; Firestore writes are keyed on
+  `event === "chat"` / `"compaction"` / `"queue"` / `artifact.*`). A plain `chat` event would have
+  been written into the parent's conversation (`tool_turns/`, `messages/`).
+* **Named agents** (profile host): `profiles.rpc {name, method: "subagents.watch", params:
+  {threadId}}` reaches the agent's runtime, which binds the host's socket; the client's transport
+  binds `(profile, K)` (`profile_rpc_session_key`), so the runtime's events reach it as
+  `profile.event {profile, type: "chat" | "agent" | "compaction", data}` — on the gateway and on
+  the relay alike (`profile.event` is not stored by the relay either). The default profile goes
+  through the host's private socket the same way. `subagents.unwatch` through the host releases
+  only the caller's binding and is not forwarded (the runtime's one watcher is the host's socket,
+  shared by every client; its lease runs out once nobody renews it). The host treats `K` events
+  as nobody's turn: no busy state (`active_runs`), no roster activity, no attention refresh, no
+  group routing.
+
+**Authority.** The subscription is the gate (authorized as above). Each event also carries the
+parent conversation's authority (`child_event_access`): an ordinary conversation's events are
+open to the watching sockets; an account-owned (voice) conversation's go to that account's
+recipients only, on every hop (signed across the profile runtime hop). Delivery never reads or
+locks anything among the owner's conversations for a `subagent:` key.
+
+**Unchanged:** batching, delivery and the parent's report turns (`turnOrigin: "subagent"` on the
+parent's key), `subagent.*` events, `subagents.transcript`. Older clients never bind a `subagent:`
+conversation, so they get none of these events.
 
 ## 17. Open items
 

@@ -40,7 +40,7 @@ to ONE caller. They are never conversation state.
 | `sessionKey` | The conversation. `<channel>:<chat_id>`, e.g. `web:abc123`, `desktop:default`. The unit of routing, locking, compaction and history. |
 | `runId` | One turn's lifecycle: the stream, its tool turns, its Stop, its terminal event. |
 | `streamRunId` | Relay only. Present when the durable message id (`runId`) differs from the lifecycle id; then `streamRunId` is the lifecycle one. |
-| `turnOrigin` | Present on every event of a run the server started on its own: `"subagent"` for a subagent's report turn (§4.7). Absent on a client's own turn. |
+| `turnOrigin` | Present on every event of a run the server started on its own: `"subagent"` for a subagent's report turn (§4.7), `"subagent_task"` for a subagent's own turn in its conversation `subagent:<threadId>` (§4.8). Absent on a client's own turn. |
 
 **Invariants**
 
@@ -67,6 +67,8 @@ Discriminated by `data.state`.
 | `run_started` | A run the server started opened (§4.7). Not a terminal, no text. | `turnOrigin`, `hiddenPrompt`, `steerable` |
 | `streaming` | One delta of assistant text. | `delta` |
 | `iteration_step` | One tool-protocol step inside the turn. | `iterationIdx`, `role`, `content`, `tool_calls?`, `tool_call_id?`, `name?` |
+| `tool_progress` | A call's state changed (queued, running, ended). Not a step. | `iterationIdx`, `revision`, `call` |
+| `agent_note` | A subagent's turn only (§4.8): the main agent's message it read. Not a step. | `iterationIdx`, `author`, `content` |
 | `final` | **Terminal.** The turn's durable assistant message. | `message.content[]`, `model`, `usage`, `completedAt`, `durationMs`, `aborted?`, `attachments?`, `toolMessages?` |
 | `aborted` | Legacy early terminal. The authoritative `final, aborted:true` still follows. | — |
 | `error` | **Terminal.** Provider/agent failure as a product state. | `errorCode`, `errorTitle`, `errorMessage`, `retryable` |
@@ -102,6 +104,9 @@ may ignore this event entirely and still recover the current snapshot later.
 `exec.approval.requested`, `agent.clarify.requested`, `plan.updated`,
 `plan.approval.requested`, `goal.updated`, `tool.*`, `cron.*`, `agent_state`,
 `tick`.
+
+`subagent.stream` (relay only, §4.8) wraps a subagent's own events for the
+relay session that watches it.
 
 Only `chat`, `plan.updated`, `plan.approval.requested`, `goal.updated` and
 `compaction` are **conversation-scoped** — the relay fans those out to every
@@ -220,6 +225,61 @@ run_started ─▶ [streaming | agent delta | iteration_step | tool_progress]* �
 Older clients ignore `run_started` and `turnOrigin`; on the relay they see
 the deltas as before, on the direct gateway they show the reply on the next
 history read.
+
+**4.8 — A subagent's own turn streams to whoever watches it.** A subagent
+working for the owner is a thread with its own read-only conversation
+`K = subagent:<threadId>`. While a turn of it runs (run id `R`), the server
+sends that turn's events — only to clients that watch the thread:
+
+```
+run_started ─▶ [agent delta | iteration_step | tool_progress | agent_note | compaction]* ─▶ final | error
+```
+
+- Every event carries `sessionKey: K`, `runId: R` and
+  `turnOrigin: "subagent_task"`. A client shows them only in `K`'s own view
+  and never counts them as the agent's (or its parent conversation's)
+  activity, notification or unread state.
+- `run_started`: `hiddenPrompt: false`, `steerable: false`, `prompt` (the task
+  the main agent gave — the brief), `promptAuthor: "main_agent"`, `threadId`,
+  `turn`, `trigger`, `parentSessionKey`, `title`, `mark`, `model`,
+  `withConversation`, `startedAt`; `resumed: true` when the run continues
+  after a restart (its earlier steps are in `chat.inflight`, not sent again).
+  There is no `state:"user"` event.
+- `agent {stream:"assistant", data:{text}}`: what the model said, one delta
+  per reply (token streaming may later send several). As in an owner's turn,
+  an `iteration_step` with `tool_calls` (an empty list included) moves the
+  text before it out of the live bubble.
+- `iteration_step` / `tool_progress`: an owner's turn's shapes. A tool step
+  not `ok` adds `status` (`error`, `timeout`, `interrupted`, `not_run`).
+- `chat {state:"agent_note", iterationIdx, author:"main_agent", content}`: a
+  message from the main agent the subagent read at a step.
+- `compaction {phase, compactionId, tokensBefore, tokensAfter,
+  messagesRemoved, sessionKey: K, runId: R}`: a summary fitting the
+  subagent's context (§5's lifecycle).
+- One terminal, after the turn is saved (`subagents.history` then has it):
+  `final` with `outcome` (`ok`; stopped: `cancelled` | `interrupted` with
+  `aborted: true` and empty text), `message.usage` (the run's tokens),
+  `model`, `durationMs`, `completedAt`; or `error` with `outcome` (`error` |
+  `timeout`), `errorCode`, `errorTitle`, `errorMessage`, `retryable: false`.
+- **Watching.** `subagents.watch {threadId}` (allowed to whoever may read the
+  parent conversation) binds the caller for `leaseSeconds` (120; renew by
+  calling again, about every 90 s) and replies with `inflight` (the turn so
+  far, as `chat.inflight`: `user: ""`, `prompt`, `promptAuthor`, `subagent`,
+  `iterations` holding `iteration_step` and `agent_note` events in order,
+  `toolProgress`), `activeRunId`, `status`, `compaction`. The snapshot and the
+  binding are taken together: apply the snapshot, then every event received
+  after sending the request, in order. `subagents.unwatch {threadId}` or a
+  disconnect ends the binding. `chat.inflight {sessionKey: K}` also binds the
+  calling direct-gateway socket, as for any conversation.
+- **Direct gateway:** the events above as they are. **Relay:** each inside
+  `{"type":"event","event":"subagent.stream","sessionId",
+  "data":{"sessionKey":K,"event":"chat"|"agent"|"compaction","data":…}}`
+  to the watching session only — a `chat` event there would be stored in the
+  conversation of the receiving session; the relay stores nothing of this
+  name. **Named agents** (`profiles.rpc` watch/unwatch): `profile.event
+  {profile, type:"chat"|"agent"|"compaction", data}` on either transport.
+- Clients that never watch get none of these. `system.capabilities`:
+  `subagentStreamVersion: 1`, `featureMethods` has `subagents.watch`.
 
 ---
 
