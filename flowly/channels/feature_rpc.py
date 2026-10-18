@@ -5338,13 +5338,26 @@ def push_register(params: dict) -> dict:
     push_secret = (params.get("pushSecret") or "").strip()
     if not push_id or not push_secret:
         raise FeatureRpcError("INVALID", "pushId and pushSecret required")
-    get_push_registry().register(
+    registry = get_push_registry()
+    registry.register(
         push_id=push_id,
         push_secret=push_secret,
         gateway_id=(params.get("gatewayId") or "").strip(),
         platform=(params.get("platform") or "ios").strip(),
         kind=(params.get("kind") or "gateway").strip(),
     )
+    # The phone's chat island (iOS Live Activities): its update token and its
+    # push-to-start token, each registered with the relay on its own. A key
+    # sent empty drops that registration; a key not sent leaves it as it is.
+    for kind, prefix in (("activity", "activity"), ("activityStart", "activityStart")):
+        if f"{prefix}PushId" not in params:
+            continue
+        registry.set_activity(
+            push_id,
+            kind,
+            str(params.get(f"{prefix}PushId") or "").strip(),
+            str(params.get(f"{prefix}PushSecret") or "").strip(),
+        )
     return {"ok": True}
 
 

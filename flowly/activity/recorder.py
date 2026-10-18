@@ -43,7 +43,7 @@ import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from flowly.activity import store
 from flowly.activity.steps import describe_step, is_work
@@ -155,14 +155,32 @@ class EndedTask:
     excerpts: list[str]
 
 
+#: ``(event, task, outcome)``: ``"begin"`` (outcome empty) or ``"end"``.
+ActivityListener = Callable[[str, "ActiveTask", str], None]
+
+
 class ActivityRecorder:
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._listeners: list[ActivityListener] = []
         self._active: dict[str, ActiveTask] = {}
         # Turn id → its steps' details, for turns that ended lately.
         self._recent: OrderedDict[str, list[dict[str, str]]] = OrderedDict()
 
     # ── lifecycle ────────────────────────────────────────────────────────
+
+    def add_listener(self, listener: ActivityListener) -> None:
+        """Hear each turn begin and end (the phone's chat island follows them).
+        A listener runs on the turn's own thread, must be quick, and never
+        fails the turn."""
+        self._listeners.append(listener)
+
+    def _tell(self, event: str, task: ActiveTask, outcome: str = "") -> None:
+        for listener in tuple(self._listeners):
+            try:
+                listener(event, task, outcome)
+            except Exception:  # noqa: BLE001 — a listener never fails a turn
+                pass
 
     @staticmethod
     def records(session_key: str) -> bool:
@@ -186,6 +204,7 @@ class ActivityRecorder:
             starts = self._mark_working(task) if task.trigger.get("kind") in BACKGROUND_TRIGGERS else None
         if starts is not None:
             store.append(starts, at_ms=task.started_at)
+        self._tell("begin", task)
         return task
 
     @staticmethod
@@ -231,6 +250,7 @@ class ActivityRecorder:
     ) -> EndedTask | None:
         if task is None:
             return None
+        self._tell("end", task, outcome)
         with self._lock:
             if self._active.get(task.session_key) is task:
                 del self._active[task.session_key]
