@@ -14,7 +14,7 @@ from weakref import WeakKeyDictionary
 import pytest
 from aiohttp import web
 
-from flowly.agent.subagent import SubagentManager
+from flowly.agent.subagent import _MAX_CONCURRENT_SUBAGENTS, SubagentManager
 from flowly.agent.subagent_observation import TaskEvents, run_view
 from flowly.agent.subagent_registry import SubagentRegistry, SubagentRunRecord
 from flowly.agent.tools.delegate import DelegateTool
@@ -380,9 +380,9 @@ async def test_wait_tasks_count_toward_concurrency_limit(tmp_path):
     mgr = manager(tmp_path, Provider(action=wait))
     sync_task = asyncio.create_task(mgr.spawn("first", wait=True))
     await entered.wait()
-    for i in range(7):
+    for i in range(_MAX_CONCURRENT_SUBAGENTS - 1):
         await mgr.spawn(f"Task {i}", silent=True)
-    denied = json.loads(await mgr.spawn("ninth", silent=True))
+    denied = json.loads(await mgr.spawn("one too many", silent=True))
     assert denied["status"] == "rejected"
     mgr.cancel_all()
     await asyncio.gather(sync_task, return_exceptions=True)

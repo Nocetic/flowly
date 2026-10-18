@@ -27,10 +27,12 @@ from typing import Any
 
 import pytest
 
+from flowly.agent.delegation import MAX_CHILDREN_PER_CONVERSATION
 from flowly.agent.subagent import (
     SubagentManager,
     SubagentToolRegistry,
     _BLOCKED_SUBAGENT_TOOLS,
+    _MAX_CONCURRENT_SUBAGENTS,
 )
 from flowly.agent.subagent_registry import SubagentRegistry, SubagentRunRecord
 from flowly.agent.tools.base import Tool
@@ -262,7 +264,7 @@ class TestSubagentRecursionGuard:
     async def test_concurrency_cap_is_enforced(self, tmp_path: Path) -> None:
         mgr = _build_manager(tmp_path, sleep=2.0)
         accepted = 0
-        for i in range(10):
+        for i in range(_MAX_CONCURRENT_SUBAGENTS + 2):
             r = await mgr.spawn(
                 task=f"job {i}",
                 label=f"j{i}",
@@ -271,22 +273,22 @@ class TestSubagentRecursionGuard:
             )
             if '"status": "started"' in r:
                 accepted += 1
-        # Max 8 across the whole process — the rest must be rejected.
-        assert accepted == 8
+        # The process's limit holds — the rest must be rejected.
+        assert accepted == _MAX_CONCURRENT_SUBAGENTS
         # Clean up.
         mgr.cancel_children("cli:cap-test")
         await asyncio.sleep(0.1)
 
     @pytest.mark.asyncio
-    async def test_one_conversation_runs_at_most_three_of_its_own(self, tmp_path: Path) -> None:
+    async def test_one_conversation_runs_at_most_its_limit_of_its_own(self, tmp_path: Path) -> None:
         mgr = _build_manager(tmp_path, sleep=2.0)
         outcomes = []
-        for i in range(5):
+        for i in range(MAX_CHILDREN_PER_CONVERSATION + 2):
             r = json.loads(await mgr.spawn(
                 task=f"part {i}", origin_channel="web", origin_chat_id="busy", origin="agent",
             ))
             outcomes.append(r["status"])
-        assert outcomes == ["started"] * 3 + ["rejected"] * 2
+        assert outcomes == ["started"] * MAX_CHILDREN_PER_CONVERSATION + ["rejected"] * 2
         # Another conversation still has room.
         other = json.loads(await mgr.spawn(
             task="elsewhere", origin_channel="web", origin_chat_id="calm", origin="owner",

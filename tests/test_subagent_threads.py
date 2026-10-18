@@ -38,7 +38,8 @@ from unittest.mock import AsyncMock
 import pytest
 from aiohttp import web
 
-from flowly.agent.subagent import SubagentManager
+from flowly.agent.delegation import MANY_CHILDREN_RUNNING, MAX_CHILDREN_PER_CONVERSATION
+from flowly.agent.subagent import _MAX_CONCURRENT_SUBAGENTS, SubagentManager
 from flowly.agent.subagent_checkpoint import GRACE_PROMPT, restore_child_state
 from flowly.agent.subagent_observation import run_view
 from flowly.agent.subagent_registry import SubagentRegistry, SubagentRunRecord, ThreadCapReached
@@ -821,7 +822,7 @@ async def test_the_cap_closes_the_thread_idle_longest_and_says_so(tmp_path, home
     assert view["threadStatus"] == "closed"
     # The closed one takes no new task, and says why.
     followed = await manager.followup(oldest.run_id, "Also check B", parent_session_key=CHAT)
-    assert followed["status"] == "closed" and "closed to keep at most 16 subagents" in followed["error"]
+    assert followed["status"] == "closed" and f"closed to keep at most {MAX_OPEN_THREADS_PER_CONVERSATION} subagents" in followed["error"]
     assert len([t for t in registry.threads_for_parent(CHAT) if t.status == "open"]) == MAX_OPEN_THREADS_PER_CONVERSATION
     # Another conversation's threads are not counted.
     other = json.loads(await manager.spawn(task="Elsewhere", origin_channel="desktop", origin_chat_id="c2",
@@ -845,6 +846,53 @@ async def test_the_cap_refuses_when_every_open_thread_is_working(tmp_path, home)
         f"{MAX_OPEN_THREADS_PER_CONVERSATION} subagents of this conversation are open and all of them "
         "are working; one must finish, or be closed with agent_close, before another can start.")}
     assert len(manager.registry.all()) == MAX_OPEN_THREADS_PER_CONVERSATION
+
+
+def test_the_limits_leave_room_for_a_conversations_full_share():
+    # Every running subagent is an open thread, and the process limit must not
+    # cut one conversation's share short.
+    assert MAX_OPEN_THREADS_PER_CONVERSATION >= MAX_CHILDREN_PER_CONVERSATION
+    assert _MAX_CONCURRENT_SUBAGENTS >= MAX_CHILDREN_PER_CONVERSATION
+
+
+@pytest.mark.asyncio
+async def test_many_running_subagents_are_stated_and_the_conversations_limit_holds(tmp_path, home):
+    gate = asyncio.Event()
+
+    async def wait(provider: _Scripted) -> LLMResponse:
+        await gate.wait()
+        return LLMResponse(content="Done.")
+
+    manager = _manager(home, tmp_path, _Scripted([wait] * (MAX_CHILDREN_PER_CONVERSATION + 1)))
+
+    async def start(n: int) -> dict[str, Any]:
+        return json.loads(await manager.spawn(task=f"Task {n}", origin_channel="desktop",
+                                              origin_chat_id="chat-1", parent_session_key=CHAT,
+                                              origin="agent"))
+
+    results = [await start(n) for n in range(MAX_CHILDREN_PER_CONVERSATION)]
+    assert all(r["status"] == "started" for r in results)
+    # Up to the threshold the result says nothing about how many run …
+    assert not any("running at once" in r["message"] for r in results[:MANY_CHILDREN_RUNNING])
+    # … past it, each start says how many are running now.
+    first_many = results[MANY_CHILDREN_RUNNING]["message"]
+    assert first_many.endswith(
+        f" {MANY_CHILDREN_RUNNING + 1} subagents of this conversation are running at once (at most "
+        f"{MAX_CHILDREN_PER_CONVERSATION}); each one uses its own model calls and tokens.")
+    assert f" {MAX_CHILDREN_PER_CONVERSATION} subagents of this conversation" in results[-1]["message"]
+    # The conversation's limit refuses one more; another conversation still starts.
+    refused = await start(MAX_CHILDREN_PER_CONVERSATION)
+    assert refused == {"status": "rejected", "error": (
+        f"{MAX_CHILDREN_PER_CONVERSATION} subagents are already running for this conversation. "
+        "Wait for one to finish, or do this part yourself.")}
+    other = json.loads(await manager.spawn(task="Elsewhere", origin_channel="desktop",
+                                           origin_chat_id="chat-2", parent_session_key="desktop:chat-2",
+                                           origin="agent"))
+    assert other["status"] == "started"
+    assert "running at once" not in other["message"]
+    gate.set()
+    for r in [*results, other]:
+        await _settle(manager, r["run_id"])
 
 
 # ── The conversation that started it is deleted ─────────────────────────────

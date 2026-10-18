@@ -27,7 +27,10 @@ Origin = Literal["owner", "agent", "system"]
 
 # Children a single conversation may have running at once (owner- or
 # agent-started). System work (self-review, Board, cron) is not counted here.
-MAX_CHILDREN_PER_CONVERSATION = 3
+MAX_CHILDREN_PER_CONVERSATION = 20
+# Past this many running at once, a start's result says how many run (each
+# uses its own model calls), so the agent can tell the owner. A fact, not a limit.
+MANY_CHILDREN_RUNNING = 10
 
 # A quote shorter than this proves nothing ("ver", "ok").
 _MIN_QUOTE_CHARS = 6
