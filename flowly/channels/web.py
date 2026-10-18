@@ -507,6 +507,13 @@ class WebChannel(BaseChannel):
         if session_id and len(session_id) <= 256:
             now = time.monotonic()
             self._profile_directory_sessions[session_id] = now
+            # The roster draws the main agent too: its tool activity reaches
+            # the directory only while its events feed the host, as a
+            # gateway's directory socket already keeps them (it binds rooms).
+            if self._profile_host is not None:
+                self._profile_host.retain_default_events(
+                    self._profile_directory_lease_owner(session_id)
+                )
             self._prune_profile_bindings(now)
             while (
                 len(self._profile_directory_sessions)
@@ -516,7 +523,20 @@ class WebChannel(BaseChannel):
                     self._profile_directory_sessions,
                     key=self._profile_directory_sessions.__getitem__,
                 )
-                self._profile_directory_sessions.pop(oldest, None)
+                self._drop_profile_directory(oldest)
+
+    @classmethod
+    def _profile_directory_lease_owner(cls, session_id: str) -> str:
+        return cls._profile_lease_owner(session_id) + ":directory"
+
+    def _drop_profile_directory(self, session_id: str) -> None:
+        """Forget one relay session's directory, and its main-agent lease."""
+        if self._profile_directory_sessions.pop(session_id, None) is None:
+            return
+        if self._profile_host is not None:
+            self._profile_host.release_default_events(
+                self._profile_directory_lease_owner(session_id)
+            )
 
     def _bind_profile_rooms(self, session_id: str, event_mode: Any) -> None:
         """Open the group surface for one relay session.
@@ -635,7 +655,7 @@ class WebChannel(BaseChannel):
                 )
 
     def _remove_profile_relay_session(self, session_id: str) -> None:
-        self._profile_directory_sessions.pop(session_id, None)
+        self._drop_profile_directory(session_id)
         self._profile_room_sessions.pop(session_id, None)
         self._profile_room_event_modes.pop(session_id, None)
         for profile, session_key in tuple(
@@ -647,7 +667,8 @@ class WebChannel(BaseChannel):
         self._clear_profile_subagent_observers()
         for session_id in tuple(self._profile_bindings_by_relay):
             self._remove_profile_relay_session(session_id)
-        self._profile_directory_sessions.clear()
+        for session_id in tuple(self._profile_directory_sessions):
+            self._drop_profile_directory(session_id)
         self._profile_room_sessions.clear()
         self._profile_room_event_modes.clear()
         self._profile_conversation_sessions.clear()
@@ -659,7 +680,7 @@ class WebChannel(BaseChannel):
         cutoff = now - _PROFILE_BINDING_TTL_SECONDS
         for session_id, touched_at in tuple(self._profile_directory_sessions.items()):
             if touched_at < cutoff:
-                self._profile_directory_sessions.pop(session_id, None)
+                self._drop_profile_directory(session_id)
         for session_id, touched_at in tuple(self._profile_room_sessions.items()):
             if touched_at < cutoff:
                 self._profile_room_sessions.pop(session_id, None)

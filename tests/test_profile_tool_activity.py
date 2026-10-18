@@ -166,3 +166,78 @@ async def test_the_relay_channel_sends_activity_to_the_directory_only() -> None:
     assert [frame["sessionId"] for frame in sent] == ["directory"]
     assert sent[0]["event"] == "profile.event"
     assert sent[0]["data"]["type"] == "tool.activity"
+
+
+class _LeaseHost:
+    """Records the main agent's event leases, as ProfileHost keeps them."""
+
+    def __init__(self) -> None:
+        self.leases: set[str] = set()
+
+    def retain_default_events(self, owner: str) -> None:
+        self.leases.add(owner)
+
+    def release_default_events(self, owner: str) -> None:
+        self.leases.discard(owner)
+
+
+def _relay_channel():
+    from flowly.bus.queue import MessageBus
+    from flowly.channels.web import WebChannel
+    from flowly.config.schema import WebChannelConfig
+
+    channel = WebChannel(WebChannelConfig(), MessageBus())
+    host = _LeaseHost()
+    channel._profile_host = host
+    return channel, host
+
+
+def test_a_relay_directory_keeps_the_main_agents_activity_flowing() -> None:
+    # The roster draws the main agent too; its tool activity exists only while
+    # its events feed the host.
+    channel, host = _relay_channel()
+    channel._bind_profile_directory("phone")
+    channel._bind_profile_directory("phone")
+    assert host.leases == {"relay:phone:directory"}
+
+    channel._remove_profile_relay_session("phone")
+    assert host.leases == set()
+
+
+def test_a_relay_directory_that_expires_or_is_cleared_releases_its_lease(monkeypatch) -> None:
+    from flowly.channels import web
+
+    channel, host = _relay_channel()
+    channel._bind_profile_directory("old")
+    channel._bind_profile_directory("other")
+    channel._profile_directory_sessions["old"] = (
+        time.monotonic() - web._PROFILE_BINDING_TTL_SECONDS - 1
+    )
+    channel._prune_profile_bindings()
+    assert host.leases == {"relay:other:directory"}
+
+    channel._clear_profile_subscriptions()
+    assert host.leases == set()
+
+
+def test_a_relay_directory_evicted_over_the_limit_releases_its_lease(monkeypatch) -> None:
+    from flowly.channels import web
+
+    monkeypatch.setattr(web, "_PROFILE_DIRECTORY_BINDING_LIMIT", 1)
+    channel, host = _relay_channel()
+    channel._bind_profile_directory("first")
+    channel._profile_directory_sessions["first"] -= 1
+    channel._bind_profile_directory("second")
+    assert set(channel._profile_directory_sessions) == {"second"}
+    assert host.leases == {"relay:second:directory"}
+
+
+@pytest.mark.asyncio
+async def test_a_gateway_directory_keeps_the_main_agents_activity_flowing(profile_roots) -> None:
+    server = GatewayServer(host="127.0.0.1", enable_profile_host=True)
+    server._ws_clients["directory"] = _socket()
+    server._bind_profile_client_request("directory", "profiles.list", {})
+    assert server._profile_subscription_uses_default(
+        server._profile_client_subscriptions["directory"]
+    ) is True
+    await server.stop()
