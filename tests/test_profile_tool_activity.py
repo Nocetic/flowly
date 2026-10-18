@@ -81,7 +81,8 @@ async def test_the_host_publishes_activity_without_arguments_or_results(profile_
     )
 
     activity = [envelope for envelope in seen if envelope["type"] == "tool.activity"]
-    assert [envelope["data"]["phase"] for envelope in activity] == ["start", "end", "idle"]
+    # The turn shows life with its first tool, so the roster hears it begin.
+    assert [envelope["data"]["phase"] for envelope in activity] == ["turn", "start", "end", "idle"]
     assert all(envelope["profile"] == "writer" for envelope in activity)
     text = json.dumps(activity)
     assert "id_rsa" not in text and "PRIVATE KEY" not in text
@@ -241,3 +242,26 @@ async def test_a_gateway_directory_keeps_the_main_agents_activity_flowing(profil
         server._profile_client_subscriptions["directory"]
     ) is True
     await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_turn_reaches_the_roster_once_at_its_first_sign_of_life(profile_roots) -> None:
+    # The roster draws an agent at work from the start of its turn, not from
+    # its first tool call: one ``turn`` per conversation's turn, ended by idle.
+    host = ProfileHost()
+    seen: list[dict] = []
+
+    async def capture(envelope: dict) -> None:
+        if envelope["type"] == "tool.activity":
+            seen.append(envelope["data"])
+
+    host.subscribe_events(capture)
+    delta = {"runId": "r1", "sessionKey": "ios:a", "stream": "assistant", "data": {"text": "Hi"}}
+    await host._handle_profile_event("writer", "agent", delta)
+    await host._handle_profile_event("writer", "agent", delta)
+    await host._handle_profile_event("writer", "tool.start", {**_START, "sessionKey": "ios:a"})
+    await host._handle_profile_event("writer", "chat", {"runId": "r1", "sessionKey": "ios:a", "state": "final"})
+    await host._handle_profile_event("writer", "agent", delta)
+
+    assert [item["phase"] for item in seen] == ["turn", "start", "idle", "turn"]
+    assert seen[0] == {"phase": "turn", "scope": "ios:a"}
