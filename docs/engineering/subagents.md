@@ -147,7 +147,16 @@ loop's tool loop does, against the window of **the child's model**:
   follows the thread's history, which is compactable like the rest: a summary takes the place of
   what it covers, and what it keeps stays on its side of the task (`[system, summary, kept
   history…, task, kept work…]`, §16b). A later summary updates the
-  earlier one (it is fed as the previous record), so there is one summary at a time. The summary
+  earlier one (it is fed as the previous record), so there is one summary at a time.
+  **The kept tail of a turn too big to keep whole** (`CompactionService._calculate_keep_recent`,
+  main agent and child alike): the turn's question plus its newest *whole exchanges* that fit
+  half the history budget (`_recent_turn_tail` — an assistant message and the tool results that
+  answer its calls, kept or dropped together, a contiguous run ending at the newest message, never
+  a call without its result). Before, only the question and the final answer were kept
+  (`_essential_turn_tail`, now the fallback when no exchange fits); a turn still running has no
+  final answer, so a mid-turn compaction left the agent none of the work it had just done and it
+  redid it. Such a tail is not the history's suffix, so the summary reads the whole history,
+  dropped exchanges included. Tests: `tests/test_compaction_safety.py` ("a running turn…"). The summary
   is made by the service's own provider and model (the main agent's, like the main agent's own
   summaries) and its calls' `usage` is collected (`collect_summary_usage`, a context variable
   per task, failed attempts included) and counted toward the run.

@@ -138,6 +138,60 @@ def _essential_turn_tail(block: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [m for m in (user, final) if m is not None]
 
 
+def _recent_turn_tail(block: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """The user's question and the newest whole exchanges of a turn that fit
+    ``limit`` tokens, in order.
+
+    Used when a turn is too big to keep whole. Keeping only the question and
+    the final answer (``_essential_turn_tail``) threw away every tool call
+    and result of the turn — and a turn still running has no final answer, so
+    after a mid-turn compaction the agent kept nothing of the work it had
+    just done and did it again. The newest exchanges are what it needs next;
+    the older ones (and these, again) go to the summary, which reads the whole
+    history whenever the kept tail is not its plain suffix.
+
+    An exchange is an assistant message and the tool results that answer its
+    calls, kept or dropped together, so the tail stays protocol-clean: no call
+    without its result, no result without its call. The kept exchanges are a
+    contiguous run ending at the turn's newest message. Empty when not even
+    the question fits.
+    """
+    user_at = next((i for i, m in enumerate(block) if m.get("role") == "user"), None)
+    if user_at is None:
+        return []
+    user = block[user_at]
+    exchanges: list[list[dict[str, Any]]] = []
+    for message in block[user_at + 1:]:
+        if message.get("role") == "tool" and exchanges:
+            exchanges[-1].append(message)
+        elif message.get("role") == "assistant":
+            exchanges.append([message])
+        # Anything else (a stray tool result with no call before it, a
+        # second user-role message) is left to the summary.
+    used = estimate_messages_tokens([user])
+    if used > limit:
+        return []
+    kept: list[list[dict[str, Any]]] = []
+    for exchange in reversed(exchanges):
+        calls = {
+            call.get("id")
+            for call in (exchange[0].get("tool_calls") or [])
+            if isinstance(call, dict)
+        }
+        answered = {m.get("tool_call_id") for m in exchange[1:]}
+        if calls - answered:
+            # A call still waiting for its result (the turn is in flight, or
+            # the result was lost): it cannot stand in the tail on its own.
+            break
+        cost = estimate_messages_tokens(exchange)
+        if used + cost > limit:
+            break
+        kept.append(exchange)
+        used += cost
+    kept.reverse()
+    return [user] + [message for exchange in kept for message in exchange]
+
+
 @dataclass
 class _SessionState:
     """Compaction bookkeeping for one conversation."""
@@ -892,6 +946,12 @@ class CompactionService:
                 )
                 if block_tokens <= hard_limit:
                     return _with_newest_user(list(block))
+                # The question and the newest whole exchanges that fit — the
+                # work the agent was in the middle of — rather than the
+                # question alone.
+                recent = _recent_turn_tail(block, hard_limit)
+                if len(recent) > 1:
+                    return _with_newest_user(recent)
                 essential = _essential_turn_tail(block)
                 if (
                     essential
