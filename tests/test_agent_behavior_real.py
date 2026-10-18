@@ -25,6 +25,14 @@ and checks what the agent *did*, not how its prose reads:
   runs only the named scenarios.
 
 Subagents are recorded, not run, so a scenario costs one conversation turn.
+
+A live model does not choose the same way every time, and providers fail now
+and then, so one run is not a verdict (``verdict``): a scenario that passes
+its first run passes; one that fails runs twice more and passes only if both
+of those pass (two of three). A provider error (an exception, or no model
+call at all) is not the agent's behaviour: that run is repeated and not
+counted. The report records every run, so a scenario that only sometimes
+behaves stays visible. ``FLOWLY_EVAL_ATTEMPTS=1`` restores single runs.
 Each run writes ``agent-behavior-report.json`` (path in ``FLOWLY_EVAL_OUT``,
 default the system temp dir) with tool calls, model calls and timings per
 scenario, so two runs can be diffed.
@@ -192,6 +200,28 @@ SCENARIOS = [
 ]
 
 
+def verdict(results: list[str | None], attempts: int = 3) -> tuple[bool, bool]:
+    """(passed, done) for a scenario's runs so far, oldest first; each run is
+    None when it behaved, else the failure reason.
+
+    The first run passing settles it. After a failure the scenario needs the
+    two runs that follow to pass (two of three overall); a second failure
+    settles it as failed. ``attempts`` 1 judges one run.
+    """
+    if not results:
+        return False, False
+    if results[0] is None:
+        return True, True
+    if attempts <= 1:
+        return False, True
+    later = results[1:]
+    if any(result is not None for result in later):
+        return False, True
+    if len(later) >= min(2, attempts - 1):
+        return True, True
+    return False, False
+
+
 def _config_path() -> Path:
     return Path(os.environ.get("FLOWLY_EVAL_CONFIG") or Path.home() / ".flowly" / "config.json")
 
@@ -213,7 +243,7 @@ def agent_factory():
     return config, provider
 
 
-async def _observe(config, provider, scenario: Scenario, home: Path) -> Observed:
+async def _observe(config, provider, scenario: Scenario, home: Path, attempt: int = 1) -> Observed:
     from flowly.agent.loop import AgentLoop
     from flowly.bus.queue import MessageBus
 
@@ -225,7 +255,9 @@ async def _observe(config, provider, scenario: Scenario, home: Path) -> Observed
         return await original_chat(*args, **kwargs)
 
     provider.chat = counting_chat  # type: ignore[method-assign]
-    workspace = home / "workspace" / scenario.name
+    # Each run is a conversation of its own: a repeated run never continues
+    # the last one's history.
+    workspace = home / "workspace" / f"{scenario.name}-{attempt}"
     workspace.mkdir(parents=True, exist_ok=True)
     loop = AgentLoop(
         bus=MessageBus(), provider=provider, workspace=workspace,
@@ -245,7 +277,7 @@ async def _observe(config, provider, scenario: Scenario, home: Path) -> Observed
                 "message": "It is working on this task in the background."}
 
     loop.subagents.followup = recorded_followup  # type: ignore[method-assign]
-    session_key = f"eval:{scenario.name}"
+    session_key = f"eval:{scenario.name}:{attempt}"
     if scenario.history:
         session = loop.sessions.get_or_create(session_key)
         for row in scenario.history:
@@ -286,14 +318,42 @@ async def test_agent_behaviour_on_owner_conversations(agent_factory, monkeypatch
     report: list[dict[str, Any]] = []
     failures: list[str] = []
     only = {n for n in os.environ.get("FLOWLY_EVAL_ONLY", "").split(",") if n}
+    attempts = max(1, int(os.environ.get("FLOWLY_EVAL_ATTEMPTS") or 3))
     for scenario in (s for s in SCENARIOS if not only or s.name in only):
-        observed = await _observe(config, provider, scenario, home)
-        problem = scenario.check(observed)
-        report.append({"scenario": scenario.name, "ok": problem is None, "problem": problem,
-                       **{k: v for k, v in asdict(observed).items() if k != "final"},
-                       "final_preview": observed.final[:300]})
-        if problem:
-            failures.append(f"{scenario.name}: {problem}")
+        results: list[str | None] = []
+        runs: list[dict[str, Any]] = []
+        provider_errors = 0
+        passed = done = False
+        while not done:
+            run = len(runs) + provider_errors + 1
+            try:
+                observed = await _observe(config, provider, scenario, home, attempt=run)
+            except Exception as error:  # the provider, not the agent
+                observed = None
+                reason = f"provider error: {type(error).__name__}: {error}"
+            else:
+                reason = "no model call (provider error)" if observed.model_calls == 0 else None
+            if reason is not None:
+                provider_errors += 1
+                if provider_errors > 2:
+                    results.append(reason)  # the provider kept failing: report it
+                    passed, done = False, True
+                continue
+            problem = scenario.check(observed)
+            results.append(problem)
+            runs.append({"ok": problem is None, "problem": problem,
+                         **{k: v for k, v in asdict(observed).items() if k != "final"},
+                         "final_preview": observed.final[:300]})
+            passed, done = verdict(results, attempts)
+        last = runs[-1] if runs else {"tools": [], "model_calls": 0, "seconds": 0}
+        report.append({"scenario": scenario.name, "ok": passed,
+                       "problem": None if passed else next((r for r in results if r), None),
+                       "runs": len(runs), "passed_runs": sum(r is None for r in results),
+                       "provider_errors": provider_errors, "tools": last.get("tools", []),
+                       "model_calls": last.get("model_calls", 0), "seconds": last.get("seconds", 0),
+                       "attempts": runs})
+        if not passed:
+            failures.append(f"{scenario.name}: {report[-1]['problem']}")
 
     out_dir = Path(os.environ.get("FLOWLY_EVAL_OUT") or tempfile.gettempdir())
     out = out_dir / "agent-behavior-report.json"
@@ -301,6 +361,7 @@ async def test_agent_behaviour_on_owner_conversations(agent_factory, monkeypatch
                               ensure_ascii=False, indent=2))
     print(f"\nagent behaviour report → {out}")
     for row in report:
-        print(f"  {'✓' if row['ok'] else '✗'} {row['scenario']:<22} tools={row['tools']} "
+        print(f"  {'✓' if row['ok'] else '✗'} {row['scenario']:<22} "
+              f"{row['passed_runs']}/{row['runs']} runs passed tools={row['tools']} "
               f"model_calls={row['model_calls']} {row['seconds']}s {row['problem'] or ''}")
     assert not failures, "\n".join(failures)
