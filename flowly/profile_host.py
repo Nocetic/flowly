@@ -120,6 +120,7 @@ _SAFE_DELEGATED_TOOLS = (
 _PROFILE_TASK_DISABLED_TOOLS = (
     "message_profile",
     "spawn",
+    "agent_followup",
     "delegate_to",
     "board_run",
     "board_update",
@@ -490,10 +491,14 @@ class ProfileHost:
                 "profiles.manager.claim",
                 "profiles.rpc",
                 "profiles.cron.notify",
+                "profiles.agenda.notify",
                 *self._rooms.methods,
             ],
             "profileRpcMethods": sorted(PROFILE_RPC_TIMEOUTS),
             "rpcIdentityGuard": True,
+            # profiles.rpc {ifRunning: true}: read an agent only while it is
+            # up, never start it (PROFILE_NOT_RUNNING otherwise).
+            "rpcIfRunning": True,
             "events": ["profile.event", "profile.room"],
             "storageMode": "profile-local",
             "processIsolation": "per-profile-gateway",
@@ -631,6 +636,14 @@ class ProfileHost:
             return self.claim_management(params.get("ttlMs") if isinstance(params, dict) else None)
         if method == "profiles.stop":
             return await self.stop(_required_string(params, "name").strip(), by_user=True)
+        if method == "profiles.agenda.notify":
+            from flowly.push.profile_agenda_push import notify_profile_agenda
+
+            return await notify_profile_agenda(
+                self.host_id,
+                _required_string(params, "name").strip(),
+                _required_string(params, "itemId"),
+            )
         if method == "profiles.cron.notify":
             from flowly.push.profile_cron_push import notify_profile_cron
 
@@ -641,6 +654,9 @@ class ProfileHost:
                 _required_string(params, "runId"),
             )
         if method == "profiles.rpc":
+            if_running = params.get("ifRunning", False)
+            if not isinstance(if_running, bool):
+                raise ProfileHostError("INVALID_PARAMS", "ifRunning must be true or false.")
             return await self.rpc(
                 _required_string(params, "name").strip(),
                 params.get("method"),
@@ -648,6 +664,7 @@ class ProfileHost:
                 params.get("timeoutMs"),
                 expected_host_id=params.get("expectedHostId"),
                 expected_bot_id=params.get("expectedBotId"),
+                if_running=if_running,
             )
         if method in self._rooms.methods:
             result = await self._rooms.dispatch(method, params)
@@ -1037,9 +1054,26 @@ class ProfileHost:
         *,
         expected_host_id: Any = None,
         expected_bot_id: Any = None,
+        if_running: bool = False,
     ) -> Any:
+        """Run one allowed method on an agent of this host.
+
+        ``if_running`` reads an agent only when it is already up: a stopped
+        or not-yet-started agent answers PROFILE_NOT_RUNNING instead of being
+        started. What follows agents in the background (a subagent's live
+        conversation, renewed every minute or so) must never wake one.
+        """
         _validate_profile_selector(name)
         method, safe = validate_profile_rpc(method, params)
+        if method == "subagents.unwatch":
+            # The agent's runtime knows one watcher for every client of this
+            # host: the host's own socket. Releasing it for one client would
+            # cut the others; each client's own binding is released by its
+            # transport, and the runtime's lease runs out once nobody renews it.
+            from flowly.agent.subagent_threads import thread_session_key
+
+            return {"schemaVersion": 1, "ok": True, "watching": False,
+                    "threadId": safe["threadId"], "sessionKey": thread_session_key(safe["threadId"])}
         if method in {"subagents.list", "subagents.get"}:
             # The shared runtime socket carries canonical events internally.
             # Each external gateway/relay reader selects its own wire version.
@@ -1071,9 +1105,11 @@ class ProfileHost:
             safe.pop("allowedTools", None)
             safe.pop("disabledTools", None)
             safe["turnOrigin"] = "user"
-        identity_options = {"expected_bot_id": expected_bot_id} if guarded else {}
+        target_options: dict[str, Any] = {"expected_bot_id": expected_bot_id} if guarded else {}
+        if if_running:
+            target_options["if_running"] = True
         result = await self._target_rpc(
-            name, method, safe, bounded_timeout(method, timeout_ms), **identity_options
+            name, method, safe, bounded_timeout(method, timeout_ms), **target_options
         )
         if expected_bot_id is not None and ensure_profile_bot_id(name).bot_id != expected_bot_id:
             raise ProfileHostError('PROFILE_IDENTITY_CHANGED', 'The selected agent has changed.')
@@ -1091,7 +1127,7 @@ class ProfileHost:
                         break
                     more = await self._target_rpc(
                         name, method, {**safe, "before": cursor}, bounded_timeout(method, timeout_ms),
-                        **identity_options,
+                        **target_options,
                     )
                     if not isinstance(more, dict) or not isinstance(more.get("sessions"), list):
                         break
@@ -2244,10 +2280,22 @@ class ProfileHost:
         with request_owner_scope(owner), event_access_scope(access):
             await self._handle_primary_frame_event(frame)
 
+    async def announce_primary_objectives(self, data: dict[str, Any]) -> None:
+        """The main agent's goals changed: tell every app showing this host.
+
+        Unlike the main agent's other events this needs no lease: it carries
+        no content, and a remote goals panel that reads them only through
+        ``profiles.rpc`` holds none (``flowly/objectives/events.py``).
+        """
+        await self._emit("default", "objectives.changed", data)
+
     async def _handle_primary_frame_event(self, frame: dict[str, Any]) -> None:
         if frame.get("type") == "event":
             payload = frame.get("data")
             if not isinstance(payload, dict):
+                return
+            if frame.get("event") == "objectives.changed":
+                # Announced once by the runtime (announce_primary_objectives).
                 return
             session_key = str(payload.get("sessionKey") or "")
             run_id = str(payload.get("runId") or "")
@@ -2276,6 +2324,16 @@ class ProfileHost:
         payload = data if isinstance(data, dict) else {}
         run_id = str(payload.get("runId") or "")
         session_key = str(payload.get("sessionKey") or "")
+        from flowly.session.keys import is_subagent_thread
+
+        if is_subagent_thread(session_key):
+            # A subagent's running turn, live, for whoever watches it: not the
+            # agent's own turn (no busy state, no waits it settles, no roster
+            # activity, no attention refresh) and never a group's.
+            if runtime is not None:
+                runtime.last_used_at = time.time()
+            await self._emit(profile, event, payload)
+            return
         if event == "cron.completed" and profile != "default":
             # Push belongs to the primary host, independently of phone sockets
             # or Desktop windows. Keep network I/O off the runtime reader.
@@ -2286,6 +2344,13 @@ class ProfileHost:
                     "runId": payload.get("runId"),
                 }),
                 name=f"profile-cron-push:{profile}:{run_id}",
+            )
+        if event == "agenda.delivered" and profile != "default":
+            # A message the agent wrote first: the phone rings from here, the
+            # primary host, which holds the device registrations.
+            self._spawn_background(
+                self._notify_agenda_delivery({"name": profile, "itemId": payload.get("itemId")}),
+                name=f"profile-agenda-push:{profile}:{payload.get('itemId')}",
             )
         internal_turn = bool(self._broker_sessions.get((profile, session_key)))
         if internal_turn or (profile, session_key) in self._interactive_task_sessions:
@@ -2410,6 +2475,13 @@ class ProfileHost:
         entry["status"] = "ok" if payload.get("success") else "error"
         duration = payload.get("durationMs")
         entry["duration_ms"] = duration if isinstance(duration, int) else None
+
+    async def _notify_agenda_delivery(self, params: dict[str, Any]) -> None:
+        try:
+            await self.dispatch("profiles.agenda.notify", params)
+        except Exception:
+            # Notification failures must not break the runtime event reader.
+            logger.warning("Profile agenda push could not be dispatched for {}", params.get("name"))
 
     async def _notify_cron_completion(self, params: dict[str, Any]) -> None:
         try:
@@ -2757,6 +2829,7 @@ class ProfileHost:
         timeout: float,
         *,
         expected_bot_id: str | None = None,
+        if_running: bool = False,
     ) -> Any:
         expected = params.get('expectedBotId')
         if expected is not None and ensure_profile_bot_id(target).bot_id != expected:
@@ -2776,6 +2849,11 @@ class ProfileHost:
             if not self._runtime_is_open(target_runtime):
                 # Stop is never a reason to start or restart an agent.
                 return {"aborted": False}
+        elif if_running:
+            target_runtime = self._runtimes.get(target)
+            if not self._runtime_is_open(target_runtime):
+                # A read that follows an agent in the background never wakes it.
+                raise ProfileHostError("PROFILE_NOT_RUNNING", "The agent is not running.")
         else:
             target_runtime = await self._ensure_runtime(target)
         # Runtime startup can yield while a profile is deleted/re-created.

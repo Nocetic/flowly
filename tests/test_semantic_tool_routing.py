@@ -928,7 +928,6 @@ async def test_agent_loop_uses_semantic_promotion_without_an_extra_llm_call(
             {"role": "system", "content": "test"},
             {"role": "user", "content": "Check official documentation."},
         ],
-        action_turn=False,
         turn_content="Check official documentation.",
         session_key="web:test",
         tool_platform="web",

@@ -6,7 +6,7 @@ from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
-from flowly.tool_activity import project_tool_call_for_ui
+from flowly.tool_activity import is_internal_tool, project_tool_call_for_ui
 from flowly.utils.display_text import bounded_tool_result
 
 _TERMINAL = frozenset({"completed", "failed", "stopped"})
@@ -54,6 +54,8 @@ class ToolProgress:
             if previous:
                 continue
             function = projected.get("function") or {}
+            if is_internal_tool(function.get("name")):
+                continue  # the agent's own bookkeeping never shows as a step
             arguments = str(function.get("arguments") or "{}")
             call = {"id": call_id, "index": index, "name": str(function.get("name") or "")[:128],
                     "arguments": arguments[:_MAX_ARGUMENTS],

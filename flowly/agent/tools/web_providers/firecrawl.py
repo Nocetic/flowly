@@ -11,6 +11,7 @@ and the post-redirect final URL is re-checked against Flowly's SSRF guard.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import os
 from typing import Any
 
@@ -18,6 +19,10 @@ from loguru import logger
 
 from flowly.agent.tools.web_providers._config import provider_section
 from flowly.agent.tools.web_providers.base import WebSearchProvider
+
+
+def _sdk_installed() -> bool:
+    return importlib.util.find_spec("firecrawl") is not None
 
 
 def _firecrawl_config() -> tuple[str, str]:
@@ -97,7 +102,8 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
         if not getattr(section, "enabled", False):
             return False
         api_key, api_url = _firecrawl_config()
-        return bool(api_key or api_url)
+        # Configured is not enough: without its SDK every call fails.
+        return bool(api_key or api_url) and _sdk_installed()
 
     def search(self, query: str, limit: int = 5) -> dict[str, Any]:
         try:

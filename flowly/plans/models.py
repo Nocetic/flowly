@@ -40,6 +40,10 @@ PlanStatus = Literal[
 StepStatus = Literal["pending", "in_progress", "completed", "blocked", "skipped"]
 
 # Terminal plan states never mutate further (except an explicit archive).
+#: Tools whose progress is presented by the plan checklist above the input,
+#: never as rows in a reply's tool trail (a tick is bookkeeping, not work).
+PLAN_TOOL_NAMES: frozenset[str] = frozenset({"plan"})
+
 TERMINAL_STATUSES: frozenset[str] = frozenset(
     {"completed", "blocked", "rejected", "aborted"}
 )

@@ -53,12 +53,24 @@ def client_event(event: str, data: dict, version: int = 1) -> tuple[str, dict]:
     return "subagent.started", legacy
 
 
-def run_view(record: SubagentRunRecord, *, detail: bool = False) -> dict[str, Any]:
+def run_view(record: SubagentRunRecord, *, detail: bool = False,
+             thread: Any | None = None) -> dict[str, Any]:
+    """The wire shape of a run (schemaVersion 2).
+
+    ``thread`` is the run's ``SubagentThreadRecord`` when it has one. Thread
+    fields are additive: ``threadId`` (the run's thread; for a subagent run
+    from before threads existed its own run id, with ``legacy: true`` and no
+    history to page), ``turn``, ``trigger``, ``threadStatus`` (``open`` |
+    ``closed``) and ``threadRuns``. System runs and delegated tasks have no
+    thread (``threadId: null``).
+    """
     counts = Counter(step.get("tool", "unknown") for step in record.tool_trace)
     duration = None
     if record.started_at is not None:
         end = record.ended_at if record.ended_at is not None else time.time()
-        duration = round(max(0, end - record.started_at), 1)
+        # Time it worked: the downtime of a restart it continued across is
+        # left out.
+        duration = round(max(0, end - record.started_at - (record.suspended_seconds or 0.0)), 1)
     view = {
         "schemaVersion": 2, "runId": record.run_id, "shortId": record.run_id[:8],
         "label": record.display_name or record.label, "task": record.task,
@@ -75,10 +87,41 @@ def run_view(record: SubagentRunRecord, *, detail: bool = False) -> dict[str, An
         "resultPreview": record.result_preview, "resultChars": record.result_chars,
         "resultAvailable": record.result_available, "artifactIds": list(record.artifact_ids),
         "deliveryState": record.delivery_state,
+        "origin": record.origin, "mark": deepcopy(record.mark),
+        # Tokens so far (live while it runs), never a price.
+        "usage": {
+            "inputTokens": int(record.usage.get("input", 0)),
+            "outputTokens": int(record.usage.get("output", 0)),
+            "cacheReadTokens": int(record.usage.get("cacheRead", 0)),
+            "totalTokens": int(record.usage.get("total", 0)),
+        },
+        "childSessionKey": record.child_session_key,
+        # Continued after a restart: when it last continued (None if it
+        # never was) and the downtime left out of ``duration``.
+        "resumedAt": record.resumed_at,
+        "suspendedSeconds": round(record.suspended_seconds or 0.0, 1),
+        **_thread_fields(record, thread),
     }
     if detail:
         view["toolTrace"] = deepcopy(record.tool_trace)
     return view
+
+
+def _thread_fields(record: SubagentRunRecord, thread: Any | None) -> dict[str, Any]:
+    legacy = not record.thread_id and record.kind == "subagent" and record.origin != "system"
+    thread_id = record.thread_id or (record.run_id if legacy else None)
+    if thread is not None and getattr(thread, "thread_id", None) == record.thread_id:
+        status, runs = thread.status, len(thread.runs)
+    else:
+        # A legacy run, or a thread already pruned: nothing more can run on it.
+        status, runs = ("closed", 1) if thread_id else (None, 0)
+    fields: dict[str, Any] = {
+        "threadId": thread_id, "turn": record.turn, "trigger": record.trigger,
+        "threadStatus": status, "threadRuns": runs,
+    }
+    if legacy:
+        fields["legacy"] = True
+    return fields
 
 
 class TaskEvents:

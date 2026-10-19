@@ -150,7 +150,7 @@ async def main():
         async with host_screen_run_scope(gateway, args[0], args[2]) as run:
             result = await loop._run_llm_tool_loop(
                 [{"role": "system", "content": "Complete the browser task."}, {"role": "user", "content": "Read the login result."}],
-                action_turn=False, session_key=args[0], outbound_run_id=args[2])
+                session_key=args[0], outbound_run_id=args[2])
             run.succeeded = not loop.is_run_aborted(args[2])
         return result[0], {"aborted": loop.is_run_aborted(args[2])}
 

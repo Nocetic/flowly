@@ -17,6 +17,7 @@ from flowly.compaction.coordination import (
 from flowly.compaction.estimator import estimate_messages_tokens
 from flowly.compaction.pruning import (
     compute_adaptive_chunk_ratio,
+    microcompact_tool_results,
     prune_history_for_context_share,
     split_into_turn_blocks,
 )
@@ -135,6 +136,60 @@ def _essential_turn_tail(block: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 final = m
                 break
     return [m for m in (user, final) if m is not None]
+
+
+def _recent_turn_tail(block: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """The user's question and the newest whole exchanges of a turn that fit
+    ``limit`` tokens, in order.
+
+    Used when a turn is too big to keep whole. Keeping only the question and
+    the final answer (``_essential_turn_tail``) threw away every tool call
+    and result of the turn — and a turn still running has no final answer, so
+    after a mid-turn compaction the agent kept nothing of the work it had
+    just done and did it again. The newest exchanges are what it needs next;
+    the older ones (and these, again) go to the summary, which reads the whole
+    history whenever the kept tail is not its plain suffix.
+
+    An exchange is an assistant message and the tool results that answer its
+    calls, kept or dropped together, so the tail stays protocol-clean: no call
+    without its result, no result without its call. The kept exchanges are a
+    contiguous run ending at the turn's newest message. Empty when not even
+    the question fits.
+    """
+    user_at = next((i for i, m in enumerate(block) if m.get("role") == "user"), None)
+    if user_at is None:
+        return []
+    user = block[user_at]
+    exchanges: list[list[dict[str, Any]]] = []
+    for message in block[user_at + 1:]:
+        if message.get("role") == "tool" and exchanges:
+            exchanges[-1].append(message)
+        elif message.get("role") == "assistant":
+            exchanges.append([message])
+        # Anything else (a stray tool result with no call before it, a
+        # second user-role message) is left to the summary.
+    used = estimate_messages_tokens([user])
+    if used > limit:
+        return []
+    kept: list[list[dict[str, Any]]] = []
+    for exchange in reversed(exchanges):
+        calls = {
+            call.get("id")
+            for call in (exchange[0].get("tool_calls") or [])
+            if isinstance(call, dict)
+        }
+        answered = {m.get("tool_call_id") for m in exchange[1:]}
+        if calls - answered:
+            # A call still waiting for its result (the turn is in flight, or
+            # the result was lost): it cannot stand in the tail on its own.
+            break
+        cost = estimate_messages_tokens(exchange)
+        if used + cost > limit:
+            break
+        kept.append(exchange)
+        used += cost
+    kept.reverse()
+    return [user] + [message for exchange in kept for message in exchange]
 
 
 @dataclass
@@ -769,58 +824,26 @@ class CompactionService:
         """
         Proactively truncate old tool results to delay compaction.
 
-        Keeps the most recent N tool results at full length,
-        truncates older ones to save tokens.
+        Keeps the most recent ``keep_recent_full`` tool results at full
+        length and cuts older ones to ``truncate_chars`` (configured under
+        ``microcompact``), keeping a spilled result's file pointer.
 
         Args:
             messages: Current message history.
 
         Returns:
-            Messages with old tool results truncated (in-place safe, returns new list).
+            Messages with old tool results truncated (never mutated in place).
         """
         cfg = self.config.microcompact
         if not cfg.enabled:
             return messages
-
-        # Lazy import — flowly.agent.loop imports this module at top level,
-        # so importing flowly.agent.* here would create an import cycle.
-        from flowly.agent.tool_result_spill import extract_spill_pointer
-
-        # Find indices of all tool-role messages
-        tool_indices = [
-            i for i, m in enumerate(messages)
-            if m.get("role") == "tool"
-        ]
-
-        if len(tool_indices) <= cfg.keep_recent_full:
-            return messages  # Nothing to truncate
-
-        # Indices to truncate (all except the most recent N)
-        truncate_indices = set(tool_indices[:-cfg.keep_recent_full])
-
-        result = []
-        changed = 0
-        for i, msg in enumerate(messages):
-            if i in truncate_indices:
-                content = msg.get("content", "")
-                if len(content) > cfg.truncate_chars:
-                    truncated = content[:cfg.truncate_chars] + "\n[old tool output truncated]"
-                    # A spilled tool result carries a file pointer at the END
-                    # of its text — exactly where truncation cuts. Re-append
-                    # it so the full output stays reachable via read_file.
-                    pointer = extract_spill_pointer(content)
-                    if pointer and pointer not in truncated:
-                        truncated += pointer
-                    result.append({**msg, "content": truncated})
-                    changed += 1
-                else:
-                    result.append(msg)
-            else:
-                result.append(msg)
-
-        if changed > 0:
-            logger.debug(f"Microcompact: truncated {changed} old tool results")
-
+        result = microcompact_tool_results(
+            messages,
+            keep_recent_full=cfg.keep_recent_full,
+            truncate_chars=cfg.truncate_chars,
+        )
+        if result is not messages:
+            logger.debug("Microcompact: truncated old tool results")
         return result
 
     def _keep_recent_cap(self, history_budget: int) -> int:
@@ -923,6 +946,12 @@ class CompactionService:
                 )
                 if block_tokens <= hard_limit:
                     return _with_newest_user(list(block))
+                # The question and the newest whole exchanges that fit — the
+                # work the agent was in the middle of — rather than the
+                # question alone.
+                recent = _recent_turn_tail(block, hard_limit)
+                if len(recent) > 1:
+                    return _with_newest_user(recent)
                 essential = _essential_turn_tail(block)
                 if (
                     essential

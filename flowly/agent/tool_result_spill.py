@@ -21,6 +21,7 @@ off-limits to the agent.
 from __future__ import annotations
 
 import hashlib
+import os
 import tempfile
 import time
 from datetime import datetime
@@ -46,18 +47,33 @@ def get_spill_dir() -> Path:
     return Path(tempfile.gettempdir()) / "flowly-tool-results"
 
 
-def spill_tool_result(content: str, tool_name: str) -> Path | None:
+def spill_tool_result(content: str, tool_name: str, directory: Path | None = None) -> Path | None:
     """Write the full tool result to the spill dir. Returns None on failure.
 
     Failure is non-fatal by design — the caller falls back to plain
     truncation, which is the pre-spill behaviour.
+
+    ``directory`` is a private spill dir whose lifetime its owner manages (a
+    subagent thread keeps its raw outputs as long as its history): created
+    0700, files 0600, never swept by the 7-day temp retention.
     """
     try:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        digest = hashlib.sha1(content.encode("utf-8", "replace")).hexdigest()[:8]
+        if directory is not None:
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            path = directory / f"{tool_name}-{stamp}-{digest}.txt"
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), 0o600)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(content.encode("utf-8", "replace"))
+            logger.info(
+                f"[spill] persisted oversized {tool_name} result: "
+                f"{len(content)} chars -> {path}"
+            )
+            return path
         spill_dir = get_spill_dir()
         spill_dir.mkdir(parents=True, exist_ok=True)
         _cleanup_old_spills(spill_dir)
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        digest = hashlib.sha1(content.encode("utf-8", "replace")).hexdigest()[:8]
         path = spill_dir / f"{tool_name}-{stamp}-{digest}.txt"
         path.write_text(content, encoding="utf-8")
         logger.info(

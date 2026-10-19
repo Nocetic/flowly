@@ -22,29 +22,18 @@ import pytest
 from flowly.agent.loop import AgentLoop
 from flowly.agent.subagent_announce_queue import AnnounceItem, AnnounceQueue
 
-# ── Ayak A: tool policy ends the turn after an async dispatch ────────────────
+# ── Ayak A: the parent keeps its tools after a dispatch ─────────────────────
 
 def _tool_defs(*names: str) -> list[dict]:
     return [{"function": {"name": n}} for n in names]
 
 
-def test_policy_hides_all_tools_after_async_dispatch() -> None:
+def test_policy_never_hides_tools_outside_a_live_call() -> None:
+    """A dispatch no longer ends the parent's turn by taking its tools away;
+    the parent keeps working while its subagents run."""
     agent = object.__new__(AgentLoop)  # bypass heavy __init__
-    defs = _tool_defs("web_search", "exec", "builtin_agent", "message", "artifact")
-    filtered, hidden = agent._apply_turn_tool_policy(
-        defs, live_call_turn=False, builtin_agent_dispatched=True
-    )
-    # Nothing left to call → the next step is a plain text ack → turn ends.
-    assert filtered == []
-    assert set(hidden) == {"web_search", "exec", "builtin_agent", "message", "artifact"}
-
-
-def test_policy_unchanged_when_no_dispatch() -> None:
-    agent = object.__new__(AgentLoop)
-    defs = _tool_defs("web_search", "exec")
-    filtered, hidden = agent._apply_turn_tool_policy(
-        defs, live_call_turn=False, builtin_agent_dispatched=False
-    )
+    defs = _tool_defs("web_search", "exec", "spawn", "message", "artifact")
+    filtered, hidden = agent._apply_turn_tool_policy(defs, live_call_turn=False)
     assert filtered == defs
     assert hidden == []
 

@@ -50,6 +50,15 @@ PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     "subagents.list": 15_000,
     "subagents.get": 15_000,
     "subagents.result": 15_000,
+    "subagents.transcript": 15_000,
+    # A subagent's conversation, page by page (read only).
+    "subagents.history": 15_000,
+    # A subagent's running turns, live (the caller is bound to them).
+    "subagents.watch": 15_000,
+    "subagents.unwatch": 15_000,
+    # The owner stopping one subagent from its pill, sidebar or the notch.
+    "subagents.cancel": 30_000,
+    "subagents.stats": 15_000,
     "memory.editor.list": 30_000,
     "memory.editor.document": 30_000,
     "memory.editor.save": 30_000,
@@ -129,6 +138,12 @@ PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     "cron.remove": 30_000,
     "cron.run": 60_000,
     "cron.output": 30_000,
+    # A named agent's tracked goals and agenda (flowly/agenda/rpc.py).
+    "objectives.list": 30_000,
+    "objectives.update": 30_000,
+    "agenda.list": 30_000,
+    "agenda.settings.get": 30_000,
+    "agenda.settings.set": 30_000,
 }
 
 _EXEC_SECURITY = {"deny", "allowlist", "full"}
@@ -150,7 +165,7 @@ def is_internal_profile_session(value: Any) -> bool:
     return isinstance(value, str) and value.startswith(_INTERNAL_PROFILE_SESSION_PREFIXES)
 
 
-def _validate_session_key(value: Any, *, required: bool = False) -> None:
+def _validate_session_key(value: Any, *, required: bool = False, method: str = "") -> None:
     if value is None and not required:
         return
     if (
@@ -164,6 +179,18 @@ def _validate_session_key(value: Any, *, required: bool = False) -> None:
             "INVALID_PARAMS",
             "Profile conversation identity is invalid.",
         )
+    from flowly.session.keys import (
+        SUBAGENT_THREAD_READ_ONLY,
+        SUBAGENT_THREAD_READ_ONLY_MESSAGE,
+        SUBAGENT_THREAD_READABLE_METHODS,
+        is_subagent_thread,
+    )
+
+    if is_subagent_thread(value):
+        # A named agent's subagent conversation may be read, never written.
+        if method in SUBAGENT_THREAD_READABLE_METHODS:
+            return
+        raise ProfileHostError(SUBAGENT_THREAD_READ_ONLY, SUBAGENT_THREAD_READ_ONLY_MESSAGE)
     if (
         not value.startswith(REMOTE_SESSION_PREFIXES)
         or is_internal_profile_session(value)
@@ -342,14 +369,35 @@ def profile_rpc_session_key(method: str, params: dict[str, Any]) -> str:
 
     Every ``agent.home.*`` call is about the agent's home conversation, though
     none carries its key: the introduction it starts streams there, and the
-    caller must be watching it before the first words are sent.
+    caller must be watching it before the first words are sent. A
+    ``subagents.watch`` is about the subagent's conversation, whose events the
+    caller then receives (``subagents.unwatch`` binds nothing: see
+    :func:`profile_rpc_unwatched_key`).
     """
     if method.startswith("agent.home."):
         from flowly.agent_home import HOME_SESSION
 
         return HOME_SESSION
+    if method == "subagents.watch":
+        return _subagent_watch_key(params)
+    if method == "subagents.unwatch":
+        return ""
     session_key = params.get("sessionKey")
     return session_key if isinstance(session_key, str) else ""
+
+
+def profile_rpc_unwatched_key(method: str, params: Any) -> str:
+    """The subagent conversation a validated ``subagents.unwatch`` releases, or ""."""
+    if method != "subagents.unwatch" or not isinstance(params, dict):
+        return ""
+    return _subagent_watch_key(params)
+
+
+def _subagent_watch_key(params: dict[str, Any]) -> str:
+    from flowly.agent.subagent_threads import is_thread_id, thread_session_key
+
+    thread_id = params.get("threadId")
+    return thread_session_key(thread_id) if is_thread_id(thread_id) else ""
 
 
 def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]:
@@ -383,6 +431,11 @@ def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]
             event_version(value)
         except ValueError as exc:
             raise ProfileHostError("INVALID_PARAMS", str(exc)) from exc
+    if method in {"subagents.watch", "subagents.unwatch"}:
+        from flowly.agent.subagent_threads import is_thread_id
+
+        if set(value) - {"threadId"} or not is_thread_id(value.get("threadId")):
+            raise ProfileHostError("INVALID_PARAMS", "A subagent's thread id is required.")
     if method == 'goal.get' and 'goalId' in value:
         goal_id = value['goalId']
         if (not isinstance(goal_id, str) or not 1 <= len(goal_id) <= 512
@@ -430,13 +483,19 @@ def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]
         "sessions.model.set",
     }
     if method in session_key_methods:
-        _validate_session_key(value.get("sessionKey"), required=True)
+        _validate_session_key(value.get("sessionKey"), required=True, method=method)
     elif "sessionKey" in value:
-        _validate_session_key(value.get("sessionKey"))
+        _validate_session_key(value.get("sessionKey"), method=method)
     if method == "sessions.delete":
         if "key" in value and "sessionKey" in value and value["key"] != value["sessionKey"]:
             raise ProfileHostError("INVALID_PARAMS", "Conversation targets do not match.")
-        _validate_session_key(value.get("sessionKey") or value.get("key"), required=True)
+        _validate_session_key(value.get("sessionKey") or value.get("key"), required=True, method=method)
+    from flowly.session.keys import SubagentThreadReadOnlyError, require_rpc_subagent_access
+
+    try:
+        require_rpc_subagent_access(method, value)
+    except SubagentThreadReadOnlyError as exc:
+        raise ProfileHostError(exc.code, exc.message) from None
     if method == "media.read":
         media_id = value.get("mediaId")
         offset = value.get("offset", 0)

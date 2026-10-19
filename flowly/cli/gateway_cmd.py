@@ -520,11 +520,10 @@ def gateway(
         # gateway's job). Keeping these blocked is non-negotiable.
         "cron",
         "message",
-        # Lower-level fire-and-forget spawners are hidden so the cron agent
-        # reaches for `builtin_agent` (sync in cron context) instead. If
-        # cron called `spawn`, it would get "accepted" back and spin waiting
-        # for an async announcement that never arrives inline.
+        # A scheduled run does its work itself. Background spawners report
+        # back on a later turn, which a cron tick never has.
         "spawn",
+        "agent_followup",
         "delegate_to",
         "message_profile",
         # NOTE: Side-effect integrations (google_drive, email, linear, etc.)
@@ -886,6 +885,9 @@ def gateway(
         state_dir=get_data_dir(),
         main_config=config,
     )
+    # The gateway continues subagents a restart stopped (their checkpoints
+    # and suspend-on-shutdown); a CLI session leaves them to it.
+    agent.subagents.resume_enabled = True
 
     # Multi-agent setup (if agents are configured in config.json)
     multi_agents = config.agents.agents
@@ -1219,32 +1221,14 @@ def gateway(
                     "unless the task ABOVE explicitly asks for it. The user reads your "
                     "text reply — that's the whole deliverable.\n"
                     "\n"
-                    "# Specialist dispatch — ONE call, then STOP\n"
-                    "`builtin_agent` delegates focused work to a specialist:\n"
-                    "- `researcher` — researches AND writes a final markdown report "
-                    "(auto-saved as artifact). Use for ANY 'research X and write it up' "
-                    "task. It is SELF-CONTAINED.\n"
-                    "- `writer` — only when you already have the raw material and just "
-                    "need it reshaped.\n"
-                    "- `coder` — code review / refactor / debug.\n"
+                    "# How to work\n"
+                    "Do the task yourself with the tools it needs, then reply. Stop "
+                    "as soon as you have what the task asks for: if one `web_search` "
+                    "or `web_fetch` answers it, that is enough.\n"
                     "\n"
-                    "STRICT EXECUTION PLAN (follow in order, stop when the condition is met):\n"
-                    "1. If a single `web_search`/`web_fetch` answers the task, do that, "
-                    "then STOP and reply.\n"
-                    "2. Otherwise call ONE specialist (researcher for research+write, "
-                    "writer for reshape-only, coder for code).\n"
-                    "3. When the specialist returns: your NEXT turn MUST be the final "
-                    "reply. No more tool calls. Do NOT look up the artifact you just "
-                    "got back (you already have its text). Do NOT 'also save to Drive' "
-                    "or 'also send an email'. Just output the report to the user and end.\n"
-                    "\n"
-                    "Forbidden patterns — these waste 3-5 minutes and deliver nothing "
-                    "the user asked for:\n"
-                    "  ✗ researcher → writer (chain)\n"
-                    "  ✗ specialist → artifact(list) → artifact(get) (you already have "
-                    "the content)\n"
-                    "  ✗ specialist → google_drive(create) (user didn't ask for Drive)\n"
-                    "  ✗ specialist → email(send) (user didn't ask to email anyone)\n"
+                    "Don't add deliverables nobody asked for — no 'also saving to "
+                    "Drive', no email, no looking up an artifact you just wrote. Your "
+                    "final text reply is the deliverable.\n"
                     "\n"
                     "If any tool fails, include a one-sentence error note in your reply. "
                     "Then STOP."
@@ -1578,6 +1562,67 @@ def gateway(
         deliver=hb_cfg.deliver,
     )
 
+    # The agent's agenda (flowly/agenda): follow-ups it plans for itself, the
+    # goals it tracks, and the limits on writing first. Every runtime runs its
+    # own, named agents included; the daily budget is shared through the
+    # canonical home. See docs/engineering/agent-goals.md.
+    from flowly.agenda.service import AGENDA_GOAL_KEY, AGENDA_ITEM_KEY, AGENDA_SENDER, REVIEW_SESSION, AgendaService
+    from flowly.agent.tools.follow_up import FollowUpTool
+    from flowly.agent.tools.objective import ObjectiveTool
+    from flowly.agent.tools.proactivity import ProactivityTool
+    from flowly.bus.events import InboundMessage as _AgendaInbound
+    from flowly.profile import current_profile_display_name, current_profile_name
+
+    async def _publish_agenda_wake(item: dict, prompt: str) -> None:
+        # Enters the conversation the follow-up is about as a hidden system
+        # turn, like a finished background task reporting back.
+        await bus.publish_inbound(_AgendaInbound(
+            channel="system",
+            sender_id=AGENDA_SENDER,
+            chat_id=item["sessionKey"],
+            content=prompt,
+            metadata={
+                AGENDA_ITEM_KEY: item["id"],
+                **({AGENDA_GOAL_KEY: item["objectiveId"]} if item.get("objectiveId") else {}),
+            },
+        ))
+
+    async def _run_agenda_review(prompt: str) -> None:
+        # A fresh isolated session each day; its route ("agenda") cannot
+        # message the owner, ask them anything or create scheduled tasks.
+        # It is removed afterwards: what it planned lives in the agenda, and
+        # no client should list it as a conversation.
+        review = agent.sessions.get_or_create(REVIEW_SESSION)
+        review.clear()
+        agent.sessions.save(review)
+        try:
+            await agent.process_direct(prompt, session_key=REVIEW_SESSION)
+        finally:
+            try:
+                agent.sessions.delete(REVIEW_SESSION)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"[agenda] review session cleanup skipped: {exc}")
+
+    async def _announce_agenda_delivery(session_key: str, _text: str, item_id: str) -> None:
+        # A named agent's runtime holds no device registrations: it says which
+        # wake-up spoke, and the primary host (or Desktop, managing it) has
+        # the phone ring from that agent's own record (profiles.agenda.notify).
+        await gateway_server.broadcast_event("agenda.delivered", {"itemId": item_id, "sessionKey": session_key})
+
+    agenda = AgendaService(
+        profile=current_profile_name(),
+        agent_name=current_profile_display_name(),
+        publish_wake=_publish_agenda_wake,
+        is_busy=agent.subagents.is_busy,
+        run_review=_run_agenda_review,
+        list_conversations=agent.sessions.list_sessions,
+        notify=_announce_agenda_delivery if local_runtime else None,
+    )
+    agent.tools.register(ObjectiveTool())
+    agent.tools.register(FollowUpTool())
+    agent.tools.register(ProactivityTool())
+    agent.agenda = agenda
+
     # A managed profile backend is a local RPC process, never a second copy of
     # the account's messaging gateway. Disable every channel in memory even if
     # an older or hand-edited profile config still contains transport secrets.
@@ -1817,6 +1862,14 @@ Respond to the user now:"""
         # the previous model.
         agent.provider = new_provider
         agent.model = new_model
+        # Subagents are started on the agent's provider and model, and their
+        # summaries already go through the compaction service below: a swap
+        # that left the manager behind sent a new subagent's calls to the old
+        # provider with the new model's id.
+        subagents = getattr(agent, "subagents", None)
+        if subagents is not None:
+            subagents.provider = new_provider
+            subagents.model = new_model
         # Keep the compaction service in lockstep: it holds its own
         # provider/model refs (summarization, the flowly-proxy window clamp
         # and the model's real context window all read them) — a hot-swap
@@ -2088,6 +2141,13 @@ Respond to the user now:"""
             if shared_tool.name == "artifact" and getattr(agent, "_artifact_store", None) is None:
                 continue
             agent.tools.register(shared_tool)
+        if getattr(agent, "_artifact_store", None) is not None:
+            from flowly.agent.tools.shared_service import SharedArtifactTool
+
+            # A subagent's saved work belongs in the same Library.
+            agent.subagents.artifact_tool_factory = lambda: SharedArtifactTool(
+                gateway_server, agent._artifact_store,
+            )
 
     # A standing goal's turns re-enter through each surface's OWN chat entry,
     # so an autonomous turn is indistinguishable from a typed one: the direct
@@ -2102,6 +2162,12 @@ Respond to the user now:"""
     if _web_channel is not None and hasattr(_web_channel, "run_autonomous_turn"):
         _web_channel.supports_turn_start = True
         agent.register_goal_turn_submitter("web", _web_channel.run_autonomous_turn)
+    # A finished subagent's report is its conversation's own turn and streams
+    # through the same runners (flowly/agent/report_turn.py). A surface with
+    # nobody watching declines, and the report goes over the bus as before.
+    agent.register_report_turn_submitter("direct", gateway_server.run_report_turn)
+    if _web_channel is not None and hasattr(_web_channel, "run_report_turn"):
+        agent.register_report_turn_submitter("web", _web_channel.run_report_turn)
 
     # Mirror relay/web chat liveness to local desktop gateway clients. This
     # lets the desktop UI react when another client (iOS/web) talks to this
@@ -2324,9 +2390,10 @@ Respond to the user now:"""
                 + ("; ".join(done) or "nothing yet")
                 + ". Remaining: "
                 + ("; ".join(remaining) or "none")
-                + ". Continue from where it left off, ticking each step with "
-                "plan(action='update_step') and calling plan(action='complete') "
-                "at the end. The plan is already approved — do not re-propose."
+                + ". Continue from where it left off. Report finished steps with "
+                "plan(action='update') alongside your next real tool call; the plan "
+                "completes itself when every step is done. The plan is already "
+                "approved — do not re-propose."
             )
             try:
                 await agent.process_direct(content=prompt, session_key=session_key)
@@ -2387,6 +2454,16 @@ Respond to the user now:"""
 
     agent.subagents._on_event = _on_subagent_event
 
+    # A subagent's running turn streams live to whoever watches its thread
+    # (subagents.watch): direct sockets here, relay sessions over the web
+    # channel. A named agent's gateway does the same for its host's socket,
+    # which forwards it as profile.event.
+    from flowly.agent.subagent_stream import SubagentStreamHub
+
+    agent.subagents.stream_sink = SubagentStreamHub(
+        lambda: (gateway_server, channels.get_channel("web")),
+    )
+
     # Board completion also wakes authenticated Desktop clients. Deliberately
     # broadcast no card content or identifiers: clients can refresh the Board
     # through its existing authorized RPC after receiving this signal.
@@ -2437,7 +2514,6 @@ Respond to the user now:"""
 
     # P2.8 — expose the assistant registry so the desktop UI's "Your
     # agents" section can list / reload user-defined assistants.
-    gateway_server._assistant_registry = getattr(agent, "_assistant_registry", None)
 
     # Wire Meeting Coach (continuous listening + real-time coaching).
     # STT runs client-side (desktop → web-app /api/stt/transcribe); the
@@ -2533,6 +2609,13 @@ Respond to the user now:"""
         _catalog_task: asyncio.Task | None = None
         _manager_task: asyncio.Task | None = None
         _board_orchestrator = getattr(agent, "_board_orchestrator", None)
+
+        async def _shutdown_subagents() -> None:
+            try:
+                await agent.subagents.shutdown(wait_seconds=1.5)
+            except Exception:
+                logger.exception("Subagent shutdown failed")
+
         try:
             if local_runtime:
                 gateway_server.set_managed_runtime_control(
@@ -2603,6 +2686,24 @@ Respond to the user now:"""
 
                     _manager_task = asyncio.create_task(_watch_desktop_manager())
             await cron.start()
+
+            # A change to the goals is announced, not polled for
+            # (flowly/objectives/events.py): to this runtime's own clients
+            # (a named agent's host observes them and carries it on as a
+            # profile event), to the apps showing this host's agents when this
+            # is the host, and to relay sessions reading the goals directly.
+            from flowly.objectives import events as _objective_events
+
+            async def _announce_objectives(data: dict) -> None:
+                await gateway_server.broadcast_event(_objective_events.EVENT, data)
+                if gateway_server.profile_host is not None:
+                    await gateway_server.profile_host.announce_primary_objectives(data)
+                _web = channels.get_channel("web")
+                if _web is not None and hasattr(_web, "send_objectives_event"):
+                    await _web.send_objectives_event(data)
+
+            _objective_events.set_broadcaster(_announce_objectives)
+            await agenda.start()
             if not local_runtime:
                 await heartbeat.start(run_on_start=True)
 
@@ -2801,6 +2902,10 @@ Respond to the user now:"""
                 [main_task, asyncio.create_task(shutdown_event.wait())],
                 return_when=asyncio.FIRST_COMPLETED
             )
+            # Subagents first: Desktop kills a foreground gateway 3 s after
+            # SIGTERM (a named agent's runtime after 5 s), long before
+            # channels, cron and the server have closed.
+            await _shutdown_subagents()
 
             # Cancel pending tasks
             for task in pending:
@@ -2813,6 +2918,7 @@ Respond to the user now:"""
         finally:
             # Graceful shutdown
             console.print("[dim]Cleaning up...[/dim]")
+            await _shutdown_subagents()  # no-op when already done above
             from flowly.channels import feature_rpc as _feature_rpc
             await _feature_rpc.close_mcp_connection_runtime()
             if voice_plugin:
@@ -2832,6 +2938,10 @@ Respond to the user now:"""
             # CronService records one explicit cancelled result before the
             # event loop and agent are torn down.
             await cron.shutdown()
+            agenda.stop()
+            from flowly.objectives import events as _objective_events_done
+
+            _objective_events_done.set_broadcaster(None)
             await gateway_server.stop()
             heartbeat.stop()
             if delegate is not None and hasattr(delegate, "cancel_all"):

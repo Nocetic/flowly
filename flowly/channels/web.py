@@ -19,6 +19,14 @@ from loguru import logger
 from flowly.gateway_logs.notable import notable
 
 from flowly.browser_annotations import append_browser_annotation_context
+from flowly.agent.report_turn import (
+    REPORT_TURN,
+    REPORT_TURN_ORIGIN,
+    report_notice,
+    report_turn_fields,
+    run_started_event,
+)
+from flowly.bus.events import ConversationInboundMessage
 from flowly.bus.events import InboundMessage as _Base
 from flowly.bus.events import OutboundMessage
 from flowly.bus.queue import MessageBus
@@ -31,7 +39,12 @@ from flowly.live_voice.relay_events import RelayOutbound, RelayRecipients
 from flowly.live_voice.relay_transport import CAPABILITY as RELAY_VOICE_CAPABILITY
 from flowly.live_voice.relay_transport import RelayBrowserVerifier, RelayMessage, RelayPrincipal
 from flowly.profile import get_flowly_home
-from flowly.profile_host_contract import ProfileHostError, profile_rpc_session_key, validate_profile_rpc
+from flowly.profile_host_contract import (
+    ProfileHostError,
+    profile_rpc_session_key,
+    profile_rpc_unwatched_key,
+    validate_profile_rpc,
+)
 from flowly.profile_rooms import PROFILE_ROOM_METHODS
 from flowly.render_capabilities import normalize_render_capabilities
 
@@ -54,7 +67,26 @@ _OUTBOUND_QUEUE_LIMIT = 50  # cap pending replays to avoid unbounded growth
 _PROFILE_BINDING_LIMIT = 1024
 _PROFILE_DIRECTORY_BINDING_LIMIT = 256
 _PROFILE_BINDING_TTL_SECONDS = 6 * 60 * 60
+# subagents.watch bounds: subagent conversations one relay session watches at
+# once (the oldest lease gives way), and conversations watched in all.
+_SUBAGENT_WATCHES_PER_SESSION = 32
+_SUBAGENT_WATCHED_CONVERSATIONS = 1024
 _PROFILE_RUN_BINDING_LIMIT = 2048
+#: OutboundMessage metadata: the conversation a message the agent wrote first
+#: belongs to; the relay opens a session for it (``_agent_first_session``).
+AGENT_FIRST_CONVERSATION_KEY = "agent_first_conversation"
+#: A relay session that read or changed this agent's goals hears
+#: ``objectives.changed`` for this long after its last such call; a screen that
+#: stays open renews it with its fallback read (every 5 minutes).
+_OBJECTIVES_WATCH_SECONDS = 15 * 60
+_OBJECTIVES_WATCH_LIMIT = 64
+_OBJECTIVES_WATCH_METHODS = frozenset({
+    "objectives.list", "objectives.update",
+    "agenda.list", "agenda.settings.get", "agenda.settings.set",
+})
+_AGENT_FIRST_OPEN_ATTEMPTS = 6
+_AGENT_FIRST_OPEN_TIMEOUT = 10.0
+_AGENT_FIRST_OPEN_RETRY_SECONDS = 10.0
 _PROFILE_LONG_RUNNING_METHODS = frozenset({
     "profiles.connect",
     "profiles.configure",
@@ -320,10 +352,17 @@ class WebChannel(BaseChannel):
         self._pending: dict[str, asyncio.Queue] = {}
         self._subagent_observers: dict[str, float] = {}
         self._subagent_event_versions: dict[str, int] = {}
+        # Relay sessions showing this agent's goals → when their watch ends.
+        self._objectives_watchers: dict[str, float] = {}
         self._profile_subagent_observers: dict[tuple[str, str], tuple[int, float]] = {}
         self._profile_subagent_reads: dict[object, str] = {}
+        # subagent:<threadId> → {relay session: lease expiry (monotonic)}: who
+        # watches a subagent's running turns (subagents.watch).
+        self._subagent_stream_watchers: dict[str, dict[str, float]] = {}
         # Map session_key (e.g. "web:FirestoreId") → relay session_id (browser UUID)
         self._session_key_to_relay_id: dict[str, str] = {}
+        # Replies to ``conversation.open``, by request id.
+        self._conversation_open_waiters: dict[str, asyncio.Future] = {}
         # Outbound replay queue. When a send fails (transient WS drop, frame
         # too large after retry, etc.) the serialised payload is parked here
         # so the next successful connection can flush it. Bounded to prevent
@@ -688,7 +727,8 @@ class WebChannel(BaseChannel):
         # have the full tool events already.
         if event_type in ("directory", "tool.activity"):
             targets.update(self._profile_directory_sessions)
-        elif event_type in {"connection", "error", "needsInput"}:
+        # Whatever shows this agent hears that it changed, or that its goals did.
+        elif event_type in {"connection", "error", "needsInput", "objectives.changed"}:
             targets.update(self._profile_directory_sessions)
             for (candidate_profile, _session_key), subscribers in (
                 self._profile_conversation_sessions.items()
@@ -790,6 +830,10 @@ class WebChannel(BaseChannel):
             # A home call binds its conversation too: the introduction it
             # starts streams there, before any history read binds it.
             inner_session_key = profile_rpc_session_key(validated_method, validated_params)
+            released = profile_rpc_unwatched_key(validated_method, validated_params)
+            if released:
+                # This session no longer follows that subagent's turns.
+                self._unbind_profile_conversation(profile, released, session_id)
             if inner_session_key:
                 # Bind before dispatch: chat.send may emit its first event
                 # immediately after the acknowledgement on a fast local model.
@@ -918,6 +962,8 @@ class WebChannel(BaseChannel):
         self._clear_profile_subscriptions()
         self._subagent_observers.clear()
         self._subagent_event_versions.clear()
+        self._clear_subagent_stream_watchers()
+        self._objectives_watchers.clear()
         self._relay_principals.clear()
         self._relay_recipients.clear()
         self._relay_authority = None
@@ -989,6 +1035,9 @@ class WebChannel(BaseChannel):
         session_id = msg.chat_id  # chat_id = sessionId for web channel
         canonical_session = msg.metadata.get('session_key')
         session_key = canonical_session if isinstance(canonical_session, str) and canonical_session else self._session_key_for_relay_id(session_id)
+        agent_first = msg.metadata.get(AGENT_FIRST_CONVERSATION_KEY)
+        if isinstance(agent_first, str) and agent_first:
+            session_id = await self._agent_first_session(agent_first) or session_id
 
         progress = msg.metadata.get("tool_progress_event")
         if isinstance(progress, dict) and progress.get("state") == "tool_progress":
@@ -1067,6 +1116,11 @@ class WebChannel(BaseChannel):
                     **(
                         {"goalRun": True}
                         if iter_event.get("goalRun") is True
+                        else {}
+                    ),
+                    **(
+                        {"turnOrigin": iter_event["turnOrigin"]}
+                        if isinstance(iter_event.get("turnOrigin"), str)
                         else {}
                     ),
                 },
@@ -1168,6 +1222,9 @@ class WebChannel(BaseChannel):
             data_block["goalRun"] = True
         if msg.metadata.get("goalTerminal") is True:
             data_block["goalNotice"] = True
+        if isinstance(msg.metadata.get("turnOrigin"), str):
+            # A run the server started (a subagent's report): whose run it is.
+            data_block["turnOrigin"] = msg.metadata["turnOrigin"]
         usage_meta = msg.metadata.get("usage")
         if isinstance(usage_meta, dict) and usage_meta:
             data_block["usage"] = {
@@ -1232,6 +1289,12 @@ class WebChannel(BaseChannel):
         tool_messages = msg.metadata.get("tool_messages")
         if isinstance(tool_messages, list) and tool_messages:
             data_block["toolMessages"] = tool_messages
+
+        # Goals the turn started tracking or finished: a card under the reply
+        # (flowly/objectives/cards.py). Omitted when there are none.
+        goal_cards = msg.metadata.get("goalCards")
+        if isinstance(goal_cards, list) and goal_cards:
+            data_block["goalCards"] = goal_cards
 
         # ``aborted`` propagates through to the relay → Firestore →
         # client UI so a turn that was stopped mid-flight can be
@@ -1401,6 +1464,46 @@ class WebChannel(BaseChannel):
                     pending.delivered.add(destination)
                 delivered = True
         return delivered
+
+    async def _agent_first_session(self, conversation_id: str) -> str | None:
+        """A relay session for a message the agent writes first.
+
+        The relay routes a bot's events by client session, and a conversation
+        nobody has open has none: a message sent under the conversation's id
+        was dropped, neither stored nor pushed. The relay opens one on request
+        for a conversation of this server's owner (``conversation.open``,
+        relay ``conversation-open.ts``); the message then takes the ordinary
+        final path. None when the relay cannot (offline through every attempt,
+        or an older relay that does not answer): the caller keeps its own id.
+        """
+        for attempt in range(_AGENT_FIRST_OPEN_ATTEMPTS):
+            socket = self._ws
+            if socket is not None:
+                request_id = uuid.uuid4().hex
+                waiter = asyncio.get_running_loop().create_future()
+                self._conversation_open_waiters[request_id] = waiter
+                try:
+                    await asyncio.wait_for(socket.send(json.dumps({
+                        "type": "conversation.open", "requestId": request_id, "conversationId": conversation_id,
+                    })), timeout=5.0)
+                    reply = await asyncio.wait_for(waiter, timeout=_AGENT_FIRST_OPEN_TIMEOUT)
+                except Exception:  # noqa: BLE001 — closed socket, timeout: try again or give up
+                    reply = None
+                finally:
+                    self._conversation_open_waiters.pop(request_id, None)
+                if isinstance(reply, dict):
+                    session_id = reply.get("sessionId")
+                    if reply.get("ok") is True and isinstance(session_id, str) and session_id:
+                        return session_id
+                    logger.warning(
+                        "[WebChannel] relay would not open web:{} for an agent-first message: {}",
+                        conversation_id, reply.get("error"),
+                    )
+                    return None
+            if attempt + 1 < _AGENT_FIRST_OPEN_ATTEMPTS:
+                await asyncio.sleep(_AGENT_FIRST_OPEN_RETRY_SECONDS)
+        logger.warning("[WebChannel] no relay session for an agent-first message to web:{}", conversation_id)
+        return None
 
     async def _send_or_queue(self, payload: str) -> None:
         pending = RelayOutbound(payload, self._outbound_event_access(payload))
@@ -1704,7 +1807,9 @@ class WebChannel(BaseChannel):
         ) as ws:
             self._subagent_observers.clear()
             self._subagent_event_versions.clear()
+            self._objectives_watchers.clear()
             self._clear_profile_subagent_observers()
+            self._clear_subagent_stream_watchers()
             self._ws = ws
             if self._screen_gateway is not None:
                 from flowly.desktop_runtime.relay_rpc import RelayScreenRpc
@@ -1794,6 +1899,8 @@ class WebChannel(BaseChannel):
                     self._clear_profile_subscriptions()
                     self._subagent_observers.clear()
                     self._subagent_event_versions.clear()
+                    self._clear_subagent_stream_watchers()
+                    self._objectives_watchers.clear()
                     self._relay_principals.clear()
                     self._relay_recipients.clear()
                     self._relay_authority = None
@@ -1943,6 +2050,11 @@ class WebChannel(BaseChannel):
                     and msg.get('linkId') == self._relay_authority.link_id):
                 self._relay_authority_enabled = True
 
+        elif msg_type == "conversation.opened":
+            waiter = self._conversation_open_waiters.get(str(msg.get("requestId") or ""))
+            if waiter is not None and not waiter.done():
+                waiter.set_result(msg)
+
         elif msg_type == "browser-connected":
             session_id = msg.get("sessionId", "")
             logger.debug(f"[WebChannel] Browser connected: {session_id}")
@@ -1957,7 +2069,9 @@ class WebChannel(BaseChannel):
             self._pending.pop(session_id, None)
             self._subagent_observers.pop(session_id, None)
             self._subagent_event_versions.pop(session_id, None)
+            self._objectives_watchers.pop(session_id, None)
             self._clear_profile_subagent_observers(session_id)
+            self._clear_subagent_stream_watchers(session_id)
             self._remove_profile_relay_session(session_id)
 
         elif msg_type == "rpc":
@@ -2072,6 +2186,18 @@ class WebChannel(BaseChannel):
             else:
                 await ws.send(json.dumps({"type": "rpc", "id": rpc_id, "sessionId": session_id,
                     "error": {"code": "METHOD_NOT_FOUND", "message": "Screen relay transport is unavailable."}}))
+            return
+
+        from flowly.session.keys import SubagentThreadReadOnlyError, require_rpc_subagent_access
+        try:
+            # A subagent's conversation is read-only to every client: only a
+            # read may name one.
+            require_rpc_subagent_access(method, params)
+        except SubagentThreadReadOnlyError as error:
+            await ws.send(json.dumps({
+                "type": "rpc", "id": rpc_id, "sessionId": session_id,
+                "error": {"code": error.code, "message": error.message, "retryable": False},
+            }))
             return
 
         if method == "chat.send":
@@ -2485,6 +2611,11 @@ class WebChannel(BaseChannel):
                 )
             )
             return
+        if method == "subagents.watch" and session_id:
+            # Same step as the snapshot in the reply: nothing falls between.
+            self._watch_subagent_stream(session_id, str(result.get("sessionKey") or ""))
+        elif method == "subagents.unwatch" and session_id:
+            self._unwatch_subagent_stream(session_id, str(result.get("sessionKey") or ""))
         if method in {"subagents.list", "subagents.get"} and session_id:
             now = time.monotonic()
             self._prune_subagent_observers(now)
@@ -2492,6 +2623,8 @@ class WebChannel(BaseChannel):
                 self._subagent_observers[session_id] = now + 120
                 if "eventVersion" in params:
                     self._subagent_event_versions[session_id] = event_version(params)
+        if method in _OBJECTIVES_WATCH_METHODS and session_id:
+            self._watch_objectives(session_id)
         if method == "system.capabilities" and self._profile_host is not None:
             result = {**result, "profileHost": self._profile_host.capabilities()}
         await ws.send(
@@ -2539,10 +2672,141 @@ class WebChannel(BaseChannel):
         if previous is None and profile == "default" and self._profile_host is not None:
             self._profile_host.retain_default_events(self._profile_lease_owner(session_id) + ":subagents")
 
+    def _watch_objectives(self, session_id: str) -> None:
+        """Let a relay session that just read the goals hear when they change.
+
+        Only an authenticated call reaches here, so a session hears about goals
+        exactly when it has shown them. At the limit the watch closest to its
+        end makes room: a screen opened now always hears.
+        """
+        if len(session_id) > 256:
+            return
+        now = time.monotonic()
+        self._objectives_watchers = {
+            key: expiry for key, expiry in self._objectives_watchers.items() if expiry > now
+        }
+        if session_id not in self._objectives_watchers:
+            while len(self._objectives_watchers) >= _OBJECTIVES_WATCH_LIMIT:
+                self._objectives_watchers.pop(
+                    min(self._objectives_watchers, key=self._objectives_watchers.__getitem__)
+                )
+        self._objectives_watchers[session_id] = now + _OBJECTIVES_WATCH_SECONDS
+
+    async def send_objectives_event(self, data: dict) -> None:
+        """Tell the relay sessions showing this agent's goals that they changed.
+
+        The event carries no goal content (``flowly/objectives/events.py``):
+        each reads the goals again through its own authorized RPC. A missed
+        event is caught by the screen's fallback read, so nothing is queued.
+        """
+        if not self._ws:
+            return
+        now = time.monotonic()
+        self._objectives_watchers = {
+            key: expiry for key, expiry in self._objectives_watchers.items() if expiry > now
+        }
+
+        async def send(session_id: str) -> None:
+            frame = json.dumps({
+                "type": "event", "event": "objectives.changed",
+                "data": data, "sessionId": session_id,
+            })
+            pending = RelayOutbound(frame, self._outbound_event_access(frame))
+            await asyncio.wait_for(self._deliver_relay_outbound(pending), timeout=1)
+
+        await asyncio.gather(
+            *(send(key) for key in tuple(self._objectives_watchers)), return_exceptions=True
+        )
+
     def _prune_subagent_observers(self, now: float) -> None:
         self._subagent_observers = {key: expiry for key, expiry in self._subagent_observers.items() if expiry > now}
         self._subagent_event_versions = {key: version for key, version in self._subagent_event_versions.items()
                                         if key in self._subagent_observers}
+
+    # ── A subagent's running turn, live (flowly.agent.subagent_stream) ──────
+
+    def _stream_watchers(self) -> dict[str, dict[str, float]]:
+        watchers = self.__dict__.get("_subagent_stream_watchers")
+        if watchers is None:
+            watchers = self.__dict__["_subagent_stream_watchers"] = {}
+        return watchers
+
+    def _watch_subagent_stream(self, session_id: str, session_key: str) -> None:
+        """Bind a relay session to a subagent's conversation for one lease."""
+        from flowly.agent.subagent_stream import WATCH_LEASE_SECONDS
+        from flowly.session.keys import is_subagent_thread
+
+        if not session_id or len(session_id) > 256 or not is_subagent_thread(session_key):
+            return
+        watchers = self._stream_watchers()
+        now = time.monotonic()
+        mine = [key for key, sessions in watchers.items() if session_id in sessions]
+        if session_key not in mine and len(mine) >= _SUBAGENT_WATCHES_PER_SESSION:
+            oldest = min(mine, key=lambda key: watchers[key][session_id])
+            self._unwatch_subagent_stream(session_id, oldest)
+        if session_key not in watchers and len(watchers) >= _SUBAGENT_WATCHED_CONVERSATIONS:
+            for key, sessions in list(watchers.items()):
+                for candidate, expiry in list(sessions.items()):
+                    if expiry <= now:
+                        self._unwatch_subagent_stream(candidate, key)
+            if len(watchers) >= _SUBAGENT_WATCHED_CONVERSATIONS:
+                return
+        watchers.setdefault(session_key, {})[session_id] = now + WATCH_LEASE_SECONDS
+
+    def _unwatch_subagent_stream(self, session_id: str, session_key: str) -> None:
+        watchers = self._stream_watchers()
+        sessions = watchers.get(session_key)
+        if sessions is None:
+            return
+        sessions.pop(session_id, None)
+        if not sessions:
+            watchers.pop(session_key, None)
+
+    def _clear_subagent_stream_watchers(self, session_id: str | None = None) -> None:
+        watchers = self._stream_watchers()
+        if session_id is None:
+            watchers.clear()
+            return
+        for key in [key for key, sessions in watchers.items() if session_id in sessions]:
+            self._unwatch_subagent_stream(session_id, key)
+
+    def subagent_stream_watched(self, session_key: str) -> bool:
+        """Whether any relay session watches this subagent conversation (cheap)."""
+        return bool(self._stream_watchers().get(session_key))
+
+    def prepare_subagent_stream(self, event: str, session_key: str, data: dict):
+        """The delivery of one event to the relay sessions watching now, or None.
+
+        Each goes as ``{"type": "event", "event": "subagent.stream",
+        "sessionId", "data": {"sessionKey", "event", "data"}}``: the relay
+        hands an event name it does not know to that session alone and stores
+        nothing of it — a plain ``chat`` event would be written into the
+        conversation of the session that receives it. No offline replay.
+        """
+        from flowly.agent.subagent_stream import RELAY_STREAM_EVENT
+
+        sessions = self._stream_watchers().get(session_key)
+        if not sessions or self._ws is None:
+            return None
+        now = time.monotonic()
+        pending: list[RelayOutbound] = []
+        for session_id, expiry in list(sessions.items()):
+            if expiry <= now:
+                self._unwatch_subagent_stream(session_id, session_key)
+                continue
+            frame = json.dumps({
+                "type": "event", "event": RELAY_STREAM_EVENT, "sessionId": session_id,
+                "data": {"sessionKey": session_key, "event": event, "data": data},
+            })
+            pending.append(RelayOutbound(frame, self._outbound_event_access(frame)))
+        if not pending:
+            return None
+
+        async def deliver() -> None:
+            await asyncio.gather(*(asyncio.wait_for(self._deliver_relay_outbound(item), timeout=5)
+                                   for item in pending), return_exceptions=True)
+
+        return deliver
 
     async def send_subagent_event(self, event_name: str, data: dict) -> None:
         """Live updates for successful task-history readers; no offline replay.
@@ -2577,14 +2841,17 @@ class WebChannel(BaseChannel):
 
         asyncio.create_task(_run())
 
-    def _make_stream_callback(self, session_id: str, session_key: str, run_id: str):
+    def _make_stream_callback(self, session_id: str, session_key: str, run_id: str,
+                              turn_fields: dict[str, Any] | None = None):
         """The per-delta fan-out every relay turn uses.
 
         ``sessionKey`` is what makes the relay route a delta to the
         CONVERSATION rather than to the socket that started the turn — so a
         client that reconnected mid-turn (or never started one, as with an
-        autonomous goal turn) still receives the live reply.
+        autonomous goal turn) still receives the live reply. ``turn_fields``
+        mark a run the server started (a subagent's report).
         """
+        fields = dict(turn_fields or {})
 
         async def stream_callback(delta: str) -> None:
             from flowly.agent import inflight
@@ -2595,6 +2862,7 @@ class WebChannel(BaseChannel):
                 "runId": run_id,
                 "sessionKey": session_key,
                 "delta": delta,
+                **fields,
             }
             await self._send_or_queue(json.dumps({
                 "type": "event",
@@ -2612,6 +2880,7 @@ class WebChannel(BaseChannel):
                     "sessionKey": session_key,
                     "source": "relay",
                     "data": {"text": delta},
+                    **fields,
                 },
             ))
 
@@ -2689,6 +2958,42 @@ class WebChannel(BaseChannel):
         self._track_chat_publish(task, session_key, run_id)
         return True
 
+    async def run_report_turn(self, session_key: str, notice: dict[str, Any]) -> bool:
+        """Run a subagent's report as the conversation's own relay turn.
+
+        The relay twin of ``GatewayServer.run_report_turn``: a fresh run id, a
+        command record (``turnOrigin: "subagent"``), the same streaming
+        callback and agent-queue entry ``chat.send`` uses, and the notice kept
+        hidden. Returns False when the conversation has no relay session yet,
+        so the caller delivers it over the bus (queued for the relay).
+        """
+        if getattr(self, 'supports_turn_start', False) is not True:
+            # Without the turn boundary the run could not announce itself
+            # inside the turn lock; the bus serves the notice instead.
+            return False
+        session_id = self._session_key_to_relay_id.get(session_key) or ""
+        if not session_id and session_key.startswith("web:"):
+            session_id = session_key.split(":", 1)[1]
+        if not session_id:
+            return False
+        run_id = str(uuid.uuid4())
+        self.chat_commands.accept(session_key, run_id, {"turnOrigin": REPORT_TURN_ORIGIN})
+        # The reply goes to the relay session the conversation has now, which
+        # may not be the one the subagent was started from.
+        metadata = {
+            REPORT_TURN: report_notice(str(notice.get("sender_id") or "subagent"), f"web:{session_id}"),
+        }
+        task = asyncio.create_task(self._process_message(
+            session_id,
+            session_key,
+            str(notice.get("content") or ""),
+            run_id,
+            self._make_stream_callback(session_id, session_key, run_id, report_turn_fields(session_key)),
+            extra_metadata=metadata,
+        ))
+        self._track_chat_publish(task, session_key, run_id)
+        return True
+
     def _track_chat_publish(self, task: asyncio.Task, session_key: str, run_id: str) -> None:
         self._active_tasks[run_id] = task
 
@@ -2729,17 +3034,29 @@ class WebChannel(BaseChannel):
         }
         if extra_metadata:
             metadata.update(extra_metadata)
+        # A subagent's report: hidden notice, its events marked, and it
+        # announces itself once it holds the conversation's turn lock.
+        report_turn = isinstance(metadata.get(REPORT_TURN), dict)
+        turn_fields = report_turn_fields(session_key) if report_turn else {}
         if getattr(self, 'supports_turn_start', False) is True:
             from flowly.agent import inflight
 
             async def on_turn_started(text: str) -> None:
                 self.chat_commands.settle(session_key, run_id, 'running')
-                inflight.begin(session_key, run_id, text, goal_run=bool(metadata.get('goal_run')))
+                inflight.begin(session_key, run_id, "" if report_turn else text,
+                               goal_run=bool(metadata.get('goal_run')),
+                               turn_origin=turn_fields.get("turnOrigin"))
+                if report_turn:
+                    data = run_started_event(run_id, session_key)
+                    await self._send_or_queue(json.dumps({
+                        "type": "event", "sessionId": session_id, "event": "chat", "data": data,
+                    }))
+                    asyncio.create_task(self._emit_local_event("chat", {**data, "source": "relay"}))
 
             metadata['_on_turn_started'] = on_turn_started
 
             async def on_iteration(event: dict) -> None:
-                wrapped = {**event, 'runId': run_id, 'state': 'iteration_step'}
+                wrapped = {**event, 'runId': run_id, 'state': 'iteration_step', **turn_fields}
                 inflight.append_iteration(session_key, run_id, wrapped)
                 await self.send(OutboundMessage(
                     channel='web', chat_id=session_id, content='',
@@ -2752,15 +3069,28 @@ class WebChannel(BaseChannel):
         if render_capabilities:
             metadata["render_capabilities"] = render_capabilities
 
-        inbound_with_session = _WebInboundMessage(
-            channel="web",
-            sender_id=session_id,
-            chat_id=session_id,
-            content=content,
-            media=media or [],
-            metadata=metadata,
-            _session_key=session_key,
-        )
+        if report_turn:
+            # The same system notice the bus would carry, in its conversation:
+            # the agent processes it as a subagent's report under the turn lock.
+            notice = metadata[REPORT_TURN]
+            inbound_with_session: _Base = ConversationInboundMessage(
+                channel="system",
+                sender_id=str(notice.get("sender_id") or "subagent"),
+                chat_id=str(notice.get("chat_id") or f"web:{session_id}"),
+                content=content,
+                metadata=metadata,
+                conversation_key=session_key,
+            )
+        else:
+            inbound_with_session = _WebInboundMessage(
+                channel="web",
+                sender_id=session_id,
+                chat_id=session_id,
+                content=content,
+                media=media or [],
+                metadata=metadata,
+                _session_key=session_key,
+            )
 
         try:
             await self.bus.publish_inbound(inbound_with_session)

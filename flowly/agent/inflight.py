@@ -33,15 +33,25 @@ _control_scopes: dict[str, tuple[str, SessionControlScope]] = {}
 _MAX_ITERATIONS = 600
 
 
-def _fresh(run_id: str, user: str = "", goal_run: bool | None = None) -> dict:
+# What a run's entry may describe beyond the stream (``begin(fields=...)``):
+# a subagent's turn names its task and thread (flowly.agent.subagent_stream).
+_EXTRA_FIELDS = ("prompt", "promptAuthor", "subagent")
+
+
+def _fresh(run_id: str, user: str = "", goal_run: bool | None = None,
+           turn_origin: str | None = None, fields: dict | None = None) -> dict:
+    extra = {key: fields[key] for key in _EXTRA_FIELDS if fields and key in fields}
     return {
         "runId": run_id, "text": "", "user": user or "",
         "iterations": [], "updatedAt": time.time(),
         **({'goalRun': goal_run} if goal_run is not None else {}),
+        **({'turnOrigin': turn_origin} if turn_origin else {}),
+        **({'extra': extra} if extra else {}),
     }
 
 
-def begin(session_key: str, run_id: str, user: str = "", *, goal_run: bool | None = None) -> None:
+def begin(session_key: str, run_id: str, user: str = "", *, goal_run: bool | None = None,
+          turn_origin: str | None = None, fields: dict | None = None) -> None:
     """Start tracking a run for this session, clearing any stale entry.
 
     ``user`` is the message that triggered the run. We keep it so a client that
@@ -50,11 +60,20 @@ def begin(session_key: str, run_id: str, user: str = "", *, goal_run: bool | Non
     triggering message (which isn't persisted to history until the turn
     settles) would vanish from the reopened chat. Mirrors the reference's
     ``inflight_turn`` which holds both ``user`` and ``assistant``.
+
+    ``turn_origin`` names a run the server started on its own (``"subagent"``
+    for a subagent's report): a client re-entering mid-run adopts it as that
+    kind of run (no user row, no guidance into it).
+
+    ``fields`` describe the run beyond its stream, returned by ``get`` as
+    they are: ``prompt`` / ``promptAuthor`` (a task someone other than the
+    owner gave, shown instead of a user row) and ``subagent`` (the thread a
+    subagent's turn belongs to). Other keys are ignored.
     """
     if not session_key or not run_id:
         return
     scope = SessionControlScope.capture(session_key)
-    _runs[session_key] = _fresh(run_id, user, goal_run)
+    _runs[session_key] = _fresh(run_id, user, goal_run, turn_origin, fields)
     _control_scopes[session_key] = (run_id, scope)
 
 
@@ -94,8 +113,9 @@ def append_iteration(session_key: str, run_id: str, event: dict) -> None:
     # restoring mid-run gets only the text streamed AFTER the last
     # boundary — not every preamble re-glued into one bubble. Guarded on
     # tool_calls: an assistant event without them has no panel entry the
-    # text could have moved into.
-    if event.get("role") == "assistant" and event.get("tool_calls"):
+    # text could have moved into. An empty list is a step whose calls were
+    # all hidden (the agent's own bookkeeping): still a boundary.
+    if event.get("role") == "assistant" and isinstance(event.get("tool_calls"), list):
         cur["text"] = ""
     cur["updatedAt"] = time.time()
 
@@ -126,6 +146,20 @@ def clear_text(session_key: str, run_id: str, steering_sequence: int = 0) -> Non
         cur["text"] = ""
         if steering_sequence:
             cur["steeringSequence"] = steering_sequence
+        cur["updatedAt"] = time.time()
+
+
+def text(session_key: str, run_id: str) -> str:
+    """The run's live text since its last step boundary ("" for another run or none)."""
+    cur = _runs.get(session_key)
+    return cur["text"] if cur and cur.get("runId") == run_id else ""
+
+
+def replace_text(session_key: str, run_id: str, text: str) -> None:
+    """A streamed reply was taken back: the live text is ``text`` from here on."""
+    cur = _runs.get(session_key)
+    if cur and cur.get("runId") == run_id:
+        cur["text"] = text
         cur["updatedAt"] = time.time()
 
 
@@ -176,4 +210,7 @@ def get(session_key: str) -> dict | None:
         **({"steeringSequence": cur["steeringSequence"]} if cur.get("steeringSequence") else {}),
 
         **({'goalRun': cur['goalRun']} if 'goalRun' in cur else {}),
+        **({'turnOrigin': cur['turnOrigin']} if cur.get('turnOrigin') else {}),
+        **{key: (dict(value) if isinstance(value, dict) else value)
+           for key, value in (cur.get('extra') or {}).items()},
     }

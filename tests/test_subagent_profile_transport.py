@@ -91,9 +91,12 @@ async def test_profile_history_and_live_events_negotiate_per_reader(history, tra
 
 
 def test_profile_history_is_read_only_and_rejects_invalid_versions():
-    for method in ("subagents.list", "subagents.get", "subagents.result"):
+    # Reading, and the owner stopping one run, reach every bot the same way;
+    # starting work or changing a bot's model through the profile host does not.
+    for method in ("subagents.list", "subagents.get", "subagents.result", "subagents.transcript",
+                   "subagents.stats", "subagents.cancel"):
         assert validate_profile_rpc(method, {})[0] == method
-    for method in ("subagents.cancel", "subagents.spawn", "subagents.set_model"):
+    for method in ("subagents.spawn", "subagents.set_model"):
         with pytest.raises(ProfileHostError):
             validate_profile_rpc(method, {})
     with pytest.raises(ProfileHostError):

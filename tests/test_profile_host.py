@@ -1523,3 +1523,31 @@ async def test_the_gateway_says_whether_it_is_stopping_or_restarting(
     await server.stop()
 
     assert sent[0] == {"type": "event", "event": "gateway.stopping", "data": {"restarting": restarting}}
+
+
+@pytest.mark.asyncio
+async def test_a_read_if_running_never_starts_a_stopped_agent(profile_roots):
+    # What follows an agent in the background (a subagent's live conversation,
+    # renewed every minute or so) reads it only while it is up.
+    profiles.create_profile('writer', local_runtime=True)
+    host = ProfileHost()
+    host._ensure_runtime = AsyncMock(side_effect=AssertionError('started the agent'))
+    host._rpc = AsyncMock(return_value={'ok': True})
+    assert host.capabilities()['rpcIfRunning'] is True
+    request = {'name': 'writer', 'method': 'subagents.watch', 'params': {'threadId': '7f3c2a10-4b1e-4c8e-9a51-3d2f0e6b1c77'}, 'ifRunning': True}
+
+    with pytest.raises(ProfileHostError) as stopped:
+        await host.dispatch('profiles.rpc', request)
+    assert stopped.value.code == 'PROFILE_NOT_RUNNING'
+    host._ensure_runtime.assert_not_awaited()
+    host._rpc.assert_not_awaited()
+
+    # Up and running: the read goes through, still without a start.
+    host._runtime_is_open = lambda runtime: True  # type: ignore[method-assign]
+    host._runtimes['writer'] = SimpleNamespace(active_runs=set())
+    assert await host.dispatch('profiles.rpc', request) == {'ok': True}
+    host._ensure_runtime.assert_not_awaited()
+
+    with pytest.raises(ProfileHostError) as invalid:
+        await host.dispatch('profiles.rpc', {**request, 'ifRunning': 'yes'})
+    assert invalid.value.code == 'INVALID_PARAMS'

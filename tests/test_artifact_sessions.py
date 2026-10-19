@@ -54,29 +54,3 @@ def test_artifact_summary_keeps_session_and_omits_content() -> None:
     assert summary["session_key"] == "tui:one"
     assert summary["metadata"] == {"language": "html"}
     assert "content" not in summary
-
-
-@pytest.mark.asyncio
-async def test_subagent_auto_saved_artifact_keeps_parent_session(tmp_path) -> None:
-    from flowly.artifacts.store import _CACHE, get_store
-
-    manager = object.__new__(SubagentManager)
-    manager._state_dir = tmp_path
-    manager._artifact_on_change = None
-
-    artifact_id = await manager._save_result_as_artifact(
-        "run-1",
-        "builtin:writer",
-        "Write a report",
-        "Report body",
-        session_key="tui:parent",
-    )
-
-    store = get_store(tmp_path)
-    try:
-        artifact = store.get(artifact_id or "")
-        assert artifact is not None
-        assert artifact["session_key"] == "tui:parent"
-    finally:
-        store.close()
-        _CACHE.pop(str(tmp_path), None)

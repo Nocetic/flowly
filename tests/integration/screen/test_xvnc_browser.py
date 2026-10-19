@@ -637,7 +637,7 @@ async def test_authenticated_gateway_run_uses_the_running_screen_and_keeps_it_du
             assert (await gateway.send_browser_tool_request("open", "read_page", {}))["success"]
             result = await loop._run_llm_tool_loop(
                 [{"role": "system", "content": "Complete the browser task."}, {"role": "user", "content": "Read the login result."}],
-                action_turn=False, session_key=args[0], outbound_run_id=args[2])
+                session_key=args[0], outbound_run_id=args[2])
             run.succeeded = not loop.is_run_aborted(args[2])
         return result[0], {"aborted": loop.is_run_aborted(args[2])}
 

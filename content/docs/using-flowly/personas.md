@@ -35,13 +35,7 @@ The config default is `agents.defaults.persona = "default"`. See [Configuration]
 
 ## Switching at runtime
 
-Inside the TUI, switch persona with a slash command:
-
-```
-/persona
-```
-
-The `/assistants` slash command is also available for assistant selection. See [Terminal UI](./tui.md).
+Use `flowly persona set <name>` (above) to change the default persona.
 
 You can also override the persona when launching the gateway:
 

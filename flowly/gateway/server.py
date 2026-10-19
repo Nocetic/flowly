@@ -8,6 +8,7 @@ import json
 import mimetypes
 import os
 import secrets
+import time
 import uuid
 import weakref
 from collections import OrderedDict
@@ -55,7 +56,12 @@ from flowly.profile_collaboration import (
 from flowly.profile_collaboration import (
     ProfileRunBinding as _ProfileRunBinding,
 )
-from flowly.profile_host_contract import ProfileHostError, profile_rpc_session_key, validate_profile_rpc
+from flowly.profile_host_contract import (
+    ProfileHostError,
+    profile_rpc_session_key,
+    profile_rpc_unwatched_key,
+    validate_profile_rpc,
+)
 from flowly.profile_rooms import PROFILE_ROOM_METHODS
 from flowly.render_capabilities import normalize_render_capabilities
 from flowly.session.manager import SessionManager
@@ -256,12 +262,17 @@ _PROFILE_HOST_LONG_RUNNING_METHODS = frozenset({
     "profiles.delete.commit",
     "profiles.rpc",
     "profiles.cron.notify",
+    "profiles.agenda.notify",
     "profiles.stop",
 })
 _PROFILE_CLIENT_SUBSCRIPTION_LIMIT = 128
 _PROFILE_PROFILES_PER_CLIENT_LIMIT = 64
 _PROFILE_CONVERSATIONS_PER_CLIENT_LIMIT = 256
 _PROFILE_RUN_SUBSCRIPTION_LIMIT = 2048
+# subagents.watch bounds: subagent conversations one socket watches at once
+# (the oldest lease gives way), and conversations watched in all.
+_SUBAGENT_WATCHES_PER_SOCKET = 32
+_SUBAGENT_WATCHED_CONVERSATIONS = 1024
 
 
 def _loopback_peer(request: Any) -> bool:
@@ -665,6 +676,9 @@ class GatewayServer:
         # (transport-rebind, mirroring the reference gateway).
         self._session_ws: dict[str, web.WebSocketResponse] = {}
         self._agent_home_ws: set[web.WebSocketResponse] = set()
+        # subagent:<threadId> → {socket: lease expiry (monotonic)}: who
+        # watches a subagent's running turns (subagents.watch).
+        self._subagent_stream_watchers: dict[str, dict[Any, float]] = {}
         # Tick task for periodic health pings to connected clients.
         self._tick_task: asyncio.Task | None = None
         # Browser provider tracking. Chrome extensions and the desktop's
@@ -1228,7 +1242,7 @@ class GatewayServer:
             card = self.board_store.get_card(card_id) if card_id else None
             if card is not None and card.run_id:
                 try:
-                    await self._subagent_manager.cancel(card.run_id)
+                    await self._subagent_manager.cancel(card.run_id, by="owner")
                 except Exception as exc:
                     logger.warning("[board] legacy subagent cancel failed: {}", exc)
         return await apply_board_action(
@@ -1486,6 +1500,7 @@ class GatewayServer:
             # anyway; _ws_send already no-ops on a closed socket).
             for _sk in [k for k, v in self._session_ws.items() if v is ws]:
                 self._session_ws.pop(_sk, None)
+            self._forget_subagent_stream_socket(ws)
             getattr(self, "_agent_home_ws", set()).discard(ws)
             if is_current_connection and client_id in self._extension_clients:
                 cancelled = self._unregister_browser_provider(client_id)
@@ -1590,6 +1605,7 @@ class GatewayServer:
 
     async def _dispatch_ws_rpc(self, ws: web.WebSocketResponse, client_id: str, data: dict) -> None:
         """Dispatch an RPC call to the appropriate handler."""
+        from flowly.session.keys import SubagentThreadReadOnlyError, require_rpc_subagent_access
         from flowly.session.ownership import SessionAccessError, require_rpc_session
 
         method = data.get("method", "")
@@ -1607,6 +1623,10 @@ class GatewayServer:
                 return
 
         try:
+            # A subagent's conversation is read-only to every client: only a
+            # read may name one (chat.send, chat.steer, chat.compact,
+            # sessions.delete, sessions.model.set… are refused).
+            require_rpc_subagent_access(method, params)
             require_rpc_session(method, params, sessions_dir=self.sessions.sessions_dir if self.sessions else None)
             # display.* pins the requested profile's identity itself (a named
             # profile's screen is served by this gateway), never this one's.
@@ -1677,16 +1697,6 @@ class GatewayServer:
 
             elif method == "subagents.list":
                 await self._ws_rpc_subagents_list(ws, rpc_id, params)
-
-            elif method == "subagents.cancel":
-                await self._ws_rpc_subagents_cancel(ws, rpc_id, params)
-
-            # P2.8 — Assistant registry (Desktop Agents tab "Your agents" section)
-            elif method == "assistants.list":
-                await self._ws_rpc_assistants_list(ws, rpc_id, params)
-
-            elif method == "assistants.reload":
-                await self._ws_rpc_assistants_reload(ws, rpc_id, params)
 
             elif method == "exec.approval.resolve":
                 await self._ws_rpc_exec_approval_resolve(ws, rpc_id, params)
@@ -1868,6 +1878,8 @@ class GatewayServer:
 
             else:
                 await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", f"Unknown method: {method}")
+        except SubagentThreadReadOnlyError as error:
+            await self._ws_rpc_error(ws, rpc_id, error.code, error.message)
         except SessionAccessError as error:
             await self._ws_rpc_error(ws, rpc_id, error.code, error.message)
         except Exception as e:
@@ -2406,82 +2418,6 @@ class GatewayServer:
 
         await self._ws_rpc_reply(ws, rpc_id, {"tasks": tasks})
 
-    # --- RPC: subagents.cancel ---
-
-    async def _ws_rpc_subagents_cancel(
-        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
-    ) -> None:
-        run_id = params.get("runId", "")
-        if not run_id:
-            await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "runId is required")
-            return
-
-        if not self._subagent_manager:
-            await self._ws_rpc_error(ws, rpc_id, "NOT_AVAILABLE", "Subagent manager not available")
-            return
-
-        result_json = await self._subagent_manager.cancel(run_id)
-        import json as _json
-
-        result = _json.loads(result_json)
-        await self._ws_rpc_reply(ws, rpc_id, result)
-
-    # --- RPC: assistants.list / assistants.reload (P2.8) ---
-    # Desktop UI's "Agents" tab reads these to populate the "Your agents"
-    # section. Desktop writes the .md files directly via Node fs; when
-    # it's done it calls assistants.reload so Python picks up the new
-    # file without a gateway restart.
-
-    async def _ws_rpc_assistants_list(
-        self,
-        ws: web.WebSocketResponse,
-        rpc_id: str,
-        params: dict,
-    ) -> None:
-        registry = getattr(self, "_assistant_registry", None)
-        if registry is None:
-            await self._ws_rpc_error(
-                ws,
-                rpc_id,
-                "NOT_AVAILABLE",
-                "Assistant registry not wired",
-            )
-            return
-        assistants = []
-        for a in registry.all():
-            assistants.append(
-                {
-                    "name": a.name,
-                    "description": a.description,
-                    "model": a.model,
-                    "allowedTools": sorted(a.allowed_tools) if a.allowed_tools else None,
-                    "autoSaveArtifact": a.auto_save_artifact,
-                    "artifactType": a.artifact_type,
-                    "systemPrompt": a.system_prompt,
-                    "builtin": a.builtin,
-                    "sourcePath": str(a.source_path) if a.source_path else None,
-                }
-            )
-        await self._ws_rpc_reply(ws, rpc_id, {"assistants": assistants})
-
-    async def _ws_rpc_assistants_reload(
-        self,
-        ws: web.WebSocketResponse,
-        rpc_id: str,
-        params: dict,
-    ) -> None:
-        registry = getattr(self, "_assistant_registry", None)
-        if registry is None:
-            await self._ws_rpc_error(
-                ws,
-                rpc_id,
-                "NOT_AVAILABLE",
-                "Assistant registry not wired",
-            )
-            return
-        report = registry.reload()
-        await self._ws_rpc_reply(ws, rpc_id, report.to_dict())
-
     # --- RPC: coaching.* (meeting coach) ---
 
     def _coaching_session_id(self, client_id: str, params: dict) -> str:
@@ -2939,6 +2875,33 @@ class GatewayServer:
             await self._ws_rpc_reply(ws, rpc_id, {"sessionKey": session_key, "messages": []})
             return
 
+        from flowly.session.history_page import HistoryPageError, history_page
+        from flowly.session.history_rows import history_row, project_rows
+        from flowly.session.keys import is_subagent_thread
+
+        if is_subagent_thread(session_key):
+            # A subagent's conversation lives in its own store and is only
+            # read here: nothing is created or cached for it.
+            try:
+                rows, _thread = feature_rpc.subagent_thread_rows(session_key)
+                rows, page_info = history_page(rows, session_key, params)
+            except feature_rpc.FeatureRpcError as exc:
+                await self._ws_rpc_error(ws, rpc_id, exc.code, exc.message)
+                return
+            except HistoryPageError as exc:
+                await self._ws_rpc_error(ws, rpc_id, exc.code, str(exc))
+                return
+            await self._ws_rpc_reply(ws, rpc_id, {
+                "sessionKey": session_key,
+                "sessionId": session_key,
+                "messages": project_rows([history_row(m) for m in rows]),
+                "thinkingLevel": None,
+                "modelOverride": None,
+                "readOnly": True,
+                **page_info,
+            })
+            return
+
         session = self.sessions.get_or_create(session_key)
         # Return full messages (not just role/content) for richer UI rendering.
         # We also pass the tool-protocol fields (tool_calls on assistant turns,
@@ -2952,98 +2915,25 @@ class GatewayServer:
         # latter is the compacted LLM working context (just [summary]+recent
         # after a /compact), which would drop the early turns from the chat UI.
         source_messages = self.sessions.get_full_messages(session_key)
-        from flowly.session.history_page import HistoryPageError, history_page
         try:
             source_messages, page_info = history_page(source_messages, session_key, params)
         except HistoryPageError as exc:
             await self._ws_rpc_error(ws, rpc_id, exc.code, str(exc))
             return
-        messages = []
-        for m in source_messages:
-            msg: dict[str, Any] = {"role": m["role"]}
-            # Normalise content into array format expected by the iOS/desktop protocol.
-            content_raw = m.get("content", "")
-            if isinstance(content_raw, str):
-                msg["content"] = [{"type": "text", "text": content_raw}]
-            elif isinstance(content_raw, list):
-                msg["content"] = content_raw
-            else:
-                msg["content"] = [{"type": "text", "text": str(content_raw)}]
-            if m.get("tool_calls"):
-                msg["tool_calls"] = m["tool_calls"]
-            if m.get("tool_call_id"):
-                msg["tool_call_id"] = m["tool_call_id"]
-            if m.get("name"):
-                msg["name"] = m["name"]
-            # Context-boundary rows (a compaction happened here). Typed fields
-            # ride alongside the legacy text so a client can render the divider
-            # without matching a string — the relay's Firestore row carries the
-            # same pair, so both transports look identical to a client.
-            if m.get("kind"):
-                msg["kind"] = m["kind"]
-            if m.get("kind") == "voice" and isinstance(m.get("voice"), dict):
-                msg["voice"] = m["voice"]
-            if m.get("kind") == "agent_setup_card" and isinstance(m.get("setupCard"), dict):
-                msg["setupCard"] = m["setupCard"]
-            if m.get("boundaryKind"):
-                msg["boundaryKind"] = m["boundaryKind"]
-            if m.get("compactionId"):
-                msg["compactionId"] = m["compactionId"]
-            # Reconstruct attachment previews from the media paths saved on the
-            # user turn. Images get a small base64 JPEG thumbnail (not the full
-            # original — that could be 25 MB) so the desktop shows the same
-            # bubble preview it did live, with no Firestore and no bloated
-            # history payload. Best-effort per file.
-            # Media on this turn — user-attached inbound files AND media the agent
-            # produced (image_generate / screenshot, saved on the assistant turn).
-            # Use the inline-thumbnail shape so a remote client (iOS / desktop)
-            # renders the preview from history with no fetch — matching the live
-            # reply path. (mediaId is still set for clients that want full-res.)
-            media_paths = m.get("media")
-            if isinstance(media_paths, list) and media_paths:
-                # Descriptors persisted with the turn. Without them a reopened
-                # chat would have to re-probe every file to learn a clip's
-                # duration — and on a host with no ffmpeg it could not, so the
-                # video would come back from history poorer than it was live.
-                atts = _reply_media_attachments(
-                    media_paths, _assets_index(m.get("media_assets"))
-                )
-                if atts:
-                    msg["attachments"] = atts
-            if "timestamp" in m:
-                msg["timestamp"] = m["timestamp"]
-            if "usage" in m:
-                msg["usage"] = m["usage"]
-            if m.get("aborted") is True:
-                msg["aborted"] = True
-            if m.get("id"):
-                msg["id"] = m["id"]
-            if m.get("steering_run_id"):
-                msg["steeringRunId"] = m["steering_run_id"]
-            for source, target in (
-                ("steering_sequence", "steeringSequence"),
-                ("steering_source_run_id", "steeringSourceRunId"),
-                ("steering_message_id", "steeringMessageId"),
-                ("steering_iteration_idx", "steeringIterationIdx"),
-                ("steering_previous_iteration_idx", "steeringPreviousIterationIdx"),
-                ("steering_tool_call_ids", "steeringToolCallIds"),
-            ):
-                if source in m:
-                    msg[target] = m[source]
-            run_id = m.get("run_id")
-            if isinstance(run_id, str) and run_id:
-                msg["runId"] = run_id
-            duration_ms = m.get("duration_ms")
-            if isinstance(duration_ms, (int, float)) and not isinstance(duration_ms, bool):
-                msg["durationMs"] = max(0, int(duration_ms))
-            messages.append(msg)
+
+        # Reconstruct attachment previews from the media paths saved on the
+        # turn. Images get a small base64 JPEG thumbnail (not the full original
+        # — that could be 25 MB) so the desktop shows the same bubble preview
+        # it did live, with no Firestore and no bloated history payload. The
+        # descriptors persisted with the turn spare re-probing every file (on
+        # a host with no ffmpeg a clip's duration could not be learned again).
+        def attachments(media_paths: list, media_assets: Any) -> list[dict]:
+            return _reply_media_attachments(media_paths, _assets_index(media_assets))
 
         # ``messages`` is a transport DTO, not provider history. Flatten any
         # deferred-call wrappers here so a reopened Desktop/iOS conversation
         # renders the same effective tool identity it showed while streaming.
-        from flowly.tool_activity import project_tool_messages_for_ui
-
-        messages = project_tool_messages_for_ui(messages)
+        messages = project_rows([history_row(m, attachments=attachments) for m in source_messages])
 
         await self._ws_rpc_reply(
             ws,
@@ -3480,6 +3370,75 @@ class GatewayServer:
         )
         return True
 
+    async def run_report_turn(self, session_key: str, notice: dict[str, Any]) -> bool:
+        """Run a subagent's report as its conversation's own streamed turn.
+
+        Nobody typed it, so it starts like a goal's next turn: a fresh run id,
+        a command record (``turnOrigin: "subagent"``) and this runner, so it
+        streams, shows its tool steps, resumes on re-entry and stops like a
+        typed turn. The notice itself stays hidden: no user row, no in-flight
+        user text. Returns False when no client watches the conversation, so
+        the caller delivers it over the bus instead. The turn runs in its own
+        task (like ``chat.send``): the caller is a subagent's completion and
+        must not wait for the conversation's turn lock.
+        """
+        from flowly.agent.report_turn import REPORT_TURN, REPORT_TURN_ORIGIN, report_notice
+
+        ws = next((target for target in self._session_targets(session_key) if not target.closed), None)
+        if ws is None or self.on_chat_message is None:
+            return False
+        if getattr(self.on_chat_message, 'supports_turn_start', False) is not True:
+            # A host without the turn boundary (or the turn markers) would run
+            # the notice as a visible owner message. The bus serves it instead.
+            return False
+        content = str(notice.get("content") or "")
+        run_id = str(uuid.uuid4())
+
+        async def stream_callback(delta: str) -> None:
+            await self._session_send(
+                session_key,
+                ws,
+                {
+                    "type": "event",
+                    "event": "agent",
+                    "data": {
+                        "runId": run_id,
+                        "sessionKey": session_key,
+                        "turnOrigin": REPORT_TURN_ORIGIN,
+                        "stream": "assistant",
+                        "data": {"text": delta},
+                    },
+                },
+            )
+
+        self.chat_commands.accept(session_key, run_id, {"turnOrigin": REPORT_TURN_ORIGIN})
+        task = asyncio.create_task(self._run_chat(
+            ws,
+            "",
+            session_key,
+            content,
+            run_id,
+            stream_callback,
+            extra_metadata={
+                REPORT_TURN: report_notice(
+                    str(notice.get("sender_id") or "subagent"),
+                    str(notice.get("chat_id") or session_key),
+                ),
+                "turn_origin": REPORT_TURN_ORIGIN,
+            },
+        ))
+        self._active_tasks[run_id] = task
+
+        def finished(completed: asyncio.Task) -> None:
+            self._active_tasks.pop(run_id, None)
+            if completed.cancelled():
+                self.chat_commands.settle(session_key, run_id, 'aborted')
+            elif completed.exception() is not None:
+                self.chat_commands.settle(session_key, run_id, 'error')
+
+        task.add_done_callback(finished)
+        return True
+
     async def run_agent_introduction(self, run_id: str, prompt: str) -> bool:
         """Run a named agent's first message as an ordinary streamed turn.
 
@@ -3562,14 +3521,26 @@ class GatewayServer:
         # re-enters mid-stream must restore only the agent's words.
         from flowly.agent_home import AGENT_INTRODUCTION
 
-        hidden_prompt = bool((extra_metadata or {}).get(AGENT_INTRODUCTION))
+        from flowly.agent.report_turn import REPORT_TURN, report_turn_fields, run_started_event
+
+        # A subagent's report is the agent's own turn: its notice is hidden,
+        # every event says whose run it is, and it opens with run_started.
+        report_turn = bool((extra_metadata or {}).get(REPORT_TURN))
+        hidden_prompt = bool((extra_metadata or {}).get(AGENT_INTRODUCTION)) or report_turn
+        turn_fields = report_turn_fields(session_key) if report_turn else {}
 
         async def on_turn_started(text: str) -> None:
             nonlocal turn_started
             self.chat_commands.settle(session_key, run_id, 'running')
             inflight.begin(session_key, run_id, "" if hidden_prompt else text,
-                           goal_run=bool((extra_metadata or {}).get('goal_run')))
+                           goal_run=bool((extra_metadata or {}).get('goal_run')),
+                           turn_origin=turn_fields.get("turnOrigin"))
             turn_started = True
+            if report_turn:
+                await self._session_send(
+                    session_key, ws,
+                    {"type": "event", "event": "chat", "data": run_started_event(run_id, session_key)},
+                )
 
         if supports_turn_start:
             extra_metadata = {**(extra_metadata or {}), '_on_turn_started': on_turn_started}
@@ -3592,13 +3563,13 @@ class GatewayServer:
         # run id the loop used.
         async def iteration_callback(event: dict) -> None:
             if event.get("state") == "tool_progress":
-                wrapped = {**event, "runId": run_id}
+                wrapped = {**event, "runId": run_id, **turn_fields}
                 inflight.append_tool_progress(session_key, run_id, wrapped)
                 await self._session_send(
                     session_key, ws, {"type": "event", "event": "chat", "data": wrapped}
                 )
                 return
-            wrapped = {**event, "state": "iteration_step", "runId": run_id}
+            wrapped = {**event, "state": "iteration_step", "runId": run_id, **turn_fields}
             # Persist the tool-turn event so a client that re-enters mid-stream
             # can rebuild the live tool-call panel (chat.inflight returns these),
             # not just the assistant text. Store BEFORE the send so a dropped
@@ -3668,7 +3639,9 @@ class GatewayServer:
                 pending = self.on_chat_message(*call_args)
             result = await pending
             if supports_turn_start and not turn_started:
-                if (extra_metadata or {}).get('_goal_continuation_goal_id'):
+                if (extra_metadata or {}).get('_goal_continuation_goal_id') or report_turn:
+                    # (A report whose results were already taken in a turn
+                    # ends here too: nothing was announced, nothing to say.)
                     # A superseded autonomous prompt was rejected inside the
                     # turn lock. It never owned the stream and has no reply.
                     self.chat_commands.settle(session_key, run_id, 'aborted')
@@ -3730,6 +3703,7 @@ class GatewayServer:
                             "errorMessage": str(provider_error.get("message") or response),
                             "retryable": bool(provider_error.get("retryable", False)),
                             **context_wire,
+                            **turn_fields,
                         },
                     },
                 )
@@ -3761,6 +3735,11 @@ class GatewayServer:
                 )
                 if atts:
                     final_message["attachments"] = atts
+            # Goals the turn started tracking or finished: a card under the
+            # reply, the same shape chat.history returns (flowly/objectives/cards.py).
+            goal_cards = (metadata or {}).get("goalCards")
+            if isinstance(goal_cards, list) and goal_cards:
+                final_message["goalCards"] = goal_cards
 
             final_data: dict[str, Any] = {
                 "state": "final",
@@ -3770,6 +3749,7 @@ class GatewayServer:
                 "completedAt": datetime.now(timezone.utc).isoformat(),
                 "message": final_message,
                 **context_wire,
+                **turn_fields,
             }
             goal_snapshot = (metadata or {}).get("goal")
             if isinstance(goal_snapshot, dict):
@@ -3813,7 +3793,7 @@ class GatewayServer:
                     fallback_ws=ws,
                 )
             await self._notify_chat_delivered(session_key, response, metadata or {})
-            if not final_data.get("aborted"):
+            if not final_data.get("aborted") and (response or not report_turn):
                 self._schedule_offline_chat_push(
                     session_key,
                     response,
@@ -3828,7 +3808,7 @@ class GatewayServer:
                 {
                     "type": "event",
                     "event": "chat",
-                    "data": {"state": "aborted", "runId": run_id, "sessionKey": session_key},
+                    "data": {"state": "aborted", "runId": run_id, "sessionKey": session_key, **turn_fields},
                 },
             )
         except Exception as e:
@@ -3851,6 +3831,7 @@ class GatewayServer:
                         "errorTitle": "The agent hit an unexpected error",
                         "errorMessage": "Try again. If this continues, restart the bot.",
                         "retryable": True,
+                        **turn_fields,
                     },
                 },
             )
@@ -4208,6 +4189,97 @@ class GatewayServer:
         target = self._session_ws.get(session_key) or fallback_ws
         return [target] if target is not None else []
 
+    # ------------------------------------------------------------------
+    # A subagent's running turn, live (flowly.agent.subagent_stream)
+    # ------------------------------------------------------------------
+
+    def _stream_watchers(self) -> dict[str, dict[Any, float]]:
+        watchers = self.__dict__.get("_subagent_stream_watchers")
+        if watchers is None:
+            watchers = self.__dict__["_subagent_stream_watchers"] = {}
+        return watchers
+
+    def _watch_subagent_stream(self, ws: Any, session_key: str) -> None:
+        """Bind ``ws`` to a subagent's conversation for one lease (renewed by watching again)."""
+        from flowly.agent.subagent_stream import WATCH_LEASE_SECONDS
+        from flowly.session.keys import is_subagent_thread
+
+        if not is_subagent_thread(session_key) or getattr(ws, "closed", False):
+            return
+        watchers = self._stream_watchers()
+        now = time.monotonic()
+        mine = [key for key, sockets in watchers.items() if ws in sockets]
+        if session_key not in mine and len(mine) >= _SUBAGENT_WATCHES_PER_SOCKET:
+            # The oldest lease of this socket gives way.
+            oldest = min(mine, key=lambda key: watchers[key][ws])
+            self._unwatch_subagent_stream(ws, oldest)
+        if session_key not in watchers and len(watchers) >= _SUBAGENT_WATCHED_CONVERSATIONS:
+            self._prune_subagent_stream_watchers(now)
+            if len(watchers) >= _SUBAGENT_WATCHED_CONVERSATIONS:
+                return
+        watchers.setdefault(session_key, {})[ws] = now + WATCH_LEASE_SECONDS
+
+    def _unwatch_subagent_stream(self, ws: Any, session_key: str) -> None:
+        watchers = self._stream_watchers()
+        sockets = watchers.get(session_key)
+        if sockets is None:
+            return
+        sockets.pop(ws, None)
+        if not sockets:
+            watchers.pop(session_key, None)
+
+    def _forget_subagent_stream_socket(self, ws: Any) -> None:
+        for key in [key for key, sockets in self._stream_watchers().items() if ws in sockets]:
+            self._unwatch_subagent_stream(ws, key)
+
+    def _prune_subagent_stream_watchers(self, now: float) -> None:
+        for key, sockets in list(self._stream_watchers().items()):
+            for socket, expiry in list(sockets.items()):
+                if expiry <= now or getattr(socket, "closed", False):
+                    self._unwatch_subagent_stream(socket, key)
+
+    def _subagent_stream_targets(self, session_key: str) -> list:
+        now = time.monotonic()
+        targets: list = []
+        sockets = self._stream_watchers().get(session_key)
+        if sockets:
+            for socket, expiry in list(sockets.items()):
+                if expiry <= now or getattr(socket, "closed", False):
+                    self._unwatch_subagent_stream(socket, session_key)
+                elif socket not in targets:
+                    targets.append(socket)
+        # A chat.inflight re-entry on the conversation binds its socket too.
+        bound = self.__dict__.get("_session_ws", {}).get(session_key)
+        if bound is not None and not getattr(bound, "closed", False) and bound not in targets:
+            targets.append(bound)
+        return targets
+
+    def subagent_stream_watched(self, session_key: str) -> bool:
+        """Whether any socket would receive this subagent conversation's events (cheap)."""
+        return bool(self._stream_watchers().get(session_key)) or (
+            session_key in self.__dict__.get("_session_ws", {})
+        )
+
+    def prepare_subagent_stream(self, event: str, session_key: str, data: dict):
+        """The delivery of one event to the sockets watching now, or None.
+
+        Plain ``chat`` / ``agent`` / ``compaction`` events under the subagent's
+        own ``sessionKey`` — a client shows them only in that conversation's
+        view. Authority is the event's own (the hub sets it), checked per
+        recipient by ``_ws_send``.
+        """
+        if not self.subagent_stream_watched(session_key):
+            return None
+        targets = self._subagent_stream_targets(session_key)
+        if not targets:
+            return None
+        frame = self._scoped_event({"type": "event", "event": event, "data": data}, session_key=session_key)
+
+        async def deliver() -> None:
+            await asyncio.gather(*(self._ws_send(ws, frame) for ws in targets), return_exceptions=True)
+
+        return deliver
+
     def bind_session_ws(self, session_key: str, ws: web.WebSocketResponse) -> None:
         """Point a session's live stream at ``ws`` (transport-rebind)."""
         if session_key:
@@ -4317,6 +4389,11 @@ class GatewayServer:
             self._subagent_event_versions[ws] = event_version(params)
         if method == "chat.inflight":
             self.bind_session_ws(str(params.get("sessionKey") or ""), ws)
+        if method == "subagents.watch":
+            # Same step as the snapshot in the reply: nothing falls between.
+            self._watch_subagent_stream(ws, str(result.get("sessionKey") or ""))
+        elif method == "subagents.unwatch":
+            self._unwatch_subagent_stream(ws, str(result.get("sessionKey") or ""))
         if method == "agent.home.get":
             self.bind_session_ws(str(result.get("sessionKey") or ""), ws)
         if method == "system.capabilities" and self._profile_host is not None:
@@ -5199,6 +5276,10 @@ class GatewayServer:
         }
         if isinstance(goal_snapshot, dict):
             data["goal"] = goal_snapshot
+        # A check-in the agent wrote first about a goal: its card, the same
+        # shape a reply's goalCards have (flowly/objectives/cards.py).
+        if isinstance(metadata.get("goalCards"), list) and metadata["goalCards"]:
+            final_message["goalCards"] = metadata["goalCards"]
         if metadata.get("goal_run") is True:
             data["goalRun"] = True
         if metadata.get("goalTerminal") is True:
@@ -5624,6 +5705,14 @@ class GatewayServer:
                 if isinstance(validated_params, dict)
                 else ""
             )
+            released = (
+                profile_rpc_unwatched_key(_inner_method, validated_params)
+                if isinstance(validated_params, dict)
+                else ""
+            )
+            if released:
+                # This client no longer follows that subagent's turns.
+                subscription.conversations.discard((profile, released))
             if session_key and len(session_key) <= 256 and "\x00" not in session_key:
                 binding = (profile, session_key)
                 if (
@@ -5670,7 +5759,7 @@ class GatewayServer:
             # readers have the full tool events already.
             if event_type in ("directory", "tool.activity") and subscription.directory:
                 targets.add(client_id)
-            elif event_type in {"connection", "error", "needsInput"} and (
+            elif event_type in {"connection", "error", "needsInput", "objectives.changed"} and (
                 subscription.directory
                 or profile in subscription.profiles
                 or any(

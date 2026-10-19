@@ -157,3 +157,83 @@ class TestInjectPreLLMContext:
         )
         # Content should be unchanged (still a list)
         assert result[0]["content"] == messages[0]["content"]
+
+
+class TestPluginContextDoesNotAccumulate:
+    """Each model call carries exactly one, current plugin block.
+
+    The loop re-runs the hook before every model call of a turn and feeds the
+    result back in. Wrapping an already wrapped message stacked the block: the
+    same context appeared once, twice, three times over a three-call turn,
+    pushing the owner's own words further down each time.
+    """
+
+    @pytest.mark.asyncio
+    async def test_repeated_injection_keeps_a_single_refreshed_block(self):
+        loop = _make_loop()
+        calls = {"n": 0}
+
+        def hook(ctx):
+            calls["n"] += 1
+            return f"facts v{calls['n']}"
+
+        loop.hooks.register("pre_llm_call", hook)
+        messages = [
+            {"role": "system", "content": "You are an agent."},
+            {"role": "user", "content": "Find Mehmet"},
+        ]
+        for _ in range(3):
+            messages = await loop._inject_pre_llm_context(
+                messages=messages, tools=None, model="test"
+            )
+        content = messages[1]["content"]
+        assert content.count("<plugin_context>") == 1
+        assert "facts v3" in content and "facts v1" not in content
+        assert content.endswith("Find Mehmet")
+
+    @pytest.mark.asyncio
+    async def test_block_goes_to_the_owner_message_not_a_loop_nudge(self):
+        from flowly.agent.loop import _EPHEMERAL_NUDGE
+
+        loop = _make_loop()
+        loop.hooks.register("pre_llm_call", lambda ctx: "domain facts")
+        messages = [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "Find Mehmet"},
+            {"role": "assistant", "content": "Looking:"},
+            {"role": "user", "content": "Continue.", _EPHEMERAL_NUDGE: True},
+        ]
+        result = await loop._inject_pre_llm_context(messages=messages, tools=None, model="test")
+        assert "<plugin_context>" in result[1]["content"]
+        assert result[3]["content"] == "Continue."
+
+    @pytest.mark.asyncio
+    async def test_an_empty_refresh_removes_the_previous_block(self):
+        loop = _make_loop()
+        state = {"value": "domain facts"}
+        loop.hooks.register("pre_llm_call", lambda ctx: state["value"])
+        messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "Hi"}]
+        messages = await loop._inject_pre_llm_context(messages=messages, tools=None, model="test")
+        state["value"] = ""
+        messages = await loop._inject_pre_llm_context(messages=messages, tools=None, model="test")
+        assert messages[1]["content"] == "Hi"
+
+    @pytest.mark.asyncio
+    async def test_a_slow_plugin_cannot_hold_the_reply(self, monkeypatch):
+        import asyncio
+
+        import flowly.agent.loop as loop_module
+
+        monkeypatch.setattr(loop_module, "_PRE_LLM_HOOK_TIMEOUT_SECONDS", 0.05)
+        loop = _make_loop()
+
+        async def slow(ctx):
+            await asyncio.sleep(5)
+            return "too late"
+
+        loop.hooks.register("pre_llm_call", slow)
+        messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "Hi"}]
+        result = await asyncio.wait_for(
+            loop._inject_pre_llm_context(messages=messages, tools=None, model="test"), 2
+        )
+        assert result[1]["content"] == "Hi"

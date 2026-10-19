@@ -293,7 +293,6 @@ async def test_guidance_during_tool_waits_for_result_then_enters_same_run(tmp_pa
                     {"role": "system", "content": "test"},
                     {"role": "user", "content": "Read the fixture."},
                 ],
-                action_turn=False,
                 session_key="chat",
                 outbound_run_id="run",
                 tool_platform="web",

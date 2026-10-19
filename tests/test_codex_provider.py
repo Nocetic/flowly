@@ -825,3 +825,19 @@ def test_openai_codex_compatibility_accepts_new_gpt_5_variants():
     assert model_fits_provider("gpt-5.6-sol", "openai_codex") is True
     assert model_fits_provider("gpt-5.6-terra", "openai_codex") is True
     assert model_fits_provider("gpt-4o", "openai_codex") is False
+
+
+def test_parallel_tool_calls_on_with_one_time_fallback():
+    prov = CodexResponsesProvider(api_key="tok", account_id="acct-1")
+    tools = [{"type": "function", "function": {
+        "name": "foo", "description": "d", "parameters": {"type": "object", "properties": {}}}}]
+    msgs = [{"role": "user", "content": "yo"}]
+    payload, _ = prov._build_payload(msgs, tools, "gpt-5.5", "auto", stream=True)
+    # Several calls per response: a plan tick rides along with the real call.
+    assert payload["parallel_tool_calls"] is True
+    body = '{"detail": "Unsupported parameter: parallel_tool_calls"}'
+    assert prov._recover_rejected_payload(body, model="gpt-5.5", payload=payload) is True
+    payload, _ = prov._build_payload(msgs, tools, "gpt-5.5", "auto", stream=True)
+    assert payload["parallel_tool_calls"] is False
+    # Once off, an unrelated rejection is not mistaken for this one.
+    assert prov._recover_rejected_payload(body, model="gpt-5.5", payload=payload) is False

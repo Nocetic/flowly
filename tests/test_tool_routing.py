@@ -687,7 +687,6 @@ async def test_main_loop_executes_deferred_mcp_tool_through_bridge(
             {"role": "system", "content": "test"},
             {"role": "user", "content": "generate an image"},
         ],
-        action_turn=False,
         turn_content="generate an image",
         session_key="web:test",
         tool_platform="web",
@@ -764,7 +763,6 @@ async def test_turn_journal_survives_working_context_shrink(
 
     final, _results, _executed, _usage, working_messages = await loop._run_llm_tool_loop(
         messages=input_messages,
-        action_turn=False,
         turn_content="search context integrity",
         session_key="web:test",
         tool_platform="web",
@@ -852,7 +850,6 @@ async def test_main_loop_promotes_matching_mcp_tool_before_first_llm_call(
             {"role": "system", "content": "test"},
             {"role": "user", "content": "Use Context7 to query React docs"},
         ],
-        action_turn=False,
         turn_content="Use Context7 to query React docs",
         session_key="web:test",
         tool_platform="web",
@@ -936,7 +933,6 @@ async def test_unknown_mcp_capability_uses_search_then_call_without_describe(
             {"role": "system", "content": "test"},
             {"role": "user", "content": "Use an obscure connected capability"},
         ],
-        action_turn=False,
         turn_content="Use an obscure connected capability",
         session_key="web:test",
         tool_platform="web",
@@ -1056,7 +1052,6 @@ async def test_explicit_discovery_finds_promoted_workflow_in_one_search(
                 ),
             },
         ],
-        action_turn=False,
         turn_content=(
             "First use tool_search to find the Context7 documentation workflow, "
             "then fetch React useEffect cleanup docs."

@@ -19,12 +19,11 @@ from typing import Any, Awaitable, Callable
 from collections import OrderedDict
 from loguru import logger
 
-from flowly.bus.events import InboundMessage, OutboundMessage
+from flowly.bus.events import ConversationInboundMessage, InboundMessage, OutboundMessage
 from flowly.bus.queue import MessageBus
 from flowly.desktop_runtime.agent_activity import background_agent_activity, run_agent_worker
 from flowly.providers.base import (
     PROVIDER_REPLAY_KEY,
-    LLMErrorInfo,
     LLMProvider,
     LLMResponse,
 )
@@ -36,6 +35,7 @@ from flowly.agent.error_classifier import (
     present_provider_error,
 )
 from flowly.agent.context import ContextBuilder
+from flowly.agent.repetition import ANSWER_NOW, RepetitionGuard, mark_repeated
 from flowly.agent.tools.registry import ToolRegistry
 from flowly.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool, MemoryAppendTool
 from flowly.agent.tools.web import WebSearchTool, WebFetchTool, WebExtractTool
@@ -50,7 +50,8 @@ from flowly.agent.tools.voice import VoiceCallTool
 from flowly.agent.tools.process import ProcessTool
 from flowly.exec.process_registry import get_registry as _get_process_registry
 from flowly.exec.process_checkpoint import ProcessCheckpoint
-from flowly.agent.subagent import SubagentManager
+from flowly.agent.subagent import SUBAGENT_REPORTS_KEY, SubagentManager, record_subagent_reports
+from flowly.agent.report_turn import REPORT_TURN, REPORT_TURN_ORIGIN
 from flowly.session.manager import (
     ConcurrentSessionWriteError,
     SessionBusyError,
@@ -66,9 +67,14 @@ from flowly.session.archive import (
 )
 from flowly.cron.service import CronService
 from flowly.compaction.service import CompactionService
+from flowly.compaction.pruning import (
+    iteration_strip_passes,
+    strip_old_tool_results as _strip_old_tool_results,
+)
 from flowly.compaction.request_guard import (
     ProviderRequestCoordinator,
     request_fingerprint,
+    request_too_large_response,
 )
 from flowly.compaction.types import (
     CompactionConfig,
@@ -99,9 +105,14 @@ from flowly.agent.reply_media import extract_reply_media, extract_reply_media_as
 from flowly.media.assets import ASSETS_META_KEY, assets_to_meta
 from flowly.agent.run_abort import RunAbortedError, RunAbortController
 from flowly.agent.run_steering import ProviderSteeredError, RunSteeringController, SteeringError
+from flowly.agent.delegation import (
+    DelegationTurn,
+    conversation_from_history,
+    current_turn,
+    delegation_turn_scope,
+)
 from flowly.agent.tool_result_spill import build_spill_pointer, spill_tool_result
 from flowly.agent.tool_policy import (
-    has_explicit_tool_invocation_intent,
     normalize_tool_allowlist,
     resolve_exclusive_tool_scope,
     resolve_turn_tool_policy,
@@ -160,7 +171,7 @@ _DEFAULT_MAX_CHARS = 8000
 # Channels that are NOT genuine user activity: the agent's own background runs.
 # Memory learning (idle + turn dreamer triggers) must ignore these so a periodic
 # heartbeat/cron tick never looks like a conversation worth remembering.
-_NON_USER_CHANNELS = ("system", "heartbeat", "cron")
+_NON_USER_CHANNELS = ("system", "heartbeat", "cron", "agenda")
 
 # Passive group-context buffer bounds (Slack/Discord "listen" mode). Un-answered
 # channel messages accumulate per session until the next mention flushes them
@@ -171,6 +182,8 @@ _GROUP_BUFFER_MAX_CHARS = 6000
 _GOAL_CONTINUATION_ID = "_goal_continuation_goal_id"
 # Mirrors flowly.agent_home.AGENT_INTRODUCTION (kept import-free here).
 _AGENT_INTRODUCTION = "_agent_introduction"
+# Mirrors flowly.agenda.service.AGENDA_ITEM_KEY: the wake-up a system turn is.
+_AGENDA_ITEM = "agenda_item"
 _GOAL_BASE_USER_EPOCH = "_goal_base_user_epoch"
 _GOAL_KICKOFF = "_goal_kickoff"
 _GOAL_USER_EPOCH = "_goal_user_epoch"
@@ -351,40 +364,6 @@ class _AgentGoalDelivery(GoalDelivery):
         )
 
 
-# ── Built-in agent keyword routing ──────────────────────────────────────────
-
-_WRITING_KW = frozenset({
-    "rapor", "report", "essay", "makale", "article", "doküman", "document",
-    "yaz", "write", "hazırla", "prepare", "oluştur", "çalışma kağıdı",
-    "study guide", "özet", "summary", "mektup", "letter", "döküman",
-    "composition", "draft", "taslak",
-})
-_RESEARCH_KW = frozenset({
-    "araştır", "research", "analiz", "analysis", "karşılaştır", "compare",
-    "incele", "investigate", "kaynak", "source", "bul ve özetle",
-})
-_CODE_KW = frozenset({
-    "code review", "refactor", "debug", "test yaz", "write test",
-    "kod incele", "hata bul", "fix bug", "kod review",
-})
-
-
-def _detect_builtin_agent_type(task_text: str) -> str | None:
-    """Detect if a spawn task should be routed to a built-in specialist agent.
-
-    Returns agent type ('writer', 'researcher', 'coder') or None.
-    Uses keyword scoring to pick the best-matching specialist.
-    """
-    t = task_text.lower()
-    scores = {
-        "writer": sum(1 for kw in _WRITING_KW if kw in t),
-        "researcher": sum(1 for kw in _RESEARCH_KW if kw in t),
-        "coder": sum(1 for kw in _CODE_KW if kw in t),
-    }
-    best = max(scores, key=scores.get)  # type: ignore[arg-type]
-    return best if scores[best] > 0 else None
-
-
 def _maybe_extract_image_for_vision(raw_result: str, tool_name: str) -> str | None:
     """If the raw tool result asks the loop to render an image content block,
     return the image data URL. Otherwise return None.
@@ -488,6 +467,80 @@ _DEEPSEEK_MARK_RE = re.compile(rf"<\s*{_PIPE}\s*tool[▁_ ]*calls?[▁_ ]*(?:beg
 _XML_TOOLCALLS_RE = re.compile(r"<\s*(tool_calls|function_calls)\s*>.*?</\s*\1\s*>", re.DOTALL | re.IGNORECASE)
 _XML_INVOKE_RE = re.compile(r"<\s*invoke\b[^>]*>.*?</\s*invoke\s*>", re.DOTALL | re.IGNORECASE)
 _CODE_FENCE_RE = re.compile(r"(```.*?```|~~~.*?~~~)", re.DOTALL)
+
+
+# A plugin's pre_llm_call hook must not hold the owner's reply. Past this the
+# model is called without that iteration's plugin context.
+_PRE_LLM_HOOK_TIMEOUT_SECONDS = 5.0
+_PLUGIN_CONTEXT_OPEN = "<plugin_context>\n"
+_PLUGIN_CONTEXT_CLOSE = "\n</plugin_context>\n\n"
+
+
+def _without_plugin_context(content: Any) -> Any:
+    """Remove a plugin block this loop prepended earlier, if any."""
+    if not isinstance(content, str) or not content.startswith(_PLUGIN_CONTEXT_OPEN):
+        return content
+    end = content.find(_PLUGIN_CONTEXT_CLOSE)
+    return content if end == -1 else content[end + len(_PLUGIN_CONTEXT_CLOSE):]
+
+
+def _with_plugin_context(messages: list[dict[str, Any]], injected: str) -> list[dict[str, Any]]:
+    """Return ``messages`` carrying exactly one plugin block, ``injected``.
+
+    The loop calls the hooks before every model call and feeds the result
+    back in, so an earlier block is removed first instead of being wrapped
+    again. The block belongs to the owner's message of this turn, never to a
+    loop nudge; an empty refresh leaves no block at all.
+    """
+    result = list(messages)
+    changed = False
+    for i, message in enumerate(result):
+        if message.get("role") != "user":
+            continue
+        stripped = _without_plugin_context(message.get("content"))
+        if stripped is not message.get("content"):
+            result[i] = {**message, "content": stripped}
+            changed = True
+    if injected:
+        for i in range(len(result) - 1, -1, -1):
+            message = result[i]
+            if message.get("role") != "user" or message.get(_EPHEMERAL_NUDGE):
+                continue
+            content = message.get("content", "")
+            if isinstance(content, str):  # multimodal user msgs (rare) — skip injection
+                result[i] = {
+                    **message,
+                    "content": f"{_PLUGIN_CONTEXT_OPEN}{injected}{_PLUGIN_CONTEXT_CLOSE}{content}",
+                }
+                changed = True
+            break
+    return result if changed else messages
+
+
+# A subagent's notice names its run as "run_id=<uuid>".
+_SUBAGENT_RUN_ID_RE = re.compile(
+    r"^\[Subagent '.*?'.*?\] run_id=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+    re.MULTILINE,
+)
+
+
+# Tools that only read, so several in one response may run together.
+_PARALLEL_READ_TOOLS = frozenset({
+    "web_search", "web_fetch", "web_extract", "read_file", "list_dir",
+})
+
+
+def _announces_untaken_step(text: str | None) -> bool:
+    """True when a tool-less reply ends by announcing its next step.
+
+    "Ekrana bakıyorum:" followed by nothing means the model stopped
+    mid-action. The test is the reply's shape (a trailing colon), never its
+    vocabulary, so a question or an explanation that happens to mention an
+    action is not mistaken for one. A trailing ellipsis is too common in
+    finished prose to count.
+    """
+    stripped = (text or "").rstrip()
+    return bool(stripped) and stripped.endswith(":")
 
 
 def _contains_leaked_tool_markup(text: str | None) -> bool:
@@ -749,78 +802,6 @@ def _drop_ephemeral_nudges(messages: list[dict[str, Any]]) -> list[dict[str, Any
     return [m for m in messages if not m.get(_EPHEMERAL_NUDGE)]
 
 
-def _strip_old_tool_results(
-    messages: list[dict[str, Any]],
-    keep_last: int = 3,
-    max_old_chars: int = 200,
-    keep_last_images: int = 1,
-) -> list[dict[str, Any]]:
-    """Truncate old tool results, keeping only the last N in full.
-
-    Two separate retention windows:
-      - keep_last: how many recent text-only tool results to keep in
-        full. Older ones get truncated to max_old_chars.
-      - keep_last_images: how many recent image-bearing tool results
-        (browser_tab screenshots) to keep visually. Older ones drop
-        the image content block entirely; the text part stays. One
-        screenshot is ~10-15K tokens, so keeping more than 1-2 in
-        context blows past the model's window in a few turns.
-
-    Returns a NEW list to avoid mutating session-shared message dicts (Fix #11).
-    """
-    tool_indices = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
-    if not tool_indices:
-        return messages
-
-    # Identify which tool messages carry an image block. For these we
-    # keep only the most recent N visually; older ones lose the image.
-    image_indices = [
-        i for i in tool_indices
-        if isinstance(messages[i].get("content"), list)
-        and any(
-            isinstance(p, dict) and p.get("type") == "image_url"
-            for p in messages[i].get("content", [])
-        )
-    ]
-    image_to_strip = set(image_indices[:-keep_last_images]) if len(image_indices) > keep_last_images else set()
-
-    # Text-truncate window (existing behavior).
-    to_truncate = set(tool_indices[:-keep_last]) if len(tool_indices) > keep_last else set()
-
-    if not to_truncate and not image_to_strip:
-        return messages
-
-    result = list(messages)
-    for i in to_truncate | image_to_strip:
-        msg = result[i]
-        content = msg.get("content", "")
-
-        if i in image_to_strip and isinstance(content, list):
-            # Drop image blocks; keep text. If a text block is also old
-            # enough to truncate, do that to its text in the same pass.
-            new_content_parts: list[dict[str, Any]] = []
-            for p in content:
-                if isinstance(p, dict) and p.get("type") == "image_url":
-                    continue  # drop the image
-                if isinstance(p, dict) and p.get("type") == "text":
-                    txt = p.get("text", "")
-                    if i in to_truncate and len(txt) > max_old_chars:
-                        txt = txt[:max_old_chars] + "\n[earlier result truncated, image dropped]"
-                    new_content_parts.append({"type": "text", "text": txt})
-                else:
-                    new_content_parts.append(p)
-            # If only one text block left, collapse to plain string for
-            # providers that prefer string content on tool messages.
-            if len(new_content_parts) == 1 and new_content_parts[0].get("type") == "text":
-                result[i] = {**msg, "content": new_content_parts[0]["text"]}
-            else:
-                result[i] = {**msg, "content": new_content_parts}
-        elif i in to_truncate and isinstance(content, str) and len(content) > max_old_chars:
-            result[i] = {**msg, "content": content[:max_old_chars] + "\n[earlier result truncated]"}
-
-    return result
-
-
 # Field names whose values are likely user-private URLs (CDN links to
 # uploaded media, signed S3 keys, etc.). When we log tool dispatches we
 # substitute placeholders so a server-log dump or Sentry breadcrumb
@@ -1034,6 +1015,10 @@ class AgentLoop:
         # Gateway reference for turn-level lifecycle broadcasts. Wired by
         # set_gateway_server() once the gateway is constructed.
         self._gateway_server = None
+        # The agent's agenda (flowly/agenda/service.py), wired by the gateway
+        # that runs it. Told when the owner writes and when a wake-up's turn
+        # ends; None in the CLI, where nothing would ever wake the agent.
+        self.agenda: Any | None = None
         self._goal_output_callback: Callable[[OutboundMessage], Awaitable[None]] | None = None
         self.goal_manager: Any | None = None
         self.goal_runtime: GoalRuntime | None = None
@@ -1074,20 +1059,8 @@ class AgentLoop:
         # State dir (must be set before SubagentManager)
         self._state_dir = state_dir or (workspace / ".flowly_state")
 
-        from flowly.agent.subagent_registry import SubagentRegistry
-        self._subagent_registry = SubagentRegistry()
-        self.subagents = SubagentManager(
-            provider=provider,
-            workspace=workspace,
-            bus=bus,
-            model=self.model,
-            brave_api_key=brave_api_key,
-            exec_config=self.exec_config,
-            registry=self._subagent_registry,
-            state_dir=self._state_dir,
-        )
-
-        # Compaction service
+        # Compaction service (subagents share it: same thresholds, learned
+        # input ceilings and summaries as the main agent)
         self.compaction = CompactionService(
             provider=provider,
             model=self.model,
@@ -1099,6 +1072,27 @@ class AgentLoop:
             state_dir=self.sessions.sessions_dir,
         )
         self._provider_requests = ProviderRequestCoordinator(self.compaction)
+
+        from flowly.agent.subagent_registry import SubagentRegistry
+        self._subagent_registry = SubagentRegistry()
+        self.subagents = SubagentManager(
+            provider=provider,
+            workspace=workspace,
+            bus=bus,
+            model=self.model,
+            brave_api_key=brave_api_key,
+            exec_config=self.exec_config,
+            registry=self._subagent_registry,
+            state_dir=self._state_dir,
+            max_iterations=self.max_iterations,
+            compaction=self.compaction,
+        )
+        # Which results a conversation's saved turns handled: the delivery
+        # commit point a restart checks before announcing one again.
+        self.subagents.committed_reports = self._committed_subagent_reports
+        # A finished subagent's report runs as a live turn on the surface the
+        # owner is watching (register_report_turn_submitter), else the bus.
+        self.subagents.report_submitter = self._submit_report_turn
 
         # Trello config
         self.trello_config = trello_config
@@ -1369,6 +1363,8 @@ class AgentLoop:
             plan_manager = get_plan_manager()
 
             def session_is_waiting(target: str) -> bool:
+                if target.startswith("subagents:"):
+                    return bool(self.subagents.pending_for_goal(target.removeprefix("subagents:")))
                 if target.startswith("plan:"):
                     plan = plan_manager.get_plan(target.removeprefix("plan:"))
                     return bool(plan and plan.status in {"draft", "awaiting_approval"})
@@ -1404,6 +1400,7 @@ class AgentLoop:
                     workspace=self.workspace,
                 ),
                 pending_plan=pending_plan,
+                pending_subagents=self.subagents.pending_for_goal,
             )
             self.goal_manager = manager
             self.goal_runtime = runtime
@@ -1928,7 +1925,9 @@ class AgentLoop:
                 logger.warning(f"[skill-gov] auto {mode} failed: {exc}")
 
     # System sessions that should never get a chat title.
-    _NO_TITLE_PREFIXES = ("heartbeat:", "cron:", "system:", "memory:", "review:")
+    # ``agenda:`` is the agent's own daily review: nobody reads its title, and
+    # titling it cost a model call every morning.
+    _NO_TITLE_PREFIXES = ("heartbeat:", "cron:", "system:", "memory:", "review:", "agenda:")
 
     def _set_provisional_title(self, session: Any, user_content: str) -> None:
         """Seed a placeholder title from the user's opening message.
@@ -2267,6 +2266,11 @@ class AgentLoop:
             finally:
                 if pending:
                     await asyncio.gather(*pending, return_exceptions=True)
+            # Its subagents' conversations hold what it said (the forked
+            # conversation) and what they did: they go with it.
+            subagents = getattr(self, "subagents", None)
+            if subagents is not None:
+                subagents.forget_conversation(session_key)
             return deleted
 
     def _should_save_trajectories(self) -> bool:
@@ -2623,24 +2627,18 @@ class AgentLoop:
         # Spawn tool (for subagents)
         spawn_tool = SpawnTool(manager=self.subagents)
         self.tools.register(spawn_tool)
-
-        # Built-in agent tool (internal specialist agents)
-        # P2.8 — the `builtin_agent` tool is now registry-backed: its
-        # enum and description are derived from AssistantRegistry at
-        # schema time, so dropping a new ~/.flowly/assistants/{name}.md
-        # exposes a new specialist without a code change. Tool name and
-        # parameter shape are unchanged vs the pre-P2.8 API so LLM
-        # trajectories keep working.
-        from flowly.agent.assistants import AssistantRegistry
-        from flowly.agent.tools.builtin_agent import BuiltinAgentTool
-        from flowly.profile import get_flowly_home
-        self._assistant_registry = AssistantRegistry(
-            get_flowly_home() / "assistants"
+        from flowly.agent.tools.agent_tools import (
+            AgentCloseTool,
+            AgentFollowupTool,
+            AgentMessageTool,
+            AgentReadTool,
+            AgentWaitTool,
         )
-        builtin_agent_tool = BuiltinAgentTool(
-            manager=self.subagents, registry=self._assistant_registry,
-        )
-        self.tools.register(builtin_agent_tool)
+        self.tools.register(AgentReadTool(registry=self._subagent_registry))
+        self.tools.register(AgentMessageTool(manager=self.subagents))
+        self.tools.register(AgentFollowupTool(manager=self.subagents))
+        self.tools.register(AgentCloseTool(manager=self.subagents))
+        self.tools.register(AgentWaitTool(manager=self.subagents))
 
         # Sessions list tool (with cancel capability)
         from flowly.agent.tools.sessions_list import SessionsListTool
@@ -3697,7 +3695,19 @@ class AgentLoop:
             await self._record_group_observation(msg)
             return
 
-        if msg.channel == "web":
+        if (
+            msg.channel == "web"
+            or (msg.channel == "system" and msg.metadata.get(_AGENDA_ITEM))
+            or (msg.channel == "system" and msg.sender_id == "subagent"
+                and isinstance(msg, ConversationInboundMessage))
+        ):
+            # An agenda wake-up may research for minutes; it must not hold up
+            # other conversations' system turns (finished tasks reporting back).
+            # The agenda never wakes a conversation while a turn runs there.
+            # A subagent's report is its conversation's own turn — that
+            # conversation's turn lock keeps it in order — and must not stop
+            # every other conversation (or the owner's next message, which
+            # ends any waiting it does) from being read meanwhile.
             self._spawn_concurrent_turn(msg)
         else:
             await self._process_turn(msg)
@@ -3806,7 +3816,7 @@ class AgentLoop:
             # partial live for the entire turn so a relay client re-entering
             # mid-stream can restore the bubble + tool panel. Keyed by the same
             # session_key/run_id the WebChannel's begin() used.
-            if msg.channel == "web":
+            if msg.channel == "web" or msg.metadata.get(REPORT_TURN):
                 run_id = msg.metadata.get("run_id")
                 if run_id:
                     try:
@@ -3818,8 +3828,14 @@ class AgentLoop:
     def _failed_turn_outbound(self, msg: InboundMessage) -> OutboundMessage:
         """Keep unexpected execution errors attached to their real turn."""
         text = 'The agent could not finish this turn. Please try again.'
-        return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=text, metadata={
+        channel, chat_id = msg.channel, msg.chat_id
+        if msg.metadata.get(REPORT_TURN) and ":" in msg.chat_id:
+            # A report turn's runner waits for its terminal on the surface the
+            # notice is addressed to; "system" has no adapter to carry it.
+            channel, chat_id = msg.chat_id.split(":", 1)
+        return OutboundMessage(channel=channel, chat_id=chat_id, content=text, metadata={
             'session_key': msg.session_key, 'stream_run_id': msg.metadata.get('run_id'),
+            **({'turnOrigin': REPORT_TURN_ORIGIN} if msg.metadata.get(REPORT_TURN) else {}),
             'goal_run': bool(msg.metadata.get('goal_run')),
             'error': {'code': 'AGENT_INTERNAL_ERROR', 'title': 'The turn could not finish',
                       'message': text, 'retryable': True},
@@ -3998,6 +4014,67 @@ class AgentLoop:
         if direct:
             return registry.get("direct")
         return registry.get(channel)
+
+    def register_report_turn_submitter(self, key: str, submitter: Any) -> None:
+        """Register a surface's chat runner for subagent report turns.
+
+        ``key`` is ``"direct"`` (the gateway's own runner) or a channel name
+        (``"web"``). ``submitter(session_key, notice)`` starts the turn and
+        returns True, or returns False when nobody is watching that
+        conversation on the surface; ``notice`` is ``{"content",
+        "sender_id", "chat_id"}``. A report turn started this way streams
+        exactly like a typed turn (see flowly/agent/report_turn.py).
+        """
+        if not hasattr(self, "_report_turn_submitters"):
+            self._report_turn_submitters: dict[str, Any] = {}
+        self._report_turn_submitters[key] = submitter
+
+    async def _submit_report_turn(
+        self, session_key: str, channel: str, chat_id: str, content: str,
+    ) -> bool:
+        """Start a subagent's notice as a live turn; False = use the bus.
+
+        The surface that serves the conversation is tried first: the relay
+        for a conversation started there, the direct gateway otherwise.
+        Each surface declines when nobody is watching the conversation on it.
+        The notice keeps the authority it would have had on the bus: the
+        conversation's owner, captured the same way the bus captures it.
+        """
+        registry = getattr(self, "_report_turn_submitters", None) or {}
+        if not registry:
+            return False
+        from flowly.live_voice.authority import (
+            VoiceAuthorityError,
+            current_request_owner,
+            request_owner_scope,
+        )
+        from flowly.live_voice.events import EventAccess, current_event_access, event_access_scope
+
+        # Same capture as bind_bus_message: the producer's access, else the
+        # conversation's own; an owned conversation without a known owner is
+        # not ours to run here (the bus applies the same refusal).
+        access = current_event_access()
+        if access is None:
+            access = EventAccess.capture(session_key)
+            try:
+                if access.producer().uid is not None and current_request_owner() is None:
+                    return False
+            except VoiceAuthorityError:
+                return False
+        try:
+            owner = access.producer()
+        except VoiceAuthorityError:
+            return False
+        if not access.permits(owner):
+            return False
+        order = ("web", "direct") if channel == "web" else ("direct", "web")
+        notice = {"content": content, "sender_id": "subagent", "chat_id": f"{channel}:{chat_id}"}
+        with request_owner_scope(owner), event_access_scope(access):
+            for key in order:
+                submitter = registry.get(key)
+                if submitter is not None and await submitter(session_key, dict(notice)):
+                    return True
+        return False
 
     def goal_turn_metadata(
         self,
@@ -4271,12 +4348,10 @@ class AgentLoop:
     def stop(self) -> None:
         """Stop the agent loop.
 
-        Cascades to subagents so the gateway shutdown doesn't leave
-        background tasks running (which would end up in the registry
-        as ``ended_at=None`` and surface on the next boot as spurious
-        "Process restarted before task completed" errors). Each
-        subagent task catches CancelledError and records an
-        "interrupted" outcome gracefully — see ``_run_subagent``.
+        Cascades to subagents so the shutdown doesn't leave background
+        tasks running. A run the next start continues is suspended (it
+        stays running in the registry); any other records an
+        "interrupted" outcome — see ``SubagentManager.stop_all``.
         """
         self._running = False
         goal_runtime = getattr(self, "goal_runtime", None)
@@ -4293,11 +4368,13 @@ class AgentLoop:
                 logger.exception("AgentLoop.stop: goal process unsubscribe failed")
             self._goal_process_unsubscribe = None
         try:
-            cancelled = self.subagents.cancel_all()
+            # Runs a restart continues are suspended, the rest interrupted
+            # (SubagentManager.stop_all); the gateway already did this first.
+            cancelled = self.subagents.stop_all()
             if cancelled:
-                logger.info(f"Agent loop: cancelled {cancelled} subagent(s) on stop()")
+                logger.info(f"Agent loop: stopped {cancelled} subagent(s) on stop()")
         except Exception:
-            logger.exception("AgentLoop.stop: subagent cancel_all failed")
+            logger.exception("AgentLoop.stop: stopping subagents failed")
 
         semantic_router = getattr(self, "_semantic_tool_router", None)
         unsubscribe = getattr(self, "_semantic_registry_unsubscribe", None)
@@ -4740,24 +4817,6 @@ class AgentLoop:
                 return match.group(1).strip().lower()
         return content.lower()
 
-    def _all_tools_disabled(self, disabled_tools: object) -> bool:
-        """True when ``disabled_tools`` leaves NO tool callable this turn.
-
-        Action-turn enforcement demands a tool call; with zero available tools
-        that is impossible, so the caller must not enforce it. The flowlet
-        vision runner disables every tool by name — this is how we detect that
-        and avoid the retry/alarm/fallback spin. Fails safe: if the tool set
-        can't be read, assume tools exist (keep enforcing)."""
-        if not disabled_tools:
-            return False
-        try:
-            all_names = set(self.tools.tool_names)
-        except Exception:  # noqa: BLE001 — never let this guard break the turn
-            return False
-        if not all_names:
-            return False
-        return not (all_names - set(disabled_tools))
-
     @staticmethod
     def _turn_tools_allowed(
         metadata: dict[str, Any] | None,
@@ -4765,192 +4824,6 @@ class AgentLoop:
     ) -> bool:
         """Compatibility wrapper around the structured policy resolver."""
         return resolve_turn_tool_policy(metadata, content).allowed
-
-    def _is_action_turn(self, channel: str, content: str) -> bool:
-        """Detect whether this turn is an action request that should execute tools strictly."""
-        lowered = content.lower()
-        if "voice_call(" in lowered or "cron(" in lowered:
-            return True
-
-        intent_text = self._extract_action_intent_text(content)
-        if has_explicit_tool_invocation_intent(intent_text):
-            return True
-        action_patterns = (
-            # Call / phone
-            r"\bcall\b",
-            r"\bdial\b",
-            r"\bphone\b",
-            r"\bring\b",
-            r"\barasana\b",
-            r"\barar\s+m[ıi]s[ıi]n\b",
-            r"\baray[ıi]p\b",
-            r"\barama\b",
-            r"\btelefon(?:la)?\b",
-            # Retry
-            r"\btry\s+again\b",
-            r"\bretry\b",
-            r"\btekrar\s+dene\b",
-            r"\btekrar\s+b[iı]\s+dene\b",
-            r"\btekrar\s+bir\s+dene\b",
-            r"\btekrar\s+dener\s+m[ıi]s[ıi]n\b",
-            r"\btekrar\b.*\bden\w+\b",
-            r"\byeniden\s+dene\b",
-            r"\bbir\s+daha\s+dene\b",
-            # Reminder / notification
-            r"\bremind(?:er)?\b",
-            r"\bnotify\b",
-            r"\balert\b",
-            r"\bhat[ıi]rlat\b",
-            r"\bhaber\s+ver\b",
-            r"\bbildir\b",
-            # Schedule / cron
-            r"\bschedule\b",
-            r"\bplanla\b",
-            r"\bcron\s+olu[şs]tur\b",
-            # Send / share
-            r"\bsend\b",
-            r"\bshare\b",
-            r"\bg[öo]nder\b",
-            r"\bpayla[şs]\b",
-            # Screenshot
-            r"\bscreenshot\b",
-            r"\bss\b",
-            r"\bekran\s+g[öo]r[üu]nt[üu]s[üu]\b",
-            # Generic
-            r"\brun\s+tool\b",
-            r"\bexecute\b",
-        )
-        return any(re.search(pattern, intent_text) for pattern in action_patterns)
-
-    def _is_retry_action_followup(self, content: str) -> bool:
-        """Detect short follow-up prompts that usually mean 'retry previous action'."""
-        intent_text = self._extract_action_intent_text(content)
-        retry_patterns = (
-            r"\btry\s+again\b",
-            r"\bretry\b",
-            r"\bdo\s+it\s+again\b",
-            r"\bone\s+more\s+time\b",
-            r"\btekrar\s+dene\b",
-            r"\btekrar\s+b[iı]\s+dene\b",
-            r"\btekrar\s+bir\s+dene\b",
-            r"\btekrar\s+dener\s+m[ıi]s[ıi]n\b",
-            r"\btekrar\b.*\bden\w+\b",
-            r"\byeniden\s+dene\b",
-            r"\bbir\s+daha\s+dene\b",
-        )
-        return any(re.search(pattern, intent_text) for pattern in retry_patterns)
-
-    def _is_cancel_action_followup(self, content: str) -> bool:
-        """Detect explicit cancellation for pending actions."""
-        intent_text = self._extract_action_intent_text(content)
-        cancel_patterns = (
-            r"\bcancel\b",
-            r"\bstop\b",
-            r"\bforget\s+it\b",
-            r"\bnever\s*mind\b",
-            r"\babort\b",
-            r"\bvazge[cç]\b",
-            r"\biptal\b",
-            r"\bbo[sş]ver\b",
-        )
-        return any(re.search(pattern, intent_text) for pattern in cancel_patterns)
-
-    def _consume_pending_action_lock(self, session: Any, content: str) -> bool:
-        """
-        Consume a pending-action lock set by a previous failed action turn.
-
-        If active, force this turn into action mode unless user explicitly cancels.
-        """
-        pending = session.metadata.get("pending_action_lock")
-        if not isinstance(pending, dict):
-            return False
-        if not pending.get("active"):
-            return False
-
-        remaining = int(pending.get("remaining_turns", 0) or 0)
-        if remaining <= 0:
-            session.metadata.pop("pending_action_lock", None)
-            return False
-
-        if self._is_cancel_action_followup(content):
-            session.metadata.pop("pending_action_lock", None)
-            return False
-
-        pending["remaining_turns"] = remaining - 1
-        pending["last_consumed_at"] = datetime.now().isoformat()
-        session.metadata["pending_action_lock"] = pending
-        return True
-
-    def _set_pending_action_lock(self, session: Any, request_text: str) -> None:
-        """Arm pending-action lock so next follow-up is forced into action mode."""
-        session.metadata["pending_action_lock"] = {
-            "active": True,
-            "remaining_turns": 2,
-            "request": request_text[:300],
-            "set_at": datetime.now().isoformat(),
-        }
-
-    def _clear_pending_action_lock(self, session: Any) -> None:
-        """Clear pending-action lock after successful action execution."""
-        session.metadata.pop("pending_action_lock", None)
-
-    def _should_promote_retry_to_action(
-        self,
-        content: str,
-        history: list[dict[str, Any]],
-    ) -> bool:
-        """Promote retry follow-ups to action turns when recent context indicates pending action."""
-        if not self._is_retry_action_followup(content):
-            return False
-
-        if not history:
-            return False
-
-        recent_messages = history[-6:]
-        recent_text = " ".join(
-            str(msg.get("content", "")).lower()
-            for msg in recent_messages
-            if isinstance(msg, dict)
-        )
-        retry_context_markers = (
-            "tool call could not be verified",
-            "tool calls failed",
-            "no action was taken",
-        )
-        if any(marker in recent_text for marker in retry_context_markers):
-            return True
-
-        # If recent user messages were action-like, treat retry as action.
-        for msg in reversed(recent_messages):
-            if not isinstance(msg, dict):
-                continue
-            if msg.get("role") != "user":
-                continue
-            text = str(msg.get("content", ""))
-            if text and self._is_action_turn("", text):
-                return True
-        return False
-
-    def _contains_unverified_completion_claim(self, text: str) -> bool:
-        """Detect response phrases that claim completion without tool evidence."""
-        lowered = (text or "").lower()
-        claim_patterns = (
-            r"\byapt[ıi]m\b",
-            r"\bg[öo]nderdim\b",
-            r"\bald[ıi]m\b",
-            r"\ba[cç]t[ıi]m\b",
-            r"\bkapatt[ıi]m\b",
-            r"\btamamlad[ıi]m\b",
-            r"\bi did\b",
-            r"\bi sent\b",
-            r"\bi took\b",
-            r"\bi opened\b",
-            r"\bi closed\b",
-            r"\bdone\b",
-            r"\bcompleted\b",
-            r"\bfinished\b",
-        )
-        return any(re.search(pattern, lowered) for pattern in claim_patterns)
 
     # Hardcoded fallback messages that should be replaced by model-generated summaries.
     _HARDCODED_FALLBACKS = frozenset({
@@ -5067,31 +4940,115 @@ class AgentLoop:
             or ("call sid:" in lowered and "kullanıcı şunu söyledi:" in lowered)
         )
 
+    def _has_running_subagents(self, session_key: str) -> bool:
+        """Whether subagents this conversation started are still working."""
+        manager = getattr(self, "subagents", None)
+        if manager is None or not session_key:
+            return False
+        try:
+            return any(
+                r.parent_session_key == session_key and r.ended_at is None and r.origin != "system"
+                for r in manager.registry.all()
+            )
+        except (OSError, ValueError):
+            return False
+
+    def _turn_should_yield(self, run_id: str) -> Callable[[], bool] | None:
+        """For a waiting tool: did the owner write into or stop this turn?"""
+        if not run_id:
+            return None
+        return lambda: self._steering().has_pending(run_id) or self.is_run_aborted(run_id)
+
+    def _delegation_owner_text(self, msg: InboundMessage) -> tuple[str, bool]:
+        """What the owner wrote this turn, and whether it may authorise a subagent.
+
+        Only the owner's own words count. A goal continuation carries the
+        objective the owner set — its prompt also holds a drafted contract and
+        fixed instructions, which must not. A voice turn carries what the
+        owner said, not its wrapper. Introductions, goal controls and system
+        senders authorise nothing.
+        """
+        metadata = getattr(msg, "metadata", None) or {}
+        goal_id = metadata.get(_GOAL_CONTINUATION_ID)
+        if goal_id:
+            manager = getattr(self, "goal_manager", None)
+            state = manager.get(msg.session_key) if manager is not None else None
+            objective = str(getattr(state, "goal", "") or "")
+            return objective, bool(objective)
+        if (
+            metadata.get(_AGENT_INTRODUCTION)
+            or _is_goal_control_message(msg)
+            or not _is_user_activity_channel(msg.channel)
+            or msg.sender_id in {"goal", "process", "system", "subagent"}
+        ):
+            return msg.content or "", False
+        content = msg.content or ""
+        spoken = re.search(r'User said:\s*"(.*?)"', content, flags=re.DOTALL | re.IGNORECASE)
+        return (spoken.group(1).strip() if spoken else content), True
+
+    def _parallel_read_groups(
+        self,
+        tool_calls: Any,
+        *,
+        tools_allowed: bool,
+        live_call_turn: bool,
+        available_tool_names: set[str],
+    ) -> dict[str, list[Any]]:
+        """Runs of two or more consecutive pure reads, keyed by their first call.
+
+        Only pure reads qualify (see ``_PARALLEL_READ_TOOLS``) and only when
+        they sit next to each other: a read after a write must see what the
+        write did, so it waits its turn. Anything that writes, sends, asks or
+        looks at the screen keeps running one at a time, in order.
+        """
+        if not tools_allowed or live_call_turn:
+            return {}
+        groups: dict[str, list[Any]] = {}
+        current: list[Any] = []
+        for call in list(tool_calls or ()) + [None]:
+            if call is not None and call.name in _PARALLEL_READ_TOOLS and call.name in available_tool_names:
+                current.append(call)
+                continue
+            if len(current) >= 2:
+                groups[current[0].id] = current
+            current = []
+        return groups
+
+    def _start_parallel_reads(
+        self,
+        calls: list[Any],
+        *,
+        outbound_run_id: str,
+        execute_kwargs: dict[str, Any],
+        toolset_route: tuple[Any, Any],
+    ) -> dict[str, asyncio.Task]:
+        enabled_toolsets, disabled_toolsets = toolset_route
+        kwargs = {
+            **execute_kwargs,
+            "enabled_toolsets": enabled_toolsets,
+            "disabled_toolsets": disabled_toolsets,
+        }
+
+        def _start(call: Any) -> asyncio.Task:
+            name, args = call.name, dict(call.arguments)
+            task = asyncio.create_task(self._run_aborts.run_cancellable(
+                outbound_run_id, lambda: self.tools.execute(name, args, **kwargs),
+            ))
+            # A read the loop never awaits (the turn stopped or failed) must
+            # not surface as an unretrieved task error.
+            task.add_done_callback(
+                lambda t: t.exception() if not t.cancelled() else None
+            )
+            return task
+
+        return {call.id: _start(call) for call in calls}
+
     def _apply_turn_tool_policy(
         self,
         tool_defs: list[dict[str, Any]],
         live_call_turn: bool,
-        builtin_agent_dispatched: bool = False,
     ) -> tuple[list[dict[str, Any]], list[str]]:
         """Apply per-turn tool constraints for safety and predictability."""
-        # After an ASYNC (background) subagent was dispatched this turn, hide
-        # ALL tools. There is nothing more for the parent to DO in this turn —
-        # the work is now running in the background — so the next model step
-        # should be a short text acknowledgement ("started, I'll report back"),
-        # after which the loop ends naturally (no tool calls → break). This is
-        # what frees the parent to go idle promptly and answer each subagent's
-        # result INCREMENTALLY as it finishes, instead of marathoning on its own
-        # tool calls while completions pile up undelivered.
-        #
-        # All parallel dispatches in the SAME batch still run: the policy is
-        # applied at the START of an iteration, so the dispatch batch executes
-        # first and only the NEXT iteration is tool-less. Sync delegations don't
-        # set this flag (their result is returned inline, no "dispatched"
-        # envelope), so a synthesise-the-result turn keeps its full toolset.
-        if builtin_agent_dispatched:
-            hidden = [td.get("function", {}).get("name", "") for td in tool_defs]
-            return [], hidden
-
         if not live_call_turn:
             return tool_defs, []
 
@@ -5318,35 +5275,22 @@ class AgentLoop:
         )
 
         try:
-            contexts = await self.hooks.fire_pre_llm_call(ctx)
+            contexts = await asyncio.wait_for(
+                self.hooks.fire_pre_llm_call(ctx),
+                timeout=_PRE_LLM_HOOK_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"pre_llm_call hooks took over {_PRE_LLM_HOOK_TIMEOUT_SECONDS}s; "
+                "calling the model without plugin context"
+            )
+            contexts = []
         except Exception:
             logger.debug("pre_llm_call fire failed", exc_info=True)
             return messages
 
-        if not contexts:
-            return messages
-
-        injected = "\n\n".join(c for c in contexts if c)
-        if not injected:
-            return messages
-
-        # Prepend to the last user message inside <plugin_context> tags.
-        # Walk from the end so we hit the most recent user turn even if
-        # there are tool/assistant messages after it.
-        new_messages = list(messages)
-        for i in range(len(new_messages) - 1, -1, -1):
-            if new_messages[i].get("role") != "user":
-                continue
-            original = new_messages[i].get("content", "")
-            wrapped = (
-                f"<plugin_context>\n{injected}\n</plugin_context>\n\n{original}"
-                if isinstance(original, str)
-                else original  # multimodal user msgs (rare) — skip injection
-            )
-            new_messages[i] = {**new_messages[i], "content": wrapped}
-            break
-
-        return new_messages
+        injected = "\n\n".join(c for c in (contexts or []) if c)
+        return _with_plugin_context(messages, injected)
 
     async def _chat_with_stream(
         self,
@@ -5371,15 +5315,14 @@ class AgentLoop:
         outbound builder knows to stop iterating and flag the
         outgoing message as aborted.
         """
-        from flowly.providers.base import LLMResponse
-        accumulated_text = ""
-        final_response = None
-        chunk_count = 0
+        from flowly.providers.streamed_reply import StreamedReply
+
+        reply = StreamedReply()
         aborted = False
         steered = False
 
         async def consume_stream() -> None:
-            nonlocal accumulated_text, final_response, chunk_count, aborted
+            nonlocal aborted
             stream = self.provider.chat_stream(
                 messages=messages,
                 tools=tools,
@@ -5400,25 +5343,22 @@ class AgentLoop:
                         # Partial arguments keep the watchdog alive but never
                         # create a user-facing preparation stage or tool call.
                         self._touch_activity("receiving tool arguments")
-                    # Error text is routing input, not user-visible model output.
-                    # Keep it on the final response for classification but never
-                    # stream raw provider/SDK payloads into a client bubble.
-                    if chunk.content and chunk.finish_reason != "error":
-                        chunk_count += 1
-                        accumulated_text += chunk.content
-                        self._steering().observe_text(run_id, chunk.content)
+                    # Error text is routing input, not user-visible model output:
+                    # ``feed`` keeps it on the final response for classification
+                    # and never returns it as text for a client bubble.
+                    text = reply.feed(chunk)
+                    if text:
+                        self._steering().observe_text(run_id, text)
                         # Heartbeat for the inactivity watchdog — every stream
                         # chunk counts as progress. Without this a long streaming
                         # reply could look "idle" to the poller even though the
                         # model is actively emitting tokens.
                         self._touch_activity("receiving stream response")
-                        logger.debug(f"[stream] chunk #{chunk_count}: {len(chunk.content)} chars")
+                        logger.debug(f"[stream] chunk #{reply.chunks}: {len(text)} chars")
                         try:
-                            await stream_callback(chunk.content)
+                            await stream_callback(text)
                         except Exception as e:
                             logger.warning(f"[stream] stream_callback error: {e}")
-                    if chunk.finish_reason:
-                        final_response = chunk
 
             finally:
                 close_stream = getattr(stream, "aclose", None)
@@ -5436,80 +5376,23 @@ class AgentLoop:
 
         if aborted:
             logger.info(
-                f"[stream] aborted at chunk #{chunk_count}, "
-                f"{len(accumulated_text)} chars preserved, run_id={run_id}"
+                f"[stream] aborted at chunk #{reply.chunks}, "
+                f"{len(reply.text)} chars preserved, run_id={run_id}"
             )
 
-        logger.info(f"[stream] done: {chunk_count} chunks, {len(accumulated_text)} total chars{' (ABORTED)' if aborted else ''}")
+        logger.info(f"[stream] done: {reply.chunks} chunks, {len(reply.text)} total chars{' (ABORTED)' if aborted else ''}")
 
         if aborted or steered:
-            # Build a synthetic final response that carries the
-            # partial text + aborted finish_reason. We don't preserve
-            # any partial tool_calls — half-built tool_call deltas
-            # are unsafe to execute.
-            return LLMResponse(
-                content=accumulated_text or None,
-                finish_reason="aborted" if aborted else "steered",
-                usage=dict(final_response.usage) if steered and final_response and final_response.usage else {},
-                partial_content_delivered=bool(accumulated_text),
-            )
+            # A synthetic final response carrying the partial text and the
+            # aborted / steered finish_reason. Partial tool_calls are never
+            # kept — half-built tool_call deltas are unsafe to execute.
+            return reply.interrupted("aborted" if aborted else "steered", keep_usage=steered)
 
-        # Preserve usage across the final-response rebuild. The earlier
-        # constructions dropped ``usage`` by omission, which meant every
-        # streaming turn surfaced an empty usage dict to the accumulator
-        # in ``_run_llm_tool_loop``. Explicitly carrying it through lets
-        # prompt_tokens / cache_read_tokens / cache_write_tokens reach
-        # the outbound metadata (and, via channel event, the UI's
-        # context-window indicator). ``LLMResponse.usage`` is typed as
-        # a plain dict with a default factory, so we fall back to an
-        # empty dict rather than None to keep downstream ``dict.get``
-        # calls safe.
-        final_usage = dict(final_response.usage) if final_response and final_response.usage else {}
-        final_error_info = final_response.error_info if final_response else None
-        final_provider_state = (
-            dict(final_response.provider_state)
-            if final_response and final_response.provider_state
-            else {}
-        )
-        final_provider_replay = (
-            copy.deepcopy(final_response.provider_replay)
-            if final_response and final_response.provider_replay
-            else {}
-        )
-        if final_response is None:
-            final_response = LLMResponse(
-                content=accumulated_text or None,
-                finish_reason="stop",
-                usage=final_usage,
-                partial_content_delivered=bool(accumulated_text),
-                provider_state=final_provider_state,
-                provider_replay=final_provider_replay,
-            )
-        elif final_response.tool_calls:
-            # Final chunk had tool calls — content came in earlier deltas
-            final_response = LLMResponse(
-                content=accumulated_text or None,
-                tool_calls=final_response.tool_calls,
-                finish_reason=final_response.finish_reason,
-                usage=final_usage,
-                error_info=final_error_info,
-                partial_content_delivered=bool(accumulated_text),
-                provider_state=final_provider_state,
-                provider_replay=final_provider_replay,
-            )
-        else:
-            # Pure text — use accumulated content
-            final_response = LLMResponse(
-                content=accumulated_text or final_response.content,
-                finish_reason=final_response.finish_reason,
-                usage=final_usage,
-                error_info=final_error_info,
-                partial_content_delivered=bool(accumulated_text),
-                provider_state=final_provider_state,
-                provider_replay=final_provider_replay,
-            )
-
-        return final_response
+        # The finished reply as one response. Usage, the provider's
+        # continuity state and replay items come from the final chunk, so
+        # prompt_tokens / cache_read_tokens / cache_write_tokens reach the
+        # outbound metadata (and the UI's context-window indicator).
+        return reply.response()
 
     async def _chat_without_stream(
         self,
@@ -5561,16 +5444,7 @@ class AgentLoop:
     @staticmethod
     def _request_too_large_response(reason: str) -> LLMResponse:
         """Fail closed with machine-routable metadata and user-safe prose."""
-        logger.warning("Provider request blocked before dispatch: {}", reason)
-        return LLMResponse(
-            content="Error calling LLM: request input is too large after compaction",
-            finish_reason="error",
-            error_info=LLMErrorInfo(
-                status_code=413,
-                code="input_too_large",
-                type="request_too_large",
-            ),
-        )
+        return request_too_large_response(reason)
 
     async def _call_provider_with_context_recovery(
         self,
@@ -5779,6 +5653,18 @@ class AgentLoop:
                 metadata={"tool_progress_event": event},
             ))
 
+    def _internal_tool_calls(self, run_id: str) -> set[str]:
+        """Ids of this run's calls to internal tools (flowly.tool_activity),
+        so their results, which arrive as separate iteration events, are left
+        out too. Bounded: only recent runs are remembered."""
+        runs = self.__dict__.setdefault("_internal_tool_call_ids", {})
+        ids = runs.get(run_id)
+        if ids is None:
+            if len(runs) >= 64:
+                runs.pop(next(iter(runs)))
+            ids = runs[run_id] = set()
+        return ids
+
     async def _emit_iteration_event(
         self,
         *,
@@ -5814,28 +5700,19 @@ class AgentLoop:
         # Project a detached copy for product surfaces.  The canonical message
         # stays untouched in provider/session history so strict tool-call /
         # tool-result name matching remains valid.
-        from flowly.tool_activity import project_tool_messages_for_ui
+        from flowly.tool_activity import iteration_event_payload
 
         self._steering().observe_iteration(outbound_run_id, iteration_idx, message)
-        ui_message = project_tool_messages_for_ui([message])[0]
-        role = ui_message.get("role") or ""
-        if role not in ("assistant", "tool"):
+        # The agent's own bookkeeping (a goal, a follow-up) is no step. An
+        # assistant step whose calls were all hidden is still a boundary
+        # (``tool_calls: []``): the text streamed so far belongs to it, so a
+        # client moves it out of its live bubble instead of showing it twice.
+        event_payload = iteration_event_payload(
+            message, run_id=outbound_run_id, iteration_idx=iteration_idx,
+            internal_call_ids=self._internal_tool_calls(outbound_run_id),
+        )
+        if event_payload is None:
             return
-        event_payload: dict[str, Any] = {
-            "runId": outbound_run_id,
-            "iterationIdx": iteration_idx,
-            "role": role,
-            "content": ui_message.get("content") or "",
-        }
-        if role == "assistant" and ui_message.get("tool_calls"):
-            event_payload["tool_calls"] = ui_message["tool_calls"]
-        if role == "tool":
-            if ui_message.get("tool_call_id"):
-                event_payload["tool_call_id"] = ui_message["tool_call_id"]
-            if ui_message.get("name"):
-                event_payload["name"] = ui_message["name"]
-            if ui_message.get("tool_activity"):
-                event_payload["tool_activity"] = ui_message["tool_activity"]
 
         # Direct-callback path (the direct gateway / any ``process_direct``
         # caller): deliver the event straight to the caller's transport — e.g.
@@ -5878,7 +5755,6 @@ class AgentLoop:
     async def _run_llm_tool_loop(
         self,
         messages: list[dict[str, Any]],
-        action_turn: bool,
         live_call_turn: bool = False,
         turn_content: str = "",
         stream_callback: Callable[[str], Awaitable[None]] | None = None,
@@ -6002,6 +5878,7 @@ class AgentLoop:
             _record_turn_message(message)
 
         final_content: str | None = None
+        repetition = RepetitionGuard()
         accumulated_tool_results: list[dict[str, Any]] = []
         executed_tool_names: list[str] = []
         blocked_tools: list[str] = []
@@ -6039,13 +5916,15 @@ class AgentLoop:
         _current_session_key: str = session_key
         successful_tools_were_used = False
         no_tool_retry_count = 0
-        forced_tool_retry = False
         strict_live_call_action = live_call_turn and self._is_strict_live_call_action_intent(turn_content)
-        enforce_action_tools = (
-            tools_allowed
-            and action_turn
-            and (not live_call_turn or strict_live_call_action)
-        )
+        # Only an active phone call still enforces a tool call: there, a short
+        # spoken command ("kapat", "call him") must act, and the spoken reply
+        # is not a chat answer the owner can read and correct. Everywhere else
+        # the model decides whether a message asks for an action.
+        enforce_action_tools = tools_allowed and live_call_turn and strict_live_call_action
+        # One continuation when a reply ends announcing a step it did not take
+        # ("Ekrana bakıyorum:"). Structural, not a word list; the reply is kept.
+        announced_step_nudged = False
 
         # Counter for per-iteration WS events the channel layer
         # forwards to clients so the desktop / iOS tool-turn panel
@@ -6096,13 +5975,11 @@ class AgentLoop:
         # a single job can run on a different model than the gateway default).
         # Falls back to self.model when no override is supplied.
         selected_model = model_override or self.model
-        selected_temperature = self.action_temperature if action_turn else 0.7
+        selected_temperature = self.action_temperature if enforce_action_tools else 0.7
         max_turn_iterations = self.max_iterations
         if live_call_turn and not enforce_action_tools:
             max_turn_iterations = min(max_turn_iterations, 3)
 
-        # Built-in agent dispatch tracking (enterprise pattern: tool hiding)
-        _builtin_agent_dispatched = False
         # One-shot soft warning state — see soft_warn_at_iteration. We don't
         # hard-stop on iteration count; we trust the model
         # to decide when it's done via stop_reason="end_turn". The warning
@@ -6122,6 +5999,17 @@ class AgentLoop:
         # block near the loop tail for the full rationale.
         self._plan_nudged_this_turn = False
         self._general_plan_nudged_this_turn = False
+        # Which general plan (and which revision of it) existed when this turn
+        # began, so the end-turn guard can tell a plan this turn worked on
+        # from one left over by an earlier conversation.
+        try:
+            from flowly.plans.manager import get_plan_manager as _gpm_start
+            _start_plan = _gpm_start().get_current(_current_session_key)
+            self._turn_start_plan = (
+                (_start_plan.id, _start_plan.updatedAt) if _start_plan else None
+            )
+        except Exception:
+            self._turn_start_plan = None
 
         # NOTE: the repetition detector that lived here was removed in
         # 2026-05-02 because it produced false positives on legitimate
@@ -6239,7 +6127,12 @@ class AgentLoop:
                         if '"error"' in c[:300] or '"_occluded"' in c[:300]:
                             recent_errors += 1
                 error_rate = recent_errors / recent_total if recent_total else 0
-                healthy = recent_total >= 5 and error_rate < 0.4
+                # Results repeating ones the turn already had are no
+                # progress, however error-free.
+                healthy = (
+                    recent_total >= 5 and error_rate < 0.4
+                    and repetition.repeats_in_a_row < 2
+                )
 
                 logger.warning(
                     f"Soft iteration warning at {iteration}/{max_turn_iterations} "
@@ -6272,13 +6165,18 @@ class AgentLoop:
                     )
                 messages.append({"role": "user", "content": nudge, _EPHEMERAL_NUDGE: True})
 
+            # Subagents of this conversation its owner stopped while the turn
+            # runs: a fact the turn has no other way to learn.
+            owner_stops = self._owner_stops_note(session_key, messages)
+            if owner_stops:
+                messages.append({"role": "user", "content": owner_stops, _EPHEMERAL_NUDGE: True})
+
             tool_defs, policy_blocked_tools = self._apply_turn_tool_policy(
                 self._routed_tool_definitions(
                     tool_platform or outbound_channel,
                     disabled_tools=disabled_tools,
                 ),
                 live_call_turn=live_call_turn,
-                builtin_agent_dispatched=_builtin_agent_dispatched,
             )
             if policy_blocked_tools:
                 blocked_tools.extend(policy_blocked_tools)
@@ -6286,7 +6184,20 @@ class AgentLoop:
             # A no-tools turn advertises no schema at all. This reduces model
             # confusion and request size, but it is only the first layer: the
             # executor gate below still rejects hallucinated structured calls.
-            if not tools_allowed:
+            # A turn going round in circles answers with what it has.
+            answer_without_tools = tools_allowed and repetition.stalled
+            if answer_without_tools:
+                logger.warning(
+                    "[loop] {} tool results in a row repeated earlier ones; "
+                    "next call answers without tools",
+                    repetition.repeats_in_a_row,
+                )
+                messages.append({
+                    "role": "user",
+                    "content": ANSWER_NOW.format(count=repetition.repeats_in_a_row),
+                    _EPHEMERAL_NUDGE: True,
+                })
+            if not tools_allowed or answer_without_tools:
                 tool_defs = []
 
             # Caller-supplied hard block list — used by cron jobs to hide
@@ -6343,22 +6254,23 @@ class AgentLoop:
             # while the tool executes. On subsequent iterations (iteration > 1),
             # if the model hasn't called any tools yet, escalate to "required"
             # to force tool use and prevent infinite text-only loops.
-            if not tools_allowed:
+            if not tools_allowed or answer_without_tools:
                 tool_choice = "none"
             elif iteration == 1:
                 tool_choice = "auto"
             else:
                 tool_choice = (
                     "required"
-                    if ((enforce_action_tools or forced_tool_retry) and not successful_tools_were_used)
+                    if (enforce_action_tools and not successful_tools_were_used)
                     else "auto"
                 )
-            # Mid-turn tool result compaction — prevent context bloat
-            # Fix #22: Less aggressive — start at iteration 5 to preserve multi-step browser context
-            if iteration > 5:
-                messages = _strip_old_tool_results(messages, keep_last=3, max_old_chars=300)
-            if iteration > 8:
-                messages = _strip_old_tool_results(messages, keep_last=2, max_old_chars=150)
+            # Mid-turn tool result compaction — prevent context bloat. The
+            # schedule (from iteration 5, harder from 8, to preserve
+            # multi-step browser context) is shared with the subagent loop.
+            for keep_last, max_old_chars in iteration_strip_passes(iteration):
+                messages = _strip_old_tool_results(
+                    messages, keep_last=keep_last, max_old_chars=max_old_chars,
+                )
 
             logger.debug(
                 "LLM request telemetry: "
@@ -6375,7 +6287,7 @@ class AgentLoop:
                 f"{disclosure.disclosed_schema_tokens}, "
                 f"capability_guidance={_active_capability_guidance}, "
                 f"dynamic_guidance_chars={_dynamic_guidance_chars}, "
-                f"action_turn={action_turn}, live_call_turn={live_call_turn}, "
+                f"live_call_turn={live_call_turn}, "
                 f"tools_allowed={tools_allowed}, "
                 f"blocked_tools={sorted(set(blocked_tools))}, "
                 f"iteration={iteration}/{max_turn_iterations}"
@@ -6638,7 +6550,7 @@ class AgentLoop:
             logger.info(
                 "LLM response telemetry: "
                 f"has_tool_calls={response.has_tool_calls}, content_len={len(response.content or '')}, "
-                f"action_turn={action_turn}, live_call_turn={live_call_turn}, iteration={iteration}"
+                f"live_call_turn={live_call_turn}, iteration={iteration}"
             )
 
             # Two different accumulation semantics live in the same
@@ -6704,16 +6616,11 @@ class AgentLoop:
                     if asked and asked not in setup_question_text:
                         setup_question_text = f"{setup_question_text}\n\n{asked}".strip()
 
-                assistant_content = None
-                if response.content and not setup_question:
-                    content_lower = response.content.lower()
-                    hallucination_phrases = [
-                        "i did", "i sent", "i took", "i opened", "i closed",
-                        "done", "completed", "finished",
-                        "yaptım", "gönderdim", "aldım", "açtım", "kapattım", "tamamlandı",
-                    ]
-                    if not any(phrase in content_lower for phrase in hallucination_phrases):
-                        assistant_content = response.content
+                # The text written with a tool call is part of the model's own
+                # reasoning trail; keep it, whatever words it uses.
+                assistant_content = (
+                    response.content if response.content and not setup_question else None
+                )
 
                 messages = _add_assistant_turn_message(
                     messages,
@@ -6744,7 +6651,30 @@ class AgentLoop:
                 turn_tools: list[str] = []
                 terminal_action_executed = False
                 turn_success_count = 0
+                # Independent reads in one response run at the same time; the
+                # loop below still takes every call in order, through every
+                # gate, and only swaps its execution for the finished read.
+                _read_groups = self._parallel_read_groups(
+                    response.tool_calls,
+                    tools_allowed=tools_allowed,
+                    live_call_turn=live_call_turn,
+                    available_tool_names=available_tool_names,
+                )
+                _prefetched: dict[str, asyncio.Task] = {}
                 for tool_call in response.tool_calls:
+                    if tool_call.id in _read_groups:
+                        # A run of reads starts together only when the loop
+                        # reaches it: never ahead of a write before it.
+                        _prefetched.update(self._start_parallel_reads(
+                            _read_groups[tool_call.id],
+                            outbound_run_id=outbound_run_id,
+                            execute_kwargs={
+                                "session_key": _current_session_key,
+                                "platform": tool_platform or outbound_channel,
+                                "disabled_tools": frozenset(disabled_tools or ()),
+                            },
+                            toolset_route=self._resolve_toolset_route(tool_platform or outbound_channel),
+                        ))
                     # Stop is checked per call, not just per LLM iteration.
                     # This guarantees a batch of N tool calls never starts call
                     # N+1 after the user has stopped the run.
@@ -7107,19 +7037,6 @@ class AgentLoop:
                         ):
                             call_args["session_key"] = _current_session_key
 
-                        # Spawn interception: redirect spawn → builtin_agent
-                        # when task matches a specialist keyword (enterprise pattern)
-                        if _effective_tool_name == "spawn" and not _builtin_agent_dispatched:
-                            _task_text = str(call_args.get("task", ""))
-                            _detected_agent = _detect_builtin_agent_type(_task_text)
-                            if _detected_agent:
-                                logger.info(
-                                    f"Spawn intercepted → builtin:{_detected_agent} "
-                                    f"(keywords matched in task)"
-                                )
-                                call_args = {"agent": _detected_agent, "task": _task_text}
-                                _effective_tool_name = "builtin_agent"
-
                         _enabled_toolsets, _disabled_toolsets = self._resolve_toolset_route(
                             tool_platform or outbound_channel
                         )
@@ -7130,14 +7047,18 @@ class AgentLoop:
                             "disabled_toolsets": _disabled_toolsets,
                             "disabled_tools": frozenset(disabled_tools or ()),
                         }
-                        _tool_result = await self._run_aborts.run_cancellable(
-                            outbound_run_id,
-                            lambda: self.tools.execute(
-                                _effective_tool_name,
-                                call_args,
-                                **_execute_kwargs,
-                            ),
-                        )
+                        _prefetch_task = _prefetched.pop(tool_call.id, None)
+                        if _prefetch_task is not None:
+                            _tool_result = await _prefetch_task
+                        else:
+                            _tool_result = await self._run_aborts.run_cancellable(
+                                outbound_run_id,
+                                lambda: self.tools.execute(
+                                    _effective_tool_name,
+                                    call_args,
+                                    **_execute_kwargs,
+                                ),
+                            )
                         # Reply-media envelope: a tool (image_generate, screenshot)
                         # produced file(s) for THIS turn's reply. Peel the paths onto
                         # the turn collector and replace the raw JSON with the human
@@ -7203,21 +7124,6 @@ class AgentLoop:
                             logger.debug(
                                 f"Tool success: {_effective_tool_name} result={result[:180]}"
                             )
-                            # Track ASYNC (background) subagent dispatch so the
-                            # next iteration hides tools and the turn ends with a
-                            # plain acknowledgement — letting each subagent's
-                            # result be delivered and answered incrementally as it
-                            # finishes, instead of the parent marathoning on its
-                            # own tool calls (staying "busy") and forcing every
-                            # announce to queue up until the turn finally ends.
-                            # The async envelope reports status "dispatched"; the
-                            # older/spawn paths used "accepted" — match both. (The
-                            # previous "accepted"-only check never fired for an
-                            # async builtin_agent, so the turn never ended early.)
-                            if _effective_tool_name == "builtin_agent" and (
-                                '"dispatched"' in result or '"accepted"' in result
-                            ):
-                                _builtin_agent_dispatched = True
                         else:
                             logger.warning(
                                 f"Tool failed: {_effective_tool_name} result={result[:220]}"
@@ -7270,9 +7176,9 @@ class AgentLoop:
                     # awkward to promote; parent already has per-tool
                     # caps (_TOOL_MAX_CHARS) and can re-call the tool
                     # with a narrower query when it needs more detail.
-                    # Context persistence now exists only on the
-                    # subagent boundary (Assistant.cap_to_artifact).
                     sanitized_result = _sanitize_tool_result(result, _effective_tool_name)
+                    if repetition.observe(_effective_tool_name, sanitized_result):
+                        sanitized_result = mark_repeated(_effective_tool_name, sanitized_result)
 
                     # If the tool flagged its result as an image-bearing
                     # screenshot, extract the data URL from the RAW
@@ -7350,6 +7256,10 @@ class AgentLoop:
                         )
                         break
 
+                # A read the loop never reached (a stop, a terminal action, a
+                # gate) is not left running.
+                for _leftover in _prefetched.values():
+                    _leftover.cancel()
                 logger.debug(f"Tool execution telemetry: executed_tools={turn_tools}")
                 if outbound_run_id and self.is_run_aborted(outbound_run_id):
                     # Keep the model's already-streamed preamble as the partial
@@ -7366,7 +7276,6 @@ class AgentLoop:
                 tools_were_used = True
                 if turn_success_count > 0:
                     successful_tools_were_used = True
-                    forced_tool_retry = False
 
                 if steering.has_pending(outbound_run_id):
                     continue
@@ -7422,38 +7331,6 @@ class AgentLoop:
 
                 continue
 
-            # Provider/model may hallucinate completion without emitting tool calls.
-            # Guard: force a corrective tool-only retry before responding.
-            # Gated on action_turn: a completion claim is only suspicious when the
-            # USER asked for an action this turn. On Q&A / retrospective turns
-            # ("toplam tool kullanımlarını söyler misin?") the model naturally says
-            # "şunları yaptım/kullandım" while reporting history — firing here
-            # discarded a correct streamed answer and forced an irrelevant tool
-            # call (observed 2026-06-11: sessions_list forced on a usage question).
-            if (
-                action_turn
-                and not successful_tools_were_used
-                and response.content
-                and self._contains_unverified_completion_claim(response.content)
-                and no_tool_retry_count < self.action_tool_retries
-            ):
-                no_tool_retry_count += 1
-                forced_tool_retry = True
-                logger.warning(
-                    "Completion claim without tool call; retrying with forced tool instruction "
-                    f"({no_tool_retry_count}/{self.action_tool_retries})"
-                )
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "The previous response claims the action was done but no tool was called. "
-                        "You must call the appropriate tool now. "
-                        "Do not claim completion without executing a tool."
-                    ),
-                    _EPHEMERAL_NUDGE: True,
-                })
-                continue
-
             if enforce_action_tools and not successful_tools_were_used:
                 if no_tool_retry_count < self.action_tool_retries:
                     no_tool_retry_count += 1
@@ -7474,10 +7351,6 @@ class AgentLoop:
                 final_content = "Tool call could not be verified, no action was taken."
                 break
 
-            if forced_tool_retry and not successful_tools_were_used:
-                final_content = "Tool call could not be verified, no action was taken."
-                break
-
             # Guard: think-only empty response — model produced thinking
             # but no content and no tool calls. Retry up to 2 times.
             if not response.content or not response.content.strip():
@@ -7490,6 +7363,37 @@ class AgentLoop:
                     continue
                 # Give up after 2 retries
                 logger.error("Empty response after 2 retries — using fallback")
+
+            # A reply that ends announcing a step ("Ekrana bakıyorum:") but
+            # took none gets one continuation. Its text stays the answer if the
+            # model still answers in prose.
+            if (
+                tools_allowed
+                and not live_call_turn
+                and not announced_step_nudged
+                and _announces_untaken_step(response.content)
+            ):
+                announced_step_nudged = True
+                logger.info("Reply announced a step without taking it; continuing once")
+                # Already streamed to the owner: keep it in the history too,
+                # so the transcript matches what they saw.
+                _append_turn_message(messages, {"role": "assistant", "content": response.content})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Continue: take the step you just announced. If no tool is "
+                        "needed after all, give your answer."
+                    ),
+                    _EPHEMERAL_NUDGE: True,
+                })
+                continue
+
+            # Ending the turn is right, plan or not, when this conversation's
+            # subagents are still working (their results start the next turn)
+            # or when the turn was told to answer without tools.
+            _end_turn_expected = repetition.stalled or self._has_running_subagents(
+                _current_session_key,
+            )
 
             # ── Plan end-turn guard (Phase 2b) ──────────────────────
             # If a plan was created in this turn AND it's still active
@@ -7507,7 +7411,7 @@ class AgentLoop:
             #   3. Errors during the check are swallowed — guard must
             #      NEVER block end-turn on infrastructure issues.
             try:
-                if not getattr(self, "_plan_nudged_this_turn", False):
+                if not _end_turn_expected and not getattr(self, "_plan_nudged_this_turn", False):
                     from flowly.agent.planner.state import get_plan_state
                     sess = getattr(self.tools, "_active_session_id", "") or ""
                     plan = get_plan_state().get(sess) if sess else None
@@ -7566,7 +7470,7 @@ class AgentLoop:
             # agent is trying to end, nudge once to finish / block / hand
             # back. Never fires for sessions without a general plan.
             try:
-                if not getattr(self, "_general_plan_nudged_this_turn", False):
+                if not _end_turn_expected and not getattr(self, "_general_plan_nudged_this_turn", False):
                     from flowly.plans.manager import get_plan_manager
                     gplan = get_plan_manager().get_current(_current_session_key)
                     if gplan and gplan.status == "executing":
@@ -7578,7 +7482,13 @@ class AgentLoop:
                             s.status in ("completed", "blocked", "skipped")
                             for s in gplan.steps
                         )
-                        if g_progress and g_unfinished:
+                        # A plan proposed or ticked during this turn counts
+                        # even with nothing finished: ending on it would leave
+                        # the tray stuck at 0/N.
+                        g_touched = getattr(self, "_turn_start_plan", None) != (
+                            gplan.id, gplan.updatedAt
+                        )
+                        if (g_progress or g_touched) and g_unfinished:
                             self._general_plan_nudged_this_turn = True
                             g_summary = ", ".join(
                                 f"#{s.id} ({s.status})" for s in g_unfinished[:5]
@@ -7591,13 +7501,13 @@ class AgentLoop:
                                 "role": "user",
                                 "content": (
                                     f"You're ending the turn but the plan is still "
-                                    f"active. Unfinished steps: {g_summary}. Either "
-                                    f"finish them (mark each in_progress then "
-                                    f"completed with plan(action='update_step')), or "
-                                    f"if genuinely blocked call "
-                                    f"plan(action='block', summary='why'), or if the "
-                                    f"work is done call plan(action='complete'). "
-                                    f"Don't claim done if the steps aren't."
+                                    f"active. Unfinished steps: {g_summary}. If that "
+                                    f"work is done, mark them all in ONE call: "
+                                    f"plan(action='update', steps=[{{id, status: "
+                                    f"'completed'}}, ...]) (or 'skipped'). If it isn't, "
+                                    f"finish it, or call plan(action='block', "
+                                    f"summary='why') if you genuinely can't. Don't "
+                                    f"claim done if the steps aren't."
                                 ),
                                 _EPHEMERAL_NUDGE: True,
                             })
@@ -7681,20 +7591,10 @@ class AgentLoop:
         if run_was_aborted and final_content is None:
             final_content = ""
 
-        if (
-            final_content
-            and not run_was_aborted
-            and not executed_tool_names
-            and (action_turn or self._is_retry_action_followup(turn_content))
-            and self._contains_unverified_completion_claim(final_content)
-        ):
-            logger.warning("Suppressed unverified completion claim because no tool was executed.")
-            final_content = "No tool was executed, no action was taken."
-
         logger.info(
             "LLM final telemetry: "
             f"final_content_length={len(final_content)}, executed_tools={executed_tool_names}, "
-            f"action_turn={action_turn}, live_call_turn={live_call_turn}, "
+            f"live_call_turn={live_call_turn}, "
             f"blocked_tools={sorted(set(blocked_tools))}"
         )
 
@@ -7994,6 +7894,9 @@ class AgentLoop:
                 not binding.is_active
                 or binding.session_key != msg.session_key
                 or (binding.run_id and binding.run_id != run_id)
+                # A system notice (a subagent's report) acts for nobody else:
+                # the same turn over the bus never had collaboration authority.
+                or msg.channel == "system"
             ):
                 binding = None
             host = getattr(self, "_profile_collaboration_host", None)
@@ -8026,6 +7929,14 @@ class AgentLoop:
                             or self.goal_user_epoch(msg.session_key) != base_epoch):
                         skipped_goal()
                         return None
+                if msg.metadata.get(REPORT_TURN) and self._notice_already_handled(msg):
+                    # The main agent already took this result with agent_wait.
+                    # Decided before the run announces itself, so a client
+                    # never adopts a run that ends with nothing.
+                    logger.info("Subagent notice already handled in its turn; skipping")
+                    if commands is not None:
+                        commands.settle(msg.session_key, run_id, 'aborted')
+                    return None
                 if commands is not None:
                     commands.begin_execution(msg.session_key, run_id, before_goal)
                 outcome = 'error'
@@ -8041,7 +7952,13 @@ class AgentLoop:
                             result = on_started(msg.content)
                             if inspect.isawaitable(result):
                                 await result
-                        response = await self._process_message_unlocked(msg)
+                        try:
+                            response = await self._process_message_unlocked(msg)
+                        finally:
+                            # Still under the turn lock: results this turn
+                            # took with agent_wait but never saved go back
+                            # to be announced (saved ones are delivered).
+                            self._release_subagent_results(msg)
                         if response is not None and msg.channel != 'system':
                             # The transport session id can be reused or have legacy
                             # aliases. The run's own stable conversation is authoritative.
@@ -8087,6 +8004,70 @@ class AgentLoop:
                     binding.close()
                 PROFILE_RUN_BINDING.reset(token)
 
+    def _notice_already_handled(self, msg: InboundMessage) -> bool:
+        """True when a subagent's notice was already taken inside a turn."""
+        subagents = getattr(self, "subagents", None)
+        return (
+            msg.sender_id == "subagent"
+            and subagents is not None
+            and subagents.notice_already_handled(msg.content or "")
+        )
+
+    def _committed_subagent_reports(self, session_key: str) -> set[str]:
+        """Subagent results the saved turns of ``session_key`` handled."""
+        session = self.sessions.read(session_key)
+        if session is None:
+            return set()
+        return {rid for rid in session.metadata.get(SUBAGENT_REPORTS_KEY) or [] if isinstance(rid, str)}
+
+    def _bind_subagent_turn(self, msg: InboundMessage, session_key: str, turn: DelegationTurn) -> None:
+        """Remember which turn ``msg`` runs, so its taken results are its own."""
+        if not hasattr(self, "_subagent_turns"):
+            self._subagent_turns: dict[int, tuple[str, str]] = {}
+        self._subagent_turns[id(msg)] = (session_key, turn.turn_id)
+
+    def _subagent_turn_reports(self, session_key: str, notice_run_ids: list[str] | None = None,
+                               turn: DelegationTurn | None = None) -> list[str]:
+        """The subagent results a turn handled, to be committed with its save."""
+        subagents = getattr(self, "subagents", None)
+        if subagents is None or not hasattr(subagents, "turn_reports"):
+            return list(notice_run_ids or [])
+        return subagents.turn_reports(session_key, notice_run_ids, turn.turn_id if turn else None)
+
+    def _owner_stops_note(self, session_key: str, messages: list[dict[str, Any]]) -> str:
+        """The subagents the owner stopped since this turn last looked, as a note; or "".
+
+        Taken by this turn (``SubagentManager.take_owner_stops``): its save
+        delivers them, so no later notice repeats them. A run the turn's own
+        notice already reports is left to it.
+        """
+        subagents = getattr(self, "subagents", None)
+        turn = current_turn()
+        if subagents is None or turn is None or not hasattr(subagents, "take_owner_stops"):
+            return ""
+
+        def known(run_id: str) -> bool:
+            return any(
+                m.get("role") == "user" and run_id in str(m.get("content") or "")
+                for m in messages
+            )
+
+        try:
+            return subagents.take_owner_stops(turn.session_key or session_key, turn.turn_id, known)
+        except Exception:
+            logger.exception("Could not read which subagents the owner stopped")
+            return ""
+
+    def _release_subagent_results(self, msg: InboundMessage) -> None:
+        bound = getattr(self, "_subagent_turns", {}).pop(id(msg), None)
+        subagents = getattr(self, "subagents", None)
+        if bound is None or subagents is None:
+            return  # the turn never got far enough to take any
+        try:
+            subagents.release_taken(*bound)
+        except Exception:
+            logger.exception("Could not give back subagent results of an unsaved turn")
+
     async def _process_message_unlocked(
         self, msg: InboundMessage
     ) -> OutboundMessage | None:
@@ -8102,6 +8083,8 @@ class AgentLoop:
         # Handle system messages (subagent announces)
         # The chat_id contains the original "channel:chat_id" to route back to
         if msg.channel == "system":
+            if msg.metadata.get(_AGENDA_ITEM) and getattr(self, "agenda", None) is not None:
+                return await self._process_agenda_wake(msg)
             return await self._process_system_message(msg)
 
         # pre_gateway_dispatch — let plugins drop or rewrite the inbound
@@ -8139,6 +8122,11 @@ class AgentLoop:
             and not msg.metadata.get(_AGENT_INTRODUCTION)
         ):
             self._dreamer_last_user_ts = time.time()
+            agenda = getattr(self, "agenda", None)
+            if agenda is not None:
+                # The owner's silence there is over: the agent's unanswered
+                # count resets, and follow-ups their reply settles go away.
+                agenda.owner_wrote(msg.session_key)
 
         # Mark parent session busy so subagent announces are queued, not injected mid-processing
         self.subagents.mark_busy(msg.session_key)
@@ -8819,9 +8807,6 @@ class AgentLoop:
         if isinstance(spawn_tool, SpawnTool):
             spawn_tool.set_context(tool_channel, tool_chat_id, is_subagent=False)
 
-        builtin_agent_tool = self.tools.get("builtin_agent")
-        if builtin_agent_tool and hasattr(builtin_agent_tool, "set_context"):
-            builtin_agent_tool.set_context(tool_channel, tool_chat_id)
 
         cron_tool = self.tools.get("cron")
         if isinstance(cron_tool, CronTool):
@@ -9234,9 +9219,6 @@ class AgentLoop:
             available_tools=turn_available_tools,
             reachable_tools=turn_reachable_tools,
         )
-        self._inject_recent_artifacts_hint(
-            messages, session_key=msg.session_key,
-        )
         from flowly.agent_home import begin_turn
         try:
             # Classifies this turn (introduction, tapped choice, typed message)
@@ -9253,39 +9235,12 @@ class AgentLoop:
             voice_mode=voice_mode_flag,
         )
 
-        action_turn = self._is_action_turn(msg.channel, msg.content)
-        if not action_turn and self._should_promote_retry_to_action(msg.content, history):
-            action_turn = True
-        if (
-            not action_turn
-            and tools_allowed
-            and self._consume_pending_action_lock(session, msg.content)
-        ):
-            action_turn = True
-            logger.info("Pending action lock promoted this turn to action_turn=True")
         live_call_turn = self._is_live_call_turn(msg.content)
         stream_callback = msg.metadata.get("stream_callback")
         on_iteration = msg.metadata.get("on_iteration")
         on_tool_progress = msg.metadata.get("on_tool_progress")
         model_override = msg.metadata.get("model_override")
         disabled_tools = msg.metadata.get("disabled_tools")
-
-        # A tool-less turn can NEVER satisfy action-turn enforcement — the loop
-        # would spin retrying for a tool call that is impossible, alarm, and fall
-        # back to a summary. The flowlet vision runner deliberately disables ALL
-        # tools and feeds an attacker-supplied photo whose prompt may contain
-        # action words ("card statement screenshot" hit the \bscreenshot\b
-        # pattern). If every tool is disabled, drop the action-turn flag.
-        if action_turn and (
-            not tools_allowed
-            or not turn_available_tools
-            or self._all_tools_disabled(disabled_tools)
-        ):
-            action_turn = False
-            logger.info(
-                "Action-turn flag cleared: no tools available for this turn "
-                "(nothing to enforce)."
-            )
 
         # Append-only durable delta for this turn. The provider-facing working
         # list can be rebound or shrunk by recovery/compaction without changing
@@ -9319,12 +9274,23 @@ class AgentLoop:
 
         # Keep a positive ceiling for the whole turn, not just a deny list
         # computed from one registry snapshot. Late MCP discovery cannot widen it.
+        owner_text, owner_authored = self._delegation_owner_text(msg)
+        delegation_turn = DelegationTurn(
+            owner_text=owner_text,
+            conversation=conversation_from_history(history, owner_text if owner_authored else ""),
+            model=effective_model,
+            owner_authored=owner_authored,
+            origin_channel=tool_channel,
+            origin_chat_id=tool_chat_id,
+            session_key=msg.session_key,
+            should_yield=self._turn_should_yield(msg.metadata.get("run_id") or ""),
+        )
+        self._bind_subagent_turn(msg, msg.session_key, delegation_turn)
         with tool_execution_scope(msg.session_key, allowed_tools=allowed_tools if tools_allowed else frozenset()), self._steering().register(
             msg.metadata.get("run_id") or "", msg.session_key, persist_guidance
-        ):
+        ), delegation_turn_scope(delegation_turn):
             final_content, tool_results, _executed_tools, usage, _loop_messages = await self._run_llm_tool_loop(
                 messages=messages,
-                action_turn=action_turn,
                 live_call_turn=live_call_turn,
                 turn_content=msg.content,
                 stream_callback=stream_callback,
@@ -9356,14 +9322,6 @@ class AgentLoop:
             int((time.monotonic() - turn_started_at) * 1000),
         )
 
-        if action_turn:
-            successful_tools = [r for r in tool_results if r.get("success")]
-            if successful_tools:
-                self._clear_pending_action_lock(session)
-            else:
-                self._set_pending_action_lock(session, display_content)
-                logger.warning("Action turn ended without successful tool execution; pending lock armed.")
-
         # P4 — voice mode response sanitizer. The prompt already tells
         # the model not to emit markdown/emoji/URLs for TTS, but models
         # drift. Strip the obvious TTS-hostile patterns so the client
@@ -9388,8 +9346,20 @@ class AgentLoop:
         introduction_failed = introduction_turn and (
             bool(provider_error) or turn_aborted or not str(final_content or "").strip()
         )
+        # Goals this turn started tracking or finished: their cards ride the
+        # closing reply (live and in history), since the objective tool's own
+        # calls never show (flowly/objectives/cards.py).
+        goal_cards: list[dict[str, Any]] = []
+        if not provider_error and not turn_aborted:
+            try:
+                from flowly.objectives.cards import goal_cards_from_turn
+
+                goal_cards = goal_cards_from_turn(turn_messages)
+            except Exception as exc:  # noqa: BLE001 — a card never fails a turn
+                logger.debug(f"[goals] card skipped: {exc}")
         if not introduction_failed:
             session.extend_with_turn_messages(
+                goal_cards=goal_cards or None,
                 user_content=display_content,
                 new_messages=turn_messages,
                 final_content=final_content,
@@ -9418,7 +9388,16 @@ class AgentLoop:
                 provider_state_out,
                 turn_start_index=turn_start_index,
             )
+        # Subagent results this turn took with agent_wait are delivered by
+        # this save, and only by it (see SubagentManager.release_taken).
+        subagent_reports = (
+            self._subagent_turn_reports(msg.session_key, turn=delegation_turn)
+            if not introduction_failed else []
+        )
+        record_subagent_reports(session.metadata, subagent_reports)
         self.sessions.save(session)
+        if subagent_reports:
+            self.subagents.mark_delivered(msg.session_key, subagent_reports)
         await self._index_turn_media(
             session, reply_media_assets, msg.media, msg.channel
         )
@@ -9517,6 +9496,7 @@ class AgentLoop:
                    if reply_media_assets else {}),
                 "tool_results": tool_results,
                 "executed_tools": _executed_tools,
+                **({"goalCards": goal_cards} if goal_cards else {}),
                 "toolPolicy": "auto" if tools_allowed else "none",
                 # Failed/aborted turns may contain usage from an earlier
                 # successful iteration, not the terminal request. Keep that
@@ -9606,6 +9586,21 @@ class AgentLoop:
             },
         )
 
+    async def _process_agenda_wake(self, msg: InboundMessage) -> OutboundMessage | None:
+        """A follow-up the agent planned for itself (flowly/agenda/service.py).
+
+        It runs as a hidden system turn in the conversation it is about. The
+        agenda waits on its outcome; a turn that fails tells it at once, so
+        the wake-up is retried later instead of holding the agenda for the
+        whole turn timeout.
+        """
+        item_id = str(msg.metadata.get(_AGENDA_ITEM) or "")
+        try:
+            return await self._process_system_message(msg)
+        except Exception:
+            self.agenda.turn_finished(item_id, delivered=False, text="", session_key=msg.chat_id, failed=True)
+            raise
+
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
         Process a system message (e.g., subagent announce).
@@ -9625,8 +9620,40 @@ class AgentLoop:
             origin_channel = "cli"
             origin_chat_id = msg.chat_id
         
-        # Use the origin session for context
-        session_key = f"{origin_channel}:{origin_chat_id}"
+        subagents = getattr(self, "subagents", None)
+        if (
+            msg.sender_id == "subagent"
+            and subagents is not None
+            and subagents.notice_already_handled(msg.content or "")
+        ):
+            # The main agent already took this result or message with
+            # agent_wait during its turn; handling it again would repeat it.
+            logger.info("Subagent notice already handled in its turn; skipping")
+            return None
+
+        # The conversation the notice belongs to. Work started in a desktop
+        # chat names that chat's own key; other notices fall back to the
+        # delivery address.
+        session_key = (
+            msg.session_key
+            if not msg.session_key.startswith("system:")
+            else f"{origin_channel}:{origin_chat_id}"
+        )
+        # A subagent's report run by a surface's chat runner streams like the
+        # owner's turn: deltas, tool steps and tool progress go to the
+        # runner's callbacks, and the runner sends the one final. Without a
+        # runner (the bus) the reply is delivered after the turn, as before.
+        live_report = bool(msg.metadata.get(REPORT_TURN)) and msg.sender_id == "subagent"
+        # Filled only for a live report: its runner turns a provider failure
+        # into the native error event, as for the owner's turn.
+        provider_error: dict[str, Any] = {}
+        report_turn = msg.sender_id == "subagent" and not msg.metadata.get(_AGENDA_ITEM)
+        run_id = str(msg.metadata.get("run_id") or "")
+        turn_started_at = time.monotonic()
+        if report_turn:
+            # Compaction before the turn, as the owner's turn has it: a long
+            # conversation fits before the results land in it. Stop ends it.
+            await self._compact_before_report(session_key, origin_channel, origin_chat_id, run_id)
         session = self.sessions.get_or_create(session_key)
         
         # Update tool contexts
@@ -9638,9 +9665,6 @@ class AgentLoop:
         if isinstance(spawn_tool, SpawnTool):
             spawn_tool.set_context(origin_channel, origin_chat_id)
 
-        builtin_agent_tool = self.tools.get("builtin_agent")
-        if builtin_agent_tool and hasattr(builtin_agent_tool, "set_context"):
-            builtin_agent_tool.set_context(origin_channel, origin_chat_id)
 
         cron_tool = self.tools.get("cron")
         if isinstance(cron_tool, CronTool):
@@ -9653,14 +9677,20 @@ class AgentLoop:
 
         # Build messages with the announce content. This path is the
         # subagent-completion-announce turn — the parent wakes back up
-        # to deliver the specialist's result, so it runs on the parent
+        # to deliver the subagent's result, so it runs on the parent
         # agent's primary model (self.model), not on any per-cron
         # override (subagent runs are out-of-band by then). The
         # announce turn is delivered on the parent's origin channel,
         # so the channel hint must match origin_channel rather than
         # the announce message's transport channel.
+        # A wake-up of the agent's own agenda runs with nobody watching: its
+        # tools are the "agenda" route's (look things up, memory, past
+        # conversations, goals and follow-ups — nothing that acts), and nothing
+        # of it streams to a client before it decides to say something.
+        agenda_item = str(msg.metadata.get(_AGENDA_ITEM) or "")
+        tool_route = "agenda" if agenda_item else origin_channel
         system_disclosure = self._routed_tool_disclosure(
-            origin_channel,
+            tool_route,
             intent_text=msg.content,
         )
         system_available_tools = {
@@ -9681,26 +9711,6 @@ class AgentLoop:
             available_tools=system_available_tools,
             reachable_tools=set(system_disclosure.all_names),
         )
-        self._inject_recent_artifacts_hint(
-            messages, session_key=f"{origin_channel}:{origin_chat_id}",
-        )
-
-        # A system wake-up (subagent announce, board / exec / delegate
-        # notification) delivers a RESULT for the parent to synthesize and hand
-        # to the user — it is NOT a user action request. Classifying it from the
-        # announce CONTENT (the subagent's own report, which routinely contains
-        # words like "gönder" / "bildir" / "send") wrongly flips this into
-        # action-enforce mode: the parent is then forced to call a tool AFTER
-        # the real work is already done, and when it has nothing valid left to
-        # call the loop emits the misleading "Tool calls failed, no action was
-        # taken." (Observed with multi-subagent research fan-out: each
-        # completion woke the parent into a forced-tool turn that failed.)
-        #
-        # A delivery turn must never enforce tools — the model summarizes (and
-        # MAY optionally call message / artifact) without being forced. This
-        # mirrors how an async-delegation completion re-enters as a plain,
-        # non-enforced message turn rather than an action request.
-        action_turn = False
         live_call_turn = self._is_live_call_turn(msg.content)
         turn_messages: list[dict[str, Any]] = []
         reply_media: list[str] = []
@@ -9709,51 +9719,139 @@ class AgentLoop:
         reply_media_assets: list = []
         provider_state = self._provider_continuity_state(session)
         provider_state_out: dict[str, Any] = {}
-        final_content, tool_results, _executed_tools, system_usage, _loop_messages = await self._run_llm_tool_loop(
-            messages=messages,
-            action_turn=action_turn,
-            live_call_turn=live_call_turn,
-            turn_content=msg.content,
-            session_key=f"{origin_channel}:{origin_chat_id}",
-            tool_platform=origin_channel,
-            outbound_channel=origin_channel,
-            outbound_chat_id=origin_chat_id,
-            outbound_run_id=msg.metadata.get("run_id") or "",
-            reply_media=reply_media,
-            reply_media_assets=reply_media_assets,
-            turn_messages_out=turn_messages,
-            provider_state=provider_state,
-            provider_state_out=provider_state_out,
+        # A system wake-up (a subagent's result, a notice) is not the owner
+        # speaking: nothing in it counts as the owner asking for a subagent.
+        # The owner's next message waits behind this turn rather than
+        # entering it, so this turn stops waiting as soon as one arrives.
+        owner_epoch = self.goal_user_epoch(session_key)
+        system_turn = DelegationTurn(
+            owner_text=msg.content or "",
+            conversation=conversation_from_history(self._history_with_summary_anchor(session)),
+            model=self.model,
+            owner_authored=False,
+            origin_channel=origin_channel,
+            origin_chat_id=origin_chat_id,
+            session_key=session_key,
+            # Not steerable: the turn is the agent's own and its trigger is a
+            # hidden system notice. What the owner writes meanwhile is their
+            # next turn; its arrival ends any waiting here (the epoch moves
+            # before that turn queues for the lock), and so does Stop.
+            should_yield=lambda: (
+                self.goal_user_epoch(session_key) != owner_epoch
+                or (bool(run_id) and self.is_run_aborted(run_id))
+            ),
+            steerable=False,
         )
+        self._bind_subagent_turn(msg, session_key, system_turn)
+        with delegation_turn_scope(system_turn):
+            final_content, tool_results, _executed_tools, system_usage, _loop_messages = await self._run_llm_tool_loop(
+                messages=messages,
+                live_call_turn=live_call_turn,
+                turn_content=msg.content,
+                session_key=session_key,
+                tool_platform=tool_route,
+                outbound_channel="" if agenda_item else origin_channel,
+                outbound_chat_id="" if agenda_item else origin_chat_id,
+                outbound_run_id=msg.metadata.get("run_id") or "",
+                reply_media=reply_media,
+                reply_media_assets=reply_media_assets,
+                turn_messages_out=turn_messages,
+                provider_state=provider_state,
+                provider_state_out=provider_state_out,
+                **({
+                    "stream_callback": msg.metadata.get("stream_callback"),
+                    "on_iteration": msg.metadata.get("on_iteration"),
+                    "on_tool_progress": msg.metadata.get("on_tool_progress"),
+                    "error_out": provider_error,
+                } if live_report else {}),
+            )
+        turn_aborted = bool(run_id) and self.is_run_aborted(run_id)
+        turn_duration_ms = max(0, int((time.monotonic() - turn_started_at) * 1000))
 
-        # No pending-action-lock bookkeeping here: a system/announce turn is a
-        # delivery turn (action_turn is always False above), so it neither sets
-        # nor clears the lock — that lifecycle belongs to real user action turns.
+        # An agenda wake-up speaks only when its reply starts with [SEND]
+        # (flowly/agenda/prompts.py). Otherwise nothing of it stays in the
+        # conversation: no hidden trigger, no reply, no push. What its tools
+        # recorded (a goal's log) stays.
+        agenda_cards: list[dict[str, Any]] = []
+        if agenda_item:
+            from flowly.agenda.prompts import wake_decision
+
+            send, message = wake_decision(final_content)
+            if not send:
+                if getattr(self, "agenda", None) is not None:
+                    self.agenda.turn_finished(agenda_item, delivered=False, text="", session_key=session_key)
+                logger.info(f"[agenda] {agenda_item} stayed silent in {session_key}")
+                return None
+            final_content = message
+            # A check-in about a goal carries the goal's card, so the message
+            # leads to it (flowly/objectives/cards.py).
+            agenda_goal = str(msg.metadata.get("agenda_goal") or "")
+            if agenda_goal:
+                try:
+                    from flowly.objectives.cards import checkin_card
+
+                    card = checkin_card(agenda_goal)
+                    if card is not None:
+                        agenda_cards = [card]
+                except Exception as exc:  # noqa: BLE001 — a card never fails a turn
+                    logger.debug(f"[agenda] check-in card skipped: {exc}")
+
 
         # Save to session (mark as system message in history). Full
         # tool-protocol structure is preserved by
         # ``extend_with_turn_messages`` so a subagent's tool work is
         # visible to the parent agent on the next turn.
         turn_start_index = len(session.messages)
+        # A report delivered by the local push below gets a run identity of
+        # its own, saved with the reply and carried by the push, so a client
+        # that showed the push recognises the saved row instead of adding it
+        # a second time.
+        local_push = bool(final_content) and not live_report and origin_channel in (
+            "cli", "tui", "desktop", "ios", "android",
+        )
+        saved_run_id = run_id or (uuid.uuid4().hex if local_push and report_turn else "")
+        if provider_error:
+            # Like the owner's turn: the error text stays in history but is
+            # not an assistant completion with a run identity.
+            saved_run_id = ""
         session.extend_with_turn_messages(
+            goal_cards=agenda_cards or None,
             user_content=f"[System: {msg.sender_id}] {msg.content}",
             new_messages=turn_messages,
             final_content=final_content,
-            usage=system_usage,
+            # A stopped report keeps its usage for accounting only, like the
+            # owner's turn: it may describe an earlier request of the turn.
+            usage=system_usage if not turn_aborted and not provider_error else None,
+            **({"accounting_usage": system_usage} if turn_aborted or provider_error else {}),
             reply_media=reply_media or None,
             reply_media_assets=reply_media_assets or None,
             # System triggers (subagent/board/memory announces) drive this turn
             # and stay in the LLM context, but must never render in the chat as a
             # user message — only the assistant's summary is user-facing.
             user_display_hidden=True,
-            run_id=(msg.metadata.get("run_id") or None),
+            run_id=(saved_run_id or None),
+            **({"aborted": turn_aborted, "duration_ms": turn_duration_ms} if live_report else {}),
         )
         self._commit_provider_continuity(
             session,
             provider_state_out,
             turn_start_index=turn_start_index,
         )
+        # The results this turn handled — the notice's, and any it took with
+        # agent_wait — are recorded in the same save as the turn: that save
+        # is what delivers them. A crash right after it cannot make a
+        # restart announce them a second time.
+        subagent_reports = self._subagent_turn_reports(
+            session_key,
+            _SUBAGENT_RUN_ID_RE.findall(msg.content or "") if msg.sender_id == "subagent" else [],
+            system_turn,
+        )
+        record_subagent_reports(session.metadata, subagent_reports)
         self.sessions.save(session)
+        if subagent_reports and subagents is not None:
+            # The conversation has now handled these results; a goal waiting
+            # on them may continue.
+            subagents.mark_delivered(session_key, subagent_reports)
         # A system/announce turn has no inbound attachment — it is triggered by
         # the agent's own machinery, not by a person handing it a file.
         await self._index_turn_media(session, reply_media_assets, None, origin_channel)
@@ -9765,27 +9863,180 @@ class AgentLoop:
         # so the reply actually shows up. Request-scoped replies don't come
         # through here, so there's no double delivery; remote channels
         # (Telegram/…) are delivered by their adapter via the return below.
-        if final_content and origin_channel in ("cli", "tui", "desktop"):
+        #
+        # A report a surface's runner started is not pushed: the runner sends
+        # its final, under the run id it streamed.
+        if local_push:
             gw = getattr(self, "_gateway_server", None)
             if gw is not None and hasattr(gw, "push_session_message"):
+                push_metadata: dict[str, Any] = {}
+                if agenda_cards:
+                    push_metadata["goalCards"] = agenda_cards
+                if report_turn and saved_run_id:
+                    push_metadata["stream_run_id"] = saved_run_id
                 try:
+                    # The conversation's own key: a desktop chat's is not
+                    # channel:chat_id, and clients match the event by it.
                     await gw.push_session_message(
-                        f"{origin_channel}:{origin_chat_id}", final_content
+                        session_key if report_turn else f"{origin_channel}:{origin_chat_id}",
+                        final_content,
+                        **({"metadata": push_metadata} if push_metadata else {}),
                     )
                 except Exception as exc:
                     logger.warning(f"[board] local push failed: {exc}")
+                if report_turn and hasattr(gw, "_schedule_offline_chat_push"):
+                    # Nobody is watching (that is why the bus carried it): a
+                    # phone that registered for pushes hears about the reply.
+                    try:
+                        gw._schedule_offline_chat_push(session_key, final_content, run_id=saved_run_id)
+                    except Exception as exc:  # noqa: BLE001 — a push never fails a turn
+                        logger.debug(f"[subagent] offline push skipped: {exc}")
+
+        if agenda_item and getattr(self, "agenda", None) is not None:
+            self.agenda.turn_finished(
+                agenda_item, delivered=True, text=final_content or "", session_key=session_key,
+            )
+
+        if report_turn:
+            # After-turn bookkeeping the owner's turn has: the provider's own
+            # count for the compaction trigger, and a background compaction
+            # if this report pushed the conversation over budget.
+            self._after_report_turn(session_key, session, system_usage, origin_channel,
+                                    origin_chat_id, aborted=turn_aborted or bool(provider_error))
 
         return OutboundMessage(
             channel=origin_channel,
             chat_id=origin_chat_id,
             content=final_content,
             media=reply_media,
-            metadata=(
-                {ASSETS_META_KEY: assets_to_meta(reply_media_assets)}
-                if reply_media_assets
-                else {}
-            ),
+            metadata={
+                **({ASSETS_META_KEY: assets_to_meta(reply_media_assets)} if reply_media_assets else {}),
+                **({"goalCards": agenda_cards} if agenda_cards else {}),
+                # A relay conversation's id is not a relay session: the web
+                # channel asks the relay to open one, or the message the agent
+                # wrote first is dropped there, unstored and unpushed.
+                **({"agent_first_conversation": origin_chat_id, "session_key": session_key}
+                   if agenda_item and origin_channel == "web" else {}),
+                # A reply about work started in a desktop chat belongs to
+                # that chat, whose key is not channel:chat_id.
+                **({"session_key": session_key}
+                   if session_key != f"{origin_channel}:{origin_chat_id}" and not agenda_item else {}),
+                # The runner's final carries what the owner's turn's does: the
+                # run it streamed under, usage, context occupancy, Stop.
+                **(self._report_turn_metadata(
+                    session_key, session, system_usage, turn_messages,
+                    run_id=run_id, aborted=turn_aborted, duration_ms=turn_duration_ms,
+                    provider_error=provider_error,
+                ) if live_report else {}),
+            },
         )
+
+    def _report_turn_metadata(
+        self,
+        session_key: str,
+        session: Any,
+        usage: dict[str, Any] | None,
+        turn_messages: list[dict[str, Any]],
+        *,
+        run_id: str,
+        aborted: bool,
+        duration_ms: int,
+        provider_error: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Outbound metadata a live report turn's runner needs for its final.
+
+        The same fields the owner's turn returns (see _process_message_inner):
+        the run the deltas streamed under (``stream_run_id``), the
+        conversation's key, usage and context occupancy for the context
+        ring, Stop and duration, and the tool steps the relay persists.
+        """
+        from flowly.tool_activity import project_tool_messages_for_ui
+
+        telemetry = self._context_usage_telemetry(
+            session_key, session, usage, provider_error=bool(provider_error), aborted=aborted,
+        )
+        tool_messages = project_tool_messages_for_ui([
+            {k: v for k, v in m.items() if k in ("role", "content", "tool_calls", "tool_call_id", "name")}
+            for m in turn_messages if m.get("tool_calls") or m.get("role") == "tool"
+        ])
+        return {
+            "session_key": session_key,
+            "stream_run_id": run_id or None,
+            "turnOrigin": REPORT_TURN_ORIGIN,
+            "usage": usage if not aborted and not provider_error else {},
+            "model": self.model,
+            # The runner's native error contract (state:"error" / failed).
+            "error": provider_error or None,
+            "contextTokens": telemetry["tokens"],
+            "contextTokensStale": telemetry["stale"],
+            "contextTokensSource": telemetry["source"],
+            **({"contextTokensMeasuredAt": telemetry["measured_at"]} if telemetry.get("measured_at") else {}),
+            "contextWindow": self._effective_context_window(),
+            "tool_messages": tool_messages,
+            "aborted": aborted,
+            "duration_ms": duration_ms,
+        }
+
+    async def _compact_before_report(
+        self, session_key: str, channel: str, chat_id: str, run_id: str,
+    ) -> None:
+        """The pre-turn compaction check for a subagent's report turn.
+
+        The owner's turn checks before it builds its request; a report turn
+        skipped it, so a long conversation could take a large report on top
+        of a history already over budget. This runs the same pass the
+        background post-turn check runs (same signal, lock and commit path),
+        awaited, inside the turn lock, and ended by Stop. Any failure leaves
+        the history as it is: the per-request guard still fits the request.
+        """
+        probe = ConversationInboundMessage(
+            channel=channel, sender_id="subagent", chat_id=chat_id,
+            content="", conversation_key=session_key,
+        )
+
+        def cancelled() -> bool:
+            return bool(run_id) and self.is_run_aborted(run_id)
+
+        try:
+            await asyncio.wait_for(
+                self._post_turn_compaction(probe, settle=False, should_cancel=cancelled),
+                timeout=POST_TURN_COMPACTION_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — compaction never fails the report
+            logger.warning(f"Compaction before a report turn skipped: {exc}")
+
+    def _after_report_turn(
+        self,
+        session_key: str,
+        session: Any,
+        usage: dict[str, Any] | None,
+        channel: str,
+        chat_id: str,
+        *,
+        aborted: bool,
+    ) -> None:
+        """Record the report turn's size and schedule the after-turn compaction."""
+        try:
+            telemetry = self._context_usage_telemetry(
+                session_key, session, usage, provider_error=False, aborted=aborted,
+            )
+            from types import SimpleNamespace
+
+            self._note_turn_usage(session_key, SimpleNamespace(metadata={
+                "contextTokens": telemetry["tokens"],
+                "contextTokensStale": telemetry["stale"],
+                "contextTokensSource": telemetry["source"],
+                "contextTokensMeasuredAt": telemetry.get("measured_at"),
+                "model": self.model,
+            }))
+            self._schedule_post_turn_compaction(ConversationInboundMessage(
+                channel=channel, sender_id="subagent", chat_id=chat_id,
+                content="", conversation_key=session_key,
+            ))
+        except Exception as exc:  # noqa: BLE001 — never fail the turn
+            logger.debug(f"Post-report compaction scheduling skipped: {exc}")
 
     @staticmethod
     def _turn_message_ts(session: Any, role: str, key: str) -> str:
@@ -9876,72 +10127,6 @@ class AgentLoop:
             "api_call_count": self._api_call_count,
             "max_iterations": self.max_iterations,
         }
-
-    def _inject_recent_artifacts_hint(
-        self,
-        messages: list[dict[str, Any]],
-        session_key: str,
-    ) -> None:
-        """Prepend an ephemeral system note listing recent subagent
-        artifacts for this session, if any exist.
-
-        Conditional on the tracker actually having entries — when no
-        subagent has produced an artifact in this session, nothing is
-        injected. That's the entire point: the LLM only learns about
-        artifacts that were really created, so proactive offers like
-        'Tam raporu göstereyim mi?' never promise a file that doesn't
-        exist (the risk with a blanket prompt rule).
-
-        The hint lands AFTER the cached system prompt — it's a fresh
-        ephemeral message each turn, so prompt-cache hits on the big
-        static prompt still work. ~100-200 tokens per turn when there
-        ARE artifacts; zero cost otherwise.
-        """
-        try:
-            recent = self.subagents.recent_completed_dispatches(
-                parent_session_key=session_key,
-                max_age_seconds=600.0,  # 10 min — matches the guard window
-            )
-        except Exception:
-            # Tracker unavailable — fail silent. Hint is best-effort.
-            return
-        if not recent:
-            return
-        # Cap to top 5 most recent. More than that just bloats tokens
-        # without helping — the user rarely cares about a research from
-        # 9 minutes ago when they're talking about something 1 minute old.
-        recent = recent[:5]
-        lines = [
-            "[Session context — persisted artifacts produced earlier in this session]",
-        ]
-        for r in recent:
-            import time as _time
-            mins_ago = max(0, int((_time.time() - r["completed_at"]) / 60))
-            when = f"{mins_ago} min ago" if mins_ago > 0 else "just now"
-            lines.append(
-                f"- {r['artifact_id']} — \"{r['title'][:80]}\" "
-                f"(from {r['label']}, completed {when})"
-            )
-        lines.append(
-            "\nIf the user asks to view, save, reference, or follow up "
-            "on one of these — in any language — use "
-            "artifact(action='get', artifact_id=..., offset=0, limit=6000) "
-            "to read it, or just reference the artifact_id in your reply "
-            "(the client renders it as a preview card). Do NOT re-dispatch "
-            "the specialist and do NOT invent artifact IDs outside this "
-            "list. When delivering a summary derived from one of these, "
-            "you MAY proactively offer the full artifact (in the user's "
-            "language, one short sentence) — but only because the "
-            "artifact above actually exists."
-        )
-        hint = "\n".join(lines)
-        # Insert AFTER the cached system prompt (messages[0]) so the
-        # big prompt can still hit the cache. Skip if messages is
-        # unexpectedly empty or first message is not system.
-        if messages and messages[0].get("role") == "system":
-            messages.insert(1, {"role": "system", "content": hint})
-        else:
-            messages.insert(0, {"role": "system", "content": hint})
 
     @staticmethod
     def _inject_render_capability_hint(
@@ -10085,7 +10270,7 @@ class AgentLoop:
             metadata["render_capabilities"] = normalized_render_capabilities
         # Real (user-facing) delivery coordinates. When session_key is
         # "cron:{job_id}" the derived channel/chat_id aren't deliverable —
-        # tools that capture context (spawn, cron, builtin_agent, message,
+        # tools that capture context (spawn, cron, message,
         # voice_call) must use these instead so they never persist the
         # literal "cron" channel into jobs.json / announcements.
         if origin_channel:
@@ -10099,14 +10284,27 @@ class AgentLoop:
         if extra_metadata:
             metadata.update(extra_metadata)
 
-        msg = InboundMessage(
-            channel=channel,
-            sender_id="user",
-            chat_id=chat_id,
-            content=content,
-            media=media or [],
-            metadata=metadata,
-        )
+        notice = metadata.get(REPORT_TURN)
+        if isinstance(notice, dict):
+            # A subagent's report, started by the surface's chat runner: the
+            # same system notice the bus would carry, in its conversation.
+            msg: InboundMessage = ConversationInboundMessage(
+                channel="system",
+                sender_id=str(notice.get("sender_id") or "subagent"),
+                chat_id=str(notice.get("chat_id") or session_key),
+                content=content,
+                metadata=metadata,
+                conversation_key=session_key,
+            )
+        else:
+            msg = InboundMessage(
+                channel=channel,
+                sender_id="user",
+                chat_id=chat_id,
+                content=content,
+                media=media or [],
+                metadata=metadata,
+            )
 
         try:
             response = await self._process_message(msg)
@@ -11380,13 +11578,22 @@ class AgentLoop:
             logger.debug(f"Post-turn compaction ended with: {e}")
 
     @background_agent_activity
-    async def _post_turn_compaction(self, msg: InboundMessage) -> None:
+    async def _post_turn_compaction(
+        self,
+        msg: InboundMessage,
+        *,
+        settle: bool = True,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> None:
         """Background twin of the pre-turn compaction block.
 
         Same signal, same lock, same commit path — the only differences are
         WHEN it runs (after the reply, off the user's critical path) and that
         there is no run to cancel it from. Every failure mode ends in "leave
         the session untouched": the pre-turn check still guards the next turn.
+
+        A subagent's report turn awaits it before it starts
+        (``_compact_before_report``): no settle, and its Stop cancels.
         """
         session_key = msg.session_key
         # Hoisted so the outermost failure path can close the cycle it opened
@@ -11401,7 +11608,7 @@ class AgentLoop:
         # answer), so an early "started" is wiped the instant the reply lands:
         # observed live as a 15-second compaction with no visible shimmer.
         # It also reads better — the answer, then the summarising notice.
-        if POST_TURN_SETTLE_SECONDS > 0:
+        if settle and POST_TURN_SETTLE_SECONDS > 0:
             await asyncio.sleep(POST_TURN_SETTLE_SECONDS)
         try:
             session = self.sessions.get_or_create(session_key)
@@ -11493,6 +11700,7 @@ class AgentLoop:
                         history,
                         session_key=session_key,
                         history_budget=self.compaction.history_budget(overhead),
+                        **({"should_cancel": should_cancel} if should_cancel is not None else {}),
                     )
                 except Exception as e:
                     logger.error(f"Post-turn compaction failed: {e}")

@@ -902,6 +902,11 @@ def chat_inflight(params: dict) -> dict:
         raise FeatureRpcError('TASK_TARGET_CHANGED', str(exc)) from exc
 
     session_key = (params.get("sessionKey") or "").strip()
+    if _subagent_conversation_hidden(session_key):
+        # A subagent's running turn is read by whoever may read the
+        # conversation that started it; a conversation with no thread has none.
+        return {"inflight": None, "plan": None, "compaction": None, "goal": None,
+                "approvals": [], "clarifies": []}
     cur = _inflight_get(session_key) if session_key else None
     result: dict = {"inflight": cur}
     # Attach the current plan snapshot so a client that re-enters mid-turn
@@ -939,6 +944,29 @@ def chat_inflight(params: dict) -> dict:
     # open approvals and questions, serialized exactly like those events.
     result["approvals"], result["clarifies"] = _pending_prompts(session_key)
     return result
+
+
+def _subagent_conversation_hidden(session_key: str) -> bool:
+    """For ``subagent:<threadId>``: True when there is no such thread to read.
+
+    Its readers are those of the conversation that started it: anyone else
+    gets NOT_FOUND (raised). Any other key: False.
+    """
+    from flowly.agent.subagent_threads import THREAD_KEY_PREFIX, is_thread_id
+    from flowly.session.keys import is_subagent_thread
+
+    if not is_subagent_thread(session_key):
+        return False
+    thread_id = session_key[len(THREAD_KEY_PREFIX):]
+    if not is_thread_id(thread_id):
+        return True
+    try:
+        _subagent_thread({"threadId": thread_id})
+    except FeatureRpcError as error:
+        if error.code in ("NOT_FOUND", "SUBAGENT_THREAD_LEGACY", "UNAVAILABLE"):
+            return True
+        raise
+    return False
 
 
 def _pending_prompts(session_key: str) -> tuple[list[dict], list[dict]]:
@@ -3118,18 +3146,42 @@ def _flowlet_store():
     return get_store()
 
 
-def _flowlet_values(flowlet: dict) -> dict:
+def _flowlet_values(flowlet: dict, tz: Any = None) -> dict:
+    """Live values, computed in ``tz`` or the flowlet's remembered device zone."""
     from flowly.flowlets import queries
-    from flowly.flowlets.store import get_store, now_ms
+    from flowly.flowlets.store import now_ms
+    from flowly.flowlets.zones import zone_for
 
-    store = get_store()
+    store = _flowlet_store()
     return queries.resolve_values(
         flowlet["definition"],
         store.get_state(flowlet["id"]),
         store.get_events(flowlet["id"]),
         now_ms(),
-        None,
+        tz if tz is not None else zone_for(flowlet),
     )
+
+
+def _flowlet_zone(flowlet: dict, params: dict) -> Any:
+    """Adopt the zone a client sent (``tz``) and return the one to compute in."""
+    from flowly.flowlets.zones import adopt_client_zone
+
+    return adopt_client_zone(_flowlet_store(), flowlet, params)
+
+
+async def _broadcast_flowlet_state(flowlet_id: str, values: dict, rev: int,
+                                   preview: Any = None) -> None:
+    """Fan fresh values out to every other client. ``rev`` lets each one drop a
+    map older than what it already shows."""
+    if _flowlet_broadcast_cb is None:
+        return
+    data: dict = {"id": flowlet_id, "values": values, "rev": rev}
+    if preview is not None:
+        data["preview"] = preview
+    try:
+        await _flowlet_broadcast_cb("flowlet.state", data)
+    except Exception:
+        pass
 
 
 def _flowlet_summary(flowlet: dict, values: dict | None = None) -> dict:
@@ -3140,14 +3192,15 @@ def _flowlet_summary(flowlet: dict, values: dict | None = None) -> dict:
         "accent": flowlet.get("accent"),
         "pinned": flowlet.get("pinned"),
         "version": flowlet.get("version"),
+        "rev": flowlet.get("rev", 0),
         "catalog": flowlet.get("catalog"),
         "updatedAt": flowlet.get("updated_at"),
     }
     if values is not None:
         s["values"] = values
-        from flowly.flowlets.queries import flowlet_preview
+        from flowly.flowlets.card import preview_for
 
-        preview = flowlet_preview(flowlet.get("definition") or {}, values)
+        preview = preview_for(flowlet, values, _flowlet_store())
         if preview is not None:
             s["preview"] = preview
     return s
@@ -3173,9 +3226,11 @@ def flowlets_get(params: dict) -> dict:
     flowlet_id = str(params.get("id", "") or "")
     if not flowlet_id:
         raise FeatureRpcError("INVALID", "id required")
-    flowlet = _flowlet_store().get(flowlet_id)
+    store = _flowlet_store()
+    flowlet = store.get(flowlet_id)
     if not flowlet:
         raise FeatureRpcError("NOT_FOUND", "Flowlet not found")
+    zone = _flowlet_zone(flowlet, params)
     # Opening the screen refreshes its due data sources in the background — the
     # fresh values arrive as a `flowlet.state` broadcast a moment later.
     if _flowlet_refresh_cb is not None and (flowlet.get("definition") or {}).get("sources"):
@@ -3185,30 +3240,12 @@ def flowlets_get(params: dict) -> dict:
             _asyncio.get_running_loop().create_task(_flowlet_refresh_cb(flowlet_id, False))
         except Exception:
             pass  # no loop / best-effort
-    # Serving-time guarantees (never persisted): every user-owned list row is
-    # EDITABLE (a drill screen with edit inputs — synthesized if the agent
-    # authored none), and a list with an `image` field always DISPLAYS its
-    # photos (row thumbnail + full photo). Editable runs first so a synthesized
-    # drill screen also picks up its full photo from the photo pass.
-    from flowly.flowlets.composites import expand_composites
-    from flowly.flowlets.normalize import (
-        assign_missing_ids,
-        ensure_chart_layout,
-        ensure_editable_drill,
-        ensure_photo_display,
-    )
+    # Serving-time guarantees (never persisted) live in one place shared with
+    # the action path: composites expand, ids are assigned, list rows become
+    # editable, photo lists display photos, a title-only header is dropped.
+    from flowly.flowlets.normalize import served_definition
 
-    # Composites (catalog 3) expand to primitives FIRST, so the photo/edit
-    # augmentation and the client both see plain v2 nodes; an old client renders
-    # the expansion with no changes. Forgotten ids are assigned (same
-    # deterministic ids resolve_values/apply_action derive, so values and taps
-    # line up). Then a chart-bearing multi-column grid is forced full-width
-    # (charts don't fit side by side on a phone).
-    definition = ensure_chart_layout(
-        ensure_photo_display(
-            ensure_editable_drill(assign_missing_ids(expand_composites(flowlet["definition"])))
-        )
-    )
+    definition = served_definition(flowlet["definition"], flowlet.get("name"))
     return {
         "flowlet": {
             "id": flowlet["id"],
@@ -3221,7 +3258,8 @@ def flowlets_get(params: dict) -> dict:
             "definition": definition,
             "updatedAt": flowlet.get("updated_at"),
         },
-        "values": _flowlet_values(flowlet),
+        "values": _flowlet_values(flowlet, zone),
+        "rev": store.rev(flowlet_id),
     }
 
 
@@ -3241,8 +3279,11 @@ async def flowlets_refresh(params: dict) -> dict:
             refreshed = await _flowlet_refresh_cb(flowlet_id, True)
         except Exception as exc:
             raise FeatureRpcError("UNAVAILABLE", f"couldn't refresh: {exc}")
-    fresh = _flowlet_store().get(flowlet_id) or flowlet  # re-read post-refresh
-    return {"id": flowlet_id, "refreshed": refreshed, "values": _flowlet_values(fresh)}
+    store = _flowlet_store()
+    fresh = store.get(flowlet_id) or flowlet  # re-read post-refresh
+    zone = _flowlet_zone(fresh, params)
+    return {"id": flowlet_id, "refreshed": refreshed,
+            "values": _flowlet_values(fresh, zone), "rev": store.rev(flowlet_id)}
 
 
 def flowlets_state(params: dict) -> dict:
@@ -3251,10 +3292,12 @@ def flowlets_state(params: dict) -> dict:
     flowlet_id = str(params.get("id", "") or "")
     if not flowlet_id:
         raise FeatureRpcError("INVALID", "id required")
-    flowlet = _flowlet_store().get(flowlet_id)
+    store = _flowlet_store()
+    flowlet = store.get(flowlet_id)
     if not flowlet:
         raise FeatureRpcError("NOT_FOUND", "Flowlet not found")
-    return {"id": flowlet_id, "values": _flowlet_values(flowlet)}
+    zone = _flowlet_zone(flowlet, params)
+    return {"id": flowlet_id, "values": _flowlet_values(flowlet, zone), "rev": store.rev(flowlet_id)}
 
 
 async def flowlets_action(params: dict) -> dict:
@@ -3279,6 +3322,9 @@ async def flowlets_action(params: dict) -> dict:
         flowlet_id
     ):
         raise FeatureRpcError("RATE_LIMITED", "too many requests; try again in a moment")
+    if _fl is None:
+        raise FeatureRpcError("NOT_FOUND", f"flowlet '{flowlet_id}' not found")
+    op_id = params.get("opId")
     try:
         result = await apply_action(
             store,
@@ -3286,27 +3332,22 @@ async def flowlets_action(params: dict) -> dict:
             component_id,
             value=params.get("value"),
             agent_runner=_flowlet_agent_runner_cb,
+            tz=_flowlet_zone(_fl, params),
+            op_id=str(op_id) if op_id else None,
         )
     except FlowletActionError as exc:
         raise FeatureRpcError(exc.code, exc.message)
+    if result.get("duplicate"):
+        return result  # a retried tap: nothing changed, nothing to fan out
     # Recompute the card headline so list tiles update live (not just the open
     # screen) — carry it in both the reply and the broadcast.
-    from flowly.flowlets.queries import flowlet_preview
+    from flowly.flowlets.card import preview_for
 
     flowlet = store.get(flowlet_id)
-    preview = (
-        flowlet_preview(flowlet.get("definition") or {}, result["values"]) if flowlet else None
-    )
+    preview = preview_for(flowlet, result["values"], store) if flowlet else None
     if preview is not None:
         result["preview"] = preview
-    if _flowlet_broadcast_cb is not None:
-        try:
-            data = {"id": flowlet_id, "values": result["values"]}
-            if preview is not None:
-                data["preview"] = preview
-            await _flowlet_broadcast_cb("flowlet.state", data)
-        except Exception:
-            pass
+    await _broadcast_flowlet_state(flowlet_id, result["values"], result["rev"], preview)
     # Evaluate reactive watches immediately (goal celebration / threshold nudge
     # shouldn't wait for the next heartbeat). Best-effort — never fail the tap.
     if _flowlet_watch_hook_cb is not None:
@@ -3420,30 +3461,35 @@ async def flowlets_capture(params: dict) -> dict:
     flowlet = store.get(flowlet_id)
     if not flowlet:
         raise FeatureRpcError("NOT_FOUND", f"flowlet '{flowlet_id}' not found")
-    component = _find_component(flowlet.get("definition") or {}, component_id)
+    from flowly.flowlets.normalize import served_definition
+
+    component = _find_component(served_definition(flowlet["definition"], flowlet.get("name")),
+                                component_id)
     if not component:
         raise FeatureRpcError("NOT_FOUND", f"component '{component_id}' not found")
+    op_id = str(params.get("opId") or "")
+    if op_id and not store.claim_op(flowlet_id, op_id):
+        # A retried upload: the photo was already read and saved once.
+        return {"id": flowlet_id, "values": _flowlet_values(flowlet), "rev": store.rev(flowlet_id),
+                "duplicate": True}
     try:
         values = await apply_capture(
-            store, flowlet, component, data, runner=_flowlet_vision_runner_cb
+            store, flowlet, component, data, runner=_flowlet_vision_runner_cb,
+            tz=_flowlet_zone(flowlet, params),
         )
     except FlowletCaptureError as exc:
+        if op_id:
+            store.release_op(flowlet_id, op_id)
         raise FeatureRpcError(exc.code, exc.message)
+    rev = store.rev(flowlet_id)
 
-    from flowly.flowlets.queries import flowlet_preview
+    from flowly.flowlets.card import preview_for
 
-    preview = flowlet_preview(flowlet.get("definition") or {}, values)
-    result = {"id": flowlet_id, "values": values}
+    preview = preview_for(store.get(flowlet_id) or flowlet, values, store)
+    result = {"id": flowlet_id, "values": values, "rev": rev}
     if preview is not None:
         result["preview"] = preview
-    if _flowlet_broadcast_cb is not None:
-        try:
-            msg = {"id": flowlet_id, "values": values}
-            if preview is not None:
-                msg["preview"] = preview
-            await _flowlet_broadcast_cb("flowlet.state", msg)
-        except Exception:
-            pass
+    await _broadcast_flowlet_state(flowlet_id, values, rev, preview)
     return result
 
 
@@ -3473,21 +3519,15 @@ async def flowlets_item_remove(params: dict) -> dict:
     except Exception as exc:  # noqa: BLE001
         raise FeatureRpcError("INVALID", str(exc))
 
-    from flowly.flowlets.queries import flowlet_preview
+    from flowly.flowlets.card import preview_for
 
-    values = _flowlet_values(flowlet)
-    preview = flowlet_preview(defn, values)
-    result = {"id": flowlet_id, "values": values}
+    values = _flowlet_values(flowlet, _flowlet_zone(flowlet, params))
+    rev = store.rev(flowlet_id)
+    preview = preview_for(flowlet, values, store)
+    result = {"id": flowlet_id, "values": values, "rev": rev}
     if preview is not None:
         result["preview"] = preview
-    if _flowlet_broadcast_cb is not None:
-        try:
-            msg = {"id": flowlet_id, "values": values}
-            if preview is not None:
-                msg["preview"] = preview
-            await _flowlet_broadcast_cb("flowlet.state", msg)
-        except Exception:
-            pass
+    await _broadcast_flowlet_state(flowlet_id, values, rev, preview)
     return result
 
 
@@ -4252,82 +4292,29 @@ def audit_clear() -> dict:
     return {"success": True}
 
 
-# ── Assistants (Agents tab) ─────────────────────────────────────────────────
+# ── Retired: user-defined assistants and specialist models ──────────────────
+#
+# The main agent writes each subagent's brief itself; there are no stored
+# researcher/writer/coder specialists or owner-made assistants any more. An
+# older client still asks for them, so the reads answer "none" and the writes
+# say plainly that the feature is gone instead of failing as unknown methods.
+# Assistant files an owner made earlier stay on disk untouched.
+
+_RETIRED_AGENTS_MESSAGE = (
+    "Custom agents were retired: the agent now creates a subagent for a task itself."
+)
 
 
-def _assistants_dir() -> Path:
-    return get_flowly_home() / "assistants"
+def assistants_list_retired() -> dict:
+    return {"assistants": [], "retired": True}
 
 
-def assistants_list() -> dict:
-    """User-defined + builtin assistants in the desktop Agents-tab shape."""
-    from flowly.agent.assistants import AssistantRegistry
-
-    reg = AssistantRegistry(_assistants_dir())
-    try:
-        reg.reload()
-    except Exception:
-        pass
-    out = []
-    for a in reg.all():
-        out.append(
-            {
-                "name": a.name,
-                "description": a.description,
-                "model": a.model,
-                "allowedTools": sorted(a.allowed_tools) if a.allowed_tools else None,
-                "autoSaveArtifact": getattr(a, "auto_save_artifact", False),
-                "artifactType": getattr(a, "artifact_type", None),
-                "systemPrompt": getattr(a, "system_prompt", ""),
-                "builtin": a.builtin,
-                "sourcePath": str(a.source_path) if a.source_path else None,
-            }
-        )
-    return {"assistants": out}
+def subagents_assistants_retired(params: dict) -> dict:
+    return {"assistants": [], "retired": True}
 
 
-def assistants_write(params: dict) -> dict:
-    """Create/edit a user assistant by writing ~/.flowly/assistants/{name}.md —
-    same YAML-fronted format the desktop writes locally. Returns
-    ``{"success": bool, "error"?: str}``."""
-    name = str(params.get("name", ""))
-    if not re.match(r"^[a-z0-9][a-z0-9_-]*$", name):
-        return {
-            "success": False,
-            "error": (
-                f"Invalid assistant name '{name}'. Use lowercase letters, digits, - and _ only."
-            ),
-        }
-    lines = [
-        "---",
-        f"name: {name}",
-        f"description: {params.get('description', '')}",
-        f"model: {params.get('model', '')}",
-    ]
-    tools = params.get("allowedTools")
-    if tools:
-        lines.append("allowed_tools: [" + ", ".join(f'"{t}"' for t in tools) + "]")
-    if params.get("autoSaveArtifact") is True:
-        lines.append("auto_save_artifact: true")
-    at = params.get("artifactType")
-    if at and at != "markdown":
-        lines.append(f"artifact_type: {at}")
-    lines += ["---", "", (params.get("systemPrompt") or "").strip(), ""]
-    d = _assistants_dir()
-    d.mkdir(parents=True, exist_ok=True)
-    (d / f"{name}.md").write_text("\n".join(lines), encoding="utf-8")
-    return {"success": True}
-
-
-def assistants_delete(params: dict) -> dict:
-    """Delete a user assistant (.md). Returns ``{"deleted": bool, "ok": bool}``."""
-    name = str(params.get("name", ""))
-    deleted = False
-    target = _assistants_dir() / f"{name}.md"
-    if target.exists():
-        target.unlink()
-        deleted = True
-    return {"deleted": deleted, "ok": deleted}
+def agents_feature_retired(params: dict) -> dict:
+    raise FeatureRpcError("FEATURE_RETIRED", _RETIRED_AGENTS_MESSAGE)
 
 
 # ── Pairing (Telegram / WhatsApp device approval) ───────────────────────────
@@ -4413,7 +4400,8 @@ def subagents_list(params: dict) -> dict:
 
     _validate_subagent_event_version(params)
 
-    records = _subagent_registry().all()
+    registry = _subagent_registry()
+    records = registry.all()
     status = params.get("status")
     filters = {
         "running": lambda r: r.ended_at is None,
@@ -4446,15 +4434,15 @@ def subagents_list(params: dict) -> dict:
     if page and len(page) < len(records):
         last = page[-1]
         next_cursor = base64.urlsafe_b64encode(json.dumps([last.created_at, last.run_id]).encode()).decode()
-    return {"schemaVersion": 2, "tasks": [run_view(r) for r in page],
+    return {"schemaVersion": 2, "tasks": [run_view(r, thread=_thread_of(registry, r)) for r in page],
             "counts": counts, "nextCursor": next_cursor}
 
 
 def subagents_get(params: dict) -> dict:
     from flowly.agent.subagent_observation import run_view
     _validate_subagent_event_version(params)
-    _, record = _subagent_record(params)
-    return {"schemaVersion": 2, "task": run_view(record, detail=True)}
+    registry, record = _subagent_record(params)
+    return {"schemaVersion": 2, "task": run_view(record, detail=True, thread=_thread_of(registry, record))}
 
 
 def _validate_subagent_event_version(params: dict) -> None:
@@ -4477,6 +4465,221 @@ def subagents_result(params: dict) -> dict:
         raise FeatureRpcError("UNAVAILABLE", "The task result could not be read") from exc
 
 
+def subagents_transcript(params: dict) -> dict:
+    """A run's transcript, for the owner opening a subagent from the chat.
+
+    Params: ``runId``; ``after`` (default 0) — return steps after this
+    sequence number, so a client polls with the ``nextSeq`` it last got;
+    ``limit`` (default 200, max 1000). ``done`` tells whether the run ended.
+    """
+    # A client may still hold an 8-character id from an older notice.
+    registry, record = _subagent_record(params, allow_prefix=True)
+    after = params.get("after", 0)
+    limit = params.get("limit", 200)
+    try:
+        page = registry.read_transcript(record.run_id, after, limit)
+    except ValueError as exc:
+        raise FeatureRpcError("INVALID", str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise FeatureRpcError("NOT_FOUND", "No such task") from exc
+    except OSError as exc:
+        raise FeatureRpcError("UNAVAILABLE", "The task transcript could not be read") from exc
+    from flowly.agent.subagent_observation import run_view
+    return {"schemaVersion": 2, "task": run_view(record, thread=_thread_of(registry, record)), **page}
+
+
+def _thread_of(registry, record):
+    getter = getattr(registry, "get_thread", None)
+    if not record.thread_id or getter is None:
+        return None
+    return getter(record.thread_id)
+
+
+def _subagent_thread(params: dict):
+    """The thread a ``subagents.history`` call names (``threadId`` or ``runId``)."""
+    from flowly.agent.subagent_threads import is_thread_id
+
+    thread_id, run_id = params.get("threadId"), params.get("runId")
+    if thread_id is None and run_id is None:
+        raise FeatureRpcError("INVALID", "threadId or runId is required")
+    for value in (thread_id, run_id):
+        if value is not None and not is_thread_id(value):
+            raise FeatureRpcError("INVALID", "threadId and runId must be subagent ids")
+    registry = _subagent_registry()
+    record = registry.get(run_id) if run_id is not None else None
+    if run_id is not None and record is None:
+        raise FeatureRpcError("NOT_FOUND", "Task not found")
+    if record is not None:
+        if thread_id is not None and record.thread_id != thread_id:
+            raise FeatureRpcError("INVALID", "runId is not a run of threadId")
+        thread_id = record.thread_id or None
+        if thread_id is None:
+            if record.kind == "subagent" and record.origin != "system":
+                # From before subagents kept their conversation: its
+                # transcript (subagents.transcript) is what there is.
+                raise FeatureRpcError(
+                    "SUBAGENT_THREAD_LEGACY",
+                    "This subagent ran before its conversation was kept; its transcript is available.",
+                )
+            raise FeatureRpcError("NOT_FOUND", "This task has no conversation")
+    thread = registry.get_thread(thread_id)
+    if thread is None:
+        legacy = registry.get(thread_id)
+        if legacy is not None and not legacy.thread_id and legacy.kind == "subagent" and legacy.origin != "system":
+            raise FeatureRpcError(
+                "SUBAGENT_THREAD_LEGACY",
+                "This subagent ran before its conversation was kept; its transcript is available.",
+            )
+        raise FeatureRpcError("NOT_FOUND", "Subagent not found")
+    _require_parent_visible(thread.parent_session_key)
+    return registry, thread
+
+
+def _require_parent_visible(parent_session_key: str) -> None:
+    """A subagent's conversation is readable by whoever may read the one that started it."""
+    from flowly.session.ownership import require_session_file
+    from flowly.utils.helpers import safe_filename
+
+    if any(char in parent_session_key for char in ('/', '\\', '\x00')):
+        raise FeatureRpcError("NOT_FOUND", "Subagent not found")
+    path = get_flowly_home() / "sessions" / (safe_filename(parent_session_key.replace(':', '_')) + '.jsonl')
+    require_session_file(path, parent_session_key)
+
+
+def subagent_thread_rows(session_key: str):
+    """``(display rows, thread)`` of the subagent conversation ``subagent:<threadId>``; read only."""
+    from flowly.agent.subagent_threads import THREAD_KEY_PREFIX
+
+    thread_id = session_key.strip()[len(THREAD_KEY_PREFIX):]
+    registry, thread = _subagent_thread({"threadId": thread_id})
+    try:
+        rows = registry.thread_store.display_rows(thread.thread_id)
+    except OSError as exc:
+        raise FeatureRpcError("UNAVAILABLE", "The subagent's conversation could not be read") from exc
+    return rows, thread
+
+
+def subagents_history(params: dict) -> dict:
+    """A subagent's conversation, page by page (read only).
+
+    Params: ``threadId`` or ``runId`` (a run of the thread); ``limit``
+    (1–200, default 50); ``before`` — the cursor of the page last returned,
+    for the one before it. Rows are ``chat.history`` rows, oldest first, plus
+    what a subagent turn says (``kind: "subagent_task" | "agent_note"``,
+    ``author``, ``turn``, tool ``status``, a turn's ``outcome``). A turn
+    appears once its run has ended; the running one is ``chat.inflight``'s.
+    A subagent from before conversations were kept answers
+    ``SUBAGENT_THREAD_LEGACY`` (its transcript is still there).
+    """
+    from flowly.agent.subagent_observation import run_view
+    from flowly.agent.subagent_threads import thread_view
+    from flowly.session.history_page import HistoryPageError, history_page
+    from flowly.session.history_rows import project_rows, subagent_history_row
+
+    registry, thread = _subagent_thread(params)
+    page_params: dict = {"limit": params.get("limit", 50)}
+    if params.get("before") is not None:
+        page_params["before"] = params["before"]
+    try:
+        rows = registry.thread_store.display_rows(thread.thread_id)
+    except OSError as exc:
+        raise FeatureRpcError("UNAVAILABLE", "The subagent's conversation could not be read") from exc
+    try:
+        page, info = history_page(rows, thread.child_session_key, page_params)
+    except HistoryPageError as exc:
+        raise FeatureRpcError(exc.code, str(exc)) from exc
+    runs = [run_view(run, thread=thread) for run in registry.runs_of_thread(thread)]
+    return {
+        "schemaVersion": 1,
+        "thread": thread_view(thread, runs),
+        "sessionKey": thread.child_session_key,
+        "readOnly": True,
+        "messages": project_rows([subagent_history_row(m) for m in page]),
+        "historyPageVersion": info.get("historyPageVersion", 1),
+        "hasOlder": bool(info.get("hasOlder")),
+        "before": info.get("before"),
+    }
+
+
+def subagents_watch(params: dict) -> dict:
+    """Receive a subagent's running turns live, and what its running turn did so far.
+
+    Params: ``threadId``. Allowed to whoever may read the conversation that
+    started it (as ``subagents.history``). The transport binds the caller
+    for ``leaseSeconds``: calling again renews it (clients do so about every
+    90 s), ``subagents.unwatch`` or a disconnect ends it. While bound, every
+    turn of the thread streams to the caller as its own chat events under
+    ``sessionKey`` (``subagent:<threadId>``) — on the relay inside
+    ``subagent.stream`` envelopes (docs/chat-wire-protocol.md §4.8).
+
+    ``inflight`` is the running turn so far (``chat.inflight``'s entry: the
+    task as ``prompt``, text, steps, tool progress), taken in the same step as
+    the binding, so the stream continues exactly where it ends; null when
+    nothing runs. ``compaction`` is a summary in progress, as in
+    ``chat.inflight``.
+    """
+    import time as _time
+
+    from flowly.agent import compaction_status
+    from flowly.agent.inflight import get as _inflight_get
+    from flowly.agent.subagent_stream import STREAM_VERSION, WATCH_LEASE_SECONDS
+
+    if params.get("threadId") is None:
+        raise FeatureRpcError("INVALID", "threadId is required")
+    _, thread = _subagent_thread({"threadId": params.get("threadId")})
+    key = thread.child_session_key
+    return {
+        "schemaVersion": 1,
+        "ok": True,
+        "watching": True,
+        "threadId": thread.thread_id,
+        "sessionKey": key,
+        "status": thread.status,
+        "activeRunId": thread.active_run_id,
+        "leaseSeconds": int(WATCH_LEASE_SECONDS),
+        "streamVersion": STREAM_VERSION,
+        "inflight": _inflight_get(key),
+        "compaction": compaction_status.get(key, _time.time()),
+    }
+
+
+def subagents_unwatch(params: dict) -> dict:
+    """Stop receiving a subagent's turns live (``subagents.watch``). Idempotent."""
+    from flowly.agent.subagent_threads import is_thread_id, thread_session_key
+
+    thread_id = params.get("threadId")
+    if not is_thread_id(thread_id):
+        raise FeatureRpcError("INVALID", "threadId must be a subagent id")
+    return {"schemaVersion": 1, "ok": True, "watching": False, "threadId": thread_id,
+            "sessionKey": thread_session_key(thread_id)}
+
+
+def subagents_stats(params: dict) -> dict:
+    """How this bot's subagents went over a period: runs, outcomes, time, tokens.
+
+    Params: ``days`` (1–365, default 30); ``includeSystem`` (default false —
+    the agent's own upkeep, such as self-review, is left out). Read from the
+    metric lines each ended run leaves (flowly/agent/subagent_metrics.py),
+    which outlive the runs themselves.
+    """
+    from pathlib import Path
+
+    from flowly.agent.subagent_metrics import metrics_path, read_metrics, summarize
+
+    days = params.get("days", 30)
+    if type(days) is not int or not 1 <= days <= 365:
+        raise FeatureRpcError("INVALID", "days must be a whole number from 1 to 365")
+    include_system = params.get("includeSystem", False)
+    if not isinstance(include_system, bool):
+        raise FeatureRpcError("INVALID", "includeSystem must be true or false")
+    registry = _subagent_registry()
+    try:
+        rows = read_metrics(metrics_path(Path(registry._path)))
+    except OSError as exc:
+        raise FeatureRpcError("UNAVAILABLE", "Subagent metrics could not be read") from exc
+    return {"schemaVersion": 1, **summarize(rows, days=days, include_system=include_system)}
+
+
 async def subagents_cancel(params: dict) -> dict:
     _, record = _subagent_record(params, allow_prefix=True)
     if record.ended_at is not None:
@@ -4486,7 +4689,10 @@ async def subagents_cancel(params: dict) -> dict:
         manager = _subagent_delegate_provider() if _subagent_delegate_provider else None
     if manager is None:
         raise FeatureRpcError("UNAVAILABLE", "This task cannot be stopped here")
-    result = json.loads(await manager.cancel(record.run_id))
+    # A client's stop is the owner's: the main agent is told of it.
+    stopping = manager.cancel(record.run_id) if record.kind == "delegate" \
+        else manager.cancel(record.run_id, by="owner")
+    result = json.loads(await stopping)
     if result.get("status") == "error":
         raise FeatureRpcError("CONFLICT", result.get("error", "Task state changed"))
     return {"ok": True, "runId": record.run_id, "run_id": record.run_id[:8], "status": record.outcome or result.get("status")}
@@ -4500,138 +4706,18 @@ def set_subagent_delegate_provider(provider) -> None:
     _subagent_delegate_provider = provider
 
 
-def subagents_assistants(params: dict) -> dict:
-    """Specialists the user can run as subagents, with their model settings —
-    for the desktop/TUI "subagent models" editor.
-
-    Each entry resolves the three-tier model policy (see ``builtin_agent``):
-      * ``override`` — what ``agents.assistant_models[name]`` holds:
-        ``""`` (unset → use the specialist's own default), ``"inherit"``
-        (run on the bot's selected model), or a concrete model id.
-      * ``effectiveModel`` — the model a spawn would actually use right now.
-      * ``defaultModel`` — the specialist's built-in default.
-
-    Returns ``{"assistants": [{name, description, defaultModel, override,
-    effectiveModel, builtin}], "botModel": <agents.defaults.model>}``.
-    """
-    from flowly.agent.assistants import AssistantRegistry
-    from flowly.config.loader import load_config
-
-    cfg = load_config()
-    overrides = cfg.agents.assistant_models or {}
-    bot_model = cfg.agents.defaults.model or ""
-
-    reg = AssistantRegistry(_assistants_dir())
-    try:
-        reg.reload()
-    except Exception:
-        pass
-
-    out = []
-    for a in reg.all():
-        override = overrides.get(a.name, "") or ""
-        if override == "inherit":
-            effective = bot_model
-        elif override:
-            effective = override
-        else:
-            effective = a.model
-        out.append(
-            {
-                "name": a.name,
-                "description": a.description,
-                "defaultModel": a.model,
-                "override": override,
-                "effectiveModel": effective,
-                "builtin": a.builtin,
-            }
-        )
-    return {"assistants": out, "botModel": bot_model}
-
-
-def subagents_set_model(params: dict) -> dict:
-    """Set (or clear) the per-specialist model override.
-
-    Params: ``{"name": <specialist>, "model": <id>|"inherit"|""}``.
-      * a model id  — run that specialist on this model
-      * ``"inherit"`` — run it on the bot's selected model
-      * ``""`` / null — clear the override (use the specialist's default)
-
-    Writes ``agents.assistant_models`` in config. No restart needed: the next
-    ``builtin_agent`` dispatch reads the fresh config when it spawns.
-    Returns ``{"ok": True, "name", "override", "effectiveModel", "botModel"}``.
-    """
-    name = params.get("name")
-    if not isinstance(name, str) or not name.strip():
-        raise FeatureRpcError("INVALID", "name must be a non-empty string")
-    name = name.strip()
-
-    raw = params.get("model")
-    model = (raw or "").strip() if isinstance(raw, str) else ""
-
-    from flowly.agent.assistants import AssistantRegistry
-    from flowly.config.loader import get_config_path, load_config
-    from flowly.integrations.config_io import (
-        _atomic_write_json,
-        _load_raw,
-        _set_path,
-    )
-
-    reg = AssistantRegistry(_assistants_dir())
-    try:
-        reg.reload()
-    except Exception:
-        pass
-    asst = reg.get(name)
-    if asst is None:
-        raise FeatureRpcError("INVALID", f"unknown specialist '{name}'. Available: {reg.names()}")
-
-    cfg = load_config()
-    overrides = dict(cfg.agents.assistant_models or {})
-    if model:
-        overrides[name] = model
-    else:
-        overrides.pop(name, None)
-
-    # Write the whole map at once via the raw path (merge=False replaces the
-    # leaf). save_config()'s deep-merge can ADD/overwrite keys but never DELETE
-    # one, so clearing an override (pop) would silently survive on disk — the
-    # raw replace makes "reset to default" actually stick. Atomic + backed up,
-    # same convention as the /model picker's _set_default_model.
-    raw = _load_raw()
-    _set_path(raw, "agents.assistant_models", overrides, merge=False)
-    _atomic_write_json(get_config_path(), raw)
-
-    bot_model = cfg.agents.defaults.model or ""
-    if model == "inherit":
-        effective = bot_model
-    elif model:
-        effective = model
-    else:
-        effective = asst.model
-    return {
-        "ok": True,
-        "name": name,
-        "override": model,
-        "effectiveModel": effective,
-        "botModel": bot_model,
-    }
-
-
 async def subagents_spawn(params: dict) -> dict:
     """Manually launch a background subagent for an ad-hoc task.
 
-    Unlike ``builtin_agent`` (which the LLM calls and picks a specialist), this
-    is a user-initiated spawn from a client UI (TUI ``/subagents <task>``). It
-    runs a generic subagent on the bot's model and announces the result back to
-    the origin session asynchronously — the same delivery path async specialists
-    use — so the chat the user spawned from receives the answer when it's ready.
+    A user-initiated spawn from a client UI (TUI ``/subagents <task>``). It
+    runs a subagent on the bot's model and announces the result back to the
+    origin session asynchronously, so the chat the user spawned from receives
+    the answer when it's ready.
 
     Params:
       ``task`` (required) — what the subagent should do.
       ``sessionKey`` — origin session ("channel:chat_id"); the result is
         announced here. Defaults to ``cli:direct``.
-      ``assistant`` — optional specialist name to run as (else generic).
 
     Returns ``{"ok": True, "runId": <id>, "displayName": <name>}``.
     """
@@ -4654,23 +4740,6 @@ async def subagents_spawn(params: dict) -> dict:
     else:
         origin_channel, origin_chat_id = "cli", session_key
 
-    # Optional specialist. Unknown name ⇒ generic subagent (don't fail the
-    # spawn over a bad assistant; the task still runs).
-    assistant = None
-    asst_name = params.get("assistant")
-    if isinstance(asst_name, str) and asst_name.strip():
-        try:
-            from flowly.agent.assistants import AssistantRegistry
-
-            reg = AssistantRegistry(_assistants_dir())
-            try:
-                reg.reload()
-            except Exception:
-                pass
-            assistant = reg.get(asst_name.strip())
-        except Exception:
-            assistant = None
-
     raw = await manager.spawn(
         task=task,
         label="manual",
@@ -4678,7 +4747,8 @@ async def subagents_spawn(params: dict) -> dict:
         origin_chat_id=origin_chat_id,
         cleanup="keep",
         wait=False,
-        assistant=assistant,
+        # The owner typed this task in a client: it is theirs.
+        origin="owner",
     )
     # An async (wait=False) spawn always returns a JSON envelope: on success
     # ``{"status": "dispatched", "run_id": ..., "label": ...}``, on refusal
@@ -4692,7 +4762,7 @@ async def subagents_spawn(params: dict) -> dict:
         except Exception:
             payload = {}
     status = str(payload.get("status") or "")
-    if status in ("rejected", "forbidden", "error"):
+    if status in ("rejected", "forbidden", "error", "refused"):
         raise FeatureRpcError(
             "REJECTED",
             str(payload.get("error") or payload.get("message") or "subagent spawn refused"),
@@ -5319,6 +5389,19 @@ def pairing_approve(params: dict) -> dict:
 # adding an RPC here lights it up over both relay and gateway at once.
 
 from functools import partial as _partial
+
+
+def _agenda_handler(name: str):
+    """Tracked goals and the agent's agenda (flowly/agenda/rpc.py)."""
+    def handle(params: dict) -> dict:
+        from flowly.agenda import rpc as agenda_rpc
+        from flowly.objectives.store import ObjectiveError
+
+        try:
+            return getattr(agenda_rpc, name)(params or {})
+        except ObjectiveError as exc:
+            raise FeatureRpcError(exc.code, str(exc)) from None
+    return handle
 import inspect as _inspect
 
 
@@ -5366,6 +5449,7 @@ def system_capabilities() -> dict:
     method itself, so its mere presence already signals a capable bot.
     """
     from flowly import __version__
+    from flowly.objectives import events as objective_events
     from flowly.runtime_capabilities import resolve_runtime_capabilities
 
     runtime = resolve_runtime_capabilities()
@@ -5390,6 +5474,13 @@ def system_capabilities() -> dict:
         # Clients send ``limit`` only to a bot that says so: an old gateway
         # cut its list at ``limit`` and returned no way to the rest.
         "sessionsListVersion": 2,
+        # 1: a subagent's running turn streams to whoever ``subagents.watch``es
+        # it (docs/chat-wire-protocol.md §4.8).
+        "subagentStreamVersion": 1,
+        # 1: ``objectives.changed`` is raised when the goals change
+        # (``flowly/objectives/events.py``); a goals screen then reads again
+        # on it and polls only as a fallback.
+        "objectivesEventsVersion": 1 if objective_events.announcing() else 0,
         "runtime": {
             "role": runtime.role.value,
             "profile": runtime.profile_name,
@@ -5562,9 +5653,14 @@ _DISPATCH: dict[str, tuple] = {
     "subagents.list": (subagents_list, True, False),
     "subagents.get": (subagents_get, True, False),
     "subagents.result": (subagents_result, True, False),
+    "subagents.transcript": (subagents_transcript, True, False),
+    "subagents.history": (subagents_history, True, False),
+    "subagents.watch": (subagents_watch, True, False),
+    "subagents.unwatch": (subagents_unwatch, True, False),
     "subagents.cancel": (subagents_cancel, True, False),
-    "subagents.assistants": (subagents_assistants, True, False),
-    "subagents.set_model": (subagents_set_model, True, False),
+    "subagents.stats": (subagents_stats, True, False),
+    "subagents.assistants": (subagents_assistants_retired, True, False),
+    "subagents.set_model": (agents_feature_retired, True, False),
     "subagents.spawn": (subagents_spawn, True, False),
     "board.card": (board_card, True, False),
     "cron.list": (cron_list, True, False),
@@ -5686,9 +5782,10 @@ _DISPATCH: dict[str, tuple] = {
     "flowlets.createFromTemplate": (flowlets_create_from_template, True, False),
     "model.list": (model_list, True, False),
     "model.set": (model_set, True, True),
-    "assistants.list": (assistants_list, False, False),
-    "assistants.write": (assistants_write, True, False),
-    "assistants.delete": (assistants_delete, True, False),
+    "assistants.list": (assistants_list_retired, False, False),
+    "assistants.reload": (subagents_assistants_retired, True, False),
+    "assistants.write": (agents_feature_retired, True, False),
+    "assistants.delete": (agents_feature_retired, True, False),
     "skills.list": (skills_list, False, False),
     "skills.install": (skills_install, True, True),
     "skills.remove": (skills_remove, True, True),
@@ -5701,6 +5798,11 @@ _DISPATCH: dict[str, tuple] = {
     "activity.step": (activity_step, True, False),
     "activity.seen": (activity_seen, True, False),
     "sessions.read": (sessions_read, True, False),
+    "objectives.list": (_agenda_handler("objectives_list"), True, False),
+    "objectives.update": (_agenda_handler("objectives_update"), True, False),
+    "agenda.list": (_agenda_handler("agenda_list"), True, False),
+    "agenda.settings.get": (_agenda_handler("agenda_settings_get"), True, False),
+    "agenda.settings.set": (_agenda_handler("agenda_settings_set"), True, False),
     "audit.list": (audit_list, True, False),
     "audit.stats": (audit_stats, False, False),
     "audit.clear": (audit_clear, False, False),
@@ -5816,8 +5918,16 @@ async def dispatch(method: str, params: dict) -> tuple[dict, bool]:
                 "This feature is owned by the primary Flowly runtime.",
             )
     fn, wants_params, restart = entry
+    from flowly.session.keys import SubagentThreadReadOnlyError, require_rpc_subagent_access
     from flowly.session.ownership import SessionAccessError, require_rpc_session
 
+    try:
+        # A subagent's conversation is written only by the agent that
+        # started it: any call but a read naming one is refused here, the
+        # one door every transport's feature RPCs pass.
+        require_rpc_subagent_access(method, params)
+    except SubagentThreadReadOnlyError as error:
+        raise FeatureRpcError(error.code, error.message) from None
     try:
         require_rpc_session(method, params)
         result = fn(params) if wants_params else fn()

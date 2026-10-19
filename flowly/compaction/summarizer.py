@@ -3,7 +3,9 @@
 import asyncio
 import json
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 from loguru import logger
@@ -567,6 +569,33 @@ async def _chat_streamed(
     return LLMResponse(content="".join(text), finish_reason=finish_reason or "stop", usage=usage)
 
 
+# The provider-reported usage of every summarisation call made while a
+# ``collect_summary_usage`` block is active in this task. The service's API
+# returns a summary, not a bill; a caller that accounts tokens per run (a
+# subagent) collects them here instead, failed attempts included.
+_USAGE_SINK: ContextVar[list[dict[str, Any]] | None] = ContextVar(
+    "compaction_usage_sink", default=None,
+)
+
+
+@contextmanager
+def collect_summary_usage() -> Iterator[list[dict[str, Any]]]:
+    """Collect the ``usage`` of each summarisation call made inside the block."""
+    calls: list[dict[str, Any]] = []
+    token = _USAGE_SINK.set(calls)
+    try:
+        yield calls
+    finally:
+        _USAGE_SINK.reset(token)
+
+
+def _note_usage(response: Any) -> None:
+    sink = _USAGE_SINK.get()
+    usage = getattr(response, "usage", None)
+    if sink is not None and isinstance(usage, dict) and usage:
+        sink.append(dict(usage))
+
+
 async def _chat_bounded(
     provider: LLMProvider,
     *,
@@ -579,19 +608,23 @@ async def _chat_bounded(
     provider streams, otherwise one request bounded by a fixed timeout."""
     if _streams(provider):
         try:
-            return await _chat_streamed(
+            response = await _chat_streamed(
                 provider, messages=messages, model=model,
                 max_tokens=max_tokens, should_cancel=should_cancel,
             )
+            _note_usage(response)
+            return response
         except _StreamUnavailable as exc:
             logger.warning(
                 f"Summary stream failed before any output ({exc.__cause__}); "
                 "retrying as one request"
             )
-    return await _chat_single(
+    response = await _chat_single(
         provider, messages=messages, model=model,
         max_tokens=max_tokens, should_cancel=should_cancel,
     )
+    _note_usage(response)
+    return response
 
 
 async def _chat_single(

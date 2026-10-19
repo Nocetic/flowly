@@ -513,11 +513,6 @@ class GatewayClient:
         reply = await self._await_reply(rid, timeout=10.0)
         return bool(reply.get("deleted"))
 
-    async def assistants_list(self) -> list[dict[str, Any]]:
-        rid = await self._rpc("assistants.list", {})
-        reply = await self._await_reply(rid, timeout=10.0)
-        return reply.get("assistants", [])
-
     async def audit_list(
         self,
         *,
@@ -601,25 +596,11 @@ class GatewayClient:
         reply = await self._await_reply(rid, timeout=10.0)
         return reply.get("artifact") if isinstance(reply, dict) else None
 
-    # --- subagent specialists + manual spawn -----------------------
+    # --- manual spawn ---------------------------------------------
 
-    async def subagents_assistants(self) -> dict[str, Any]:
-        """Specialists + their per-specialist model overrides + the bot model."""
-        rid = await self._rpc("subagents.assistants", {})
-        return await self._await_reply(rid, timeout=10.0)
-
-    async def subagents_set_model(self, name: str, model: str) -> dict[str, Any]:
-        """Set/clear a specialist's model override ('' clears, 'inherit', or id)."""
-        rid = await self._rpc("subagents.set_model", {"name": name, "model": model})
-        return await self._await_reply(rid, timeout=10.0)
-
-    async def subagents_spawn(
-        self, task: str, *, session_key: str, assistant: str | None = None
-    ) -> dict[str, Any]:
+    async def subagents_spawn(self, task: str, *, session_key: str) -> dict[str, Any]:
         """Manually launch a background subagent; result lands in ``session_key``."""
         params: dict[str, Any] = {"task": task, "sessionKey": session_key}
-        if assistant:
-            params["assistant"] = assistant
         rid = await self._rpc("subagents.spawn", params)
         return await self._await_reply(rid, timeout=15.0)
 

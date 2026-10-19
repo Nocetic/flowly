@@ -3,8 +3,10 @@
 The agent calls ``plan(action="propose", ...)`` to decompose a task into
 steps. In YOLO, an ordinary agent-authored tracking plan starts immediately;
 an explicitly requested review (including standing/one-shot plan mode) blocks
-until the user decides. Once executable, the agent ticks steps with
-``update_step`` as it works and finishes with ``complete``.
+until the user decides. Once executable, the agent reports finished steps
+with ``update`` (batched, sent alongside its next real tool call); the manager
+starts the next step and completes the plan itself, so tracking costs no extra
+model round trips.
 
 Distinct from ``browser_plan`` (browser-coupled, evidence + validator). This
 is the general, session-level plan that syncs to every client's composer.
@@ -29,6 +31,20 @@ def plan_tool_enabled() -> bool:
     return val not in {"0", "false", "no", "off"}
 
 
+_STEP_STATUSES = ("completed", "skipped", "blocked", "in_progress", "pending")
+
+
+def _progress(plan: Any) -> dict[str, Any]:
+    """Terse tool result: what the model needs to continue, nothing more."""
+    done = sum(1 for s in plan.steps if s.status in ("completed", "skipped"))
+    out: dict[str, Any] = {"ok": True, "status": plan.status,
+                           "progress": f"{done}/{len(plan.steps)}"}
+    current = next((s for s in plan.steps if s.status == "in_progress"), None)
+    if current is not None:
+        out["current"] = {"id": current.id, "content": current.content}
+    return out
+
+
 class PlanTool(Tool):
     def __init__(
         self,
@@ -49,36 +65,37 @@ class PlanTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Plan mode — for any task that is long or has several distinct "
-            "steps, propose a plan before doing the work. The plan appears "
-            "above the user's input on every device with live ticks as you "
-            "complete each step.\n\n"
+            "Track a multi-step task as a live checklist shown above the user's "
+            "input on every device (not in the chat).\n\n"
+            "WHEN: only for work with 3+ distinct steps or that takes several "
+            "minutes, or when the user asks for a plan / runs /plan. Never for a "
+            "question, a single action, or anything you can finish in one or two "
+            "tool calls (one flowlet, one reminder, one small edit) — just do it.\n\n"
+            "COST: a plan call sent on its own costs a full model round trip. Send "
+            "plan updates in the SAME response as the real tool call you make next, "
+            "never as a standalone step. The server keeps the books: a started plan "
+            "puts step 1 in progress, finishing a step starts the next pending one, "
+            "and the plan completes itself once every step is completed or skipped. "
+            "So report only finished steps — several at once is fine — and if the "
+            "work took fewer moves than planned, mark them all completed in one update.\n\n"
             "ACTIONS:\n"
-            "- propose(goal, steps[, title, detailsMd, requiresApproval]): "
-            "decompose the task. In YOLO an ordinary tracking plan auto-starts; "
-            "otherwise this blocks until the user decides. Set requiresApproval "
-            "to true when the user explicitly asked to review/approve the plan "
-            "or asked for a plan without execution. Explicit /plan or standing "
-            "Plan mode is always review-gated by the backend. steps = array "
-            "of {id:int(1..N), content:str(imperative, e.g. 'Add the RPC "
-            "handler'), activeForm?:str(gerund), note?:str}. title = short plan "
-            "title. detailsMd = optional Markdown body shown in the plan card. "
-            "The result tells you what the user chose:\n"
-            "  • approved → execute the steps now, calling update_step as you go.\n"
-            "  • revise  → the user's feedback is included; call propose AGAIN "
-            "with updated steps (it continues the same plan).\n"
-            "  • rejected → do NOT do the task; acknowledge and stop.\n"
-            "  • timeout  → not approved; do not execute the task.\n"
-            "- view(): return the current plan.\n"
-            "- update_step(id, status[, note]): status = pending|in_progress|"
-            "completed|blocked|skipped. Mark a step in_progress before starting "
-            "it and completed right after — this drives the live ticks.\n"
-            "- complete([summary]): declare the whole plan done.\n"
-            "- block([reason]): the plan can't proceed and needs the user.\n"
-            "- abort(): discard the current plan.\n\n"
-            "When review is required, side-effecting tools (running commands, "
-            "writing files, sending messages, external services) stay blocked "
-            "until approval — so propose first, then follow the decision."
+            "- propose(goal, steps[, title, detailsMd, requiresApproval]): steps = "
+            "[{id:1..N, content:'imperative, user-visible outcome', activeForm?}], "
+            "3-7 steps, not micro-actions. In YOLO an ordinary plan starts at once; "
+            "otherwise the call waits for the user. approved → do the work; revise → "
+            "propose again with the feedback (same plan); rejected or not_approved → "
+            "do not do the task. Pass requiresApproval=true when the user wants to "
+            "review first or wants a plan without execution. Explicit /plan or "
+            "standing Plan mode is always review-gated.\n"
+            "- update(steps=[{id, status, note?}]): status = completed | skipped | "
+            "blocked | in_progress | pending.\n"
+            "- complete([summary]): optional — only to attach a summary or to close "
+            "the plan early.\n"
+            "- block(summary): the plan can't proceed without the user.\n"
+            "- abort(): discard the plan.\n"
+            "- view(): the current plan (rarely needed; results already carry progress).\n\n"
+            "While a plan awaits review, side-effecting tools (commands, file writes, "
+            "messages, external services) stay blocked; reading and searching still work."
         )
 
     @property
@@ -88,67 +105,47 @@ class PlanTool(Tool):
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": [
-                        "propose",
-                        "view",
-                        "update_step",
-                        "complete",
-                        "block",
-                        "abort",
-                    ],
+                    "enum": ["propose", "update", "complete", "block", "abort", "view"],
                 },
                 "goal": {
                     "type": "string",
-                    "description": "The task in one sentence (for propose).",
+                    "description": "The task in one sentence (propose).",
                 },
                 "title": {
                     "type": "string",
-                    "description": "Short plan title shown on the card (for propose).",
+                    "description": "Short plan title shown on the card (propose).",
                 },
                 "detailsMd": {
                     "type": "string",
-                    "description": "Optional Markdown body for the plan card (for propose).",
+                    "description": "Optional Markdown body for the plan card (propose).",
                 },
                 "requiresApproval": {
                     "type": "boolean",
                     "description": (
-                        "For propose: true when the user explicitly wants to "
+                        "propose: true when the user explicitly wants to "
                         "review/approve the plan, or wants a plan without execution."
                     ),
                 },
                 "steps": {
                     "type": "array",
-                    "description": "Array of {id, content, activeForm?, note?} (for propose).",
+                    "description": (
+                        "propose: [{id, content, activeForm?, note?}]. "
+                        "update: [{id, status, note?}] — any number of steps at once."
+                    ),
                     "items": {
                         "type": "object",
                         "properties": {
                             "id": {"type": "integer"},
                             "content": {"type": "string"},
                             "activeForm": {"type": "string"},
+                            "status": {"type": "string", "enum": list(_STEP_STATUSES)},
                             "note": {"type": "string"},
                         },
-                        "required": ["content"],
                     },
-                },
-                "id": {"type": "integer", "description": "Step id (for update_step)."},
-                "status": {
-                    "type": "string",
-                    "enum": [
-                        "pending",
-                        "in_progress",
-                        "completed",
-                        "blocked",
-                        "skipped",
-                    ],
-                    "description": "New step status (for update_step).",
-                },
-                "note": {
-                    "type": "string",
-                    "description": "Free-form annotation on a step (for update_step).",
                 },
                 "summary": {
                     "type": "string",
-                    "description": "Completion summary (for complete) or reason (for block).",
+                    "description": "Completion summary (complete) or reason (block).",
                 },
                 "session_key": {
                     "type": "string",
@@ -199,7 +196,7 @@ class PlanTool(Tool):
         if not plan_tool_enabled():
             return json.dumps({"error": "plan tool disabled (FLOWLY_PLAN_ENABLED=0)."})
 
-        valid = {"propose", "view", "update_step", "complete", "block", "abort"}
+        valid = {"propose", "view", "update", "update_step", "complete", "block", "abort"}
         if action not in valid:
             return json.dumps(
                 {"error": f"Unknown action: {action!r}. Valid: {sorted(valid)}"}
@@ -211,8 +208,16 @@ class PlanTool(Tool):
                 return await self._propose(session_key, kwargs)
             if action == "view":
                 return self._view(session_key)
+            if action == "update":
+                return await self._update(session_key, kwargs.get("steps"))
             if action == "update_step":
-                return await self._update_step(session_key, kwargs)
+                # Pre-batch spelling; still accepted so resumed sessions and
+                # older prompts keep working.
+                return await self._update(
+                    session_key,
+                    [{"id": kwargs.get("id"), "status": kwargs.get("status"),
+                      "note": kwargs.get("note")}],
+                )
             if action == "complete":
                 return await self._complete(session_key, kwargs)
             if action == "block":
@@ -270,19 +275,20 @@ class PlanTool(Tool):
             "via": decision.via,
         }
         if decision.decision == "approve":
-            approval_note = (
-                "Plan auto-started under YOLO. Execute the steps now: mark each "
+            started = (
+                "Plan auto-started under YOLO."
                 if decision.via == "policy"
-                else "Plan approved. Execute the steps now: mark each "
+                else "Plan approved."
             )
             return json.dumps(
                 {
                     **base,
                     "decision": "approved",
                     "note": (
-                        approval_note
-                        + "in_progress before starting and completed right after, "
-                        + "then call complete() at the end."
+                        started
+                        + " Step 1 is in progress. Do the work now; report finished "
+                        "steps with update in the same response as your next real "
+                        "tool call. The plan completes itself when every step is done."
                     ),
                     "plan": plan.public_view(),
                 }
@@ -333,36 +339,38 @@ class PlanTool(Tool):
             return json.dumps({"plan": None, "note": "No active plan for this session."})
         return json.dumps({"plan": plan.public_view()})
 
-    async def _update_step(self, session_key: str, kwargs: dict[str, Any]) -> str:
+    async def _update(self, session_key: str, raw: Any) -> str:
         plan = self._manager.get_current(session_key)
         if not plan:
-            return json.dumps({"error": "update_step: no active plan. Call propose first."})
-        sid = kwargs.get("id")
-        if not isinstance(sid, int):
-            return json.dumps({"error": "update_step: id (int) required."})
-        status = kwargs.get("status") or "in_progress"
-        valid = {"pending", "in_progress", "completed", "blocked", "skipped"}
-        if status not in valid:
-            return json.dumps({"error": f"update_step: invalid status {status!r}."})
-        if not plan.get_step(sid):
-            return json.dumps(
-                {
-                    "error": f"update_step: no step {sid}. Valid: "
-                    f"{[s.id for s in plan.steps]}"
-                }
-            )
-        updated = await self._manager.update_step(
-            plan.id, sid, status, note=kwargs.get("note")
-        )
+            return json.dumps({"error": "update: no active plan. Call propose first."})
+        if not isinstance(raw, list) or not raw:
+            return json.dumps({"error": "update: steps must be a non-empty array of {id, status}."})
+        updates: list[dict[str, Any]] = []
+        for item in raw:
+            if not isinstance(item, dict) or not isinstance(item.get("id"), int):
+                return json.dumps({"error": "update: every step needs an integer id."})
+            status = item.get("status") or "completed"
+            if status not in _STEP_STATUSES:
+                return json.dumps({"error": f"update: invalid status {status!r}."})
+            if not plan.get_step(item["id"]):
+                return json.dumps({
+                    "error": f"update: no step {item['id']}. Valid: {[s.id for s in plan.steps]}"
+                })
+            updates.append({"id": item["id"], "status": status, "note": item.get("note")})
+        updated = await self._manager.update_steps(plan.id, updates)
         if not updated:
-            return json.dumps({"error": "update_step: failed."})
-        return json.dumps(
-            {"success": True, "progress": updated.progress_summary(), "status": updated.status}
-        )
+            return json.dumps({"error": "update: failed."})
+        return json.dumps(_progress(updated))
 
     async def _complete(self, session_key: str, kwargs: dict[str, Any]) -> str:
         plan = self._manager.get_current(session_key)
         if not plan:
+            # The plan may already have completed itself on its last step.
+            latest = next(iter(self._manager.list_for_session(session_key)), None)
+            if latest is not None and latest.status == "completed":
+                if kwargs.get("summary"):
+                    await self._manager.complete(latest.id, str(kwargs["summary"]))
+                return json.dumps({"ok": True, "status": "completed"})
             return json.dumps({"error": "complete: no active plan."})
         updated = await self._manager.complete(plan.id, str(kwargs.get("summary", "")))
         self._manager.disarm_forced(session_key)

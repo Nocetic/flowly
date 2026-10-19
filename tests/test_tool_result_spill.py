@@ -365,19 +365,3 @@ def test_sanitize_after_relabel_no_double_prefix():
 
 
 # ── Layer 8: completion-claim guard is action-turn only ───────────────────
-
-def test_completion_claim_guard_gated_on_action_turn():
-    """The forced-tool retry block must require action_turn — reporting
-    answers like "şunları yaptım" on Q&A turns must not be discarded."""
-    import inspect
-    import re as _re
-    import flowly.agent.loop as loop_mod
-
-    src = inspect.getsource(loop_mod.AgentLoop._run_llm_tool_loop)
-    guard = _re.search(
-        r"if \(\s*action_turn\s*and not successful_tools_were_used"
-        r"\s*and response\.content"
-        r"\s*and self\._contains_unverified_completion_claim",
-        src,
-    )
-    assert guard, "completion-claim guard must be gated on action_turn"

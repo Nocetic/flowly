@@ -15,6 +15,7 @@ from typing import Any
 from loguru import logger
 
 from flowly.agent.subagent_observation import TaskEvents, run_view
+from flowly.agent.subagent_owner import process_owner
 from flowly.agent.subagent_registry import SubagentRegistry, SubagentRunRecord
 from flowly.agent.tools.base import Tool
 from flowly.bus.events import InboundMessage
@@ -157,6 +158,7 @@ class DelegateTool(Tool):
             cleanup="keep", created_at=time.time(), kind="delegate", agent_id=target_id,
             activity={"phase": "queued"},
             delivery_state="pending" if channel and chat_id else "not_required",
+            owner=process_owner(),
         )
         self._registry.register(record)
         self._running[run_id] = {"agent_id": target_id, "label": record.display_name,

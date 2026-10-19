@@ -422,3 +422,56 @@ def test_every_history_renderer_prefers_the_typed_boundary():
     assert source.index('kind") == "context_boundary"') < source.index(
         "COMPACTION_BOUNDARY_CONTENT"
     ), "the typed field must be checked before the legacy text"
+
+
+# ── §4.8: a subagent's running turn ─────────────────────────────────────────
+
+
+async def test_a_subagents_turn_never_rides_the_relay_as_conversation_state(tmp_path, monkeypatch):
+    """§4.8: on the relay a subagent's events go inside ``subagent.stream``
+    envelopes — a name the relay hands to the one watching session and never
+    stores. As ``chat`` they would be written into the conversation of the
+    session receiving them (the parent's). Inside, every event carries the
+    subagent's own ``sessionKey``, its ``runId`` and ``turnOrigin``, and the
+    turn has exactly one terminal."""
+    from unittest.mock import AsyncMock
+
+    from flowly.agent.subagent_stream import (
+        RELAY_STREAM_EVENT,
+        SUBAGENT_TURN_ORIGIN,
+        ChildStream,
+        SubagentStreamHub,
+        child_event_access,
+    )
+
+    monkeypatch.setenv('FLOWLY_HOME', str(tmp_path / 'home'))
+    assert RELAY_STREAM_EVENT not in CONVERSATION_SCOPED_EVENTS
+    relay = WebChannel(config=WebChannelConfig(enabled=True), bus=MessageBus())
+    relay._ws = AsyncMock()
+    key = "subagent:11111111-2222-4333-8444-555555555555"
+    relay._watch_subagent_stream("relay-sess-1", key)
+    hub = SubagentStreamHub(lambda: [relay])
+    stream = ChildStream(hub, run_id="run-1", session_key=key, thread_id=key.split(":", 1)[1],
+                         parent_session_key="web:parent", turn=1, trigger="spawn", title="t", mark={},
+                         model="m", brief="Do it", with_conversation=False,
+                         access=child_event_access("web:parent"))
+    await stream.start([])
+    journal = [{"role": "assistant", "content": "Looking.", "tool_calls": [
+        {"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": "ok", "status": "ok"}]
+    await stream.sync(journal)
+    stream.answer("Done.")
+    stream.end("ok", "Done.")
+    await hub.drained()
+
+    frames = [json.loads(call.args[0]) for call in relay._ws.send.await_args_list]
+    assert frames
+    terminals = 0
+    for frame in frames:
+        assert frame["type"] == "event" and frame["event"] == RELAY_STREAM_EVENT
+        assert frame["sessionId"] == "relay-sess-1" and frame["data"]["sessionKey"] == key
+        inner = frame["data"]["data"]
+        assert inner["sessionKey"] == key and inner["runId"] == "run-1"
+        assert inner["turnOrigin"] == SUBAGENT_TURN_ORIGIN
+        terminals += inner.get("state") in TERMINAL_STATES
+    assert terminals == 1

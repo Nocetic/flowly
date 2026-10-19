@@ -14,7 +14,7 @@ from weakref import WeakKeyDictionary
 import pytest
 from aiohttp import web
 
-from flowly.agent.subagent import SubagentManager
+from flowly.agent.subagent import _MAX_CONCURRENT_SUBAGENTS, SubagentManager
 from flowly.agent.subagent_observation import TaskEvents, run_view
 from flowly.agent.subagent_registry import SubagentRegistry, SubagentRunRecord
 from flowly.agent.tools.delegate import DelegateTool
@@ -87,17 +87,13 @@ async def test_provider_terminal_errors_are_never_success(tmp_path, code, status
     await mgr._events.flush()
 
 
-async def test_full_unicode_result_survives_context_cap_and_restart(tmp_path):
-    from flowly.agent.assistants import AssistantRegistry
-    assistants = AssistantRegistry(tmp_path / "assistants")
-    assistants.reload()
+async def test_full_unicode_result_survives_restart(tmp_path):
     full = "Kanıt ve sonuç 🌱.\n" * 2500
     mgr = manager(tmp_path, Provider(LLMResponse(content=full)))
-    inline = await mgr.spawn("Read report", wait=True, assistant=assistants.get("researcher"))
-    assert len(inline) < len(full)
+    inline = await mgr.spawn("Read report", wait=True)
+    assert inline == full
     restarted = SubagentRegistry(tmp_path / "runs.json")
     rec = restarted.all()[0]
-    assert rec.artifact_ids
     assert len(run_view(rec)["resultPreview"]) == 1200
     offset, chunks = 0, []
     while True:
@@ -142,7 +138,7 @@ async def test_trace_survives_cancellation_inside_tool(tmp_path, monkeypatch):
     async def capture(name, data):
         events.append((name, data))
     mgr = manager(tmp_path, Provider(response), on_event=capture)
-    await mgr.spawn("Check folder", label="builtin:researcher", silent=True)
+    await mgr.spawn("Check folder", silent=True)
     await asyncio.wait_for(entered.wait(), 2)
     rec = mgr.registry.all()[0]
     disk = SubagentRegistry(tmp_path / "runs.json").get(rec.run_id)
@@ -219,7 +215,9 @@ def test_retention_uses_completion_time_and_prunes_result_files(tmp_path, monkey
     reg.update("run-1", announced=True)
     assert len(reg.all()) == 1  # a long-running task is still recent
     now = time.time()
-    monkeypatch.setattr("flowly.agent.subagent_registry.time.time", lambda: now + 86401)
+    monkeypatch.setattr("flowly.agent.subagent_registry.time.time", lambda: now + 7 * 86400)
+    assert len(reg.all()) == 1  # a finished run is kept for weeks, not a day
+    monkeypatch.setattr("flowly.agent.subagent_registry.time.time", lambda: now + 30 * 86400 + 1)
     assert reg.all() == []
     assert SubagentRegistry(tmp_path / "runs.json").all() == []
     reg.register(record("new"))
@@ -382,9 +380,9 @@ async def test_wait_tasks_count_toward_concurrency_limit(tmp_path):
     mgr = manager(tmp_path, Provider(action=wait))
     sync_task = asyncio.create_task(mgr.spawn("first", wait=True))
     await entered.wait()
-    for i in range(4):
+    for i in range(_MAX_CONCURRENT_SUBAGENTS - 1):
         await mgr.spawn(f"Task {i}", silent=True)
-    denied = json.loads(await mgr.spawn("sixth", silent=True))
+    denied = json.loads(await mgr.spawn("one too many", silent=True))
     assert denied["status"] == "rejected"
     mgr.cancel_all()
     await asyncio.gather(sync_task, return_exceptions=True)

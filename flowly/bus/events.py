@@ -24,6 +24,23 @@ class InboundMessage:
 
 
 @dataclass
+class ConversationInboundMessage(InboundMessage):
+    """An inbound message for a conversation whose key is not ``channel:chat_id``.
+
+    A desktop chat is stored under its own conversation key while replies
+    travel to a connection id. Work the agent started in that chat (a
+    subagent's result or question) must come back to the same conversation —
+    its history, its turn lock — not to a session named after the connection.
+    """
+
+    conversation_key: str = ""
+
+    @property
+    def session_key(self) -> str:  # type: ignore[override]
+        return self.conversation_key or f"{self.channel}:{self.chat_id}"
+
+
+@dataclass
 class OutboundMessage:
     """Message to send to a chat channel."""
     

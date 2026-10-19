@@ -47,6 +47,9 @@ def _get_denied_paths() -> tuple[Path, ...]:
         home / "credentials",
         home / "electron-api.json",
         home / "sessions",
+        # Subagent conversations carry the owner's conversation they were
+        # given, like the sessions above.
+        home / "subagents" / "sessions",
     )
 
 

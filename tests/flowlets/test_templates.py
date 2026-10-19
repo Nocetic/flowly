@@ -59,7 +59,7 @@ def test_ids_are_stable_and_unique():
     # Clients key their picker off these; renaming one is a breaking change, so
     # it should take a deliberate edit here.
     assert [t.id for t in TEMPLATES] == [
-        "water", "habits", "expenses", "tasks", "sleep", "mood",
+        "water", "habits", "expenses", "tasks", "sleep", "mood", "meals",
     ]
 
 
@@ -124,3 +124,46 @@ def test_normalize_lang_handles_client_locales():
 def test_unknown_template_raises():
     with pytest.raises(KeyError):
         build_template("nope")
+
+
+def test_every_template_pie_groups_its_rows():
+    """A pie/donut over a list must group by a field; one using an unknown
+    `groupBy` resolved as a time series and showed "No data yet"."""
+    from flowly.flowlets.queries import resolve_values
+    from flowly.flowlets.synth import synth_rows
+    from flowly.flowlets.templates import TEMPLATES, build_template
+
+    def charts(node):
+        if isinstance(node, list):
+            for n in node:
+                yield from charts(n)
+        elif isinstance(node, dict):
+            if node.get("type") == "chart" and node.get("kind") in ("pie", "donut"):
+                yield node
+            yield from charts(node.get("children"))
+
+    for tpl in TEMPLATES:
+        d = build_template(tpl.id, "en")
+        for chart in charts(d["layout"]):
+            data = chart["data"]
+            assert "by" in data, (tpl.id, chart)
+            lst = data.get("list")
+            state = {lst: synth_rows(d["state"][lst]["item"], 1_791_460_800_000, None)} if lst else {}
+            slices = resolve_values(d, state, [], 1_791_460_800_000, None)[chart["id"]]
+            assert slices and all("k" in s for s in slices), (tpl.id, slices)
+
+
+def test_group_by_alias_is_repaired_or_rejected():
+    import pytest as _pytest
+
+    from flowly.flowlets.authoring import repair_definition
+    from flowly.flowlets.schema import FlowletValidationError, validate_definition
+    d = {"catalog": 3, "name": "X",
+         "state": {"rows": {"type": "list", "item": {"cat": "string", "n": "number"}}},
+         "layout": [{"type": "chart", "id": "c", "kind": "pie",
+                     "data": {"list": "rows", "field": "n", "groupBy": "cat"}}]}
+    with _pytest.raises(FlowletValidationError, match="`data.by`"):
+        validate_definition(d)
+    fixed, notes = repair_definition(d)
+    assert fixed["layout"][0]["data"]["by"] == "cat" and notes
+    validate_definition(fixed)

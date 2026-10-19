@@ -1601,6 +1601,7 @@ class ContextBuilder:
             parts.append(f"""# Skills
 
 Scan skills below. If one matches your task, load it with `skill_view(name)` and follow its instructions.
+Skip the read when a first-class tool already documents the workflow (flowlet, cron, plan): its description, templates and guide are the contract. A skill is for knowledge a tool doesn't give you.
 Skills with available="false" need dependencies — try installing with apt/brew.
 
 {skills_summary}""")
@@ -1646,69 +1647,6 @@ Skills with available="false" need dependencies — try installing with apt/brew
             "and corrections. NOT for structured facts — those go to knowledge_graph."
             )
 
-        # Built-in agents — routing is handled at framework level (code),
-        # this is just informational for the LLM
-        if available_tools is None or "builtin_agent" in available_tools:
-            parts.append(
-            "# Specialist Agents\n\n"
-            "Delegate research / writing / code work with `builtin_agent`:\n"
-            "- `researcher` — SELF-CONTAINED: researches a topic (web_search, "
-            "web_fetch) AND writes a final markdown report. "
-            "Use for any 'research X and write about it' task.\n"
-            "- `writer` — reshape already-gathered source material into "
-            "essay / doc / article. Use ONLY when you already have the content; "
-            "for 'research and write' call `researcher`, not this.\n"
-            "- `coder` — code review, refactor, debug.\n"
-            "\n"
-            "## Subagent rules (IMPORTANT)\n"
-            "1. **No chaining.** Do NOT call `researcher` then `writer` — "
-            "researcher already writes the report. Chaining re-does the work "
-            "from scratch and wastes 2-5 minutes.\n"
-            "2. **Pick one specialist per task.** If the task fits researcher, "
-            "call researcher ONCE and deliver its output. Don't also call "
-            "writer 'to polish it' — the researcher's output IS the deliverable.\n"
-            "3. **Trust the specialist's output.** A specialist returning a "
-            "report means the work is done. Deliver the report as-is; don't "
-            "rerun the task to 'improve' it, and don't run your own "
-            "web_search / web_fetch on the same topic after the specialist "
-            "already covered it.\n"
-            "4. **Skip the specialist for trivial tasks.** If a single "
-            "`web_search` + short summary answers the question, don't spawn a "
-            "subagent — answer directly.\n"
-            "5. **Long specialist outputs are auto-saved.** When a "
-            "specialist (researcher, writer) produces a long report, it "
-            "is stored as a user-visible artifact automatically — you "
-            "see it in your tool result as a `<persisted-output>` "
-            "envelope (preview + artifact_id) to keep your context "
-            "lean. The full report is already in the user's artifact "
-            "list. If the user then asks to save or keep that report "
-            "(in any language), DO NOT dispatch a new specialist and "
-            "DO NOT call `artifact(action='create', ...)` — the "
-            "artifact already exists. Confirm briefly in the user's "
-            "language that it is already saved. If you need to "
-            "reference a specific ID, the artifact_id is visible in "
-            "the prior `<persisted-output>` block in your conversation "
-            "history. Only call `artifact(action='create', ...)` when "
-            "you have inline content that was NEVER parked (short "
-            "specialist output, or content you wrote yourself).\n"
-            "6. **Async dispatch (researcher, writer).** Long specialists "
-            "return a `dispatched` envelope IMMEDIATELY — you do NOT have "
-            "the result yet. The envelope contains a `required_next_steps` "
-            "array: follow it verbatim. Concretely: emit ONE short "
-            "acknowledgement to the user in their language (under 15 "
-            "words), then END YOUR TURN. Do NOT call another tool, do "
-            "NOT try to answer from memory — that produces "
-            "hallucinations while the real specialist is still running. "
-            "The specialist's full result will arrive as a system "
-            "message on a LATER turn; compose the final answer then, "
-            "using the real data. If the user asks to 'save' that "
-            "result in a follow-up turn, the artifact is already saved — "
-            "just confirm, do NOT re-dispatch the specialist.\n"
-            "\n"
-            "Specialists run in-process with dedicated models and return their "
-            "final result to you as a tool_result — deliver it to the user."
-            )
-
         # Artifacts — tell the bot where artifacts live and how to access them
         if available_tools is None or "artifact" in available_tools:
             parts.append(
@@ -1723,21 +1661,11 @@ Skills with available="false" need dependencies — try installing with apt/brew
             "- `artifact(action='update', artifact_id=..., content=...)` — modify\n"
             "- `artifact(action='delete', artifact_id=...)` — remove\n"
             "- `artifact(action='promote', artifact_id=...)` — rarely needed; only for legacy "
-            "hidden artifacts (older sessions before the auto-save change). New subagent "
-            "outputs are already user-visible.\n\n"
-            "When a specialist subagent (researcher, writer) returns a "
-            "`<persisted-output>` envelope, the full report is ALREADY stored "
-            "as a user-visible artifact — the envelope only shows you a "
-            "preview so your context stays lean. Read specific sections with "
-            "`artifact(action='get', artifact_id=..., offset=..., limit=6000)` "
-            "when you need more detail. Do NOT paste the raw `<persisted-output>` "
-            "tags to the user; answer from the preview. "
-            "If the user asks to save/keep that report, DO NOT create a new "
-            "artifact and DO NOT re-dispatch the specialist — the artifact "
-            "already exists in their list. Just confirm it is there and "
-            "optionally mention its title.\n\n"
-            "Regular tool results (web_fetch, exec, read_file, ...) are NOT "
-            "parked — if you need more detail from a tool than what fits in "
+            "hidden artifacts.\n\n"
+            "An artifact exists only once `artifact(action='create', ...)` has returned "
+            "its id. Never tell the user something is saved without that.\n\n"
+            "Tool results are not saved anywhere — if you need more detail from a tool "
+            "than what fits in "
             "its truncation window, re-call it with a narrower query or "
             "explicit range parameters.\n\n"
             "When a user asks 'what's in my artifacts' or 'show my reports', "
@@ -2119,11 +2047,37 @@ Scheduled jobs run the full agent loop with the tools allowed by their cron rout
 
 If a scheduled job tool call fails, include the error in your response — do not silently ignore errors.""")
 
+        if has_tool("objective") or has_tool("follow_up"):
+            identity_parts.append("""## Goals and follow-ups
+
+You can keep track of the owner's goals and come back to things on your own.
+- When the owner sets out to do something over days or weeks and a plan takes shape, track it with `objective` (create it with a first `next_check`) and say in your reply that you will keep track of it. Do not track passing wishes.
+- When something is left unfinished that you could move forward later (a purchase they were researching, a decision, something they will try tomorrow), or you promise to come back to something, plan it with `follow_up`.
+- These are your own notes: never mention the tools, ids or your agenda to the owner. Talk about the goal or the thing itself.
+- Whether you may write first is decided by the owner's limits, not by you. Plan what is worth it, and plan nothing when nothing is.
+- When the owner tells you how often to write first, or when not to, set it with `proactivity`.""")
+
         background_lines: list[str] = []
         if has_tool("spawn"):
             background_lines.extend([
-                "Use `spawn` for tasks taking 15+ seconds (web research, file analysis, builds).",
-                "Do not spawn for quick commands, screenshots, or when the user needs an answer now.",
+                "**Subagents (`spawn`).** A subagent is a separate model run that works "
+                "in the background and reports back; each one costs a full run of its "
+                "own. Whether to start one is your call, or the owner's when they ask.",
+                "Write each brief for a newcomer: the goal, what you already know, the "
+                "sources to use, what is out of scope, and what to return.",
+                "After starting subagents, do any work that doesn't depend on them, "
+                "tell the owner briefly what is running, and end your turn. Don't "
+                "wait for them: when all the subagents you started in a turn have "
+                "finished, their results reach you together as one new message, and "
+                "you answer the owner's request from there. Treat a result as the "
+                "subagent's own report: check what matters, don't redo its work.",
+                "A subagent keeps its conversation after it reports: `agent_followup` "
+                "gives it another task, `agent_close` ends it.",
+                "Steer or answer a running subagent with `agent_message`; read the "
+                "rest of a long result with `agent_read`. `agent_wait` is only for "
+                "the rare case where your own work in this turn cannot finish "
+                "without a result due within a minute or two. Never sleep, poll "
+                "`sessions_list` or re-read results in a loop.",
             ])
         if has_tool("sessions_list"):
             background_lines.extend([
@@ -2380,7 +2334,9 @@ When in doubt, ASK FIRST. A wrong action can't be undone.""")
                     "Relevant skills include descriptions; every remaining skill "
                     "is still named in the compact index. Load a matching skill "
                     "with `skill_view(name)` and follow it. Skills marked "
-                    "available=\"false\" need setup.\n\n"
+                    "available=\"false\" need setup. Skip the read when a first-class "
+                    "tool already documents the workflow (flowlet, cron, plan): its "
+                    "description, templates and guide are the contract.\n\n"
                     f"{skills_summary}"
                 )
 

@@ -147,11 +147,12 @@ class Extractor(Protocol):
 
 # Session-key prefixes the dreamer must NOT learn from: the agent's own
 # autonomous/background runs. Their transcripts are machine-generated (heartbeat
-# ticks, cron jobs, subagent tasks, system announces) — mining them as "user
+# ticks, cron jobs, subagent tasks, system announces, the agent's daily review
+# of its goals) — mining them as "user
 # memory" is exactly how the dreamer ends up "proposing memories with no
 # conversation" and treating its own tool output as user facts. Only genuine
 # user-channel conversation should feed memory extraction.
-_AUTOMATION_PREFIXES = ("heartbeat:", "cron:", "subagent:", "system:")
+_AUTOMATION_PREFIXES = ("heartbeat:", "cron:", "subagent:", "system:", "agenda:")
 
 # The SQL clause form (one NOT LIKE per prefix) plus a guard against the stale
 # ``<key>.full`` display-mirror twins that older indexes still hold.

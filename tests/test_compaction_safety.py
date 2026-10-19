@@ -614,6 +614,81 @@ def test_newest_user_protection_is_not_disabled_with_tail_optimization() -> None
     assert kept == [newest]
 
 
+def _exchange(call_id: str, result_chars: int, narration: str = "") -> list[dict]:
+    return [
+        {"role": "assistant", "content": narration,
+         "tool_calls": [{"id": call_id, "function": {"name": "web_fetch", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": call_id, "name": "web_fetch",
+         "content": f"page {call_id} " + "text " * (result_chars // 5)},
+    ]
+
+
+def _in_flight_turn() -> list[dict]:
+    """A turn still running: an early huge result, then three small newer
+    exchanges, and no final answer yet."""
+    return (
+        [{"role": "user", "content": "compare the three hosting options"}]
+        + _exchange("old", 60_000, "Reading the big pricing page.")
+        + _exchange("n1", 1_200, "Now Render.")
+        + _exchange("n2", 1_200, "Now Fly.io.")
+        + _exchange("n3", 1_200, "Now Hetzner.")
+    )
+
+
+def test_a_running_turn_too_big_to_keep_keeps_its_newest_tool_exchanges():
+    """Before: a turn too big to keep whole kept only the question (a running
+    turn has no final answer), so after a mid-turn compaction the agent had
+    none of the work it had just done and redid it."""
+    service = _service(_Provider(LLMResponse(content="s", finish_reason="stop")))
+    turn = _in_flight_turn()
+    messages = _conversation(10) + turn
+
+    kept = service._calculate_keep_recent(messages, history_budget=6_000)
+
+    assert kept[0] is turn[0], "the question stays verbatim"
+    ids = [m.get("tool_call_id") for m in kept if m.get("role") == "tool"]
+    assert ids == ["n1", "n2", "n3"], f"the newest exchanges, in order: {ids}"
+    assert not any("page old" in str(m.get("content")) for m in kept), "the huge old result goes to the summary"
+
+
+def test_a_kept_running_turn_has_no_call_without_its_result():
+    service = _service(_Provider(LLMResponse(content="s", finish_reason="stop")))
+    messages = _conversation(10) + _in_flight_turn()
+
+    kept = service._calculate_keep_recent(messages, history_budget=6_000)
+
+    calls = [c["id"] for m in kept for c in (m.get("tool_calls") or [])]
+    results = [m.get("tool_call_id") for m in kept if m.get("role") == "tool"]
+    assert sorted(calls) == sorted(results), (calls, results)
+    for index, message in enumerate(kept):
+        if message.get("role") == "tool":
+            caller = next(m for m in reversed(kept[:index]) if m.get("role") == "assistant")
+            assert message["tool_call_id"] in {c["id"] for c in caller["tool_calls"]}
+
+
+def test_a_newest_exchange_still_waiting_for_its_result_is_never_kept_alone():
+    service = _service(_Provider(LLMResponse(content="s", finish_reason="stop")))
+    turn = _in_flight_turn()[:-1]  # n3's call without its result
+    messages = _conversation(10) + turn
+
+    kept = service._calculate_keep_recent(messages, history_budget=6_000)
+
+    calls = [c["id"] for m in kept for c in (m.get("tool_calls") or [])]
+    results = [m.get("tool_call_id") for m in kept if m.get("role") == "tool"]
+    assert sorted(calls) == sorted(results), "no dangling call in the tail"
+
+
+async def test_a_running_turns_kept_exchanges_and_the_rest_reach_the_summary():
+    provider = _Provider(LLMResponse(content="A summary of the hosting research.", finish_reason="stop"))
+    service = _service(provider)
+    messages = _conversation(10) + _in_flight_turn()
+
+    result = await service.compact(messages, history_budget=6_000)
+
+    assert [m.get("tool_call_id") for m in result.kept_messages if m.get("role") == "tool"] == ["n1", "n2", "n3"]
+    assert provider.saw("Reading the big pricing page."), "the dropped exchange is summarized"
+
+
 async def test_an_extracted_tail_still_summarizes_the_whole_block():
     """Suffix arithmetic on an extracted tail would silently drop the block's
     tool traffic from BOTH the summary and the tail. Extract mode must feed

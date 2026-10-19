@@ -21,6 +21,7 @@ always passes — the expansion only ever emits declared refs.
 from __future__ import annotations
 
 import copy
+import re
 from typing import Any
 
 from flowly.flowlets import catalog
@@ -33,18 +34,22 @@ _SEGMENTED_MAX = 4
 # ── prop → template helpers ───────────────────────────────────────────────────
 
 
+#: A bare ``$.field`` reference not already wrapped in braces.
+_BARE_FIELD_RE = re.compile(r"(?<!\{)\$\.([A-Za-z][A-Za-z0-9_]*)")
+
+
 def _text_template(v: Any) -> str | None:
     """A composite prop → the string a ``text`` node should show.
 
-    ``"$.title"`` → ``"{$.title}"`` (interpolated); ``"{$.amount} ₺"`` → as-is;
-    a bare literal → itself. ``None``/non-string → None (sub-node omitted)."""
+    Every bare ``$.field`` becomes ``{$.field}``: ``"$.title"`` →
+    ``"{$.title}"``, ``"$.category · $.merchant"`` →
+    ``"{$.category} · {$.merchant}"``. Already-braced refs (``"{$.amount} ₺"``)
+    and plain literals are kept. ``None``/non-string → None (sub-node omitted).
+    Wrapping the whole string once printed ``{$.category · $.merchant}``
+    verbatim on every client."""
     if not isinstance(v, str) or not v:
         return None
-    if "{" in v:
-        return v
-    if v.startswith("$."):
-        return "{" + v + "}"
-    return v
+    return _BARE_FIELD_RE.sub(r"{$.\1}", v)
 
 
 def _field_ref(v: Any) -> str | None:
@@ -159,13 +164,16 @@ def _expand_form(node: dict, injected: dict, item_schema: dict) -> dict:
 
     add_fields: dict[str, str] = {}
     resets: list[dict] = []
+    required: list[dict] = []
+    first_text = True
     for fspec in fields:
         field = fspec["field"]
         ftype = item_schema.get(field, "string")
         draft = _draft_key(form_id, field)
         # inject the draft state key (namespaced, typed)
         if ftype == "number":
-            injected["state"][draft] = {"type": "number", "default": 0}
+            # Empty until typed: a seeded 0 rendered as text and hid the placeholder.
+            injected["state"][draft] = {"type": "number", "default": None, "nullable": True}
         elif ftype == "bool":
             injected["state"][draft] = {"type": "bool", "default": False}
         else:  # string / date drafts are strings
@@ -175,8 +183,22 @@ def _expand_form(node: dict, injected: dict, item_schema: dict) -> dict:
             elif isinstance(fspec.get("options"), list) and fspec["options"]:
                 default = str(fspec["options"][0])  # first option, so nothing is unset
             injected["state"][draft] = {"type": "string", "default": default}
+            if ftype == "date":
+                injected["state"][draft]["format"] = "date"
         children.append(_form_control(form_id, fspec, ftype))
         add_fields[field] = "{" + draft + "}"
+        # What a person must type before the row is worth saving: every
+        # number and the first free-text field (the row's name). Fields with
+        # options, dates and switches always carry a value; an author's
+        # `required` decides either way.
+        free_text = ftype == "string" and not isinstance(fspec.get("options"), list)
+        needed = fspec.get("required")
+        if needed is None:
+            needed = ftype == "number" or (free_text and first_text)
+        if free_text:
+            first_text = False
+        if needed:
+            required.append({"field": field, "label": str(fspec.get("label") or field)})
         resets.append({"op": "reset", "key": draft})
 
     submit = node.get("submit") or {}
@@ -184,7 +206,8 @@ def _expand_form(node: dict, injected: dict, item_schema: dict) -> dict:
         "type": "button", "id": f"{form_id}_submit",
         "text": submit.get("label") or "Add", "style": "primary",
         "action": {"op": "batch", "ops": [
-            {"op": "item_add", "key": into, "fields": add_fields},
+            {"op": "item_add", "key": into, "fields": add_fields,
+             **({"require": required} if required else {})},
             *resets,
         ]},
     })

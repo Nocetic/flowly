@@ -67,7 +67,7 @@ async def live_run(screen_gateway, tmp_path, monkeypatch):
             assert (await gateway.send_browser_tool_request("open", "get_page_text", {}))["success"]
             result["loop"] = await loop._run_llm_tool_loop(
                 [{"role": "system", "content": "Complete the browser task."}, {"role": "user", "content": "Continue."}],
-                action_turn=False, session_key=args[0], outbound_run_id=args[2], tools_allowed=False)
+                session_key=args[0], outbound_run_id=args[2], tools_allowed=False)
             run.succeeded = not loop.is_run_aborted(args[2])
         return result["loop"][0], {"aborted": loop.is_run_aborted(args[2])}
 
@@ -164,7 +164,7 @@ async def test_a_run_without_the_screen_gets_no_screen_guidance(tmp_path, monkey
                      max_iterations=2, soft_warn_at_iteration=0)
     try:
         await loop._run_llm_tool_loop([{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}],
-                                      action_turn=False, session_key="plain", outbound_run_id="plain-run",
+                                      session_key="plain", outbound_run_id="plain-run",
                                       tools_allowed=False)
     finally:
         loop.stop()
