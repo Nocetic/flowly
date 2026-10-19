@@ -101,7 +101,7 @@ from flowly.agent.prompt_blocks import (
     detect_model_families,
 )
 from flowly.render_capabilities import normalize_render_capabilities
-from flowly.agent.reply_media import extract_reply_media, extract_reply_media_assets
+from flowly.agent.reply_media import extract_reply_media, extract_reply_media_assets, publish_reply_file
 from flowly.media.assets import ASSETS_META_KEY, assets_to_meta
 from flowly.agent.run_abort import RunAbortedError, RunAbortController
 from flowly.agent.run_steering import ProviderSteeredError, RunSteeringController, SteeringError
@@ -5791,6 +5791,7 @@ class AgentLoop:
 
         cleaned, accepted, refused = take_media_tokens(content, media_token_roots(self.workspace))
         for path in accepted:
+            path = publish_reply_file(path)
             if path not in reply_media:
                 reply_media.append(path)
         for path, reason in refused:
@@ -7117,6 +7118,8 @@ class AgentLoop:
                             # summary (even if a file vanished, the model never
                             # sees an envelope).
                             for _p in _attach_paths:
+                                # Where the clients can open it at full size.
+                                _p = publish_reply_file(_p)
                                 if _p not in reply_media:
                                     reply_media.append(_p)
                             # Descriptors for those files (duration, dimensions,
@@ -9446,7 +9449,7 @@ class AgentLoop:
         if subagent_reports:
             self.subagents.mark_delivered(msg.session_key, subagent_reports)
         await self._index_turn_media(
-            session, reply_media_assets, msg.media, msg.channel
+            session, reply_media_assets, msg.media, msg.channel, reply_paths=reply_media
         )
 
         # Auto-title the session from the first exchange so every
@@ -9902,7 +9905,7 @@ class AgentLoop:
             subagents.mark_delivered(session_key, subagent_reports)
         # A system/announce turn has no inbound attachment — it is triggered by
         # the agent's own machinery, not by a person handing it a file.
-        await self._index_turn_media(session, reply_media_assets, None, origin_channel)
+        await self._index_turn_media(session, reply_media_assets, None, origin_channel, reply_paths=reply_media)
 
         # Local clients (TUI / desktop) have no channel adapter, so a
         # system-triggered reply (board result, subagent announce, …) would
@@ -10104,8 +10107,14 @@ class AgentLoop:
         reply_assets: list,
         inbound_paths: list | None,
         channel: str,
+        *,
+        reply_paths: list | None = None,
     ) -> None:
         """Add this turn's media — produced and received — to the library index.
+
+        ``reply_paths`` are all the files the reply attached; those no tool
+        described (a screenshot, a file named with ``MEDIA:``) are recorded as
+        produced too, against the same closing message.
 
         Called AFTER the session is saved, for one reason: the timestamp we
         record has to be the one ``chat.history`` will publish. That pair —
@@ -10132,6 +10141,16 @@ class AgentLoop:
                 session_key=session.key,
                 channel=channel,
                 message_ts=self._turn_message_ts(session, "assistant", "media_assets"),
+            )
+        described = {asset.path for asset in reply_assets or []}
+        undescribed = [path for path in reply_paths or [] if path not in described]
+        if undescribed:
+            await record_paths_async(
+                undescribed,
+                source=SOURCE_GENERATED,
+                session_key=session.key,
+                channel=channel,
+                message_ts=self._turn_message_ts(session, "assistant", "media"),
             )
         if inbound_paths:
             await record_paths_async(

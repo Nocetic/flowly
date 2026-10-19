@@ -211,3 +211,56 @@ def take_media_tokens(text: str, roots: list[Path]) -> tuple[str, list[str], lis
     lines = [line.rstrip() for line in cleaned.splitlines()]
     cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
     return cleaned, accepted, refused
+
+
+def publish_reply_file(path: str, media_dir: Path | None = None) -> str:
+    """The copy of an attached file the clients can open at full size.
+
+    Clients show a reply's attachment from a small inline preview and fetch
+    the original by its name from the media directory (``/api/media``, and the
+    relay's media window). A file attached from anywhere else (a screenshot in
+    ``screenshots/``, a file in the workspace) was never there, so the client
+    could only blow its preview up. It is published there: hard-linked when it
+    can be, copied otherwise, under a name that does not overwrite another
+    file. Returns the published path, or ``path`` when it is already there, is
+    a URL, or cannot be published (the preview still shows then).
+    """
+    if not isinstance(path, str) or not path or path.startswith(("http://", "https://")):
+        return path
+    import shutil
+    from hashlib import sha256
+
+    from loguru import logger
+
+    if media_dir is None:
+        from flowly.profile import get_flowly_home
+
+        media_dir = get_flowly_home() / "media"
+    try:
+        source = Path(path).resolve(strict=True)
+        media_dir.mkdir(parents=True, exist_ok=True)
+        media_dir = media_dir.resolve()
+        if source.parent == media_dir:
+            # Already servable; the path stays as the producing tool wrote it,
+            # which is the key its asset descriptor is filed under.
+            return path
+        name = source.name
+        if name.startswith("."):
+            name = "attachment" + source.suffix
+        target = media_dir / name
+        if target.exists() and not target.samefile(source):
+            stat = source.stat()
+            digest = sha256(f"{source}:{stat.st_size}:{stat.st_mtime_ns}".encode()).hexdigest()[:8]
+            target = media_dir / f"{source.stem}-{digest}{source.suffix}"
+        if target.exists():
+            if target.samefile(source):
+                return str(target)
+            raise FileExistsError(target)
+        try:
+            os.link(source, target)
+        except OSError:
+            shutil.copy2(source, target)
+        return str(target)
+    except (OSError, ValueError) as exc:
+        logger.warning(f"[media] could not publish {path} for full-size viewing: {exc}")
+        return path
