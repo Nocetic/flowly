@@ -2446,6 +2446,10 @@ Respond to the user now:"""
 
     # Wire subagent events → gateway broadcast
     async def _on_subagent_event(event_name: str, data: dict) -> None:
+        from flowly.push.activity_push import get_activity_publisher
+
+        # The phone's chat island lists the subagents of the run it shows.
+        await get_activity_publisher().on_subagent_event(event_name, data)
         deliveries = [gateway_server._broadcast_subagent_event(event_name, data)]
         web = channels.get_channel("web")
         if web is not None:
@@ -2480,6 +2484,10 @@ Respond to the user now:"""
     # Lightweight: emitted from agent loop around tools.execute(); failure
     # in the callback never affects agent execution.
     async def _on_tool_event(event_name: str, data: dict) -> None:
+        from flowly.push.activity_push import get_activity_publisher
+
+        # The phone's chat island shows the running tool's kind.
+        await get_activity_publisher().on_tool_event(event_name, data)
         await gateway_server.broadcast_tool_event(event_name, data)
 
     agent.tool_callback = _on_tool_event
@@ -2874,6 +2882,16 @@ Respond to the user now:"""
             from flowly.plans.approval import get_plan_approval_manager
             from flowly.push.approval_push import wire_waiting_pushes
             wire_waiting_pushes(_clarify_mgr, get_plan_approval_manager())
+
+            # Who is at work, pushed to the phones' chat islands (iOS Live
+            # Activities) while their app is suspended. Idle until a phone
+            # hands over an island token.
+            from flowly.push.activity_push import wire_activity_push
+            wire_activity_push(
+                profile_host=gateway_server.profile_host,
+                approvals=_approval_mgr,
+                questions=_clarify_mgr,
+            )
 
             # Run until shutdown signal
             async def run_until_shutdown():

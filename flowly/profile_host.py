@@ -408,6 +408,9 @@ class ProfileHost:
         self._broker_waiters: dict[tuple[str, str], asyncio.Future[dict[str, Any]]] = {}
         self._interactive_task_sessions: dict[tuple[str, str], str] = {}
         self._terminal_events: dict[tuple[str, str], dict[str, Any]] = {}
+        # Conversations the roster already heard begin a turn (see
+        # ``_roster_turn``); insertion-ordered, so the oldest go first.
+        self._roster_turns: dict[tuple[str, str], None] = {}
         self._broker_target_locks: dict[str, asyncio.Lock] = {}
         self._profile_message_requests: dict[
             tuple[str, str], tuple[str, str, asyncio.Task[Any]]
@@ -2384,6 +2387,9 @@ class ProfileHost:
         if not internal_turn:
             # Before the group-room hand-off: an agent working in a group is
             # still that agent working, and its character shows it.
+            turn = self._roster_turn(profile, event, payload)
+            if turn is not None:
+                await self._emit(profile, "tool.activity", turn)
             activity = _tool_activity(event, payload)
             if activity is not None:
                 await self._emit(profile, "tool.activity", activity)
@@ -2416,6 +2422,30 @@ class ProfileHost:
         # durable task state and completion notification instead.
         if not internal_turn:
             await self._emit(profile, event, payload)
+
+    def _roster_turn(self, profile: str, event: str, payload: dict[str, Any]) -> dict[str, str] | None:
+        """``{"phase": "turn", "scope": …}`` the first time a conversation's
+        turn shows life, so the roster draws the agent at work from the start
+        of its turn rather than from its first tool call. A turn's end
+        (``idle``) forgets the conversation. Clients that predate the phase
+        ignore it."""
+        scope = payload.get("sessionKey")
+        if not isinstance(scope, str) or not scope.strip():
+            return None
+        scope = scope[:512]
+        key = (profile, scope)
+        if event == "chat" and payload.get("state") in ("final", "aborted", "error"):
+            self._roster_turns.pop(key, None)
+            return None
+        alive = event in ("agent", "tool.start") or (
+            event == "chat" and payload.get("state") in ("iteration_step", "tool_progress", "run_started")
+        )
+        if not alive or key in self._roster_turns:
+            return None
+        self._roster_turns[key] = None
+        while len(self._roster_turns) > 512:
+            self._roster_turns.pop(next(iter(self._roster_turns)))
+        return {"phase": "turn", "scope": scope}
 
     def _capture_task_audit_event(
         self,

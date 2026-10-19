@@ -68,9 +68,12 @@ class PushRegistry:
                and (s.get("pushSecret"), s.get("gatewayId"), s.get("kind"), s.get("platform")) == wanted
                for s in self._subs):
             return
-        # Dedup by pushId — a device re-registering replaces its old entry.
+        # Dedup by pushId — a device re-registering replaces its old entry, and
+        # keeps the Live Activity tokens it handed over earlier.
+        previous = next((s for s in self._subs if s.get("pushId") == push_id), {})
+        kept = {k: previous[k] for k in ACTIVITY_REGISTRATION_KINDS if isinstance(previous.get(k), dict)}
         self._subs = [s for s in self._subs if s.get("pushId") != push_id]
-        self._subs.append({
+        self._subs.append({**kept, 
             "pushId": push_id,
             "pushSecret": push_secret,
             "gatewayId": gateway_id or "",
@@ -85,6 +88,39 @@ class PushRegistry:
         self._save()
         logger.debug(f"[push] registered device {push_id[:8]} ({platform})")
 
+    def set_activity(self, push_id: str, kind: str, activity_push_id: str, activity_secret: str) -> bool:
+        """Attach (or, with an empty id, drop) one of a device's Live Activity
+        registrations: ``activity`` (its island's update token) or
+        ``activityStart`` (its push-to-start token), each its own relay
+        ``pushId``/``pushSecret``. False when the device is not registered."""
+        if kind not in ACTIVITY_REGISTRATION_KINDS:
+            return False
+        for sub in self._subs:
+            if sub.get("pushId") != push_id:
+                continue
+            wanted = ({"pushId": activity_push_id, "pushSecret": activity_secret}
+                      if activity_push_id and activity_secret else None)
+            if sub.get(kind) == wanted:
+                return True
+            if wanted is None:
+                sub.pop(kind, None)
+            else:
+                sub[kind] = wanted
+            self._save()
+            return True
+        return False
+
+    def drop_activity(self, push_id: str, kind: str, activity_push_id: str) -> None:
+        """Forget a Live Activity registration the relay said is dead — only
+        if it is still the one the device holds (a newer one may have come)."""
+        for sub in self._subs:
+            current = sub.get(kind)
+            if sub.get("pushId") == push_id and isinstance(current, dict) \
+                    and current.get("pushId") == activity_push_id:
+                sub.pop(kind, None)
+                self._save()
+                return
+
     def unregister(self, push_id: str) -> None:
         before = len(self._subs)
         self._subs = [s for s in self._subs if s.get("pushId") != push_id]
@@ -94,6 +130,10 @@ class PushRegistry:
     def list(self) -> list[dict[str, Any]]:
         return list(self._subs)
 
+
+#: A device's Live Activity registrations, beside its alert one: its island's
+#: update token, and its push-to-start token.
+ACTIVITY_REGISTRATION_KINDS = ("activity", "activityStart")
 
 _registry: PushRegistry | None = None
 
@@ -152,6 +192,45 @@ def _send_one(base: str, sub: dict[str, Any], title: str, body: str,
         return e.code
     except Exception:
         return 0
+
+
+def _send_activity_one(base: str, push_id: str, push_secret: str, activity: dict[str, Any]) -> int:
+    """Blocking POST of one Live Activity push to /api/push/send. Returns the
+    HTTP status (0 on a network error)."""
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(
+        f"{base}/api/push/send",
+        data=json.dumps({"pushId": push_id, "activity": activity}).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {push_secret}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310 — fixed https host
+            return resp.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception:
+        return 0
+
+
+async def send_activity(push_id: str, push_secret: str, activity: dict[str, Any]) -> int:
+    """Send one Live Activity push through the relay, retrying a transient
+    failure once. The relay turns the platform-neutral ``activity`` into the
+    APNs payload; see ``flowly.push.activity_push``."""
+    base = _relay_base()
+    status = 0
+    for delay in (None, RETRY_DELAYS[0]):
+        if delay is not None:
+            await asyncio.sleep(delay)
+        try:
+            status = await asyncio.to_thread(_send_activity_one, base, push_id, push_secret, activity)
+        except Exception:  # pragma: no cover
+            status = 0
+        if status not in TRANSIENT:
+            break
+    return status
 
 
 #: Devices pushed at once. Each push is one relay call that can take a second

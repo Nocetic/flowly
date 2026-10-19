@@ -5619,8 +5619,10 @@ class GatewayServer:
         # A host-owned group may include the primary profile. Group RPC is the
         # authenticated lease that keeps its private in-process event feed
         # alive; without it the primary response completes in the runtime but
-        # the room remains stuck in ``running`` for remote/iOS clients.
-        return subscription.rooms or "default" in subscription.profiles or any(
+        # the room remains stuck in ``running`` for remote/iOS clients. The
+        # directory draws the main agent among the others, from its tool
+        # activity, which only that feed produces.
+        return subscription.rooms or subscription.directory or "default" in subscription.profiles or any(
             profile == "default" for profile, _session in subscription.conversations
         )
 
