@@ -57,11 +57,11 @@ async def test_default_cli_first_turn_navigates_through_screen_tool(agent, scree
     assert loop._main_config.tools.computer.enabled is False
     assert loop.tools.get("computer") is None
     assert "browser_tab" not in loop._routed_tool_names("web")
-    async with host_screen_run_scope(gateway, "chat", "first-run") as run:
+    async with host_screen_run_scope(gateway, "desktop:chat", "first-run") as run:
         assert "browser_tab" in loop._routed_tool_names("web")
         result = await loop._run_llm_tool_loop(
             [{"role": "user", "content": "x.com'u açar mısın"}],
-            turn_content="x.com'u açar mısın", session_key="chat", outbound_run_id="first-run",
+            turn_content="x.com'u açar mısın", session_key="desktop:chat", outbound_run_id="first-run",
             tool_platform="web")
         assert result[0] == "Opened"
         assert result[2] == ["browser_tab"]

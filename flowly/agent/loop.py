@@ -908,18 +908,41 @@ def _merge_turn_usage(
 # Screen outcomes a run may report as-is; anything else is CONTROL_UNAVAILABLE.
 _SCREEN_RUN_ERRORS = frozenset({"SCREEN_BUSY", "HUMAN_HAS_CONTROL", "STALE_GENERATION", "PROFILE_IDENTITY_CHANGED",
                                 "HANDOFF_RECOVERY_REQUIRED", "HANDOFF_STATE_INVALID"})
-SCREEN_HANDOFF_GUIDANCE = (
+_SCREEN_TASK = (
     "[Screen task] This task runs in the browser on the user's own server screen, which they can watch and "
-    "take over. Use browser_tab for this browser: tabs_list to see open tabs, navigate with a URL to open "
-    "a site, then read_page for fresh element refs. The browser runs in an isolated Screen environment; "
-    "a missing shell DISPLAY or xdg-open failure does not mean it is absent. Do not search host browser "
-    "binaries, scan debugging ports or write your own CDP driver. If browser_tab is unavailable under "
-    "the current tool policy, report that limitation instead of bypassing it with shell commands. "
-    "When a step needs them (signing in with a password, a two-factor or verification code, a "
-    "CAPTCHA, or approving a payment), do not guess and do not ask them to paste passwords or codes into "
-    "chat. Say what is needed and ask them to take control on the Screen, complete it there and give "
+    "take over from Flowly Desktop. Use browser_tab for this browser: tabs_list to see open tabs, navigate "
+    "with a URL to open a site, then read_page for fresh element refs. The browser runs in an isolated "
+    "Screen environment; a missing shell DISPLAY or xdg-open failure does not mean it is absent. Do not "
+    "search host browser binaries, scan debugging ports or write your own CDP driver. If browser_tab is "
+    "unavailable under the current tool policy, report that limitation instead of bypassing it with shell "
+    "commands. When a step needs them (signing in with a password, a two-factor or verification code, a "
+    "CAPTCHA, or approving a payment), do not guess and do not ask them to paste passwords, codes or card "
+    "details into chat. "
+)
+# The person is in an app that shows this screen: they can take over now.
+SCREEN_HANDOFF_GUIDANCE = _SCREEN_TASK + (
+    "Say what is needed and ask them to take control on the Screen, complete it there and give "
     "control back; this same task then continues from a fresh look at the page."
 )
+# The person is somewhere the screen cannot be shown (Telegram, the phone app
+# before its screen viewer, a terminal): telling them to "take control" there
+# asks the impossible, and the task would sit waiting for it.
+SCREEN_HANDOFF_ELSEWHERE_GUIDANCE = _SCREEN_TASK + (
+    "This conversation is not in Flowly Desktop, the only app where they can see and take control of "
+    "this screen. Say what is needed and that they can finish it from Flowly Desktop: open this agent's "
+    "screen in the Computer panel, take control, complete the step and give control back. Then end your "
+    "reply: do not say you are waiting for them and do not retry the step until they tell you it is done."
+)
+# Conversations held in an app that shows the agent's screen. The phone apps
+# join when their screen viewer ships.
+SCREEN_VIEWER_SESSION_PREFIXES = ("desktop:",)
+
+
+def screen_handoff_guidance(session_key: str) -> str:
+    """The screen task's guidance for where this conversation is held."""
+    if isinstance(session_key, str) and session_key.startswith(SCREEN_VIEWER_SESSION_PREFIXES):
+        return SCREEN_HANDOFF_GUIDANCE
+    return SCREEN_HANDOFF_ELSEWHERE_GUIDANCE
 
 
 class AgentLoop:
@@ -6070,7 +6093,7 @@ class AgentLoop:
         screen_run = current_screen_run()
         if screen_run is not None and screen_run.uses_screen():
             # Ephemeral guidance for this screen run; never part of the durable journal.
-            messages.append({"role": "user", "content": SCREEN_HANDOFF_GUIDANCE})
+            messages.append({"role": "user", "content": screen_handoff_guidance(session_key)})
 
         while iteration < max_turn_iterations or steering.has_pending(outbound_run_id):
             try:

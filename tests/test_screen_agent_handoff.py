@@ -133,13 +133,38 @@ async def test_another_chat_cannot_release_the_original_run_on_a_refused_claim(l
 
 
 async def test_a_screen_run_is_told_to_hand_logins_and_codes_to_the_person(live_run):
-    from flowly.agent.loop import SCREEN_HANDOFF_GUIDANCE
+    from flowly.agent.loop import SCREEN_HANDOFF_ELSEWHERE_GUIDANCE, SCREEN_HANDOFF_GUIDANCE
 
     _, _, _, _, model, _, _, _ = live_run
     first = model.calls[0]["messages"]
-    assert any(message.get("content") == SCREEN_HANDOFF_GUIDANCE for message in first)
-    for word in ("two-factor", "take control on the Screen", "do not ask them to paste passwords"):
-        assert word in SCREEN_HANDOFF_GUIDANCE
+    # "original-chat" is not held in Flowly Desktop: the agent is not told to
+    # ask for a takeover the person cannot make there.
+    assert any(message.get("content") == SCREEN_HANDOFF_ELSEWHERE_GUIDANCE for message in first)
+    assert not any(message.get("content") == SCREEN_HANDOFF_GUIDANCE for message in first)
+    for guidance in (SCREEN_HANDOFF_GUIDANCE, SCREEN_HANDOFF_ELSEWHERE_GUIDANCE):
+        for word in ("two-factor", "do not ask them to paste passwords"):
+            assert word in guidance
+    assert "take control on the Screen" in SCREEN_HANDOFF_GUIDANCE
+    assert "take control on the Screen" not in SCREEN_HANDOFF_ELSEWHERE_GUIDANCE
+    for word in ("not in Flowly Desktop", "Computer panel", "end your reply", "do not say you are waiting"):
+        assert word in SCREEN_HANDOFF_ELSEWHERE_GUIDANCE
+
+
+@pytest.mark.parametrize("session_key, in_app", [
+    ("desktop:profile-home", True),
+    ("desktop:voice:abc", True),
+    ("telegram:12345", False),
+    ("whatsapp:+90555", False),
+    ("ios:conversation", False),
+    ("android:conversation", False),
+    ("web:conversation", False),
+    ("cli:direct", False),
+    ("", False),
+])
+def test_takeover_is_offered_only_where_the_screen_can_be_shown(session_key, in_app):
+    from flowly.agent.loop import SCREEN_HANDOFF_ELSEWHERE_GUIDANCE, SCREEN_HANDOFF_GUIDANCE, screen_handoff_guidance
+
+    assert screen_handoff_guidance(session_key) == (SCREEN_HANDOFF_GUIDANCE if in_app else SCREEN_HANDOFF_ELSEWHERE_GUIDANCE)
 
 
 async def test_a_run_without_the_screen_gets_no_screen_guidance(tmp_path, monkeypatch):
@@ -169,3 +194,4 @@ async def test_a_run_without_the_screen_gets_no_screen_guidance(tmp_path, monkey
     finally:
         loop.stop()
     assert SCREEN_HANDOFF_GUIDANCE not in str(model.calls[0]["messages"])
+    assert "[Screen task]" not in str(model.calls[0]["messages"])
