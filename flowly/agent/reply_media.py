@@ -18,6 +18,10 @@ drift apart.
 from __future__ import annotations
 
 import json
+import mimetypes
+import os
+import re
+import tempfile
 from pathlib import Path
 
 # Envelope key. Present in the JSON => the loop should peel media off and attach
@@ -108,3 +112,102 @@ def extract_reply_media_assets(raw_result: str) -> list:
     from flowly.media.assets import assets_from_meta
 
     return [a for a in assets_from_meta(parsed.get(_ASSETS_KEY)) if Path(a.path).is_file()]
+
+
+# ``MEDIA:/absolute/path`` — the token the channel hints tell the agent to put
+# in its reply to attach a file it made (flowly/agent/prompt_blocks.py). The
+# loop takes the tokens out of the final reply and attaches the files the same
+# way a media tool's envelope does, so every surface gets a real attachment
+# instead of the literal token. Optional backticks around the token go with it.
+_MEDIA_TOKEN = re.compile(r"`?MEDIA:(/[^\s`\"'<>]+)`?")
+# Punctuation a sentence puts after a path, never part of the file name we
+# were pointed at (checked only when the path as written does not exist).
+_TRAILING = ".,;:!?)]}"
+
+# What a token may attach, and how large: what the message tool sends, plus
+# the audio and video the clients play inline. Anything else (HTML, archives
+# of other kinds, files with no type) is refused.
+_DOCUMENT_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp",
+                   "application/pdf", "text/plain", "application/zip"}
+_PLAYABLE_TYPES = {"audio/mpeg", "audio/ogg", "audio/wav", "audio/x-wav", "audio/mp4",
+                   "video/mp4", "video/quicktime", "video/webm"}
+_DOCUMENT_MAX_BYTES = 10 * 1024 * 1024
+_PLAYABLE_MAX_BYTES = 50 * 1024 * 1024
+
+
+def media_token_roots(workspace: str | Path | None = None) -> list[Path]:
+    """Where an agent's own files live: its home, its workspace, temp dirs.
+
+    A token outside them is refused, so a reply (or a page that talked the
+    agent into one) cannot attach the owner's other files to a chat.
+    """
+    from flowly.profile import get_flowly_home
+
+    roots = [get_flowly_home(), Path(tempfile.gettempdir()), Path("/tmp")]
+    if workspace:
+        roots.append(Path(workspace).expanduser())
+    resolved: list[Path] = []
+    for root in roots:
+        try:
+            path = root.resolve()
+        except OSError:
+            continue
+        if path not in resolved:
+            resolved.append(path)
+    return resolved
+
+
+def deliverable_media_path(raw: str, roots: list[Path]) -> tuple[Path | None, str]:
+    """``(path, "")`` when ``raw`` names a file a reply may attach, else ``(None, reason)``."""
+    if not raw.startswith("/"):
+        return None, "not absolute"
+    try:
+        path = Path(raw).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None, "not found"
+    if not any(path.is_relative_to(root) for root in roots):
+        return None, "outside the agent's files"
+    if not path.is_file():
+        return None, "not a file"
+    mime, _ = mimetypes.guess_type(path.name)
+    if mime in _DOCUMENT_TYPES:
+        limit = _DOCUMENT_MAX_BYTES
+    elif mime in _PLAYABLE_TYPES:
+        limit = _PLAYABLE_MAX_BYTES
+    else:
+        return None, f"unsupported type {mime or 'unknown'}"
+    size = path.stat().st_size
+    if not 0 < size <= limit:
+        return None, "empty" if size == 0 else "too large"
+    return path, ""
+
+
+def take_media_tokens(text: str, roots: list[Path]) -> tuple[str, list[str], list[tuple[str, str]]]:
+    """Take every ``MEDIA:`` token out of ``text``.
+
+    Returns the text without them, the files to attach (resolved, in order, no
+    repeats) and the refused tokens with why. Refused tokens leave the text
+    too: a raw server path is noise to the reader, and a channel adapter must
+    never get a second chance to send it.
+    """
+    if not isinstance(text, str) or "MEDIA:" not in text:
+        return text, [], []
+    accepted: list[str] = []
+    refused: list[tuple[str, str]] = []
+
+    def take(match: re.Match) -> str:
+        raw, tail = match.group(1), ""
+        while raw and raw[-1] in _TRAILING and not os.path.exists(raw):
+            raw, tail = raw[:-1], raw[-1] + tail
+        path, reason = deliverable_media_path(raw, roots)
+        if path is None:
+            refused.append((raw, reason))
+        elif str(path) not in accepted:
+            accepted.append(str(path))
+        return tail
+
+    cleaned = _MEDIA_TOKEN.sub(take, text)
+    # A token on its own line leaves the line empty: close the gap it leaves.
+    lines = [line.rstrip() for line in cleaned.splitlines()]
+    cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+    return cleaned, accepted, refused

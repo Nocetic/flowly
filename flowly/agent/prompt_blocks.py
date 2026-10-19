@@ -1034,7 +1034,9 @@ inline LaTeX / math when relevant.
 
 Media delivery: include `MEDIA:/absolute/path/to/file` to surface a
 file inline. Images render as inline previews, audio / video play
-inline, PDFs and HTML render as rich previews. Local file paths
+inline, PDFs render as previews. Only files you made attach — in your
+Flowly home (screenshots, media), your workspace or a temp directory —
+up to 10 MB (50 MB for audio / video). Local file paths
 MUST be absolute. Do not use Markdown image syntax ``![alt](/path)``
 for local files — only ``MEDIA:/absolute/path`` works for them.
 Remote ``![alt](https://...)`` URLs render as inline images.
@@ -1061,7 +1063,9 @@ when relevant.
 
 Media delivery: include `MEDIA:/absolute/path/to/file` to surface a
 file inline. Images render as inline previews, audio / video play
-inline, PDFs and HTML render as rich previews. Local file paths
+inline, PDFs render as previews. Only files you made attach — in your
+Flowly home (screenshots, media), your workspace or a temp directory —
+up to 10 MB (50 MB for audio / video). Local file paths
 MUST be absolute. Do not use Markdown image syntax ``![alt](/path)``
 for local files — only ``MEDIA:/absolute/path`` works for them.
 Remote ``![alt](https://...)`` URLs render as inline images.

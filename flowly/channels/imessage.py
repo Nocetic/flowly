@@ -825,18 +825,16 @@ class IMessageChannel(BaseChannel):
 
         The platform hint tells the agent it may embed these; the
         adapter converts them to native attachments and removes the
-        token from the visible text.
+        token from the visible text. The agent loop already takes them
+        out of its own replies; this covers anything else sent here, by
+        the same rule (only the agent's own files, of a sendable type).
         """
-        import re
+        from flowly.agent.reply_media import media_token_roots, take_media_tokens
 
-        paths: list[str] = []
-
-        def _grab(m: re.Match) -> str:
-            paths.append(m.group(1).strip())
-            return ""
-
-        cleaned = re.sub(r"MEDIA:(/[^\s\"']+)", _grab, content)
-        return cleaned.strip(), paths
+        cleaned, paths, refused = take_media_tokens(content, media_token_roots())
+        for path, reason in refused:
+            logger.warning(f"iMessage media token {path} not attached ({reason})")
+        return cleaned, paths
 
     @property
     def _bluebubbles(self) -> tuple[str, str] | None:

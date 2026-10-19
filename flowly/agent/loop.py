@@ -5752,6 +5752,28 @@ class AgentLoop:
                 exc_info=True,
             )
 
+    def _take_reply_media_tokens(self, content: Any, reply_media: list[str]) -> Any:
+        """Attach the files a final reply names with ``MEDIA:/path``.
+
+        Every channel hint promises the token (prompt_blocks.py), but only the
+        iMessage adapter ever read it: on Desktop, iOS, Telegram and the rest
+        the reply showed the raw path. Taken here, the files ride the reply's
+        media like a media tool's (one bubble, history included) and the text
+        loses the token. Only the agent's own files qualify
+        (:func:`flowly.agent.reply_media.media_token_roots`).
+        """
+        if not isinstance(content, str) or "MEDIA:" not in content:
+            return content
+        from flowly.agent.reply_media import media_token_roots, take_media_tokens
+
+        cleaned, accepted, refused = take_media_tokens(content, media_token_roots(self.workspace))
+        for path in accepted:
+            if path not in reply_media:
+                reply_media.append(path)
+        for path, reason in refused:
+            logger.warning(f"[media] reply named {path} with MEDIA: but it was not attached ({reason})")
+        return cleaned
+
     async def _run_llm_tool_loop(
         self,
         messages: list[dict[str, Any]],
@@ -9322,6 +9344,8 @@ class AgentLoop:
             int((time.monotonic() - turn_started_at) * 1000),
         )
 
+        final_content = self._take_reply_media_tokens(final_content, reply_media)
+
         # P4 — voice mode response sanitizer. The prompt already tells
         # the model not to emit markdown/emoji/URLs for TTS, but models
         # drift. Strip the obvious TTS-hostile patterns so the client
@@ -9796,6 +9820,7 @@ class AgentLoop:
                 except Exception as exc:  # noqa: BLE001 — a card never fails a turn
                     logger.debug(f"[agenda] check-in card skipped: {exc}")
 
+        final_content = self._take_reply_media_tokens(final_content, reply_media)
 
         # Save to session (mark as system message in history). Full
         # tool-protocol structure is preserved by
