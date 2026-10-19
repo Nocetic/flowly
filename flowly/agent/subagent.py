@@ -68,7 +68,11 @@ from flowly.compaction.service import CompactionService
 from flowly.compaction.summarizer import collect_summary_usage
 from flowly.providers.base import LLMErrorInfo, LLMResponse
 from flowly.providers.streamed_reply import StreamedReply
-from flowly.agent.delegation import MAX_CHILDREN_PER_CONVERSATION, assign_mark
+from flowly.agent.delegation import (
+    MANY_CHILDREN_RUNNING,
+    MAX_CHILDREN_PER_CONVERSATION,
+    assign_mark,
+)
 from flowly.agent.tools.agent_tools import ChildAgentMessageTool
 from flowly.agent.subagent_observation import TaskEvents, run_view
 from flowly.agent.subagent_stream import ChildStream, child_event_access
@@ -147,7 +151,8 @@ _BLOCKED_SUBAGENT_TOOLS: frozenset[str] = frozenset({
 _DEFAULT_MAX_ITERATIONS = 100
 # Each model call's timeout when no wall clock divides the run's time.
 _MODEL_CALL_TIMEOUT_SECONDS = 300.0
-_MAX_CONCURRENT_SUBAGENTS = 8
+# The process's limit: room for one conversation's full share plus others.
+_MAX_CONCURRENT_SUBAGENTS = 32
 # A finished run's result that the conversation has not handled in this long
 # no longer holds a goal (see pending_for_goal). Counted from the later of its
 # end and this process's start, so a result announced again after a long
@@ -725,6 +730,16 @@ class SubagentManager:
                 records.append(record)
         return records
 
+    def _many_running_note(self, parent_session_key: str) -> str:
+        """How many of this conversation's subagents run, once that is many; else ''."""
+        running = len(self._running_siblings(parent_session_key))
+        if running <= MANY_CHILDREN_RUNNING:
+            return ""
+        return (
+            f" {running} subagents of this conversation are running at once (at most "
+            f"{MAX_CHILDREN_PER_CONVERSATION}); each one uses its own model calls and tokens."
+        )
+
     def resume_pending(self) -> None:
         """Called on startup: continue or settle what a stopped process left.
 
@@ -1133,6 +1148,7 @@ class SubagentManager:
                 f"{whose} history stays readable. agent_close closes a subagent that is "
                 "no longer needed."
             )
+        message += self._many_running_note(parent_session_key)
         started: dict[str, Any] = {"status": "started", "run_id": run_id}
         if record.thread_id:
             # The subagent itself: agent_followup and agent_close take it.
@@ -1283,7 +1299,7 @@ class SubagentManager:
                 "from there. Don't wait for them, don't redo their tasks and don't guess their "
                 "results: do any work that does not depend on them, then tell the owner briefly "
                 "what is running and end your turn."
-            ),
+            ) + self._many_running_note(record.parent_session_key),
         }
 
     async def close_threads(self, targets: list[str] | str, *, parent_session_key: str | None,

@@ -51,7 +51,7 @@ from loguru import logger
 
 # A conversation keeps at most this many subagents open (budget guard: it
 # bounds what the agent has to choose from, not how it works).
-MAX_OPEN_THREADS_PER_CONVERSATION = 16
+MAX_OPEN_THREADS_PER_CONVERSATION = 32
 # An open thread with no task running for this long closes on its own.
 THREAD_IDLE_CLOSE_SECONDS = 7 * 86_400
 # A closed thread — its conversation and raw tool outputs — is kept this long.

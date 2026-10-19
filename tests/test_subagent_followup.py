@@ -643,7 +643,9 @@ async def test_spawns_and_followups_of_one_turn_report_together(tmp_path, home):
 
 
 @pytest.mark.asyncio
-async def test_followups_count_toward_the_running_limits(tmp_path, home):
+async def test_followups_count_toward_the_running_limits(tmp_path, home, monkeypatch):
+    # A small limit keeps the test short; the rule does not depend on its value.
+    monkeypatch.setattr("flowly.agent.subagent.MAX_CHILDREN_PER_CONVERSATION", 3)
     provider = _Scripted(default="Done.")
     manager = _manager(home, tmp_path, provider)
     first = await _spawn(manager, title="A")

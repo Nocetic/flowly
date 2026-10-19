@@ -58,9 +58,17 @@ Arguments: `title` (shown to the owner, in their language), `task` (the brief), 
   (`owner_authored`); a goal turn counts the goal's objective; a voice turn counts what was said.
   Genuine → `origin="owner"`, otherwise `origin="agent"`. This only labels the run; it never
   refuses one.
-* **Limits (budget guards, not delegation rules).** At most 3 non-system children running per
-  conversation (`MAX_CHILDREN_PER_CONVERSATION`) and 8 overall (`_MAX_CONCURRENT_SUBAGENTS`);
-  past them `spawn` returns an error the agent can read.
+* **Limits (budget guards, not delegation rules).** At most 20 non-system children running per
+  conversation (`MAX_CHILDREN_PER_CONVERSATION`) and 32 overall (`_MAX_CONCURRENT_SUBAGENTS`, so
+  one conversation's full share still leaves room for others and for system work); past them
+  `spawn` (and `agent_followup`) returns an error the agent can read. The owner decides how much
+  to run in parallel, so the per-conversation limit only stops a runaway, not ordinary fan-out.
+* **Many at once is stated, not prevented.** Once more than `MANY_CHILDREN_RUNNING` (10) of a
+  conversation's subagents run at once, every start's result (`spawn`, `agent_followup`) ends
+  with a fact: "N subagents of this conversation are running at once (at most 20); each one uses
+  its own model calls and tokens." It gives no instruction; the agent can tell the owner what
+  that costs or go on, as it sees fit. Clients show nothing extra: the agents pill already shows
+  the count.
 * **Context fork.** With `context="conversation"` the child's first message carries the
   owner/agent exchange so far (`conversation_from_history`): what was said and answered, no
   tool calls, no tool output, no `[System:` rows (reports and notices are not the owner
@@ -798,9 +806,10 @@ a thread whose run is gone or ended.
 by `maintain()` at startup, from `resume_pending`):
 * **Idle close:** an open thread with nothing running for `THREAD_IDLE_CLOSE_SECONDS` (7 days) is
   closed `idle`, `closed_at` = last activity + 7 days.
-* **Cap:** a conversation keeps at most `MAX_OPEN_THREADS_PER_CONVERSATION` (16) open. `spawn`
+* **Cap:** a conversation keeps at most `MAX_OPEN_THREADS_PER_CONVERSATION` (32) open; it is never
+  below `MAX_CHILDREN_PER_CONVERSATION`, since every running subagent is an open one. `spawn`
   past it closes the thread idle longest (`cap`), under the registry lock, and the tool result says
-  so as a fact: *"This conversation keeps at most 16 subagents open; starting this one closed '…',
+  so as a fact: *"This conversation keeps at most 32 subagents open; starting this one closed '…',
   idle the longest. Its history stays readable. agent_close closes a subagent that is no longer
   needed."* If every open thread has a task running (`ThreadCapReached`) the spawn is refused:
   *"16 subagents of this conversation are open and all of them are working; one must finish, or
