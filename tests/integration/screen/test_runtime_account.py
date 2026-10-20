@@ -357,6 +357,28 @@ def test_root_agent_runs_real_browser_and_input_as_unprivileged_account(layout, 
         runtime.stop(restarted["generation"])
 
 
+def test_root_desktop_picture_is_taken_by_the_application_account(layout):
+    """The display key stays with the screen's account: the supervisor runs
+    the capture as that account and hands the gateway only the picture."""
+    from flowly.desktop_runtime.desktop_still import request_still
+    from flowly.desktop_runtime.launcher import ScreenRuntime
+
+    directory, application = layout
+    runtime = ScreenRuntime(directory)
+    state = runtime.start()
+    try:
+        still = runtime.socket_directory / "still.sock"
+        info = still.stat()
+        assert (info.st_uid, info.st_mode & 0o777) == (0, 0o600)
+        assert (application.sockets / "Xauthority").stat().st_uid == application.account.uid
+        png = request_still(still)
+        assert png.startswith(b"\x89PNG\r\n\x1a\n")
+        assert struct.unpack("!II", png[16:24]) == (1440, 900)
+    finally:
+        runtime.stop(state["generation"])
+    assert not (runtime.socket_directory / "still.sock").exists()
+
+
 def test_profile_delete_stops_at_live_screen_then_removes_external_storage(provisioned, monkeypatch):
     import flowly.profile as profiles
     from flowly.desktop_runtime.launcher import ScreenRuntime

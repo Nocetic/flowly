@@ -515,6 +515,41 @@ async def test_agent_provider_uses_human_browser_and_fences_old_references(tmp_p
         await asyncio.to_thread(runtime.stop, generation)
 
 
+async def test_the_agent_gets_the_whole_desktop_from_the_screen_itself(tmp_path, login_site):
+    """No display key, no capture tool: the screen takes the picture in its
+    own session, for a run that holds it, never while the person has control."""
+    import asyncio
+    import zlib
+
+    from flowly.desktop_runtime.browser_provider import HostBrowserProvider
+
+    runtime = ScreenRuntime(tmp_path / "still")
+    state = await asyncio.to_thread(runtime.start)
+    provider = HostBrowserProvider(runtime)
+    generation = state["generation"]
+    try:
+        assert state["stillServiceVersion"] == 1
+        await provider.request("run", "open", generation, "navigate", {"url": login_site}, owner="desktop:a")
+        result = await provider.desktop_screenshot("run", "still", generation)
+        assert provider.observation_valid(result), result
+        png = base64.b64decode(result["screenshot"].split(",", 1)[1])
+        assert png.startswith(b"\x89PNG\r\n\x1a\n")
+        width, height = struct.unpack("!II", png[16:24])
+        assert (width, height) == (1440, 900)
+        # A real desktop: the browser window and dock, not one flat colour.
+        idat = b"".join(png[i + 8:i + 8 + struct.unpack("!I", png[i:i + 4])[0]]
+                        for i in range(8, len(png) - 12) if png[i + 4:i + 8] == b"IDAT")
+        assert len(set(zlib.decompress(idat)[::97])) > 8
+        human = await provider.execution.acquire("test-viewer", generation, 1)
+        refused = await provider.desktop_screenshot("run", "still-2", generation)
+        assert refused["error_code"] == "HUMAN_HAS_CONTROL"
+        runtime.authority.release("test-viewer", generation, human["epoch"])
+    finally:
+        await provider.execution.finish_run("run", generation)
+        await provider.disconnect()
+        await asyncio.to_thread(runtime.stop, generation)
+
+
 async def test_conversations_keep_their_own_tabs_and_capture_a_tab_behind(tmp_path, login_site):
     """With a real browser: a conversation's tab behind another's is captured
     (it comes forward first), old tab numbers name nothing after a restart,

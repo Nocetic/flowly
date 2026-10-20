@@ -265,6 +265,7 @@ async def test_host_screenshot_preserves_reply_attachment_contract(tmp_path, mon
     saved.write_bytes(b"generated test image")
     monkeypatch.setattr(BrowserTabTool, "_save_screenshot_to_file", lambda result: {"path": str(saved)})
     provider = Mock(request=AsyncMock(return_value={"screenshot": "data:image/jpeg;base64,dGVzdA=="}),
+                    desktop_screenshot=AsyncMock(return_value={"screenshot": "data:image/png;base64,dGVzdA=="}),
                     observation_valid=lambda result: True)
     run = HostScreenRun(Mock(), "session", "run")
     run.binding, run.decided = ScreenRunBinding(provider, "generation", "run"), True
@@ -273,10 +274,54 @@ async def test_host_screenshot_preserves_reply_attachment_contract(tmp_path, mon
         result = await ScreenshotTool().execute()
         paths, summary = extract_reply_media(result)
         assert paths == [str(saved)]
-        assert "attached" in summary
+        assert "attached" in summary and "whole desktop" in summary
         assert "data:image" not in result
+        # The whole desktop, not the browser tab.
+        provider.desktop_screenshot.assert_awaited_once()
+        provider.request.assert_not_awaited()
     finally:
         HOST_SCREEN_RUN.reset(token)
+
+
+async def test_a_screen_without_the_desktop_picture_gives_its_browser_tab(tmp_path, monkeypatch):
+    from flowly.agent.reply_media import extract_reply_media
+    from flowly.agent.tools.screenshot import ScreenshotTool
+    from flowly.desktop_runtime.context import ScreenRunBinding
+
+    monkeypatch.setenv("FLOWLY_HOME", str(tmp_path / "home"))
+    saved = tmp_path / "screen.jpg"
+    saved.write_bytes(b"generated test image")
+    monkeypatch.setattr(BrowserTabTool, "_save_screenshot_to_file", lambda result: {"path": str(saved)})
+    provider = Mock(request=AsyncMock(return_value={"screenshot": "data:image/jpeg;base64,dGVzdA=="}),
+                    desktop_screenshot=AsyncMock(return_value={"error": "x", "error_code": "SCREEN_STILL_UNAVAILABLE"}),
+                    observation_valid=lambda result: True)
+    run = HostScreenRun(Mock(), "desktop:chat", "run")
+    run.binding, run.decided = ScreenRunBinding(provider, "generation", "run", owner="desktop:chat"), True
+    token = HOST_SCREEN_RUN.set(run)
+    try:
+        paths, summary = extract_reply_media(await ScreenshotTool().execute())
+    finally:
+        HOST_SCREEN_RUN.reset(token)
+    assert paths == [str(saved)] and "Browser screenshot" in summary
+    assert provider.request.await_args.kwargs["owner"] == "desktop:chat"
+
+
+async def test_no_desktop_picture_while_the_person_has_control(tmp_path, monkeypatch):
+    from flowly.agent.tools.screenshot import ScreenshotTool
+    from flowly.desktop_runtime.context import ScreenRunBinding
+
+    monkeypatch.setenv("FLOWLY_HOME", str(tmp_path / "home"))
+    provider = Mock(request=AsyncMock(), observation_valid=lambda result: True,
+                    desktop_screenshot=AsyncMock(return_value={"error": "x", "error_code": "HUMAN_HAS_CONTROL"}))
+    run = HostScreenRun(Mock(), "desktop:chat", "run")
+    run.binding, run.decided = ScreenRunBinding(provider, "generation", "run"), True
+    token = HOST_SCREEN_RUN.set(run)
+    try:
+        result = json.loads(await ScreenshotTool().execute())
+    finally:
+        HOST_SCREEN_RUN.reset(token)
+    assert result["error_code"] == "HUMAN_HAS_CONTROL"
+    provider.request.assert_not_awaited()
 
 
 async def test_a_replaced_profile_identity_claims_nothing(screen_gateway):

@@ -139,6 +139,7 @@ def run(directory: Path, generation: str) -> None:
         input_service = None
         captures = None
         observers = None
+        stills = None
         stopping = False
         application = None
         guarded = None
@@ -183,6 +184,23 @@ def run(directory: Path, generation: str) -> None:
                     pass
                 child.wait(timeout=2)
                 raise
+
+        def application_output(arguments, env, *, timeout=10, limit=0):
+            """A short helper's stdout (at most ``limit`` bytes), or b"" when it fails."""
+            child = subprocess.Popen(application_command(arguments, system=application is not None), env=env,
+                                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL, start_new_session=True,
+                                     close_fds=True, cwd=env["HOME"], **privileges())
+            try:
+                output, _ = child.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                child.communicate(timeout=2)
+                return b""
+            return output if child.returncode == 0 and len(output) <= limit else b""
 
         def wait_for(predicate, timeout=15):
             deadline = time.monotonic() + timeout
@@ -393,8 +411,16 @@ def run(directory: Path, generation: str) -> None:
             captures = CaptureService(generation, sockets, rfb, observers=observers, viewers=viewers)
             input_service = InputService(runtime.authority, generation, sockets, observers=observers, viewers=viewers,
                                          rfb_socket=rfb, keymap=keymap, captures=captures)
+            from flowly.desktop_runtime.desktop_still import MAX_STILL_BYTES, STILL_SOURCE, StillService
+
+            (sockets / "still.sock").unlink(missing_ok=True)
+            # The desktop picture is taken inside the session by its own
+            # account; the gateway asks only for a run that holds the screen.
+            stills = StillService(sockets, lambda: application_output(
+                ["python3", "-I", "-c", STILL_SOURCE], env, timeout=10, limit=MAX_STILL_BYTES))
             state.update(phase="running", display=env["DISPLAY"], socket=str(rfb),
-                         cdpPort=port, inputServiceVersion=3, observerServiceVersion=3, captureServiceVersion=1, error=None)
+                         cdpPort=port, inputServiceVersion=3, observerServiceVersion=3, captureServiceVersion=1,
+                         stillServiceVersion=1, error=None)
             write_state(runtime.manifest, state)
             stamp, ticks = metadata_stamp(), 0
             while not stopping:
@@ -440,6 +466,11 @@ def run(directory: Path, generation: str) -> None:
                     input_service.close()
                 except Exception:
                     state.update(phase="failed", error="INPUT_SERVICE_CLOSE_FAILED")
+            if stills is not None:
+                try:
+                    stills.close()
+                except Exception:
+                    pass  # a picture service that will not close stops nothing else
             if captures is not None:
                 try:
                     captures.close()

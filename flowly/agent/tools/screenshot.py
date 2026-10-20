@@ -72,7 +72,9 @@ class ScreenshotTool(Tool):
             "The screenshot is attached to your reply automatically — do NOT call "
             "the message tool for it. "
             "Use display=0 for main monitor, display=1 for secondary, etc. "
-            "If you can't find the target app on display 0, try display=1."
+            "If you can't find the target app on display 0, try display=1. "
+            "On a server with a Screen it captures that screen's whole desktop "
+            "(browser_tab screenshot captures one tab)."
         )
 
     @property
@@ -131,8 +133,13 @@ class ScreenshotTool(Tool):
 
             from flowly.agent.tools.browser_tab import BrowserTabTool
 
-            result = await binding.provider.request(binding.run_id, str(uuid.uuid4()),
-                                                    binding.generation, "screenshot", {}, owner=binding.owner)
+            # The whole desktop the person sees; a screen started before the
+            # desktop picture existed gives its browser tab instead.
+            result = await binding.provider.desktop_screenshot(binding.run_id, str(uuid.uuid4()), binding.generation)
+            whole = result.get("error_code") != "SCREEN_STILL_UNAVAILABLE"
+            if not whole:
+                result = await binding.provider.request(binding.run_id, str(uuid.uuid4()),
+                                                        binding.generation, "screenshot", {}, owner=binding.owner)
             if not binding.provider.observation_valid(result):
                 return json.dumps({"error": "Screen control changed", "error_code": "STALE_OBSERVATION"})
             if not result.get("screenshot"):
@@ -142,7 +149,8 @@ class ScreenshotTool(Tool):
                 return json.dumps(saved)
             from flowly.agent.reply_media import media_envelope
 
-            return media_envelope([saved["path"]], "Browser screenshot captured, attached to this reply.")
+            return media_envelope([saved["path"]], ("Screen captured (the whole desktop)" if whole
+                                                    else "Browser screenshot captured") + ", attached to this reply.")
 
         # Validate format
         format = format.lower()

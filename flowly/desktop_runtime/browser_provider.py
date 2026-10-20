@@ -312,6 +312,32 @@ class HostBrowserProvider:
             return {"error": "Screen action could not complete. Observe the current state before retrying.",
                     "error_code": exc.code}
 
+    async def desktop_screenshot(self, run_id: str, request_id: str, generation: str) -> dict:
+        """The whole desktop of the screen, as one of ``run_id``'s actions.
+
+        Taken by the screen's supervisor inside its session (desktop_still),
+        so the agent needs no display key or capture tool of its own; refused
+        like every action while the person has control.
+        """
+        from flowly.desktop_runtime.desktop_still import request_still
+
+        async def operate():
+            state = await asyncio.to_thread(self.runtime.status)
+            if not state or state.get("phase") != "running" or state.get("generation") != generation:
+                raise ScreenError("SCREEN_NOT_RUNNING")
+            picture = await asyncio.to_thread(request_still, self.runtime.socket_directory / "still.sock")
+            return {"success": True, "screenshot": "data:image/png;base64," + base64.b64encode(picture).decode("ascii"),
+                    "_screenObservation": {"generation": generation, "epoch": self._epoch_now()}}
+
+        try:
+            return await self.execution.action(run_id, request_id, generation, operate)
+        except ScreenError as exc:
+            return {"error": "Screen action could not complete. Observe the current state before retrying.",
+                    "error_code": exc.code}
+
+    def _epoch_now(self) -> int:
+        return self.runtime.authority.snapshot()["epoch"]
+
     async def close_blank_tabs(self, run_id: str, generation: str, owner: str = "") -> None:
         """Close the tabs ``run_id`` opened and left blank (about:blank).
 
