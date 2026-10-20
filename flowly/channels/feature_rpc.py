@@ -943,6 +943,15 @@ def chat_inflight(params: dict) -> dict:
     # learn it is still waiting, so the handshake carries the conversation's
     # open approvals and questions, serialized exactly like those events.
     result["approvals"], result["clarifies"] = _pending_prompts(session_key)
+    # The steps the agent handed the person on its screen, waiting and settled:
+    # a client draws the waiting one's card and every settled one's line from
+    # this record (agent/tools/computer_handoff.py), never from its own memory.
+    try:
+        from flowly.agent.tools.computer_handoff import recent_steps
+
+        result["screenSteps"] = recent_steps(get_flowly_home() / "desktop", session_key) if session_key else []
+    except Exception:  # noqa: BLE001
+        result["screenSteps"] = []
     return result
 
 

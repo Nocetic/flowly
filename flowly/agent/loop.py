@@ -929,6 +929,15 @@ SCREEN_HANDOFF_GUIDANCE = _SCREEN_TASK + (
     "and you continue in a new turn from a fresh look at the page. Do the same when the browser answers "
     "HUMAN_HAS_CONTROL: the person has the screen now; hand them the step and end your reply."
 )
+# A step of this conversation is already waiting for the person on the screen:
+# the turn is told, so it answers what they said instead of handing over again.
+SCREEN_STEP_WAITING_GUIDANCE = (
+    "A step of yours is waiting for the person on your screen: \"{task}\" (handed over {ago}). Its card is in "
+    "this conversation. Do not hand it over again and do not retry the step yourself. If they say they will "
+    "do it later, acknowledge that in one sentence. If they give up on it or no longer want it, call "
+    "browser_tab with action withdraw and tell them in one sentence. If they ask about something else, answer "
+    "that; the step keeps waiting. The task continues in a new turn when they hand the screen back."
+)
 # Senders whose system notices run as the conversation's own turn (a subagent's
 # report, a screen step the person finished): streamed when someone watches.
 REPORT_SENDERS = frozenset({"subagent", "screen"})
@@ -944,6 +953,20 @@ SCREEN_HANDOFF_ELSEWHERE_GUIDANCE = _SCREEN_TASK + (
 # Conversations held in an app that shows the agent's screen. The phone apps
 # join when their screen viewer ships.
 SCREEN_VIEWER_SESSION_PREFIXES = ("desktop:",)
+
+
+def screen_step_waiting_guidance(step: dict, now: float | None = None) -> str:
+    """The turn's note that a step of this conversation already waits."""
+    elapsed = max(0, int((now if now is not None else time.time()) - float(step.get("created_at") or 0)))
+    if elapsed < 60:
+        ago = "just now"
+    elif elapsed < 3600:
+        ago = f"{elapsed // 60} min ago"
+    elif elapsed < 86400:
+        ago = f"{elapsed // 3600} h ago"
+    else:
+        ago = f"{elapsed // 86400} d ago"
+    return SCREEN_STEP_WAITING_GUIDANCE.format(task=step["task"], ago=ago)
 
 
 def screen_handoff_guidance(session_key: str) -> str:
@@ -3682,6 +3705,7 @@ class AgentLoop:
         self._running = True
         logger.info("Agent loop started")
         self.subagents.resume_pending()
+        self._recover_screen_steps()
         self._start_memory_maintenance_timer()
         self._start_dreamer_timers()
         self._start_skill_maintenance_timer()
@@ -4060,6 +4084,35 @@ class AgentLoop:
         if not hasattr(self, "_report_turn_submitters"):
             self._report_turn_submitters: dict[str, Any] = {}
         self._report_turn_submitters[key] = submitter
+
+    def _recover_screen_steps(self) -> None:
+        """Watch again every screen step handed to the person before this process
+        started (computer_handoff): its card returns and its hand-back continues
+        the task. Once, with the gateway known and the event loop running."""
+        gateway = getattr(self, "_gateway_server", None)
+        if gateway is None or getattr(self, "_screen_steps_recovered", False):
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._screen_steps_recovered = True
+        from flowly.agent.tools.computer_handoff import recover
+
+        try:
+            recover(gateway, self._continue_screen_task)
+        except Exception as exc:
+            logger.error("[Screen] step recovery failed ({})", type(exc).__name__)
+
+    async def _waiting_screen_step(self, session_key: str) -> dict | None:
+        """The conversation's screen step still waiting for the person, if any."""
+        gateway = getattr(self, "_gateway_server", None)
+        if gateway is None or not session_key.startswith(SCREEN_VIEWER_SESSION_PREFIXES):
+            return None
+        self._recover_screen_steps()  # a gateway set after the loop started
+        from flowly.agent.tools.computer_handoff import waiting_step
+
+        return await asyncio.to_thread(waiting_step, gateway, session_key)
 
     async def _continue_screen_task(self, session_key: str, channel: str, chat_id: str, content: str) -> None:
         """Start the conversation's next turn after a screen step handed to the
@@ -6114,7 +6167,11 @@ class AgentLoop:
         from flowly.desktop_runtime.host_screen_run import current_screen_run
 
         screen_run = current_screen_run()
-        if screen_run is not None and screen_run.uses_screen():
+        waiting_step = await self._waiting_screen_step(session_key)
+        if waiting_step is not None:
+            # A step already handed to the person: this turn answers them, it does not hand over again.
+            messages.append({"role": "user", "content": screen_step_waiting_guidance(waiting_step)})
+        elif screen_run is not None and screen_run.uses_screen():
             # Ephemeral guidance for this screen run; never part of the durable journal.
             messages.append({"role": "user", "content": screen_handoff_guidance(session_key)})
 

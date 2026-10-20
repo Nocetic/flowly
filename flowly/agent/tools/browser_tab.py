@@ -405,12 +405,13 @@ class BrowserTabTool(Tool):
                         "navigate", "get_page_text", "screenshot",
                         "scroll", "key", "tabs_list", "tabs_create", "tabs_close",
                         "tabs_context", "read_network_requests",
-                        "batch", "handoff",
+                        "batch", "handoff", "withdraw",
                     ],
                 },
                 "task": {
                     "type": "string",
-                    "description": "For handoff: the step the person does on your screen, one sentence.",
+                    "description": "For handoff: the step the person does on your screen, one sentence. "
+                                   "withdraw takes a waiting step back (they gave up, or it is no longer needed).",
                 },
                 "ref": {
                     "type": "string",
@@ -605,6 +606,10 @@ class BrowserTabTool(Tool):
 
             return await computer_handoff(kwargs.get("task"), self._turn_channel, self._turn_chat_id,
                                           self._screen_continuation)
+        if action == "withdraw":
+            from flowly.agent.tools.computer_handoff import withdraw_handoff
+
+            return await withdraw_handoff()
         run = current_screen_run()
         if not self.screen_enabled and run is not None and run.uses_screen():
             return json.dumps({"error": "Screen browser access is disabled.", "error_code": "SCREEN_DISABLED"})

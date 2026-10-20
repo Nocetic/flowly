@@ -36,3 +36,5 @@ class ClarifyRequest:
     kind: str = "question"
     # The agent whose screen a "computer" request is about.
     profile_id: str | None = None
+    # How the request ended when not by an answer (set by resolve(reason=)).
+    close_reason: str | None = None

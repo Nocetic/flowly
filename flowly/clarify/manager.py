@@ -101,7 +101,7 @@ class ClarifyManager:
                     except Exception as e:
                         logger.error('[ClarifyManager] Notify callback failed ({})', type(e).__name__)
                 answer = await future
-            reason = "answered"
+            reason = pending.close_reason or "answered"
             logger.info(f"[ClarifyManager] {pending.id} answered")
             return answer
         except asyncio.TimeoutError:
@@ -139,10 +139,13 @@ class ClarifyManager:
         except Exception:
             return False
 
-    def resolve(self, clarify_id: str, answer: str) -> bool:
+    def resolve(self, clarify_id: str, answer: str, *, reason: str | None = None) -> bool:
         """
         Resolve a pending clarify. Called from any surface (Gateway RPC,
         TUI panel, chat reply, ...).
+
+        ``reason`` is what surfaces are told the request ended as, when it is
+        not an answer (a screen step's state: done, withdrawn, superseded).
 
         Returns True if the clarify was found and resolved.
         """
@@ -153,6 +156,7 @@ class ClarifyManager:
         with pending_control_guard(self._control_scopes, pending) as allowed:
             if not allowed:
                 return False
+            pending.close_reason = reason
             future.set_result(answer)
             return True
 
