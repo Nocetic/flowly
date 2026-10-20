@@ -553,10 +553,13 @@ def register_display(app: web.Application, gateway) -> None:
             if input_protocol and not _supports_input(state):
                 raise ScreenError("SCREEN_UPGRADE_REQUIRED")
         except ScreenError as exc:
+            logger.info("[Screen] stream refused: {}", exc.code)
             return _error(exc.code, 403)
         except OSError:
+            logger.info("[Screen] stream refused: CONTROL_UNAVAILABLE")
             return _error("CONTROL_UNAVAILABLE", 503)
         if session.attaching >= MAX_STREAMS or session.idle_stopping:
+            logger.info("[Screen] stream refused: SCREEN_BUSY")
             return _error("SCREEN_BUSY", 429)
         session.attaching += 1
         session.activity = time.monotonic()
@@ -566,6 +569,12 @@ def register_display(app: web.Application, gateway) -> None:
                                    compress=False, timeout=2)
         tasks = []
         stream_id = secrets.token_urlsafe(24)
+        # What the stream did and how it ended, logged once when it ends (never
+        # pixels, keystrokes, tickets or tokens). The viewer side logs the same.
+        stats = {"pixelBytes": 0, "viewerBytes": 0, "inputBatches": 0, "inputDenied": 0}
+        names: dict[asyncio.Task, str] = {}
+        opened = time.monotonic()
+        ended = "setup"
         try:
             if state.get("observerServiceVersion") in (1, 2, 3):
                 async with asyncio.timeout(3):
@@ -626,6 +635,7 @@ def register_display(app: web.Application, gateway) -> None:
                 while data := await reader.read(64 * 1024):
                     await still_current()
                     await asyncio.wait_for(ws.send_bytes(data), 5)
+                    stats["pixelBytes"] += len(data)
 
             inbox = ScreenInputQueue(bool(input_protocol))
 
@@ -636,6 +646,7 @@ def register_display(app: web.Application, gateway) -> None:
                 async for message in ws:
                     if message.type != WSMsgType.BINARY:
                         raise ScreenError("INVALID_RFB_STREAM")
+                    stats["viewerBytes"] += len(message.data)
                     inbox.put(message.data)
 
             async def viewer_to_server():
@@ -648,6 +659,8 @@ def register_display(app: web.Application, gateway) -> None:
                     inputs = []
                     allowed = bool(input_protocol and epoch and await _stream_call(
                         session.runtime.authority.may_input, viewer, generation, epoch))
+                    if input_protocol and epoch and not allowed:
+                        stats["inputDenied"] += 1
                     data = gate.feed(payload, lambda: allowed, epoch=epoch,
                                      on_input=inputs.append if input_protocol else None)
                     if data:
@@ -669,6 +682,7 @@ def register_display(app: web.Application, gateway) -> None:
                                     data=base64.b64encode(batch).decode(),
                                 )
                                 input_state["nextSequence"] = result["nextSequence"]
+                                stats["inputBatches"] += 1
                                 batch.clear()
                             batch.extend(item)
 
@@ -680,10 +694,22 @@ def register_display(app: web.Application, gateway) -> None:
                                               session.identity["botId"]):
                         raise ScreenError("VIEWER_EXPIRED")
 
-            tasks.extend(asyncio.create_task(operation()) for operation in (server_to_viewer, receive_viewer, viewer_to_server, monitor))
-            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        except (ScreenError, OSError, asyncio.TimeoutError, asyncio.IncompleteReadError, ValueError):
+            for operation, name in ((server_to_viewer, "pixels"), (receive_viewer, "viewer"),
+                                    (viewer_to_server, "input"), (monitor, "monitor")):
+                task = asyncio.create_task(operation())
+                names[task] = name
+                tasks.append(task)
+            if tasks[0] not in names:
+                names[tasks[0]] = "revoked"
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            first = next(iter(done))
+            error = None if first.cancelled() else first.exception()
+            ended = f"{names.get(first, 'task')}:" + (
+                "ended" if error is None else getattr(error, "code", None) or type(error).__name__)
+        except (ScreenError, OSError, asyncio.TimeoutError, asyncio.IncompleteReadError, ValueError) as exc:
+            ended = f"{ended}:" + (getattr(exc, "code", None) or type(exc).__name__)
             if not ws.prepared:
+                logger.info("[Screen] stream failed before it opened: {}", ended)
                 return _error("TRANSPORT_UNAVAILABLE", 503)
         finally:
             for task in tasks:
@@ -716,6 +742,10 @@ def register_display(app: web.Application, gateway) -> None:
                 session.streams.discard(ws)
                 session.attaching -= 1
                 session.activity = time.monotonic()
+                if ws.prepared:
+                    logger.info("[Screen] stream ended: {} | {}s | input {} | {}", ended,
+                                round(time.monotonic() - opened, 1), "yes" if input_protocol else "view-only",
+                                json.dumps(stats, separators=(",", ":")))
         return ws
 
     async def idle_monitor():

@@ -305,3 +305,42 @@ async def test_control_lifecycle_closes_streams_even_when_queue_flush_fails(monk
     assert len(seen) == 1 and not seen[0].available
     assert channel._screen_streams is None
     assert channel._ws is None
+
+
+
+@pytest.fixture
+def screen_log():
+    from loguru import logger
+
+    lines: list[str] = []
+    sink = logger.add(lambda message: lines.append(str(message)), level="INFO", format="{message}")
+    yield lines
+    logger.remove(sink)
+
+
+async def test_a_relay_stream_says_which_side_ended_it_and_never_a_secret(screen_log):
+    """2026-10-21: a taken-over relay screen froze and closed, and nothing on the
+    server said why. The bridge now says which direction ended, with both close
+    codes and frame counts; the gateway's own line says why its side ended."""
+    async with bridge_fixture() as f:
+        assert f.bridge.open(request())
+        local, remote = await take(f.local_open), await take(f.relay_open)
+        await local.send_bytes(b"RFB\x00screen")
+        await take(f.relay_frames)
+        await remote.send_bytes(b"\x00\x01input")
+        await take(f.local_frames)
+        await remote.close()
+        await asyncio.gather(*f.bridge._tasks.values(), return_exceptions=True)
+    (line,) = [line for line in screen_log if "relay stream ended" in line]
+    assert line.startswith("[Screen] relay stream ended: input ended |")
+    assert 'frames {"pixels":1,"input":1}' in line
+    assert "secret" not in " ".join(screen_log) and "one-use-ticket" not in " ".join(screen_log)
+
+
+async def test_a_refused_local_stream_is_logged_with_its_status(screen_log):
+    async with bridge_fixture(reject_local=True) as f:
+        assert f.bridge.open(request())
+        await asyncio.gather(*f.bridge._tasks.values(), return_exceptions=True)
+        await asyncio.sleep(0)
+    assert any(line.startswith("[Screen] relay stream failed: WSServerHandshakeError (HTTP 403)") for line in screen_log)
+    assert "secret" not in " ".join(screen_log)

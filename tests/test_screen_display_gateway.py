@@ -368,9 +368,19 @@ async def test_authenticated_binary_stream_uses_only_selected_profile_and_drops_
         await ws.send_bytes(key[3:] + pointer + update)
         await asyncio.wait_for(display_gateway.received_event.wait(), 5)
         assert display_gateway.received == [(profile, update)]
-    with pytest.raises(aiohttp.WSServerHandshakeError) as replay:
-        await display_gateway.client.ws_connect(display_gateway.server.make_url(STREAM_PATH), headers=headers)
+    from loguru import logger
+
+    lines: list[str] = []
+    sink = logger.add(lambda message: lines.append(str(message)), level="INFO", format="{message}")
+    try:
+        with pytest.raises(aiohttp.WSServerHandshakeError) as replay:
+            await display_gateway.client.ws_connect(display_gateway.server.make_url(STREAM_PATH), headers=headers)
+    finally:
+        logger.remove(sink)
     assert replay.value.status == 403
+    # A replayed ticket is refused, and the server says so (never the ticket).
+    assert any(line.startswith("[Screen] stream refused: ") for line in lines)
+    assert headers["X-Flowly-Screen-Ticket"] not in " ".join(lines)
 
 
 async def test_ticket_is_not_sufficient_without_gateway_authentication(display_gateway):
@@ -403,6 +413,24 @@ async def test_observe_requires_pinned_target_and_secure_transport(display_gatew
 
 
 async def test_human_control_revokes_viewing_without_releasing_ownership(display_gateway):
+    from loguru import logger
+
+    lines: list[str] = []
+    sink = logger.add(lambda message: lines.append(str(message)), level="INFO", format="{message}")
+    try:
+        await _human_control_revokes_viewing(display_gateway)
+    finally:
+        logger.remove(sink)
+    # Each end is said once, with why (2026-10-21: a server could not tell).
+    ended = [line for line in lines if line.startswith("[Screen] stream ended:")]
+    assert len(ended) == 1 and "view-only" in ended[0] and '"pixelBytes":' in ended[0]
+    assert ended[0].split(" | ")[0] in {"[Screen] stream ended: revoked:VIEWER_REVOKED",
+                                        "[Screen] stream ended: monitor:HUMAN_HAS_CONTROL",
+                                        "[Screen] stream ended: pixels:ended", "[Screen] stream ended: viewer:ended"}
+    assert "Bearer" not in " ".join(lines)
+
+
+async def _human_control_revokes_viewing(display_gateway):
     _, headers = await observe(display_gateway)
     ws = await display_gateway.client.ws_connect(display_gateway.server.make_url(STREAM_PATH), headers=headers)
     await RfbSocket(ws).handshake()

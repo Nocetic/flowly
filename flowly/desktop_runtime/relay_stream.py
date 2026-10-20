@@ -1,6 +1,8 @@
 """Outbound-only screen transport; every byte still passes local display admission."""
 
 import asyncio
+import time
+import json
 import re
 from collections import OrderedDict
 from contextlib import asynccontextmanager
@@ -84,7 +86,9 @@ class RelayScreenStreams:
                 error = done.exception()
                 if error:
                     # Neither request headers nor exception strings may disclose credentials.
-                    logger.debug("Relay screen stream ended: {}", type(error).__name__)
+                    status = getattr(error, "status", None)
+                    logger.info("[Screen] relay stream failed: {}{}", type(error).__name__,
+                                f" (HTTP {status})" if isinstance(status, int) else "")
         task.add_done_callback(completed)
         return True
 
@@ -124,15 +128,26 @@ class RelayScreenStreams:
                     remote_headers.clear()
                     if not self.available:
                         return
-                    tasks = [asyncio.create_task(self._copy(local, remote)), asyncio.create_task(self._copy(remote, local))]
+                    counts = {"pixels": 0, "input": 0}
+                    pixels = asyncio.create_task(self._copy(local, remote, counts, "pixels"))
+                    inputs = asyncio.create_task(self._copy(remote, local, counts, "input"))
+                    opened = time.monotonic()
                     try:
-                        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                        done, _ = await asyncio.wait([pixels, inputs], return_when=asyncio.FIRST_COMPLETED)
                     finally:
-                        for task in tasks:
+                        for task in (pixels, inputs):
                             task.cancel()
-                        await asyncio.gather(*tasks, return_exceptions=True)
+                        await asyncio.gather(pixels, inputs, return_exceptions=True)
+                    first = next(iter(done))
+                    error = None if first.cancelled() else first.exception()
+                    # Which side ended it, and how: the gateway's own line says why its side did.
+                    logger.info("[Screen] relay stream ended: {} {} | {}s | gateway close {} | relay close {} | frames {}",
+                                "pixels" if first is pixels else "input",
+                                "ended" if error is None else type(error).__name__,
+                                round(time.monotonic() - opened, 1), local.close_code, remote.close_code,
+                                json.dumps(counts, separators=(",", ":")))
 
-    async def _copy(self, source, target):
+    async def _copy(self, source, target, counts=None, side=""):
         async for frame in source:
             if not self.available or frame.type != aiohttp.WSMsgType.BINARY:
                 return
@@ -140,6 +155,8 @@ class RelayScreenStreams:
                 return
             # Never queue an unbounded stream or retry uncertain input writes.
             await asyncio.wait_for(target.send_bytes(frame.data), timeout=5)
+            if counts is not None:
+                counts[side] += 1
 
     async def close(self):
         self._closed = True
