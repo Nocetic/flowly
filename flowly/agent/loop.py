@@ -924,8 +924,9 @@ _SCREEN_TASK = (
 )
 # The person is in an app that shows this screen: they can take over now.
 SCREEN_HANDOFF_GUIDANCE = _SCREEN_TASK + (
-    "Say what is needed and ask them to take control on the Screen, complete it there and give "
-    "control back; this same task then continues from a fresh look at the page."
+    "Call browser_tab with action handoff and the step in task (one sentence): they get a card that opens "
+    "your screen, take control on the Screen, complete it there and give control back, and this same call "
+    "returns so the task continues from a fresh look at the page."
 )
 # The person is somewhere the screen cannot be shown (Telegram, the phone app
 # before its screen viewer, a terminal): telling them to "take control" there

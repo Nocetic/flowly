@@ -29,3 +29,10 @@ class ClarifyRequest:
     expires_at: float = 0.0
     risk_reasons: list[str] = field(default_factory=list)
     run_id: str | None = None
+    # "question" (an answer is typed or picked) or "computer" (a step the
+    # person does on the agent's screen; ``question`` says what, see
+    # agent/tools/computer_handoff.py). Surfaces that do not know a kind
+    # still show it as a question to answer.
+    kind: str = "question"
+    # The agent whose screen a "computer" request is about.
+    profile_id: str | None = None

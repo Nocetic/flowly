@@ -28,6 +28,8 @@ def clarify_to_wire(pending: ClarifyRequest) -> dict[str, Any]:
         "createdAt": pending.created_at,
         "expiresAt": pending.expires_at,
         "riskReasons": list(pending.risk_reasons or []),
+        "kind": pending.kind,
+        **({"profileId": pending.profile_id} if pending.profile_id else {}),
     }
 
 

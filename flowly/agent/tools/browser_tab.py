@@ -400,8 +400,12 @@ class BrowserTabTool(Tool):
                         "navigate", "get_page_text", "screenshot",
                         "scroll", "key", "tabs_list", "tabs_create", "tabs_close",
                         "tabs_context", "read_network_requests",
-                        "batch",
+                        "batch", "handoff",
                     ],
+                },
+                "task": {
+                    "type": "string",
+                    "description": "For handoff: the step the person does on your screen, one sentence.",
                 },
                 "ref": {
                     "type": "string",
@@ -586,6 +590,11 @@ class BrowserTabTool(Tool):
         from flowly.desktop_runtime.authority import ScreenError
         from flowly.desktop_runtime.host_screen_run import current_screen_run, unavailable
 
+        if action == "handoff":
+            # The person takes over the screen for one step (agent/tools/computer_handoff.py).
+            from flowly.agent.tools.computer_handoff import computer_handoff
+
+            return await computer_handoff(kwargs.get("task"))
         run = current_screen_run()
         if not self.screen_enabled and run is not None and run.uses_screen():
             return json.dumps({"error": "Screen browser access is disabled.", "error_code": "SCREEN_DISABLED"})
