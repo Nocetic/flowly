@@ -12,6 +12,7 @@ import base64
 import json
 import os
 import secrets
+import socket
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -126,6 +127,10 @@ class HostBrowserProvider:
             return
         await self.disconnect()
         state = await asyncio.to_thread(self.runtime.status)
+        if state and state["phase"] == "running" and state["generation"] == generation and not state.get("cdpPort"):
+            # The person closed the browser's last window. The agent opens it
+            # again as the dock's Browser button would, then goes on.
+            state = await self._reopen_browser(generation)
         if not state or state["phase"] != "running" or state["generation"] != generation or not state.get("cdpPort"):
             raise ScreenError("BROWSER_UNAVAILABLE")
         if not await asyncio.to_thread(self._profile_browser_listens, state["cdpPort"]):
@@ -144,6 +149,36 @@ class HostBrowserProvider:
         except Exception:
             await self.disconnect()
             raise ScreenError("BROWSER_UNAVAILABLE") from None
+
+    REOPEN_SECONDS = 15
+
+    async def _reopen_browser(self, generation: str) -> dict | None:
+        """Ask the screen's browser manager to open the browser; wait for it.
+
+        The one request its socket takes (``open``), the same the dock sends;
+        nothing else can be passed. Only ever reached inside a run's admitted
+        action, so never while the person has control.
+        """
+        def ask() -> None:
+            path = self.runtime.application_socket_directory / "browser-open.sock"
+            with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as client:
+                client.settimeout(1)
+                client.connect(str(path))
+                client.send(b"open")
+
+        try:
+            await asyncio.to_thread(ask)
+        except OSError:
+            return None
+        deadline = asyncio.get_running_loop().time() + self.REOPEN_SECONDS
+        while asyncio.get_running_loop().time() < deadline:
+            state = await asyncio.to_thread(self.runtime.status)
+            if not state or state["phase"] != "running" or state["generation"] != generation:
+                return state
+            if state.get("cdpPort"):
+                return state
+            await asyncio.sleep(0.2)
+        return None
 
     def _profile_browser_listens(self, port: int) -> bool:
         """On a root host, attach only to the profile account's own listener:

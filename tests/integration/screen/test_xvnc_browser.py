@@ -1118,18 +1118,22 @@ async def test_close_browser_keeps_runtime_and_reopen_reconnects_provider(tmp_pa
             await settled(lambda: runtime.status().get("cdpPort") is None)
             assert runtime.status()["phase"] == "running"
             assert runtime.status()["generation"] == generation
-            with pytest.raises(ScreenError, match="BROWSER_UNAVAILABLE"):
-                await provider._connect(generation)
-            env = application_environment(runtime.directory, runtime.application_socket_directory)
-            env["DISPLAY"] = screen["state"]["display"]
-            subprocess.run([str(runtime.application_socket_directory / "launch-browser")],
-                           env=env, check=True, timeout=5)
-            await settled(lambda: runtime.status().get("cdpPort") is not None)
+            # The agent's next action opens the browser again itself (the
+            # person closed its last window), in the same profile.
             await provider._connect(generation)
             assert provider._browser is not first
             cookies = await provider._browser.contexts[0].cookies("http://screen.test")
             assert any(c["name"] == "persistent" and c["value"] == "same-profile" for c in cookies)
             assert runtime.status()["generation"] == generation
+            # So does the dock's Browser button: the command its entry runs.
+            await (await provider._browser.new_browser_cdp_session()).send("Browser.close")
+            await settled(lambda: runtime.status().get("cdpPort") is None)
+            env = application_environment(runtime.directory, runtime.application_socket_directory)
+            env["DISPLAY"] = screen["state"]["display"]
+            entry = (Path(env["XDG_DATA_HOME"]) / "applications" / "flowly-browser.desktop").read_text()
+            command = next(line[5:] for line in entry.splitlines() if line.startswith("Exec="))
+            subprocess.run(command.split(" "), env=env, check=True, timeout=5)
+            await settled(lambda: runtime.status().get("cdpPort") is not None)
         finally:
             await provider.disconnect()
 

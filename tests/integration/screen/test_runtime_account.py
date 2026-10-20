@@ -379,6 +379,60 @@ def test_root_desktop_picture_is_taken_by_the_application_account(layout):
     assert not (runtime.socket_directory / "still.sock").exists()
 
 
+def test_a_closed_browser_opens_again_from_the_dock_and_for_the_agent(layout):
+    """On a root host the dock's launcher lives under /run, which Ubuntu mounts
+    noexec: executed directly it failed with Permission denied, and with the
+    browser's last window closed nothing could open it again. Run this module
+    with /run mounted noexec to reproduce that host."""
+    import asyncio
+    import time
+
+    from playwright.sync_api import sync_playwright
+
+    from flowly.desktop_runtime.browser_provider import HostBrowserProvider
+    from flowly.desktop_runtime.launcher import ScreenRuntime
+
+    directory, application = layout
+    runtime = ScreenRuntime(directory)
+    state = runtime.start()
+    generation = state["generation"]
+
+    def close_browser():
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{runtime.status()['cdpPort']}")
+            browser.new_browser_cdp_session().send("Browser.close")
+        deadline = time.monotonic() + 10
+        while runtime.status().get("cdpPort") and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert not runtime.status().get("cdpPort")
+
+    try:
+        close_browser()
+        env = {**application.environment(), "DISPLAY": state["display"]}
+        entry = (Path(env["XDG_DATA_HOME"]) / "applications" / "flowly-browser.desktop").read_text()
+        command = next(line[5:] for line in entry.splitlines() if line.startswith("Exec="))
+        result = subprocess.run(command.split(" "), env=env, capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, result.stderr
+        deadline = time.monotonic() + 15
+        while not runtime.status().get("cdpPort") and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert runtime.status().get("cdpPort")
+        close_browser()
+        provider = HostBrowserProvider(runtime)
+
+        async def agent_reads():
+            try:
+                return await provider.request("run", "read", generation, "tabs_list", {})
+            finally:
+                await provider.disconnect()
+
+        listed = asyncio.run(agent_reads())
+        assert listed.get("success") is True, listed
+        runtime.authority.finish_run("run", generation)
+    finally:
+        runtime.stop(generation)
+
+
 def test_profile_delete_stops_at_live_screen_then_removes_external_storage(provisioned, monkeypatch):
     import flowly.profile as profiles
     from flowly.desktop_runtime.launcher import ScreenRuntime

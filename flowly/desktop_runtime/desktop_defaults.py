@@ -188,7 +188,9 @@ seed(launcher, "#!/bin/sh\n"
 icons = directory(data / "flowly-dock")
 entries = {}
 for name, label, command in (
-    ("browser", "Browser", str(launcher)),
+    # Read by the shell, never executed itself: /run is mounted noexec on
+    # Ubuntu, and a root host keeps the launcher there (Permission denied).
+    ("browser", "Browser", "/bin/sh " + str(launcher)),
     ("terminal", "Terminal", "/usr/bin/xfce4-terminal --disable-server --command=/bin/bash"),
     ("settings", "Settings", "/usr/bin/xfce4-settings-manager"),
 ):

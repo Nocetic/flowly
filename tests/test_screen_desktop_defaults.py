@@ -59,7 +59,12 @@ def test_browser_launcher_requests_only_the_managed_browser(application):
             server.settimeout(2)
             assert seed(application).returncode == 0
             launcher = Path(runtime) / "launch-browser"
-            result = subprocess.run([str(launcher)], env=environment, capture_output=True, text=True, timeout=10)
+            # What the dock runs: its entry's command, the launcher read by the
+            # shell (a noexec /run cannot execute it directly).
+            entry = (Path(environment["XDG_DATA_HOME"]) / "applications" / "flowly-browser.desktop").read_text()
+            command = next(line[5:] for line in entry.splitlines() if line.startswith("Exec="))
+            assert command == f"/bin/sh {launcher}"
+            result = subprocess.run(command.split(" "), env=environment, capture_output=True, text=True, timeout=10)
             assert result.returncode == 0, result.stderr
             assert server.recv(32) == b"open"
             assert not (profile.parent / "attacked").exists()
