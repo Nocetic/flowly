@@ -688,6 +688,11 @@ class BrowserTabTool(Tool):
             "batch": 120.0,
         }
         timeout = action_timeouts.get(action, 15.0)
+        if run is not None and run.uses_screen():
+            # The screen bounds its own actions (20 s, then it severs the
+            # browser connection). Giving up earlier here left the action
+            # admitted behind the tool's back: every next call came back busy.
+            timeout = max(timeout, 25.0)
 
         try:
             result = await asyncio.wait_for(

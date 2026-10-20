@@ -610,8 +610,12 @@ async def test_conversations_keep_their_own_tabs_and_capture_a_tab_behind(tmp_pa
         listed = await call("run-c", "desktop:a", "tabs_list")
         assert blank["tabId"] not in {tab["tabId"] for tab in listed["tabs"]}
         assert {tab["tabId"]: tab["yours"] for tab in listed["tabs"]} == {first["tabId"]: True, second["tabId"]: False}
-        await provider.execution.finish_run("run-c", generation)
     finally:
+        for run in ("run-a", "run-b", "run-c"):
+            try:
+                await provider.execution.finish_run(run, generation)
+            except ScreenError:
+                pass
         await provider.disconnect()
         await asyncio.to_thread(runtime.stop, generation)
     restarted = await asyncio.to_thread(runtime.start)

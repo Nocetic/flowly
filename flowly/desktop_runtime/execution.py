@@ -41,7 +41,16 @@ class ScreenExecution:
         self._run_checks.pop(run_id, None)
 
     async def action(self, run_id: str, action_id: str, generation: str,
-                     operation: Callable[[], Awaitable[T]], *, refresh_epoch: int | None = None) -> T:
+                     operation: Callable[[], Awaitable[T]], *, refresh_epoch: int | None = None,
+                     fence: Callable[[], Awaitable[None]] | None = None) -> T:
+        """Run one backend operation under an action admission.
+
+        ``fence`` severs the backend connection (the adapter's disconnect):
+        once it has run, nothing the operation queued can reach the browser,
+        which is the proof an unacknowledged command needs before its
+        admission ends. Without a fence an unknown outcome keeps the
+        admission, as a live command might still be typing.
+        """
         async def execute() -> T:
             check = self._run_checks.get(run_id)
             if refresh_epoch is not None and check is None:
@@ -51,9 +60,21 @@ class ScreenExecution:
                                                 expected_epoch=expected_epoch)
             try:
                 result = await operation()
-            except (asyncio.CancelledError, ActionOutcomeUnknownError):
-                # Gateway shutdown or loss of the backend's acknowledgement
-                # cannot grant control to a human in a replacement gateway.
+            except ActionOutcomeUnknownError:
+                # The backend's acknowledgement is lost. Severing its
+                # connection ends whatever it had queued; only then may the
+                # admission end (its result never reaches the model).
+                if fence is None:
+                    raise
+                try:
+                    await fence()
+                except Exception:
+                    raise ActionOutcomeUnknownError() from None
+                await asyncio.to_thread(self.authority.end_action, admission)
+                raise
+            except asyncio.CancelledError:
+                # Gateway shutdown: the admission records this process, and a
+                # dead process's admission is void (authority._void_dead_action).
                 raise
             except Exception:
                 # The adapter must not return/raise until its command has

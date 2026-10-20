@@ -119,7 +119,10 @@ async def test_internal_refresh_cannot_be_used_to_execute_a_write(checkpoint):
     provider._dispatch.assert_not_awaited()
 
 
-async def test_unknown_fresh_read_outcome_keeps_action_fenced_for_explicit_recovery(checkpoint):
+async def test_unknown_fresh_read_outcome_fences_the_browser_and_frees_the_screen(checkpoint):
+    """The fresh look lost its acknowledgement: the browser connection is
+    severed (nothing queued can act), the action ends, and the run can be
+    finished instead of leaving the screen busy until a stop and start."""
     gate, authority, provider = checkpoint
     held = authority.acquire("human", "gen", 1)
     gate.store.checkpoint(gate.execution)
@@ -130,12 +133,11 @@ async def test_unknown_fresh_read_outcome_keeps_action_fenced_for_explicit_recov
     provider._dispatch.side_effect = RuntimeError("private backend payload")
     with pytest.raises(ScreenError, match="HANDOFF_RECOVERY_REQUIRED"):
         await gate.wait()
-    assert authority.snapshot()["actionInFlight"]
+    assert provider._browser is None
+    assert not authority.snapshot()["actionInFlight"]
     assert gate.store.status()["state"] == "refreshing"
-    with pytest.raises(ScreenError, match="SCREEN_BUSY"):
-        await gate.finish(cancelled=True)
-    assert authority.snapshot()["runId"] == "run"
-    assert authority.snapshot()["actionInFlight"]
+    await gate.finish(cancelled=True)
+    assert authority.snapshot()["runId"] is None
 
 
 async def test_cancel_during_refresh_waits_for_real_backend_before_retiring_run(checkpoint):

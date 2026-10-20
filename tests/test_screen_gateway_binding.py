@@ -344,3 +344,25 @@ async def test_hosts_without_profile_screens_keep_their_own_browser(screen_gatew
     async with host_screen_run_scope(gateway, "session", "run") as run:
         assert run is None and current_screen_run() is None
         assert not gateway.has_browser_provider("host-desktop-browser")
+
+
+async def test_the_browser_tool_waits_as_long_as_the_screen_bounds_an_action(screen_gateway, monkeypatch):
+    """The tool's own 15 s screenshot limit fired before the screen's 20 s bound:
+    the action stayed admitted behind the tool's back and every next call was busy."""
+    import asyncio
+
+    from flowly.agent.tools import browser_tab as module
+
+    gateway, _, _ = screen_gateway
+    waits = []
+    real = asyncio.wait_for
+
+    async def record(awaitable, timeout):
+        waits.append(timeout)
+        return await real(awaitable, timeout)
+
+    monkeypatch.setattr(module.asyncio, "wait_for", record)
+    async with host_screen_run_scope(gateway, "desktop:chat", "run"):
+        await BrowserTabTool(gateway).execute("screenshot")
+    # The tool's own wait (first) covers the screen's 20 s bound (second).
+    assert len(waits) >= 2 and waits[0] >= 25 and waits[0] > waits[1]

@@ -70,12 +70,55 @@ async def test_backend_exception_text_never_leaks_credentials(provider):
     assert not provider.runtime.authority.snapshot()["actionInFlight"]
 
 
-async def test_backend_disconnect_keeps_action_closed_until_recovery(provider):
+async def test_a_lost_acknowledgement_severs_the_browser_connection_and_releases_the_action(provider):
+    """On the test VPS a screenshot that never answered left its admission
+    in flight for good: every later action was busy, a takeover waited
+    forever and the agent was told the person had control. Severing the
+    connection is the proof the command cannot act any more."""
     provider._browser = Mock(is_connected=lambda: False)
+    driver = provider._driver = Mock(stop=AsyncMock())
     provider._dispatch.side_effect = RuntimeError("CDP disconnected")
     result = await provider.request("run", "a", "generation", "click", {})
     assert result["error_code"] == "ACTION_OUTCOME_UNKNOWN"
-    assert provider.runtime.authority.snapshot()["actionInFlight"]
+    driver.stop.assert_awaited_once()
+    assert provider._browser is None
+    state = provider.runtime.authority.snapshot()
+    assert not state["actionInFlight"] and state["runId"] == "run"
+    # The next action, and a takeover, go through at once.
+    provider._browser = Mock(is_connected=lambda: True)
+    provider._dispatch.side_effect = None
+    assert (await provider.request("run", "b", "generation", "read_page", {}))["success"]
+    assert (await provider.execution.acquire("viewer", "generation", 1, wait_seconds=0))["control"] == "human"
+
+
+async def test_a_command_that_never_answers_is_bounded_and_fenced(provider, monkeypatch):
+    import asyncio
+
+    from flowly.desktop_runtime import browser_provider
+
+    async def hang(action, params):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(asyncio, "wait_for", lambda awaitable, timeout: _timeout(awaitable))
+    provider._browser = Mock(is_connected=lambda: True)
+    driver = provider._driver = Mock(stop=AsyncMock())
+    provider._dispatch.side_effect = hang
+    result = await provider.request("run", "a", "generation", "screenshot", {})
+    assert result["error_code"] == "ACTION_OUTCOME_UNKNOWN"
+    driver.stop.assert_awaited_once()
+    assert not provider.runtime.authority.snapshot()["actionInFlight"]
+
+
+async def _timeout(awaitable):
+    import asyncio
+
+    task = asyncio.ensure_future(awaitable)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    raise asyncio.TimeoutError()
 
 
 @pytest.mark.parametrize("url", ["file:///etc/passwd", "javascript:alert(1)", "data:text/html,hello", "https://user:password@example.com", "http:", None])

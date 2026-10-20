@@ -282,7 +282,7 @@ def test_schema_one_upgrades_without_dropping_a_version_two_fence(tmp_path):
     old["schema"] = 1
     path.write_text(json.dumps(old))
     human = authority.acquire("viewer", "generation", 1)
-    assert json.loads(path.read_text())["schema"] == 2
+    assert json.loads(path.read_text())["schema"] == 3
     authority.begin_input("viewer", "generation", human["epoch"])
     damaged = json.loads(path.read_text())
     damaged.pop("input")

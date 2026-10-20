@@ -19,6 +19,8 @@ from flowly.desktop_runtime.execution import ScreenExecution
 
 
 class _Page:
+    viewport_size = {"width": 1360, "height": 700}
+
     def __init__(self, browser, url="about:blank"):
         self.browser, self.url, self._closed = browser, url, False
 

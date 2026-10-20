@@ -99,7 +99,7 @@ async def test_takeover_is_still_pending_for_command_owned_by_another_worker(exe
     assert (await execution.acquire("viewer", "generation", state["epoch"]))["control"] == "human"
 
 
-async def test_unknown_backend_outcome_does_not_clear_admission(execution):
+async def test_unknown_backend_outcome_keeps_admission_without_a_fence(execution):
     async def disconnected():
         raise ActionOutcomeUnknownError()
 
@@ -107,6 +107,63 @@ async def test_unknown_backend_outcome_does_not_clear_admission(execution):
         await execution.action("run", "a", "generation", disconnected)
     assert execution.authority.snapshot()["actionInFlight"]
     assert (await execution.acquire("viewer", "generation", 1))["control"] == "human-pending"
+
+
+async def test_unknown_backend_outcome_ends_once_the_backend_is_fenced(execution):
+    fenced = []
+
+    async def disconnected():
+        raise ActionOutcomeUnknownError()
+
+    async def fence():
+        fenced.append(True)
+
+    with pytest.raises(ActionOutcomeUnknownError):
+        await execution.action("run", "a", "generation", disconnected, fence=fence)
+    assert fenced == [True]
+    assert not execution.authority.snapshot()["actionInFlight"]
+    assert (await execution.acquire("viewer", "generation", 1))["control"] == "human"
+
+
+async def test_a_fence_that_fails_keeps_the_admission(execution):
+    async def disconnected():
+        raise ActionOutcomeUnknownError()
+
+    async def fence():
+        raise RuntimeError("could not close")
+
+    with pytest.raises(ActionOutcomeUnknownError):
+        await execution.action("run", "a", "generation", disconnected, fence=fence)
+    assert execution.authority.snapshot()["actionInFlight"]
+
+
+async def test_a_dead_processs_admission_is_void(execution, monkeypatch):
+    """A gateway that died mid-command took its browser connection with it:
+    its admission must not keep the screen busy for its replacement."""
+    from flowly.desktop_runtime import authority as module
+
+    monkeypatch.setattr(module, "_owner", lambda: {"pid": 4242, "start": "1", "boot": "b"})
+    monkeypatch.setattr(module, "_alive", lambda owner: True)
+    started = asyncio.Event()
+
+    async def operation():
+        started.set()
+        await asyncio.Event().wait()
+
+    caller = asyncio.create_task(execution.action("run", "a", "generation", operation))
+    await started.wait()
+    for worker in execution._pending:
+        worker.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    assert execution.authority.snapshot()["actionInFlight"]
+    # The process is gone (a replacement gateway reads the same record).
+    monkeypatch.setattr(module, "_alive", lambda owner: owner != {"pid": 4242, "start": "1", "boot": "b"})
+    replacement = ScreenExecution(ScreenAuthority(execution.authority.directory))
+    state = replacement.authority.snapshot()
+    assert not state["actionInFlight"] and state["runId"] == "run"
+    await replacement.finish_run("run", "generation")
+    assert (await replacement.acquire("viewer", "generation", 1, wait_seconds=0))["control"] == "human"
 
 
 async def test_gateway_shutdown_cancelling_worker_leaves_durable_admission(execution):

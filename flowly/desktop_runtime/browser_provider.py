@@ -251,7 +251,13 @@ class HostBrowserProvider:
     async def _front_page(self, pages: dict[int, Any]) -> tuple[int, Any]:
         focused, visible = [], []
         for key, page in pages.items():
-            flags = await page.evaluate("({focused:document.hasFocus(), visible:document.visibilityState==='visible'})")
+            try:
+                # A page whose script is busy answers late or never: it is
+                # then simply not the one in front.
+                flags = await asyncio.wait_for(
+                    page.evaluate("({focused:document.hasFocus(), visible:document.visibilityState==='visible'})"), 3)
+            except (asyncio.TimeoutError, Exception):
+                continue
             if flags["focused"]:
                 focused.append(key)
             if flags["visible"]:
@@ -342,7 +348,8 @@ class HostBrowserProvider:
             return {**result, "_screenObservation": {"generation": generation, "epoch": self._epoch}}
 
         try:
-            return await self.execution.action(run_id, request_id, generation, operate, refresh_epoch=_refresh_epoch)
+            return await self.execution.action(run_id, request_id, generation, operate, refresh_epoch=_refresh_epoch,
+                                               fence=self.disconnect)
         except ScreenError as exc:
             return {"error": "Screen action could not complete. Observe the current state before retrying.",
                     "error_code": exc.code}
@@ -365,7 +372,7 @@ class HostBrowserProvider:
                     "_screenObservation": {"generation": generation, "epoch": self._epoch_now()}}
 
         try:
-            return await self.execution.action(run_id, request_id, generation, operate)
+            return await self.execution.action(run_id, request_id, generation, operate, fence=self.disconnect)
         except ScreenError as exc:
             return {"error": "Screen action could not complete. Observe the current state before retrying.",
                     "error_code": exc.code}
@@ -396,7 +403,7 @@ class HostBrowserProvider:
             return {}
 
         try:
-            await self.execution.action(run_id, secrets.token_urlsafe(16), generation, operate)
+            await self.execution.action(run_id, secrets.token_urlsafe(16), generation, operate, fence=self.disconnect)
         except ScreenError:
             pass
 
@@ -501,10 +508,19 @@ class HostBrowserProvider:
             # The tab comes forward first, so the capture is what the person
             # sees on the screen at that moment.
             await page.bring_to_front()
-            size = await page.evaluate("({width:innerWidth,height:innerHeight})")
-            if not 0 < size["width"] <= 3840 or not 0 < size["height"] <= 2160:
+            # The viewport from the driver when it knows it (a page it opened);
+            # otherwise asked of the page, briefly: a heavy page (x.com) can
+            # hold its script for longer than the action allows, and the
+            # capture's own byte cap still bounds it.
+            size = page.viewport_size
+            if size is None:
+                try:
+                    size = await asyncio.wait_for(page.evaluate("({width:innerWidth,height:innerHeight})"), 3)
+                except (asyncio.TimeoutError, Exception):
+                    size = None
+            if size is not None and (not 0 < size["width"] <= 3840 or not 0 < size["height"] <= 2160):
                 raise ScreenError("OBSERVATION_TOO_LARGE")
-            image = await page.screenshot(type="jpeg", quality=75, timeout=10000)
+            image = await page.screenshot(type="jpeg", quality=75, timeout=10000, animations="disabled", caret="initial")
             if len(image) > 8 * 1024 * 1024:
                 raise ScreenError("OBSERVATION_TOO_LARGE")
             return dict(success=True, tabId=tab_id,
