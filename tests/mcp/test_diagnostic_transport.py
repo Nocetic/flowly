@@ -146,6 +146,12 @@ async def test_real_log_notifications_are_opted_in_filtered_redacted_and_bounded
     tool, home = connected_peer
     result = json.loads(await tool.execute(kind="logs"))
     assert not result.get("isError")
+    # Legacy HTTP notifications use a separate stream from the tool response.
+    # Do not cancel that stream just because the response arrived first. Wait
+    # for observed delivery, with a bound that still fails missing notifications.
+    async with asyncio.timeout(5):
+        while tool._server_task.health_snapshot()["diagnostics"]["received"] < 301:
+            await asyncio.sleep(0.01)
     # Join the actual retained writer, not a sleep guessing when disk is ready.
     await asyncio.to_thread(client.shutdown_mcp_servers)
     state = tool._server_task.health_snapshot()["diagnostics"]

@@ -176,6 +176,13 @@ def test_clarify_wire_carries_every_field():
     }
 
 
+def test_a_computer_step_says_its_kind_and_agent():
+    pending = ClarifyRequest(id="c3", question="Sign in to Amazon, then hand back", choices=None,
+                             session_key="desktop:chat", kind="computer", profile_id="rhody")
+    wire = clarify_to_wire(pending)
+    assert wire["kind"] == "computer" and wire["profileId"] == "rhody"
+
+
 def test_clarify_wire_open_ended_keeps_none_choices():
     """``None`` and ``[]`` mean different things to a surface: no buttons at all
     versus an empty button row. Don't let the serializer blur them."""

@@ -32,6 +32,14 @@ import shlex
 from pathlib import Path
 
 
+def _screen_directories(home: Path) -> tuple[Path, ...]:
+    """Every agent's screen directory under this account's Flowly homes."""
+    from glob import glob
+
+    flowly = home / ".flowly"
+    return (flowly / "desktop", *(Path(path) for path in sorted(glob(str(flowly / "profiles" / "*" / "desktop")))))
+
+
 def _hardcoded_protected_roots() -> tuple[Path, ...]:
     """Return the static list of protected path roots.
 
@@ -66,6 +74,14 @@ def _hardcoded_protected_roots() -> tuple[Path, ...]:
         home / ".flowly" / "config.json",
         home / ".flowly" / "electron-api.json",
         home / ".flowly" / "desktop-client-id",
+        # An agent screen's private state: its display key and sockets, its
+        # application account's home and browser profile (cookies, logins),
+        # and the gateway's screen service sockets. The screen is reached
+        # through its own tools; a shell must never read or drive it.
+        Path("/run/flowly-screen"),
+        Path("/var/lib/flowly-screen-runtime"),
+        Path("/tmp") / f"flowly-screen-{os.getuid() if hasattr(os, 'getuid') else 0}",
+        *_screen_directories(home),
         # System secrets / privilege configuration
         Path("/etc/shadow"),
         Path("/etc/sudoers"),
@@ -182,6 +198,10 @@ def find_protected_paths_in_command(command: str) -> list[str]:
         clean = re.sub(r"^[<>&0-9]+", "", token)
         if not clean:
             continue
+        # ``VAR=/path`` and ``--flag=/path`` name the path after the ``=``.
+        if any(_flags_path(part, token) for part in clean.split("=")[1:]):
+            flagged.append(token)
+            continue
 
         # Tokens that don't look path-like — skip without parsing. We
         # intentionally treat anything with ``/`` or leading ``~`` as
@@ -200,12 +220,36 @@ def find_protected_paths_in_command(command: str) -> list[str]:
         if not clean:
             continue
 
-        try:
-            candidate = Path(clean)
-        except (ValueError, OSError):
-            continue
-
-        if is_protected_path(candidate):
+        if _flags_path(clean, token):
             flagged.append(token)
 
     return flagged
+
+
+_GLOB = re.compile(r"[*?\[]")
+
+
+def _flags_path(text: str, token: str) -> bool:
+    """Whether ``text`` (a path, possibly a shell glob) can reach a protected root."""
+    text = text.strip("\"'")
+    if not text or not (text.startswith(("/", "~")) or "/" in text):
+        return False
+    glob = _GLOB.search(text)
+    if glob:
+        # The shell expands it later: protected if any protected root could
+        # match what is fixed before the first wildcard.
+        prefix = str(Path(text[:glob.start()]).expanduser()) if text[:glob.start()] else ""
+        if text[:glob.start()].endswith("/") and not prefix.endswith("/"):
+            prefix += "/"
+        if len(prefix) > 1:
+            for root in _hardcoded_protected_roots():
+                for form in {str(root), str(_normalize(root) or root)}:
+                    if form.startswith(prefix) or prefix.startswith(form + "/"):
+                        return True
+        text = text[:glob.start()]
+        if not text:
+            return False
+    try:
+        return is_protected_path(Path(text))
+    except (ValueError, OSError):
+        return False

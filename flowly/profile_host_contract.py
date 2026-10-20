@@ -523,7 +523,8 @@ def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]
         value = {"mediaId": media_id, "offset": offset, "length": length}
     if method in {"chat.send", "chat.steer"}:
         # Remote clients may upload bytes, but they may never select paths or
-        # browser registrations on the machine that owns the bot host.
+        # browser registrations on the machine that owns the bot host. A bot's
+        # running profile screen is its browser without any selection.
         if value.get("cwd") is not None or value.get("browserAccess") is not None:
             raise ProfileHostError(
                 "REMOTE_HOST_ACCESS_DENIED",

@@ -77,6 +77,7 @@ class _Harness:
     # so the harness borrows that resolution rather than stubbing a policy.
     _resolve_toolset_route = AgentLoop._resolve_toolset_route
     _routed_tool_definitions = AgentLoop._routed_tool_definitions
+    _screen_unavailable_tools = AgentLoop._screen_unavailable_tools
     _chat_without_stream = AgentLoop._chat_without_stream
     _request_coordinator = AgentLoop._request_coordinator
     _request_too_large_response = staticmethod(AgentLoop._request_too_large_response)

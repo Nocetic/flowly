@@ -1,0 +1,16 @@
+# Clean OS package baseline with the locked Core environment from the gateway
+# fixture. Sudo credentials exist only in this disposable integration image.
+FROM flowly-screen-gateway-test:bookworm AS dependencies
+FROM python:3.12-slim-bookworm
+COPY --from=dependencies /opt/flowly/.venv /opt/flowly/.venv
+RUN apt-get update && apt-get install -y --no-install-recommends python3 sudo \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 1000 install-test \
+    && echo 'install-test:flowly-install-fixture' | chpasswd \
+    && echo 'install-test ALL=(ALL) ALL' > /etc/sudoers.d/screen-install-test \
+    && chmod 0440 /etc/sudoers.d/screen-install-test
+ENV PATH="/opt/flowly/.venv/bin:${PATH}"
+ENV PYTHONPATH=/workspace
+ENV FLOWLY_SEMANTIC_MODEL_DOWNLOAD=0
+WORKDIR /workspace
+USER install-test

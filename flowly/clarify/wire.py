@@ -28,6 +28,9 @@ def clarify_to_wire(pending: ClarifyRequest) -> dict[str, Any]:
         "createdAt": pending.created_at,
         "expiresAt": pending.expires_at,
         "riskReasons": list(pending.risk_reasons or []),
+        # A question's wire stays as it always was; other kinds say so.
+        **({"kind": pending.kind} if pending.kind != "question" else {}),
+        **({"profileId": pending.profile_id} if pending.profile_id else {}),
     }
 
 

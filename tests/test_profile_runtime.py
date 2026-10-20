@@ -264,6 +264,31 @@ def test_clone_all_does_not_copy_machine_or_runtime_identity(profile_roots) -> N
     assert not (created / ".desktop-runtime.json").exists()
 
 
+def test_full_clone_excludes_screen_credentials_before_copying_live_browser(profile_roots) -> None:
+    default, _root = profile_roots
+    browser = default / "desktop" / "browser"
+    browser.mkdir(parents=True)
+    (browser / "Cookies").write_text("private browser session", encoding="utf-8")
+    # Chromium's live singleton symlink must neither escape containment nor
+    # prevent cloning unrelated profile content when screen state is excluded.
+    (browser / "SingletonLock").symlink_to("/tmp/unrelated-process")
+    workspace_desktop = default / "workspace" / "desktop"
+    workspace_desktop.mkdir(parents=True)
+    (workspace_desktop / "document.txt").write_text("ordinary user document", encoding="utf-8")
+    created = profiles.create_profile("screen-copy", clone_from="default", clone_all=True)
+    assert not (created / "desktop").exists()
+    assert (created / "workspace" / "desktop" / "document.txt").exists()
+    assert (browser / "Cookies").read_text() == "private browser session"
+
+
+def test_import_identity_stripping_removes_old_screen_capabilities(tmp_path) -> None:
+    staged = tmp_path / "imported"
+    (staged / "desktop" / "authority").mkdir(parents=True)
+    (staged / "desktop" / "authority" / "control.json").write_text('{"viewer":"old-capability"}')
+    profiles._strip_inherited_identity(staged)
+    assert not (staged / "desktop").exists()
+
+
 def test_profile_metadata_updates_without_touching_profile_data(profile_roots) -> None:
     _default, _root = profile_roots
     created = profiles.create_profile("writer", local_runtime=True)
@@ -1021,6 +1046,54 @@ def test_profile_template_excludes_private_state_and_redacts_credentials(
     assert json.loads((source / "config.json").read_text(encoding="utf-8")) == source_config
 
 
+@pytest.mark.parametrize("kind", ["archive", "template", "backup"])
+def test_profile_exports_never_traverse_or_copy_screen_credentials(
+    profile_roots, tmp_path, monkeypatch, kind,
+) -> None:
+    source = profiles.create_profile("writer", local_runtime=True)
+    screen = source / "desktop"
+    screen.mkdir()
+    (screen / "cookies").write_bytes(b"screen-cookie-credential")
+    # Browser state may include socket symlinks or unreadable cache directories.
+    # It must be pruned before any recursive archive/template traversal.
+    (screen / "outside").symlink_to(tmp_path / "missing")
+    workspace = source / "workspace" / "desktop"
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "notes.txt").write_text("ordinary user document")
+    original = os.scandir
+
+    def guarded(path):
+        if not isinstance(path, int) and Path(path) == screen:
+            pytest.fail("export must not traverse live screen storage")
+        return original(path)
+
+    monkeypatch.setattr(os, "scandir", guarded)
+    original_write = profiles._write_profile_archive
+    inspected = []
+
+    def inspect_archive(*args, **kwargs):
+        archive = original_write(*args, **kwargs)
+        with tarfile.open(archive) as bundle:
+            names = bundle.getnames()
+            assert not any(name == "writer/desktop" or name.startswith("writer/desktop/") for name in names)
+            assert "writer/workspace/desktop/notes.txt" in names
+        inspected.append(archive)
+        return archive
+
+    monkeypatch.setattr(profiles, "_write_profile_archive", inspect_archive)
+    target = str(tmp_path / f"export-{kind}")
+    if kind == "backup":
+        password = "test backup passphrase"
+        archive = profiles.export_profile_backup("writer", target, password)
+        # Inspect the plaintext archive before encryption: import's stripping
+        # would hide an accidental credential leak from an export regression.
+        assert archive.read_bytes().startswith(profiles._BACKUP_MAGIC)
+    else:
+        exporter = profiles.export_profile if kind == "archive" else profiles.export_profile_template
+        exporter("writer", target)
+    assert len(inspected) == 1
+
+
 def test_encrypted_profile_backup_round_trips_private_state_and_identity(
     profile_roots, tmp_path: Path,
 ) -> None:
@@ -1340,3 +1413,36 @@ def test_create_cli_accepts_a_pinned_seed(profile_roots) -> None:
     )
     assert result.exit_code == 0, result.output
     assert json.loads(result.output)["profile"]["markSeed"] == 12
+
+
+def test_stream_identity_reads_only_target_metadata_and_observes_replacement(profile_roots, monkeypatch):
+    default, root = profile_roots
+    profiles.create_profile("writer", local_runtime=True)
+    expected = {name: profiles.ensure_profile_bot_id(name).bot_id for name in ("default", "writer")}
+
+    def forbidden():
+        pytest.fail("stream identity must not enumerate profiles or their skills")
+
+    monkeypatch.setattr(profiles, "list_profiles", forbidden)
+    for _ in range(20):
+        assert profiles.active_profile_identity() == ("default", default, expected["default"])
+        assert profiles.profile_identity("writer") == (root / "writer", expected["writer"])
+    replacement = str(uuid.uuid4())
+    metadata = profiles._profile_metadata(root / "writer")
+    metadata["botId"] = replacement
+    profiles._atomic_write_json(root / "writer" / "profile.json", metadata)
+    assert profiles.profile_identity("writer")[1] == replacement
+    (root / "writer").rename(root / "old-writer")
+    with pytest.raises(FileNotFoundError):
+        profiles.profile_identity("writer")
+    (root / "writer").symlink_to(root / "old-writer", target_is_directory=True)
+    with pytest.raises(FileNotFoundError):
+        profiles.profile_identity("writer")
+
+
+def test_stream_identity_backfills_legacy_metadata_once(profile_roots):
+    default, _ = profile_roots
+    path, identity = profiles.profile_identity("default")
+    assert path == default
+    assert str(uuid.UUID(identity)) == identity
+    assert profiles.profile_identity("default") == (path, identity)

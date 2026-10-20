@@ -486,21 +486,25 @@ async def test_n_run_limit_counts_mixed_terminal_outcomes(tmp_path: Path):
 
     service.on_job = run
     await _fire_scheduled(service, job)
+    first_run = job.state.last_run_id
     assert job.lifecycle == "scheduled"
     await _fire_scheduled(service, job)
+    second_run = job.state.last_run_id
     assert job.lifecycle == "scheduled"
     assert job.state.last_status == "error"
     await _fire_scheduled(service, job)
+    third_run = job.state.last_run_id
 
     assert job.lifecycle == "completed"
     assert job.enabled is False
     assert job.state.next_run_at_ms is None
     assert job.repeat_completed == 3
-    assert [record["status"] for record in service._read_run_records(job.id)] == [
-        "ok",
-        "error",
-        "ok",
-    ]
+    # Runs may complete in the same millisecond; history breaks timestamp ties
+    # by opaque run ID, which is not execution order. Verify each actual run.
+    assert len({first_run, second_run, third_run}) == 3
+    assert {record["runId"]: record["status"] for record in service._read_run_records(job.id)} == {
+        first_run: "ok", second_run: "error", third_run: "ok",
+    }
 
 
 @pytest.mark.asyncio

@@ -338,6 +338,9 @@ class WebChannel(BaseChannel):
         super().__init__(config, bus)
         self.config: WebChannelConfig = config
         self._ws = None
+        self._screen_gateway = None
+        self._screen_streams = None
+        self._screen_rpc = None
         self._relay_authority: RelayBrowserVerifier | None = None
         self._relay_authority_enabled = False
         self._relay_principals: dict[str, RelayPrincipal] = {}
@@ -417,6 +420,10 @@ class WebChannel(BaseChannel):
         self._profile_run_bindings: dict[
             tuple[str, str], tuple[str, float]
         ] = {}
+
+    def set_screen_gateway(self, gateway) -> None:
+        """Bind the owned local gateway; relay requests can never choose an endpoint."""
+        self._screen_gateway = gateway
 
     @property
     def chat_commands(self):
@@ -1825,6 +1832,24 @@ class WebChannel(BaseChannel):
             self._clear_profile_subagent_observers()
             self._clear_subagent_stream_watchers()
             self._ws = ws
+            if self._screen_gateway is not None:
+                from flowly.desktop_runtime.relay_rpc import RelayScreenRpc
+                from flowly.desktop_runtime.relay_stream import RelayScreenStreams
+                def stream_token():
+                    issued = int(time.time())
+                    return jwt.encode({**payload, "iat": issued, "exp": issued + 60}, jwt_secret, algorithm="HS256")
+                try:
+                    self._screen_streams = RelayScreenStreams(
+                        relay_url=self.config.relay_url, server_id=self.config.server_id,
+                        token=stream_token, gateway=self._screen_gateway,
+                        current=lambda: self._ws is ws, ssl_context=ssl_ctx,
+                    )
+                    self._screen_rpc = RelayScreenRpc(
+                        gateway=self._screen_gateway, current=lambda: self._ws is ws,
+                        send=lambda frame: ws.send(json.dumps(frame)),
+                    )
+                except ValueError:
+                    self._screen_streams = None
             self._relay_authority = None
             self._relay_authority_enabled = False
             self._relay_principals.clear()
@@ -1834,8 +1859,6 @@ class WebChannel(BaseChannel):
             # Replay anything that piled up while disconnected. Done before
             # entering the recv loop so a fresh inbound message can't race
             # against a stale outbound one.
-            await self._flush_outbound_queue()
-
             long_rpc_tasks: set[asyncio.Task[None]] = set()
 
             def _long_rpc_done(task: asyncio.Task[None]) -> None:
@@ -1850,6 +1873,7 @@ class WebChannel(BaseChannel):
                     )
 
             try:
+                await self._flush_outbound_queue()
                 async for raw in ws:
                     if not self._running:
                         break
@@ -1885,6 +1909,14 @@ class WebChannel(BaseChannel):
                 if pending_long_rpcs:
                     await asyncio.gather(*pending_long_rpcs, return_exceptions=True)
                 if self._ws is ws:
+                    # The screen transport belongs to this connection; a replacement
+                    # connection owns its own and must not be closed here.
+                    if self._screen_rpc is not None:
+                        await self._screen_rpc.close()
+                        self._screen_rpc = None
+                    if self._screen_streams is not None:
+                        await self._screen_streams.close()
+                        self._screen_streams = None
                     self._clear_profile_subscriptions()
                     self._subagent_observers.clear()
                     self._subagent_event_versions.clear()
@@ -1998,6 +2030,12 @@ class WebChannel(BaseChannel):
         msg_type = msg.get("type")
 
         if msg_type == "ready":
+            from flowly.desktop_runtime.relay_stream import PROTOCOL
+            if (ws is self._ws and self._screen_streams is not None and self._screen_streams.available
+                    and PROTOCOL in (msg.get("capabilities") or [])):
+                await ws.send(json.dumps({"type": "screen.transport.ready", "protocol": PROTOCOL}))
+                if self._screen_rpc is not None:
+                    self._screen_rpc.enabled = True
             if (self._ws is ws and self._relay_authority is None and isinstance(msg.get('capabilities'), list)
                     and RELAY_VOICE_CAPABILITY in msg['capabilities']):
                 from flowly.live_voice.authority import VoiceAuthorityError
@@ -2025,6 +2063,9 @@ class WebChannel(BaseChannel):
                 except Exception as e:
                     logger.warning(f"[WebChannel] on_ready callback failed: {e}")
 
+        elif msg_type == "screen.stream.open":
+            if ws is self._ws and self._screen_streams is not None:
+                self._screen_streams.open(msg)
         elif msg_type == 'relay.authority.enabled':
             if (self._ws is ws and self._relay_authority is not None and type(msg.get('version')) is int and msg['version'] == 1
                     and msg.get('linkId') == self._relay_authority.link_id):
@@ -2038,10 +2079,14 @@ class WebChannel(BaseChannel):
         elif msg_type == "browser-connected":
             session_id = msg.get("sessionId", "")
             logger.debug(f"[WebChannel] Browser connected: {session_id}")
+            if ws is self._ws and self._screen_rpc is not None:
+                self._screen_rpc.connected(session_id)
 
         elif msg_type == "browser-disconnected":
             session_id = msg.get("sessionId", "")
             logger.debug(f"[WebChannel] Browser disconnected: {session_id}")
+            if ws is self._ws and self._screen_rpc is not None:
+                await self._screen_rpc.disconnected(session_id)
             self._pending.pop(session_id, None)
             self._subagent_observers.pop(session_id, None)
             self._subagent_event_versions.pop(session_id, None)
@@ -2155,6 +2200,14 @@ class WebChannel(BaseChannel):
         rpc_id = msg.get("id", "")
         params = msg.get("params", {})
         session_id = msg.get("sessionId", "")
+
+        if isinstance(method, str) and method.startswith("display."):
+            if ws is self._ws and self._screen_rpc is not None and self._screen_rpc.enabled:
+                await self._screen_rpc.submit(session_id, msg)
+            else:
+                await ws.send(json.dumps({"type": "rpc", "id": rpc_id, "sessionId": session_id,
+                    "error": {"code": "METHOD_NOT_FOUND", "message": "Screen relay transport is unavailable."}}))
+            return
 
         from flowly.session.keys import SubagentThreadReadOnlyError, require_rpc_subagent_access
         try:

@@ -97,8 +97,25 @@ class BrowserTabTool(Tool):
     # find with no impact on outer agent flow.
     SEMANTIC_FIND_MODEL = "anthropic/claude-haiku-4.5"
 
-    def __init__(self, gateway_server: Any = None, provider: Any = None, registry: Any = None):
+    def _validate_screen_result(self, result: Any) -> Any:
+        if isinstance(result, dict) and "_screenObservation" in result:
+            check = getattr(self._gateway, "validate_browser_tool_result", None)
+            if check is None or not check(result):
+                return {"error": "Screen control changed. Read the page again after control is returned.",
+                        "error_code": "STALE_OBSERVATION"}
+            return {key: value for key, value in result.items() if key != "_screenObservation"}
+        return result
+
+    def __init__(self, gateway_server: Any = None, provider: Any = None, registry: Any = None,
+                 *, screen_only: bool = False, screen_enabled: bool = True, screen_continuation: Any = None):
         self._gateway = gateway_server
+        # The conversation this turn answers (set_context), and how the agent
+        # loop starts its next turn once a handed-over screen step is done.
+        self._turn_channel = ""
+        self._turn_chat_id = ""
+        self._screen_continuation = screen_continuation
+        self.screen_only = screen_only
+        self.screen_enabled = screen_enabled
         # Optional. When set, the `find` action transparently upgrades
         # to semantic matching via an inner Haiku call. When None we
         # fall through to the extension's substring matcher.
@@ -175,7 +192,7 @@ class BrowserTabTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Interact with web pages in the user's visible browser (embedded Flowly browser or Chrome). "
+            "Interact with web pages in the user's visible browser (profile Screen, embedded Flowly browser or Chrome). "
             "The user can see every action in real-time.\n\n"
             "Actions:\n"
             "- read_page: Get element map with ref IDs (text, NOT a screenshot). "
@@ -388,8 +405,13 @@ class BrowserTabTool(Tool):
                         "navigate", "get_page_text", "screenshot",
                         "scroll", "key", "tabs_list", "tabs_create", "tabs_close",
                         "tabs_context", "read_network_requests",
-                        "batch",
+                        "batch", "handoff", "withdraw",
                     ],
+                },
+                "task": {
+                    "type": "string",
+                    "description": "For handoff: the step the person does on your screen, one sentence. "
+                                   "withdraw takes a waiting step back (they gave up, or it is no longer needed).",
                 },
                 "ref": {
                     "type": "string",
@@ -570,7 +592,40 @@ class BrowserTabTool(Tool):
             "required": ["action"],
         }
 
+    def set_context(self, channel: str, chat_id: str) -> None:
+        """The conversation of the turn now running (as the message tool is told)."""
+        self._turn_channel, self._turn_chat_id = channel, chat_id
+
     async def execute(self, action: str = "", **kwargs: Any) -> str:
+        from flowly.desktop_runtime.authority import ScreenError
+        from flowly.desktop_runtime.host_screen_run import current_screen_run, unavailable
+
+        if action == "handoff":
+            # The person takes over the screen for one step (agent/tools/computer_handoff.py).
+            from flowly.agent.tools.computer_handoff import computer_handoff
+
+            return await computer_handoff(kwargs.get("task"), self._turn_channel, self._turn_chat_id,
+                                          self._screen_continuation)
+        if action == "withdraw":
+            from flowly.agent.tools.computer_handoff import withdraw_handoff
+
+            return await withdraw_handoff()
+        run = current_screen_run()
+        if not self.screen_enabled and run is not None and run.uses_screen():
+            return json.dumps({"error": "Screen browser access is disabled.", "error_code": "SCREEN_DISABLED"})
+        if self.screen_only:
+            if run is None or run.gateway is not self._gateway or not run.uses_screen():
+                return json.dumps({"error": "The profile Screen is not available for this run.",
+                                   "error_code": "SCREEN_NOT_AVAILABLE"})
+            # Pin the provider before any await/dispatch can re-evaluate availability.
+            # A disappearing Screen must never fall back to a connected native browser.
+            try:
+                if await run.bind() is None:
+                    return json.dumps({"error": "The profile Screen is not available for this run.",
+                                       "error_code": "SCREEN_NOT_AVAILABLE"})
+            except ScreenError as exc:
+                return json.dumps(unavailable(exc))
+
         if not self._gateway:
             return json.dumps({"error": "Gateway not available"})
 
@@ -648,12 +703,18 @@ class BrowserTabTool(Tool):
             "batch": 120.0,
         }
         timeout = action_timeouts.get(action, 15.0)
+        if run is not None and run.uses_screen():
+            # The screen bounds its own actions (20 s, then it severs the
+            # browser connection). Giving up earlier here left the action
+            # admitted behind the tool's back: every next call came back busy.
+            timeout = max(timeout, 25.0)
 
         try:
             result = await asyncio.wait_for(
                 self._gateway.send_browser_tool_request(request_id, action, params),
                 timeout=timeout,
             )
+            result = self._validate_screen_result(result)
 
             # Transparent semantic fallback for click(text=X) on
             # localized UIs. Pattern from production logs: agent calls
@@ -678,7 +739,7 @@ class BrowserTabTool(Tool):
                     tab_id=params.get("tabId"),
                 )
                 if fallback is not None:
-                    result = fallback
+                    result = self._validate_screen_result(fallback)
 
             # Screenshot: keep base64 inline so the agent's vision can
             # actually see it. Loop detects the `_render_as_image` flag
@@ -857,6 +918,7 @@ class BrowserTabTool(Tool):
             ),
             timeout=20.0,
         )
+        tree_result = self._validate_screen_result(tree_result)
         if not isinstance(tree_result, dict) or "elements" not in tree_result:
             raise RuntimeError(
                 f"read_page returned no elements: {tree_result!r}"

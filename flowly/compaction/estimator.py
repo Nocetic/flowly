@@ -5,6 +5,7 @@ different tokenizer internally but cl100k_base is a close enough
 proxy (typically within 5-10% of actual Claude token counts).
 """
 
+import threading
 from typing import Any
 
 import tiktoken
@@ -16,13 +17,18 @@ from flowly.providers.base import (
 
 # Cache the encoder
 _encoder: tiktoken.Encoding | None = None
+_encoder_lock = threading.Lock()
 
 
 def _get_encoder() -> tiktoken.Encoding:
-    """Get or create the tiktoken encoder."""
+    """Construct the exact encoder locally; never download on an agent turn."""
     global _encoder
     if _encoder is None:
-        _encoder = tiktoken.get_encoding("cl100k_base")
+        with _encoder_lock:
+            if _encoder is None:
+                from flowly.compaction.offline_encoding import load_encoding
+
+                _encoder = load_encoding()
     return _encoder
 
 

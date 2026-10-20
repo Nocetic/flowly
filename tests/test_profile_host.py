@@ -350,6 +350,32 @@ async def test_delete_requires_fresh_confirmation_bound_to_bot(profile_roots) ->
 
 
 @pytest.mark.asyncio
+async def test_screen_blocks_profile_delete_before_stopping_agent_or_removing_rooms(
+    profile_roots, monkeypatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from flowly.desktop_runtime.launcher import ScreenRuntime, write_state
+
+    profile = profiles.create_profile("writer", local_runtime=True)
+    runtime = ScreenRuntime(profile / "desktop")
+    write_state(runtime.manifest, dict(schema=1, generation="generation-1", phase="running",
+                                      supervisor=None, children=[], error=None))
+    host = ProfileHost()
+    stop = AsyncMock()
+    remove = AsyncMock()
+    monkeypatch.setattr(host, "stop", stop)
+    monkeypatch.setattr(host._rooms, "remove_profile", remove)
+    prepared = await host.prepare_delete("writer")
+    with pytest.raises(ProfileHostError) as error:
+        await host.commit_delete("writer", prepared["confirmation"])
+    assert error.value.code == "SCREEN_BUSY"
+    stop.assert_not_awaited()
+    remove.assert_not_awaited()
+    assert profiles.profile_exists("writer")
+
+
+@pytest.mark.asyncio
 async def test_profile_mutations_reject_ambiguous_parameter_types(profile_roots) -> None:
     host = ProfileHost()
     with pytest.raises(ProfileHostError) as bad_name:

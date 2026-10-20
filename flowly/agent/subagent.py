@@ -7,6 +7,7 @@ import json
 import re
 import time
 import uuid
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -1655,7 +1656,17 @@ class SubagentManager:
         # The run's state, for saving its turn into its thread however it ends.
         turn: dict[str, Any] = {}
 
+        from flowly.desktop_runtime.authority import ScreenError
+        from flowly.desktop_runtime.installation_gate import agent_environment_activity
+
+        activity = ExitStack()
+        activity_error = None
         try:
+            try:
+                activity.enter_context(agent_environment_activity())
+            except ScreenError as exc:
+                activity_error = exc.code
+                raise
             run = self._child_run(
                 run_id, task, label, origin_channel, origin_chat_id, model,
                 timeout_seconds, context, tool_trace, restored, turn,
@@ -1741,23 +1752,30 @@ class SubagentManager:
 
         except Exception as e:
             logger.error(f"[SubagentManager] [{run_id[:8]}] failed: {e}")
-            self._save_turn(run_id, turn, result="Error: Task could not finish.", outcome="error")
-            self._registry.finish(run_id, "error", error="Task could not finish", error_code="execution_failed")
-            self._end_stream(run_id, "error", "Error: Task could not finish.", "execution_failed")
-            final_result = "Error: Task could not finish."
+            if activity_error:
+                final_result = "Error: Agent environment maintenance must finish before this task can run."
+                failure, failure_code = "Agent environment maintenance must finish before this task can run", activity_error
+            else:
+                final_result = "Error: Task could not finish."
+                failure, failure_code = "Task could not finish", "execution_failed"
+            self._save_turn(run_id, turn, result=final_result, outcome="error")
+            self._registry.finish(run_id, "error", error=failure, error_code=failure_code)
+            self._end_stream(run_id, "error", final_result, failure_code)
             status = "error"
             error_str = final_result
-
         finally:
-            if not suspended:
-                # What it never read is kept for the thread's next turn before
-                # the checkpoint (its only durable record) goes.
-                try:
-                    self._stash_unread(run_id)
-                except Exception:
-                    logger.exception(f"[SubagentManager] [{run_id[:8]}] could not keep its unread messages")
-                # The result (or the end) is durable in the registry now.
-                self._drop_checkpoint(run_id)
+            try:
+                if not suspended:
+                    # What it never read is kept for the thread's next turn before
+                    # the checkpoint (its only durable record) goes.
+                    try:
+                        self._stash_unread(run_id)
+                    except Exception:
+                        logger.exception(f"[SubagentManager] [{run_id[:8]}] could not keep its unread messages")
+                    # The result (or the end) is durable in the registry now.
+                    self._drop_checkpoint(run_id)
+            finally:
+                activity.close()
 
         self._transcribe(run_id, {
             "kind": "result", "status": status, "content": _clip(final_result or "", 8_000),

@@ -72,7 +72,9 @@ class ScreenshotTool(Tool):
             "The screenshot is attached to your reply automatically — do NOT call "
             "the message tool for it. "
             "Use display=0 for main monitor, display=1 for secondary, etc. "
-            "If you can't find the target app on display 0, try display=1."
+            "If you can't find the target app on display 0, try display=1. "
+            "On a server with a Screen it captures that screen's whole desktop "
+            "(browser_tab screenshot captures one tab)."
         )
 
     @property
@@ -115,6 +117,41 @@ class ScreenshotTool(Tool):
         Returns:
             Success message with file path, or error message.
         """
+        from flowly.desktop_runtime.authority import ScreenError
+        from flowly.desktop_runtime.host_screen_run import current_screen_run, unavailable
+
+        screen_run = current_screen_run()
+        if screen_run is not None and screen_run.uses_screen():
+            import uuid
+
+            try:
+                binding = await screen_run.bind()
+            except ScreenError as exc:
+                return json.dumps(unavailable(exc))
+            if binding is None:
+                return json.dumps(unavailable(ScreenError("SCREEN_NOT_RUNNING")))
+
+            from flowly.agent.tools.browser_tab import BrowserTabTool
+
+            # The whole desktop the person sees; a screen started before the
+            # desktop picture existed gives its browser tab instead.
+            result = await binding.provider.desktop_screenshot(binding.run_id, str(uuid.uuid4()), binding.generation)
+            whole = result.get("error_code") != "SCREEN_STILL_UNAVAILABLE"
+            if not whole:
+                result = await binding.provider.request(binding.run_id, str(uuid.uuid4()),
+                                                        binding.generation, "screenshot", {}, owner=binding.owner)
+            if not binding.provider.observation_valid(result):
+                return json.dumps({"error": "Screen control changed", "error_code": "STALE_OBSERVATION"})
+            if not result.get("screenshot"):
+                return json.dumps(result)
+            saved = BrowserTabTool._save_screenshot_to_file(result)
+            if not saved.get("path"):
+                return json.dumps(saved)
+            from flowly.agent.reply_media import media_envelope
+
+            return media_envelope([saved["path"]], ("Screen captured (the whole desktop)" if whole
+                                                    else "Browser screenshot captured") + ", attached to this reply.")
+
         # Validate format
         format = format.lower()
         if format not in {"png", "jpg", "jpeg"}:

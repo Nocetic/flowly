@@ -1,0 +1,9 @@
+# Disposable systemd host with real screen applications, for cgroup enforcement.
+FROM flowly-screen-gateway-test:bookworm
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    systemd systemd-sysv dbus-user-session sudo \
+    && rm -rf /var/lib/apt/lists/* \
+    && systemctl mask systemd-firstboot.service getty.target console-getty.service
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

@@ -680,6 +680,11 @@ def gateway(
     elif remote_exposed and not auth_token:
         auth_token = generate_gateway_token()
         _token_changed = True
+    elif not auth_token and config.channels.web.enabled and config.channels.web.relay_url:
+        # The relay screen bridge enters this gateway's display routes, which
+        # always demand the token. Loopback stays exempt for other clients.
+        auth_token = generate_gateway_token()
+        _token_changed = True
 
     if not local_runtime and (_token_changed or (host.strip() and config.gateway.host != effective_host)):
         config.gateway.token = auth_token
@@ -2106,6 +2111,9 @@ Respond to the user now:"""
 
     # Wire browser_tab tool to gateway server
     agent.set_gateway_server(gateway_server)
+    # A screen-installation restart is refused while accepted messages still
+    # wait for a turn: they live only in this process's queue.
+    gateway_server._maintenance_backlog = lambda: bus.inbound_size
 
     # Profiles collaborate through the Desktop process, which is the only
     # authority that can see and start sibling runtimes. The tool is restricted
@@ -2169,6 +2177,8 @@ Respond to the user now:"""
         web.set_local_event_callback(gateway_server.broadcast_event)
     if web and hasattr(web, "set_profile_host"):
         web.set_profile_host(gateway_server.profile_host)
+    if web and hasattr(web, "set_screen_gateway"):
+        web.set_screen_gateway(gateway_server)
     if web and hasattr(web, "set_chat_commands"):
         web.set_chat_commands(gateway_server.chat_commands)
 

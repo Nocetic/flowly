@@ -1,0 +1,65 @@
+<!doctype html><html><body style="margin:0"><div id="screen"></div><script type="module">
+import RFB from '/novnc/core/rfb.js';
+const mode = new URL(location.href).searchParams.get('mode');
+const mount = document.querySelector('#screen');
+const input = new WebSocket(`ws://${location.host}/input`);
+await new Promise((resolve,reject) => { input.onopen=resolve; input.onerror=reject; });
+let rfb, pc, source;
+if (mode === 'vnc') {
+  rfb = new RFB(mount, `ws://${location.host}/rfb`);
+  rfb.viewOnly = true;
+  rfb.qualityLevel = 6; rfb.compressionLevel = 2;
+  await new Promise((resolve,reject) => { rfb.addEventListener('connect',resolve); rfb.addEventListener('disconnect',reject); });
+  source = mount.querySelector('canvas');
+} else {
+  source = document.createElement('video');
+  source.muted = true; source.autoplay = true; mount.append(source);
+  pc = new RTCPeerConnection({iceServers:[]});
+  pc.addTransceiver('video',{direction:'recvonly'});
+  const trackReady = new Promise(resolve => pc.ontrack = e => { source.srcObject = new MediaStream([e.track]); resolve(); });
+  await pc.setLocalDescription(await pc.createOffer());
+  if (pc.iceGatheringState !== 'complete') await new Promise(resolve => pc.addEventListener('icegatheringstatechange', () => { if (pc.iceGatheringState === 'complete') resolve(); }));
+  const answer = await fetch('/offer', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(pc.localDescription)}).then(r=>r.json());
+  await pc.setRemoteDescription(answer); await trackReady; await source.play();
+}
+const probe = document.createElement('canvas'); probe.width=16; probe.height=1;
+const ctx = probe.getContext('2d',{willReadFrequently:true});
+let marker, running=true, pending=new Map(), latencies=[], seen=0, lastVisibleId=null;
+function poll() {
+  if (!running) return;
+  if (marker && (mode==='vnc' || source.readyState>=2)) {
+    ctx.drawImage(source, marker.x,marker.y+24,256,1,0,0,16,1);
+    const pixels=ctx.getImageData(0,0,16,1).data;
+    let id=0;
+    for(let i=0;i<16;i++) id=(id<<1) | (pixels[i*4]>128?1:0);
+    lastVisibleId=id;
+    if(pending.has(id)) { latencies.push(performance.now()-pending.get(id)); pending.delete(id); seen++; }
+  }
+  requestAnimationFrame(poll);
+}
+requestAnimationFrame(poll);
+window.run = async (coordinates, count=180, interval=1000/60) => {
+  marker=coordinates;
+  const start=performance.now();
+  for(let i=0;i<count;i++) {
+    const id=400+i;
+    pending.set(id,performance.now());
+    input.send(JSON.stringify({x:id,y:500+Math.round(Math.sin(i/15)*70)}));
+    const wait=start+(i+1)*interval-performance.now();
+    if(wait>0) await new Promise(r=>setTimeout(r,wait));
+  }
+  await new Promise(r=>setTimeout(r,1000));
+  const sorted=latencies.sort((a,b)=>a-b);
+  const result={mode,sent:count,observed:seen,lastVisibleId,medianMs:sorted[Math.floor(sorted.length/2)],p95Ms:sorted[Math.min(sorted.length-1,Math.floor(sorted.length*.95))],maxMs:sorted.at(-1)};
+  if(pc) {
+    const stats=await pc.getStats();
+    for(const report of stats.values()) if(report.type==='inbound-rtp' && report.kind==='video') {
+      Object.assign(result,{framesDecoded:report.framesDecoded,framesDropped:report.framesDropped,bytesReceived:report.bytesReceived,jitter:report.jitter});
+      const codec=stats.get(report.codecId); result.codec=codec?.mimeType;
+    }
+  }
+  return result;
+};
+window.stop = () => { running=false; rfb?.disconnect(); pc?.close(); input.close(); };
+window.ready = true;
+</script></body></html>

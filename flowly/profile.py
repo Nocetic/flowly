@@ -82,7 +82,7 @@ _PROFILE_MUTATION_LOCK_FILE = ".profiles.lock"
 # Deleted profiles are renamed here first, then removed. Not a valid profile
 # name, so listings and the capacity count never see it.
 _PROFILE_TRASH_DIR = ".trash"
-# The profile directory a process started with, as "device:inode". A runtime
+# The profile directory a process started with, as "device:inode:botId". A runtime
 # compares it before claiming its lease, so a directory deleted and recreated
 # underneath it (by its own start-up writes) is never taken for the profile.
 PROFILE_DIR_IDENTITY_ENV = "FLOWLY_PROFILE_DIR_ID"
@@ -154,6 +154,12 @@ def _assert_named_profile_capacity() -> None:
 def _profile_mutation_lock() -> FileLock:
     _PROFILES_ROOT.mkdir(parents=True, exist_ok=True)
     return FileLock(str(_PROFILES_ROOT / _PROFILE_MUTATION_LOCK_FILE))
+
+
+def _assert_profile_not_retiring(profile_dir: Path) -> None:
+    from flowly.desktop_runtime.profile_lifecycle import assert_not_retired
+
+    assert_not_retired(profile_dir / "desktop")
 
 
 # ── Path resolution ───────────────────────────────────────────────
@@ -848,6 +854,7 @@ def create_profile(
 
     profile_dir = _PROFILES_ROOT / name
     with _profile_mutation_lock():
+        _assert_profile_not_retiring(profile_dir)
         if profile_dir.exists() or profile_dir.is_symlink():
             raise FileExistsError(f"Profile '{name}' already exists at {profile_dir}")
         _assert_named_profile_capacity()
@@ -878,12 +885,21 @@ def create_profile(
 
     try:
         if clone_all and source_dir:
+            excluded = {"desktop"}
+            if source_dir == _DEFAULT_HOME:
+                excluded.update({"profiles", "active_profile"})
             _assert_tree_no_symlinks(
                 source_dir,
-                ignored_top_level={"profiles", "active_profile"}
-                if source_dir == _DEFAULT_HOME else set(),
+                ignored_top_level=excluded,
             )
-            ignore = shutil.ignore_patterns("profiles", "active_profile") if source_dir == _DEFAULT_HOME else None
+            base_ignore = shutil.ignore_patterns("profiles", "active_profile") if source_dir == _DEFAULT_HOME else None
+
+            def ignore(directory, names):
+                ignored = set(base_ignore(directory, names)) if base_ignore else set()
+                if Path(directory) == source_dir:
+                    ignored.add("desktop")
+                return ignored
+
             shutil.copytree(source_dir, temp_dir, dirs_exist_ok=True, ignore=ignore)
             # Strip runtime files
             for stale in _CLONE_ALL_STRIP:
@@ -957,6 +973,7 @@ def create_profile(
         # can both create profiles, so checking only before staging would let
         # concurrent processes race beyond the installation limit.
         with _profile_mutation_lock():
+            _assert_profile_not_retiring(profile_dir)
             if profile_dir.exists() or profile_dir.is_symlink():
                 raise FileExistsError(f"Profile '{name}' already exists at {profile_dir}")
             _assert_named_profile_capacity()
@@ -1018,6 +1035,15 @@ def _strip_inherited_identity(profile_dir: Path) -> None:
     profile that legitimately needs the identity of the one it was copied
     from.
     """
+    # Browser login sessions, active control capabilities and runtime process
+    # identities belong to their original profile. This also covers imports
+    # of older archives that included screen runtime data.
+    screen = profile_dir / "desktop"
+    if screen.is_symlink() or screen.is_file():
+        screen.unlink()
+    elif screen.is_dir():
+        shutil.rmtree(screen)
+
     config_path = profile_dir / "config.json"
     if config_path.exists():
         try:
@@ -1282,6 +1308,61 @@ def ensure_profile_bot_id(name: str) -> ProfileInfo:
         _atomic_write_json(profile.path / _PROFILE_METADATA_FILE, current)
         profile = describe_profile(name)
     return profile
+
+
+def profile_identity(name: str) -> tuple[Path, str]:
+    """Read fresh identity without enumerating profiles, config or skill inventories.
+
+    Streaming checks call this for every input/output batch. Never cache the
+    identity: deletion/replacement must invalidate existing viewers immediately.
+    Legacy metadata still uses the existing migration path once.
+    """
+    if name == "default":
+        path = _DEFAULT_HOME
+    else:
+        validate_profile_name(name)
+        path = _PROFILES_ROOT / name
+        if not _is_describable_profile_dir(path):
+            raise FileNotFoundError(f"Profile '{name}' does not exist.")
+    raw = str(_profile_metadata(path).get("botId") or "").strip()
+    try:
+        canonical = str(uuid.UUID(raw))
+    except (ValueError, AttributeError):
+        canonical = None
+    if canonical is not None and raw == canonical:
+        return path, canonical
+    info = ensure_profile_bot_id(name)
+    return info.path, info.bot_id
+
+
+def active_profile_identity() -> tuple[str, Path, str]:
+    """``(name, home, botId)`` of this process's own profile.
+
+    A custom ``FLOWLY_HOME`` outside the profile tree is its own installation:
+    its identity lives in that home, and it never borrows the default
+    install's (``~/.flowly``) botId or directory. Default and named homes keep
+    their regular profile identity.
+    """
+    name = current_profile_name()
+    home = get_flowly_home()
+    if name != "default" or home.resolve() == _DEFAULT_HOME.resolve():
+        path, bot_id = profile_identity(name)
+        return name, path, bot_id
+    current = _profile_metadata(home)
+    raw = str(current.get("botId") or "").strip()
+    try:
+        bot_id = str(uuid.UUID(raw))
+    except (ValueError, AttributeError):
+        bot_id = str(uuid.uuid4())
+    if raw != bot_id:
+        now = _utc_now()
+        current.update({"version": 1, "botId": bot_id,
+                        "displayName": str(current.get("displayName") or "default"),
+                        "createdAt": str(current.get("createdAt") or now), "updatedAt": now,
+                        "credentialPolicy": "primary"})
+        home.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(home / _PROFILE_METADATA_FILE, current)
+    return name, home, bot_id
 
 
 def get_or_create_profile_host_id() -> str:
@@ -1918,20 +1999,33 @@ def release_runtime_lease(instance_id: str) -> None:
 
 
 def profile_dir_identity(path: Path) -> str | None:
-    """``device:inode`` of a real (non-symlink) directory, else None."""
+    """Directory and durable profile identity, resistant to inode reuse.
+
+    Directory metadata such as ctime changes during ordinary startup writes.
+    The profile UUID is stable across those writes, but changes on recreation.
+    A stray directory without metadata cannot match an admitted profile.
+    """
     try:
         info = path.lstat()
     except OSError:
         return None
     if not stat.S_ISDIR(info.st_mode):
         return None
-    return f"{info.st_dev}:{info.st_ino}"
+    bot_id = str(_profile_metadata(path).get("botId") or "").strip()
+    return f"{info.st_dev}:{info.st_ino}:{bot_id}"
 
 
 def named_profile_identity(name: str) -> str | None:
     """Identity of a named profile's directory (see PROFILE_DIR_IDENTITY_ENV)."""
     validate_profile_name(name)
-    return profile_dir_identity(_PROFILES_ROOT / name)
+    # CLI admission happens before the per-profile sandbox. Backfill legacy
+    # identity under the same lock as deletion; the runtime itself never needs
+    # that shared lock, nor may it create metadata for a deleted profile.
+    with _profile_mutation_lock():
+        if profile_dir_identity(_PROFILES_ROOT / name) is None:
+            return None
+        ensure_profile_bot_id(name)
+        return profile_dir_identity(_PROFILES_ROOT / name)
 
 
 def _remove_retired_profile(path: Path) -> bool:
@@ -1969,7 +2063,7 @@ def _sweep_profile_trash() -> None:
             _remove_retired_profile(entry)
 
 
-def delete_profile(name: str) -> None:
+def delete_profile(name: str, *, expected_bot_id: str | None = None) -> None:
     """Delete a named profile.
 
     The name is retired atomically: under the profile mutation lock (which a
@@ -1978,18 +2072,41 @@ def delete_profile(name: str) -> None:
     write into the profile, and the name is free again, so a partially
     removed tree can never be left behind as a half-alive bot. Removing the
     renamed tree afterwards is best effort and retried on the next delete.
+
+    Its screen is fenced first: a live screen, human control or an agent run
+    refuses the delete. External screen storage (root hosts: the profile's
+    application directories and account) is removed before the rename, since
+    its mapping is bound to this path; a durable journal lets a delete whose
+    acknowledgement was lost finish without replay.
     """
     validate_profile_name(name)
     if name == "default":
         raise ValueError("Cannot delete the default profile.")
 
+    from flowly.desktop_runtime.profile_lifecycle import (
+        begin_retirement,
+        cleanup_screen_storage,
+        finish_retirement,
+        removable_screen,
+        retirement,
+    )
+
     profile_dir = _PROFILES_ROOT / name
     _sweep_profile_trash()
-    with _profile_mutation_lock():
-        if not profile_dir.exists():
-            raise FileNotFoundError(f"Profile '{name}' does not exist.")
+    with removable_screen(profile_dir) as screen, _profile_mutation_lock():
         if profile_dir.is_symlink() or _PROFILES_ROOT.resolve() not in profile_dir.resolve().parents:
             raise ValueError("Profile directory failed containment validation.")
+        if not profile_dir.exists():
+            if retirement(profile_dir / "desktop") is None:
+                raise FileNotFoundError(f"Profile '{name}' does not exist.")
+            # The previous deletion removed storage and the profile, then lost
+            # its final acknowledgement. Finish that receipt without replay.
+            finish_retirement(profile_dir)
+            return
+        if expected_bot_id is not None and ensure_profile_bot_id(name).bot_id != expected_bot_id:
+            from flowly.desktop_runtime.authority import ScreenError
+
+            raise ScreenError("PROFILE_IDENTITY_CHANGED")
 
         lease = reconcile_runtime_lease(profile_dir, profile_name=name)
         if lease:
@@ -1997,10 +2114,14 @@ def delete_profile(name: str) -> None:
                 f"Profile '{name}' is running (pid {lease.get('pid')}). Stop it before deletion."
             )
 
+        begin_retirement(profile_dir)
+        if screen is not None:
+            cleanup_screen_storage(screen)
         trash = _PROFILES_ROOT / _PROFILE_TRASH_DIR
         trash.mkdir(mode=0o700, exist_ok=True)
         retired = trash / f"{name}.{uuid.uuid4().hex}"
         os.rename(profile_dir, retired)
+        finish_retirement(profile_dir)
 
     _remove_retired_profile(retired)
 
@@ -2063,7 +2184,25 @@ def _write_profile_archive(
 ) -> Path:
     import tarfile
 
-    excluded = excluded_roots or set()
+    # Machine-local browser sessions and control capabilities are never portable
+    # profile data, including in encrypted backups. Import also strips legacy
+    # copies; preventing their export avoids exposing otherwise unused secrets.
+    excluded = {"desktop", *(excluded_roots or set())}
+
+    def archive_entries():
+        # Prune before traversal: a live browser contains sockets, locks and
+        # potentially large caches. None of those entries belong in a backup.
+        def on_error(error):
+            raise error
+
+        for base, directories, files in os.walk(profile_dir, followlinks=False, onerror=on_error):
+            if Path(base) == profile_dir:
+                directories[:] = [item for item in directories if item not in excluded]
+                files = [item for item in files if item not in excluded]
+            directories.sort()
+            for item in sorted([*directories, *files]):
+                yield Path(base) / item
+
     fd, temporary_name = tempfile.mkstemp(
         prefix=f".{target.name}.", suffix=".tmp", dir=target.parent,
     )
@@ -2086,7 +2225,7 @@ def _write_profile_archive(
                 root_info.mode = 0o700
                 root_info.mtime = int(time.time())
                 bundle.addfile(root_info)
-                for candidate in sorted(profile_dir.rglob("*")):
+                for candidate in archive_entries():
                     relative = candidate.relative_to(profile_dir)
                     if relative.parts[0] in excluded:
                         continue
@@ -2130,6 +2269,7 @@ def _write_profile_archive(
 
 _TEMPLATE_EXCLUDED_ROOTS = frozenset({
     _RUNTIME_LEASE_FILE,
+    "desktop",
     ".env",
     "credentials",
     "mcp-tokens",
@@ -2491,6 +2631,7 @@ def _import_profile_archive(
     except OSError:
         pass
     with _profile_mutation_lock():
+        _assert_profile_not_retiring(profile_dir)
         if profile_dir.exists() or profile_dir.is_symlink():
             raise FileExistsError(f"Profile '{inferred}' already exists.")
         _assert_named_profile_capacity()
@@ -2556,6 +2697,7 @@ def _import_profile_archive(
         _atomic_write_json(extracted / _PROFILE_METADATA_FILE, metadata)
         _harden_profile_tree_permissions(extracted)
         with _profile_mutation_lock():
+            _assert_profile_not_retiring(profile_dir)
             if profile_dir.exists() or profile_dir.is_symlink():
                 raise FileExistsError(f"Profile '{inferred}' already exists.")
             _assert_named_profile_capacity()

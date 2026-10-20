@@ -11,6 +11,7 @@ not start: another avatar, "Needs attention".
 from __future__ import annotations
 
 import errno
+import json
 import os
 import shutil
 import subprocess
@@ -150,6 +151,44 @@ def test_a_live_profile_is_still_claimed(roots, monkeypatch) -> None:
     lease = profiles.claim_runtime_lease("instance-1")
     assert lease.exists()
     profiles.release_runtime_lease("instance-1")
+
+
+def test_reused_inode_cannot_admit_old_runtime_into_recreated_profile(roots, monkeypatch):
+    profiles.create_profile("reused", local_runtime=True)
+    old_id = profiles.named_profile_identity("reused").split(":")[2]
+    profiles.delete_profile("reused")
+    profiles.create_profile("reused", local_runtime=True)
+    home = roots / "profiles/reused"
+    current = profiles.named_profile_identity("reused")
+    device, inode, new_id = current.split(":")
+    assert new_id != old_id
+    # Force the old admission to have the new directory's dev/inode. The
+    # kernel is allowed to recycle both immediately; the UUID must fence it.
+    monkeypatch.setenv("FLOWLY_HOME", str(home))
+    monkeypatch.setenv(profiles.PROFILE_DIR_IDENTITY_ENV, f"{device}:{inode}:{old_id}")
+    with pytest.raises(FileNotFoundError, match="was deleted"):
+        profiles.claim_runtime_lease("stale-instance")
+    assert home.exists(), "a valid replacement profile must never be removed"
+    assert profiles.named_profile_identity("reused") == current
+    assert not (home / profiles._RUNTIME_LEASE_FILE).exists()
+
+
+def test_legacy_identity_is_backfilled_once_before_runtime_start(roots, monkeypatch):
+    home = roots / "profiles/legacy"
+    home.mkdir(parents=True)
+    identity = profiles.named_profile_identity("legacy")
+    assert identity.split(":")[2]
+    metadata_path = home / profiles._PROFILE_METADATA_FILE
+    metadata = json.loads(metadata_path.read_text())
+    metadata["displayName"] = "Renamed label"
+    metadata_path.write_text(json.dumps(metadata))
+    (home / "logs").mkdir()
+    assert profiles.named_profile_identity("legacy") == identity
+    monkeypatch.setenv("FLOWLY_HOME", str(home))
+    monkeypatch.setenv(profiles.PROFILE_DIR_IDENTITY_ENV, identity)
+    lease = profiles.claim_runtime_lease("legacy-instance")
+    assert lease.exists()
+    profiles.release_runtime_lease("legacy-instance")
 
 
 def test_the_cli_never_creates_a_missing_profile(tmp_path: Path) -> None:

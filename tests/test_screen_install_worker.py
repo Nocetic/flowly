@@ -1,0 +1,370 @@
+"""Execute the actual stdlib worker logic with package subprocesses replaced."""
+
+import json
+import os
+import subprocess
+import types
+from unittest.mock import Mock
+
+import pytest
+
+from flowly.desktop_runtime.install_payload import WORKER
+from flowly.desktop_runtime.install_recipe import recipe_id, screen_recipe
+
+fcntl = pytest.importorskip("fcntl")
+
+OPERATION, PLAN = "1" * 32, "a" * 64
+APT = {"/usr/bin/apt-get", "/usr/bin/dpkg"}
+RECIPE = screen_recipe({"ID": "debian", "VERSION_ID": "12"}, "aarch64", APT.__contains__)
+REVIEWED = recipe_id(RECIPE)
+
+
+@pytest.fixture
+def worker(tmp_path, monkeypatch):
+    worker = types.ModuleType("screen_install_worker_test")
+    source = WORKER.rsplit("\ntry:\n    sys.exit(main())", 1)[0]
+    exec(compile(source, "<screen-install-worker>", "exec"), worker.__dict__)
+    worker.ROOT = tmp_path / "receipts"
+    monkeypatch.setattr(worker.os, "geteuid", lambda: 0)
+    monkeypatch.setenv("SUDO_UID", "1000")
+    monkeypatch.setattr(worker.sys, "argv", ["worker", OPERATION, PLAN, REVIEWED])
+    monkeypatch.setattr(worker.platform, "machine", lambda: "aarch64")
+    worker.os_release = lambda: {"ID": "debian", "VERSION_ID": "12"}
+    worker.PROBE = APT.__contains__
+    # Test files are owned by the developer; emulate only their kernel UID.
+    fstat, lstat = os.fstat, worker.Path.lstat
+    def root_info(info):
+        fields = list(info)
+        fields[4] = 0
+        return os.stat_result(fields)
+    monkeypatch.setattr(worker.os, "fstat", lambda fd: root_info(fstat(fd)))
+    monkeypatch.setattr(worker.Path, "lstat", lambda path: root_info(lstat(path)))
+    worker.provision_runtime_account = Mock()
+    worker.command = Mock(return_value=(0, b""))
+    return worker
+
+
+def test_success_is_durable_idempotent_and_has_fixed_argv(worker, capsys):
+    assert worker.main() == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["state"] == "succeeded" and result["phase"] == "complete"
+    assert len(worker.command.call_args_list) == 3
+    audit, update, install = worker.command.call_args_list
+    assert audit.args == (["/usr/bin/dpkg", "--audit"], 30)
+    assert update.args[0][-1] == "update" and update.args[1] == 180
+    assert install.args[0][-len(RECIPE["packages"]):] == RECIPE["packages"]
+    assert "--no-remove" in install.args[0] and install.args[1] == 600
+    assert worker.main() == 0
+    assert json.loads(capsys.readouterr().out) == result
+    assert worker.command.call_count == 3
+    assert (worker.ROOT / ("1000-" + OPERATION + ".json")).stat().st_mode & 0o777 == 0o644
+
+
+@pytest.mark.parametrize("responses,code,state,calls", [
+    # Unfinished package work this installer did not leave is not touched: nothing changed.
+    ([(0, b"dirty")], "INSTALL_HOST_PACKAGES_BROKEN", "failed", 1),
+    ([(0, b""), (100, b"")], "INSTALL_INDEX_FAILED", "failed", 2),
+    ([(0, b""), (0, b""), (100, b"")], "INSTALL_PACKAGES_FAILED", "recovery_required", 3),
+    ([TimeoutError()], "INSTALL_TIMEOUT", "recovery_required", 1),
+    ([RuntimeError("private diagnostic")], "INSTALL_RECOVERY_REQUIRED", "recovery_required", 1),
+])
+def test_failures_are_typed_durable_and_never_replayed(worker, capsys, responses, code, state, calls):
+    worker.command.side_effect = responses
+    assert worker.main() == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["error"] == code and result["state"] == state
+    assert "private" not in str(result)
+    assert worker.main() == 1
+    assert json.loads(capsys.readouterr().out) == result
+    assert worker.command.call_count == calls
+
+
+def test_lock_is_host_wide_and_does_not_create_an_operation_on_contention(worker, capsys):
+    worker.directory()
+    with (worker.ROOT / "packages.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert worker.main() == 1
+        assert json.loads(capsys.readouterr().out) == {"error": "INSTALL_BUSY"}
+    assert not list(worker.ROOT.glob("*.json"))
+    worker.command.assert_not_called()
+
+
+CONFIGURE = (["/usr/bin/dpkg", "--configure", "-a"], 300)
+QUERY = ["/usr/bin/dpkg-query", "-W", "--showformat=${db:Status-Abbrev} ${binary:Package}\n"]
+
+
+def receipt(state, updated, operation=OPERATION, uid="1000", error=None):
+    return {"installVersion": 1, "operationId": operation, "planId": PLAN, "state": state,
+            "phase": "complete" if state == "succeeded" else "installing",
+            "error": error if error or state in {"succeeded", "running"} else "INSTALL_RECOVERY_REQUIRED",
+            "updatedAt": updated}
+
+
+def test_an_interrupted_operation_is_reported_never_replayed_and_repaired_by_a_new_one(worker, capsys, monkeypatch):
+    worker.directory()
+    worker.save(worker.ROOT / ("1000-" + OPERATION + ".json"), receipt("running", 1))
+    # The interrupted operation itself only reports what happened.
+    assert worker.main() == 1
+    assert json.loads(capsys.readouterr().out)["state"] == "recovery_required"
+    worker.command.assert_not_called()
+    # A new operation, from any account, repairs before running the same recipe.
+    monkeypatch.setenv("SUDO_UID", "1001")
+    monkeypatch.setattr(worker.sys, "argv", ["worker", "2" * 32, PLAN, REVIEWED])
+    assert worker.main() == 0
+    assert json.loads(capsys.readouterr().out)["state"] == "succeeded"
+    calls = [call.args for call in worker.command.call_args_list]
+    assert calls[0] == CONFIGURE and calls[1][0] == QUERY and calls[2] == CONFIGURE
+    assert calls[3][0][-5:] == ["install", "-f", "-y", "--no-install-recommends", "--no-remove"] and calls[3][1] == 600
+    assert calls[4] == (["/usr/bin/dpkg", "--audit"], 30)
+    assert calls[-1][0][-len(RECIPE["packages"]):] == RECIPE["packages"]
+    # History stays as it happened.
+    assert worker.read(worker.ROOT / ("1000-" + OPERATION + ".json"))["state"] == "recovery_required"
+
+
+def test_a_later_success_means_nothing_is_left_to_repair(worker, capsys):
+    worker.directory()
+    worker.save(worker.ROOT / ("1000-" + "3" * 32 + ".json"), receipt("recovery_required", 1, "3" * 32))
+    worker.save(worker.ROOT / ("1000-" + "4" * 32 + ".json"), receipt("succeeded", 2, "4" * 32))
+    assert worker.main() == 0
+    assert worker.command.call_args_list[0].args == (["/usr/bin/dpkg", "--audit"], 30)
+    assert len(worker.command.call_args_list) == 3
+
+
+def test_a_half_installed_package_is_reinstalled_before_anything_else(worker, capsys):
+    """A dpkg killed while unpacking leaves a package half-installed (seen live
+    with perl-base); dpkg --configure -a cannot fix that, a reinstall does."""
+    worker.directory()
+    worker.save(worker.ROOT / ("1000-" + "3" * 32 + ".json"), receipt("recovery_required", 1, "3" * 32))
+    status = b"ii  bash\niHR perl-base\niU  libfoo1:arm64\nhi  held\n"
+    worker.command.side_effect = lambda args, *rest, **kw: (1, b"") if args == CONFIGURE[0] and \
+        worker.command.call_count == 1 else (0, status if args == QUERY else b"")
+    assert worker.main() == 0
+    calls = [call.args[0] for call in worker.command.call_args_list]
+    reinstall = calls[2]
+    # Only the half-installed / reinstall-required ones; unpacked ones are configured.
+    assert reinstall[-6:] == ["install", "--reinstall", "-y", "--no-install-recommends", "--no-remove", "perl-base"]
+    assert calls[3] == CONFIGURE[0]
+
+
+def test_package_names_from_dpkg_are_checked_before_reaching_apt(worker, capsys):
+    worker.directory()
+    worker.save(worker.ROOT / ("1000-" + "3" * 32 + ".json"), receipt("recovery_required", 1, "3" * 32))
+    worker.command.side_effect = lambda args, *rest, **kw: (0, b"iHR -o-evil\n" if args == QUERY else b"")
+    assert worker.main() == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["state"] == "recovery_required" and result["error"] == "INSTALL_PACKAGES_FAILED"
+    assert not any("--reinstall" in call.args[0] for call in worker.command.call_args_list)
+
+
+@pytest.mark.parametrize("responses", [
+    [(0, b""), (1, b"")],                               # dpkg-query failed
+    [(0, b""), (0, b""), (0, b""), (100, b"")],          # apt-get -f install failed
+    [(0, b""), (0, b""), (0, b""), (0, b""), (0, b"dirty")],  # still not clean
+])
+def test_a_repair_that_does_not_converge_needs_recovery(worker, capsys, responses):
+    worker.directory()
+    worker.save(worker.ROOT / ("1000-" + "3" * 32 + ".json"), receipt("recovery_required", 1, "3" * 32))
+    worker.command.side_effect = responses
+    assert worker.main() == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["state"] == "recovery_required" and result["error"] == "INSTALL_PACKAGES_FAILED"
+
+
+def test_symlink_lock_and_corrupted_receipt_fail_closed(worker):
+    worker.directory()
+    victim = worker.ROOT / "victim"
+    victim.write_text("do not overwrite")
+    (worker.ROOT / "packages.lock").symlink_to(victim)
+    with pytest.raises(OSError):
+        worker.main()
+    assert victim.read_text() == "do not overwrite"
+    (worker.ROOT / "packages.lock").unlink()
+    (worker.ROOT / ("1000-" + OPERATION + ".json")).write_text('{"state":"succeeded"}')
+    with pytest.raises(ValueError):
+        worker.main()
+    worker.command.assert_not_called()
+
+
+def test_changed_plan_cannot_reuse_operation(worker, capsys, monkeypatch):
+    assert worker.main() == 0
+    capsys.readouterr()
+    monkeypatch.setattr(worker.sys, "argv", ["worker", OPERATION, "b" * 64, REVIEWED])
+    assert worker.main() == 1
+    assert json.loads(capsys.readouterr().out) == {"error": "OPERATION_CONFLICT"}
+    assert worker.command.call_count == 3
+
+
+def test_worker_restores_child_reaping_before_package_commands(worker, monkeypatch):
+    configure = Mock()
+    monkeypatch.setattr(worker.signal, "signal", configure)
+    def command(*args, **kwargs):
+        configure.assert_called_once_with(worker.signal.SIGCHLD, worker.signal.SIG_DFL)
+        return 0, b""
+    worker.command.side_effect = command
+    assert worker.main() == 0
+
+
+def test_command_timeout_signals_only_its_own_process_group(tmp_path, monkeypatch):
+    worker = types.ModuleType("screen_install_command_test")
+    exec(compile(WORKER.rsplit("\ntry:\n    sys.exit(main())", 1)[0], "<worker>", "exec"), worker.__dict__)
+    process = Mock(pid=4242)
+    process.wait.side_effect = [subprocess.TimeoutExpired("apt", 1), 0]
+    spawn, signal = Mock(return_value=process), Mock()
+    monkeypatch.setattr(worker.subprocess, "Popen", spawn)
+    monkeypatch.setattr(worker.os, "killpg", signal)
+    waitid = Mock(return_value=object())
+    monkeypatch.setattr(worker.os, "waitid", waitid, raising=False)
+    monkeypatch.setattr(worker.os, "WNOWAIT", 0x1000000, raising=False)
+    with pytest.raises(TimeoutError):
+        worker.command(["/usr/bin/apt-get", "update"], 1)
+    assert spawn.call_args.kwargs["start_new_session"]
+    assert spawn.call_args.kwargs["env"] == worker.ENV
+    assert all(call.args[0] == 4242 for call in signal.call_args_list)
+    assert [call.args[1] for call in signal.call_args_list] == [worker.signal.SIGTERM, worker.signal.SIGKILL]
+    assert waitid.call_args.args[1] == 4242
+    assert waitid.call_args.args[2] & worker.os.WNOWAIT
+
+
+def test_root_worker_provisions_account_before_success_and_never_replays(worker, monkeypatch, capsys):
+    monkeypatch.delenv("SUDO_UID")
+    def provision():
+        assert worker.command.call_count == 3
+        receipt = json.loads((worker.ROOT / ("0-" + OPERATION + ".json")).read_text())
+        assert receipt["state"] == "running" and receipt["phase"] == "installing"
+    worker.provision_runtime_account.side_effect = provision
+    assert worker.main() == 0
+    assert json.loads(capsys.readouterr().out)["state"] == "succeeded"
+    assert worker.main() == 0
+    worker.provision_runtime_account.assert_called_once()
+
+
+def test_account_failure_is_durable_and_blocks_python_success(worker, monkeypatch, capsys):
+    monkeypatch.delenv("SUDO_UID")
+    worker.provision_runtime_account.side_effect = ValueError("private detail")
+    assert worker.main() == 1
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["state"] == "recovery_required"
+    assert receipt["error"] == "INSTALL_RECOVERY_REQUIRED"
+    assert "private" not in str(receipt)
+    assert worker.main() == 1
+    worker.provision_runtime_account.assert_called_once()
+
+
+def test_nonroot_caller_does_not_provision_an_account(worker):
+    assert worker.main() == 0
+    worker.provision_runtime_account.assert_not_called()
+
+
+def test_someone_elses_account_is_a_plain_failure_with_its_own_reason(worker, capsys, monkeypatch):
+    monkeypatch.setenv("SUDO_UID", "0")
+    worker.provision_runtime_account = Mock(side_effect=ValueError("INSTALL_ACCOUNT_CONFLICT"))
+    assert worker.main() == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["state"] == "failed" and result["error"] == "INSTALL_ACCOUNT_CONFLICT"
+
+
+def test_an_interrupted_account_creation_still_needs_repair(worker, capsys, monkeypatch):
+    monkeypatch.setenv("SUDO_UID", "0")
+    worker.provision_runtime_account = Mock(side_effect=ValueError("INSTALL_RECOVERY_REQUIRED"))
+    assert worker.main() == 1
+    assert json.loads(capsys.readouterr().out)["state"] == "recovery_required"
+
+
+UBUNTU_PROBES = APT | {"/proc/sys/kernel/apparmor_restrict_unprivileged_userns", "/usr/sbin/apparmor_parser",
+                         "/etc/apparmor.d/abi/4.0"}
+UBUNTU = screen_recipe({"ID": "ubuntu", "VERSION_ID": "24.04"}, "x86_64", UBUNTU_PROBES.__contains__)
+
+
+@pytest.fixture
+def ubuntu(worker, monkeypatch):
+    worker.os_release = lambda: {"ID": "ubuntu", "VERSION_ID": "24.04"}
+    worker.PROBE = UBUNTU_PROBES.__contains__
+    monkeypatch.setattr(worker.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(worker.sys, "argv", ["worker", OPERATION, PLAN, recipe_id(UBUNTU)])
+    order = []
+    worker.command.side_effect = lambda args, *rest, **kw: (order.append(args[-1]), (0, b""))[1]
+    worker.install_pinned_browser = Mock(side_effect=lambda machine: order.append("browser:" + machine))
+    worker.install_apparmor_profile = Mock(side_effect=lambda: order.append("apparmor"))
+    worker.provision_runtime_account = Mock(side_effect=lambda: order.append("account"))
+    worker.order = order
+    return worker
+
+
+def test_ubuntu_installs_its_packages_then_the_pinned_browser_and_its_profile(ubuntu, capsys, monkeypatch):
+    monkeypatch.setenv("SUDO_UID", "0")
+    assert ubuntu.main() == 0
+    assert json.loads(capsys.readouterr().out)["state"] == "succeeded"
+    install = ubuntu.command.call_args_list[2].args[0]
+    assert install[-len(UBUNTU["packages"]):] == UBUNTU["packages"] and "chromium" not in install
+    assert ubuntu.order[-3:] == ["browser:x86_64", "apparmor", "account"]
+
+
+@pytest.mark.parametrize("code", ["INSTALL_DOWNLOAD_FAILED", "INSTALL_BROWSER_FAILED"])
+def test_a_browser_that_cannot_be_verified_is_a_plain_failure(ubuntu, capsys, code):
+    ubuntu.install_pinned_browser.side_effect = ubuntu.BrowserInstallError(code)
+    assert ubuntu.main() == 1
+    result = json.loads(capsys.readouterr().out)
+    # Verified or nothing: no half-published browser, nothing to repair.
+    assert result["state"] == "failed" and result["error"] == code
+    ubuntu.install_apparmor_profile.assert_not_called()
+
+
+def test_a_host_that_changed_since_review_is_refused_before_anything_runs(ubuntu, capsys):
+    ubuntu.PROBE = APT.__contains__  # e.g. the kernel's namespace restriction is gone
+    assert ubuntu.main() == 1
+    assert json.loads(capsys.readouterr().out) == {"error": "INSTALL_PLAN_CHANGED"}
+    ubuntu.command.assert_not_called()
+    assert not list(ubuntu.ROOT.glob("*.json"))
+
+
+DNF_PROBES = {"/usr/bin/dnf", "/usr/bin/rpm"}
+
+
+@pytest.fixture
+def dnf_host(worker, monkeypatch):
+    def use(release, machine="x86_64"):
+        worker.os_release = lambda: release
+        worker.PROBE = DNF_PROBES.__contains__
+        monkeypatch.setattr(worker.platform, "machine", lambda: machine)
+        recipe = screen_recipe(release, machine, DNF_PROBES.__contains__)
+        monkeypatch.setattr(worker.sys, "argv", ["worker", OPERATION, PLAN, recipe_id(recipe)])
+        return recipe
+    return use
+
+
+def test_el9_enables_epel_and_crb_then_installs_with_dnf(worker, dnf_host, capsys):
+    recipe = dnf_host({"ID": "rocky", "ID_LIKE": "rhel centos fedora", "VERSION_ID": "9.4"})
+    assert worker.main() == 0
+    calls = [call.args[0] for call in worker.command.call_args_list]
+    assert calls[0][:4] == ["/usr/bin/dnf", "-q", "repoquery", "--duplicates"]
+    assert calls[1][-3:] == ["install", "epel-release", "dnf-plugins-core"]
+    assert calls[2] == ["/usr/bin/dnf", "config-manager", "--set-enabled", "epel", "crb"]
+    assert calls[3][-1] == "makecache"
+    assert calls[4][:3] == ["/usr/bin/dnf", "-y", "--setopt=install_weak_deps=False"]
+    assert calls[4][3:] == ["install", *recipe["packages"]]
+    assert not any("apt-get" in call[0] for call in calls)
+
+
+def test_fedora_adds_no_repository(worker, dnf_host, capsys):
+    dnf_host({"ID": "fedora", "VERSION_ID": "42"}, "aarch64")
+    assert worker.main() == 0
+    calls = [call.args[0] for call in worker.command.call_args_list]
+    assert not any("epel-release" in call or "config-manager" in call for call in calls)
+
+
+def test_duplicate_rpms_someone_else_left_are_not_touched(worker, dnf_host, capsys):
+    dnf_host({"ID": "fedora", "VERSION_ID": "42"})
+    worker.command.side_effect = lambda args, *rest, **kw: (0, b"glibc.x86_64\n")
+    assert worker.main() == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["state"] == "failed" and result["error"] == "INSTALL_HOST_PACKAGES_BROKEN"
+    assert len(worker.command.call_args_list) == 1
+
+
+def test_duplicates_an_interrupted_run_left_are_removed_first(worker, dnf_host, capsys):
+    dnf_host({"ID": "fedora", "VERSION_ID": "42"})
+    worker.directory()
+    worker.save(worker.ROOT / ("1000-" + "3" * 32 + ".json"), receipt("recovery_required", 1, "3" * 32))
+    assert worker.main() == 0
+    calls = [call.args[0] for call in worker.command.call_args_list]
+    assert calls[0][-2:] == ["remove", "--duplicates"]

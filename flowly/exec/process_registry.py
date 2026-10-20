@@ -17,6 +17,7 @@ import re
 import secrets
 import signal
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Awaitable, Callable
@@ -24,6 +25,7 @@ from typing import TYPE_CHECKING, Awaitable, Callable
 from loguru import logger
 
 from flowly.bus.events import InboundMessage
+from flowly.desktop_runtime.installation_gate import agent_environment_activity
 
 if TYPE_CHECKING:
     from flowly.bus.queue import MessageBus
@@ -77,6 +79,7 @@ class ProcessSession:
     _finished_at: float = 0.0
     _completion_consumed: bool = False
     detached: bool = False
+    _environment_activity: ExitStack | None = field(default=None, repr=False)
 
     def status(self) -> str:
         return "exited" if self.exited else "running"
@@ -123,6 +126,7 @@ class ProcessRegistry:
         self._lock = asyncio.Lock()
         self._global_watch_emits: list[float] = []
         self._global_watch_cooldown_until: float = 0.0
+        self._pending_spawns: set[asyncio.Task] = set()
         self._checkpoint: "ProcessCheckpoint | None" = None
         self._trigger_callbacks: list[
             Callable[[str, str | None, str], Awaitable[None] | None]
@@ -193,52 +197,83 @@ class ProcessRegistry:
         watch_patterns: list[str] | None = None,
         notify_on_complete: bool = True,
     ) -> ProcessSession:
-        async with self._lock:
-            await self._prune_locked()
-            if len(self._running) + len(self._finished) >= MAX_PROCESSES:
-                raise RuntimeError(
-                    f"Process registry full ({MAX_PROCESSES}) — kill or wait for old ones"
-                )
+        # Once creation starts, cancellation of the caller must not abandon an
+        # unregistered child or release its admission lease before exec finishes.
+        task = asyncio.create_task(self._spawn_with_activity(
+            command, session_key=session_key, cwd=cwd, env=env,
+            watch_patterns=watch_patterns, notify_on_complete=notify_on_complete,
+        ))
+        self._pending_spawns.add(task)
 
-        session_id = "proc_" + secrets.token_hex(6)
-        session = ProcessSession(
-            id=session_id,
-            command=command,
-            session_key=session_key,
-            started_at=time.time(),
-            cwd=cwd,
-            notify_on_complete=notify_on_complete,
-            watch_patterns=list(watch_patterns or []),
-        )
+        def completed(done):
+            self._pending_spawns.discard(done)
+            if not done.cancelled():
+                done.exception()  # Retrieve failures when the caller cancelled.
 
-        from flowly.utils.subprocess_compat import hide_window_kwargs
-        proc = await asyncio.create_subprocess_shell(
-            command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=cwd,
-            env=env,
-            start_new_session=True,   # POSIX: setsid (detach). Ignored on Windows.
-            # Windows: CREATE_NO_WINDOW only — NO detach/process-group: this is an
-            # asyncio + captured-stdio spawn, where DETACHED_PROCESS would sever
-            # capture and CREATE_NEW_PROCESS_GROUP cancels the ProactorEventLoop
-            # task on Win/Py3.11. {} on POSIX (byte-identical to before).
-            **hide_window_kwargs(),
-        )
-        session.process = proc
-        session.pid = proc.pid
+        task.add_done_callback(completed)
+        return await asyncio.shield(task)
 
-        async with self._lock:
-            self._running[session_id] = session
+    async def _spawn_with_activity(
+        self,
+        command: str,
+        *,
+        session_key: str | None = None,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        watch_patterns: list[str] | None = None,
+        notify_on_complete: bool = True,
+    ) -> ProcessSession:
+        with ExitStack() as activity:
+            async with self._lock:
+                await self._prune_locked()
+                if len(self._running) + len(self._finished) >= MAX_PROCESSES:
+                    raise RuntimeError(
+                        f"Process registry full ({MAX_PROCESSES}) — kill or wait for old ones"
+                    )
 
-        session._reader_task = asyncio.create_task(
-            self._reader_loop(session),
-            name=f"process-reader:{session_id}",
-        )
-        self._persist()
+            session_id = "proc_" + secrets.token_hex(6)
+            session = ProcessSession(
+                id=session_id,
+                command=command,
+                session_key=session_key,
+                started_at=time.time(),
+                cwd=cwd,
+                notify_on_complete=notify_on_complete,
+                watch_patterns=list(watch_patterns or []),
+            )
 
-        logger.info(f"[ProcessRegistry] spawned {session_id} pid={proc.pid} cmd={command[:60]!r}")
-        return session
+            from flowly.utils.subprocess_compat import hide_window_kwargs
+            descriptor = activity.enter_context(agent_environment_activity())
+            inherited = {"pass_fds": (descriptor,)} if descriptor is not None else {}
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=cwd,
+                env=env,
+                start_new_session=True,   # POSIX: setsid (detach). Ignored on Windows.
+                # Windows: CREATE_NO_WINDOW only — NO detach/process-group: this is an
+                # asyncio + captured-stdio spawn, where DETACHED_PROCESS would sever
+                # capture and CREATE_NEW_PROCESS_GROUP cancels the ProactorEventLoop
+                # task on Win/Py3.11. {} on POSIX (byte-identical to before).
+                **hide_window_kwargs(),
+                **inherited,
+            )
+            session.process = proc
+            session.pid = proc.pid
+
+            async with self._lock:
+                self._running[session_id] = session
+
+            session._environment_activity = activity.pop_all()
+            session._reader_task = asyncio.create_task(
+                self._reader_loop(session),
+                name=f"process-reader:{session_id}",
+            )
+            self._persist()
+
+            logger.info(f"[ProcessRegistry] spawned {session_id} pid={proc.pid} cmd={command[:60]!r}")
+            return session
 
     async def get(self, session_id: str) -> ProcessSession | None:
         async with self._lock:
@@ -406,35 +441,41 @@ class ProcessRegistry:
         }
 
     async def _reader_loop(self, session: ProcessSession) -> None:
-        proc = session.process
-        if proc is None or proc.stdout is None:
-            return
         try:
-            while True:
-                chunk = await proc.stdout.read(READ_CHUNK_SIZE)
-                if not chunk:
-                    break
-                text = chunk.decode("utf-8", errors="replace")
-                session.output_buffer += text
-                if len(session.output_buffer) > MAX_OUTPUT_CHARS:
-                    session.output_buffer = session.output_buffer[-MAX_OUTPUT_CHARS:]
-                if session.watch_patterns and not session._watch_disabled:
-                    await self._check_watch_patterns(session, text)
-        except Exception as e:
-            logger.warning(f"[ProcessRegistry] reader error for {session.id}: {e}")
-        finally:
+            proc = session.process
+            if proc is None or proc.stdout is None:
+                return
             try:
-                rc = await proc.wait()
-            except Exception:
-                rc = None
-            session.exit_code = rc
-            session.exited = True
-            session._finished_at = time.time()
-            session._exit_event.set()
-            await self._move_to_finished(session)
-            await self._notify_trigger(session, "exit")
-            if session.notify_on_complete:
-                await self._emit_completion(session)
+                while True:
+                    chunk = await proc.stdout.read(READ_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    text = chunk.decode("utf-8", errors="replace")
+                    session.output_buffer += text
+                    if len(session.output_buffer) > MAX_OUTPUT_CHARS:
+                        session.output_buffer = session.output_buffer[-MAX_OUTPUT_CHARS:]
+                    if session.watch_patterns and not session._watch_disabled:
+                        await self._check_watch_patterns(session, text)
+            except Exception as e:
+                logger.warning(f"[ProcessRegistry] reader error for {session.id}: {e}")
+            finally:
+                try:
+                    rc = await proc.wait()
+                except Exception:
+                    rc = None
+                session.exit_code = rc
+                session.exited = True
+                session._finished_at = time.time()
+                session._exit_event.set()
+                await self._move_to_finished(session)
+                await self._notify_trigger(session, "exit")
+                if session.notify_on_complete:
+                    await self._emit_completion(session)
+
+        finally:
+            if session._environment_activity is not None:
+                session._environment_activity.close()
+                session._environment_activity = None
 
     async def _move_to_finished(self, session: ProcessSession) -> None:
         async with self._lock:

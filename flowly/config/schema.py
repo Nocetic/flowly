@@ -802,10 +802,12 @@ class ArtifactConfig(BaseModel):
 class BrowserTabConfig(BaseModel):
     """Browser tab tool configuration.
 
-    Requires a connected browser provider: the desktop app's embedded
-    Flowly Browser or the Flowly Chrome extension.
+    Native browser access requires a connected desktop or extension provider.
+    The installed Linux profile Screen is a separate, run-scoped provider.
     """
     enabled: bool = False
+    # Only the installed profile Screen; never grants native desktop access.
+    screen_enabled: bool = True
 
 
 class ComputerConfig(BaseModel):

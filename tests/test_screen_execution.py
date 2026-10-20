@@ -1,0 +1,257 @@
+import os
+import asyncio
+
+import pytest
+
+from flowly.desktop_runtime.authority import ScreenAuthority, ScreenError
+from flowly.desktop_runtime.execution import ActionOutcomeUnknownError, ScreenExecution
+
+
+@pytest.fixture
+def execution(tmp_path):
+    authority = ScreenAuthority(tmp_path)
+    authority.start("generation")
+    return ScreenExecution(authority)
+
+
+async def test_disconnect_does_not_release_an_unacknowledged_browser_command(execution):
+    started, acknowledged = asyncio.Event(), asyncio.Event()
+
+    async def operation():
+        started.set()
+        await acknowledged.wait()
+        return "private observation"
+
+    caller = asyncio.create_task(execution.action("run", "action", "generation", operation))
+    await started.wait()
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    assert execution.authority.snapshot()["actionInFlight"]
+    takeover = await execution.acquire("viewer", "generation", 1, wait_seconds=0)
+    assert takeover["control"] == "human-pending"
+    assert not execution.authority.may_input("viewer", "generation", takeover["epoch"])
+    finishing = asyncio.create_task(execution.finish_run("run", "generation"))
+    await asyncio.sleep(0)
+    assert not finishing.done()
+    acknowledged.set()
+    await finishing
+    human = await execution.acquire("viewer", "generation", takeover["epoch"])
+    assert human["control"] == "human"
+    assert human["runId"] is None
+
+
+async def test_takeover_discards_inflight_capture_before_returning_to_model(execution):
+    started, acknowledged = asyncio.Event(), asyncio.Event()
+
+    async def capture():
+        started.set()
+        await acknowledged.wait()
+        return b"screenshot that must not escape"
+
+    caller = asyncio.create_task(execution.action("run", "capture", "generation", capture))
+    await started.wait()
+    pending = await execution.acquire("viewer", "generation", 1, wait_seconds=0)
+    acknowledged.set()
+    with pytest.raises(ScreenError, match="STALE_OBSERVATION"):
+        await caller
+    assert (await execution.acquire("viewer", "generation", pending["epoch"]))["control"] == "human"
+    assert execution.authority.snapshot()["runId"] == "run"
+
+
+async def test_another_run_cannot_interleave_between_actions(execution):
+    async def operation():
+        return "result"
+
+    assert await execution.action("run", "a", "generation", operation) == "result"
+    with pytest.raises(ScreenError, match="SCREEN_BUSY"):
+        await execution.action("other", "b", "generation", operation)
+    await execution.finish_run("run", "generation")
+    assert await execution.action("other", "b", "generation", operation) == "result"
+
+
+async def test_human_admission_does_not_even_create_backend_operation(execution):
+    execution.authority.acquire("viewer", "generation", 1)
+
+    def forbidden():
+        pytest.fail("backend command must never be created")
+
+    with pytest.raises(ScreenError, match="HUMAN_HAS_CONTROL"):
+        await execution.action("run", "a", "generation", forbidden)
+
+
+async def test_backend_failure_keeps_run_owned_but_releases_action(execution):
+    async def failed():
+        raise RuntimeError("backend failed")
+
+    with pytest.raises(RuntimeError, match="backend failed"):
+        await execution.action("run", "a", "generation", failed)
+    state = execution.authority.snapshot()
+    assert not state["actionInFlight"]
+    assert state["runId"] == "run"
+    await execution.finish_run("run", "generation")
+
+
+async def test_takeover_is_still_pending_for_command_owned_by_another_worker(execution):
+    admission = execution.authority.begin_action("run", "a", "generation")
+    state = await execution.acquire("viewer", "generation", 1)
+    assert state["control"] == "human-pending"
+    assert not execution.authority.end_action(admission)
+    assert (await execution.acquire("viewer", "generation", state["epoch"]))["control"] == "human"
+
+
+async def test_unknown_backend_outcome_keeps_admission_without_a_fence(execution):
+    async def disconnected():
+        raise ActionOutcomeUnknownError()
+
+    with pytest.raises(ActionOutcomeUnknownError):
+        await execution.action("run", "a", "generation", disconnected)
+    assert execution.authority.snapshot()["actionInFlight"]
+    assert (await execution.acquire("viewer", "generation", 1))["control"] == "human-pending"
+
+
+async def test_unknown_backend_outcome_ends_once_the_backend_is_fenced(execution):
+    fenced = []
+
+    async def disconnected():
+        raise ActionOutcomeUnknownError()
+
+    async def fence():
+        fenced.append(True)
+
+    with pytest.raises(ActionOutcomeUnknownError):
+        await execution.action("run", "a", "generation", disconnected, fence=fence)
+    assert fenced == [True]
+    assert not execution.authority.snapshot()["actionInFlight"]
+    assert (await execution.acquire("viewer", "generation", 1))["control"] == "human"
+
+
+async def test_a_fence_that_fails_keeps_the_admission(execution):
+    async def disconnected():
+        raise ActionOutcomeUnknownError()
+
+    async def fence():
+        raise RuntimeError("could not close")
+
+    with pytest.raises(ActionOutcomeUnknownError):
+        await execution.action("run", "a", "generation", disconnected, fence=fence)
+    assert execution.authority.snapshot()["actionInFlight"]
+
+
+async def test_a_dead_processs_admission_is_void(execution, monkeypatch):
+    """A gateway that died mid-command took its browser connection with it:
+    its admission must not keep the screen busy for its replacement."""
+    from flowly.desktop_runtime import authority as module
+
+    monkeypatch.setattr(module, "_owner", lambda: {"pid": 4242, "start": "1", "boot": "b"})
+    monkeypatch.setattr(module, "_alive", lambda owner: True)
+    started = asyncio.Event()
+
+    async def operation():
+        started.set()
+        await asyncio.Event().wait()
+
+    caller = asyncio.create_task(execution.action("run", "a", "generation", operation))
+    await started.wait()
+    for worker in execution._pending:
+        worker.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    assert execution.authority.snapshot()["actionInFlight"]
+    # The process is gone (a replacement gateway reads the same record).
+    monkeypatch.setattr(module, "_alive", lambda owner: owner != {"pid": 4242, "start": "1", "boot": "b"})
+    replacement = ScreenExecution(ScreenAuthority(execution.authority.directory))
+    state = replacement.authority.snapshot()
+    # The run went with the process that held it (2026-10-20: a run kept for
+    # 18 hours by a gateway that was gone).
+    assert not state["actionInFlight"] and state["runId"] is None
+    await replacement.finish_run("run", "generation")
+    assert (await replacement.acquire("viewer", "generation", 1, wait_seconds=0))["control"] == "human"
+
+
+async def test_gateway_shutdown_cancelling_worker_leaves_durable_admission(execution):
+    started = asyncio.Event()
+
+    async def operation():
+        started.set()
+        await asyncio.Event().wait()
+
+    caller = asyncio.create_task(execution.action("run", "a", "generation", operation))
+    await started.wait()
+    for worker in execution._pending:
+        worker.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    assert execution.authority.snapshot()["actionInFlight"]
+
+
+def test_an_action_recorded_before_owners_is_void_where_processes_can_be_told(tmp_path, monkeypatch):
+    """A screen locked by a lost command under the old record (no owner) must
+    not stay locked after the update that fixes it: that record's gateway is
+    gone with the restart that installed the fix."""
+    import json
+
+    from flowly.desktop_runtime import authority as module
+
+    authority = ScreenAuthority(tmp_path)
+    authority.start("generation")
+    path = tmp_path / "control.json"
+    record = json.loads(path.read_text())
+    record.pop("runOwner")
+    record.update(schema=2, run="old-run", control="human-pending", viewer="old-view",
+                  action={"id": "lost", "nonce": "n", "epoch": record["epoch"]})
+    path.write_text(json.dumps(record))
+    # A host that can identify processes (Linux): the admitting gateway restarted.
+    monkeypatch.setattr(module, "process_identity", lambda pid, allow_init=False: {"pid": pid, "start": "1", "boot": "b"}, raising=False)
+    monkeypatch.setattr("flowly.desktop_runtime.launcher.process_identity",
+                        lambda pid, allow_init=False: {"pid": pid, "start": "1", "boot": "b"})
+    state = ScreenAuthority(tmp_path).snapshot()
+    assert not state["actionInFlight"] and state["runId"] is None
+    assert ScreenAuthority(tmp_path).confirm_acquire("old-view", "generation", state["epoch"])["control"] == "human"
+    # A host with no process identities keeps it, as before.
+    path.write_text(json.dumps(record))
+    monkeypatch.setattr("flowly.desktop_runtime.launcher.process_identity", lambda pid, allow_init=False: None)
+    assert ScreenAuthority(tmp_path).snapshot()["actionInFlight"]
+
+
+def test_a_run_whose_process_is_gone_no_longer_holds_the_screen(tmp_path, monkeypatch):
+    """The test VPS, 2026-10-20: a run's cleanup failed at 01:53 and its claim
+    outlived its gateway for 18 hours. The screen could not idle-stop, an
+    explicit stop answered SCREEN_BUSY, a takeover stayed pending and every
+    new task was refused. A run, like an action, belongs to a process."""
+    import json
+
+    alive = {"pid": 7, "start": "1", "boot": "b"}
+    monkeypatch.setattr("flowly.desktop_runtime.launcher.process_identity",
+                        lambda pid, allow_init=False: dict(alive) if pid in (7, os.getpid()) else None)
+    monkeypatch.setattr("flowly.desktop_runtime.authority.os.getpid", lambda: 7)
+    authority = ScreenAuthority(tmp_path)
+    authority.start("generation")
+    authority.claim_run("live-run", "generation")
+    # A live gateway's run holds the screen, as it must.
+    assert authority.snapshot()["runId"] == "live-run"
+    with pytest.raises(ScreenError, match="SCREEN_BUSY"):
+        authority.stop("generation")
+    # The gateway dies without finishing it.
+    alive["start"] = "2"  # pid 7 now names another process
+    state = authority.snapshot()
+    assert state["runId"] is None
+    authority.stop("generation")
+
+    # The record exactly as the VPS kept it: schema 3, no run owner, a takeover
+    # left pending by a window that is gone.
+    authority.start("generation-2")
+    path = tmp_path / "control.json"
+    record = json.loads(path.read_text())
+    record.pop("runOwner")
+    record.update(schema=3, run="1792461066801-6wekp1at", control="human-pending", viewer="old-window")
+    path.write_text(json.dumps(record))
+    state = ScreenAuthority(tmp_path).snapshot()
+    assert state["runId"] is None and state["control"] == "human-pending"
+    # Now a window can take it back, and the screen can stop again.
+    taken = ScreenAuthority(tmp_path).acquire("this-window", "generation-2", state["epoch"], reclaim=True)
+    taken = ScreenAuthority(tmp_path).confirm_acquire("this-window", "generation-2", taken["epoch"])
+    assert taken["control"] == "human"
+    released = ScreenAuthority(tmp_path).release("this-window", "generation-2", taken["epoch"])
+    ScreenAuthority(tmp_path).stop("generation-2")
+    assert json.loads(path.read_text())["schema"] == 4 and released["control"] == "agent"
