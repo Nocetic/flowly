@@ -55,7 +55,9 @@ _watchers: dict[str, asyncio.Task] = {}
 def _result(task: str, outcome: str, note: str, **extra: Any) -> str:
     import json
 
-    return json.dumps({"task": task, "outcome": outcome, **extra, "note": note})
+    # The step is in the person's language: as written, not \u escapes the model
+    # pays tokens for and the person sees in the tool panel.
+    return json.dumps({"task": task, "outcome": outcome, **extra, "note": note}, ensure_ascii=False)
 
 
 def _store(gateway) -> tuple[ScreenSteps, Any]:
@@ -227,7 +229,7 @@ async def computer_handoff(task: Any, channel: str = "", chat_id: str = "",
         current = await asyncio.to_thread(store.waiting, session_key)
     except (ScreenError, OSError, KeyError, AttributeError) as exc:
         code = exc.code if isinstance(exc, ScreenError) else "SCREEN_NOT_RUNNING"
-        return json.dumps({"task": task, **unavailable(ScreenError(code))})
+        return json.dumps({"task": task, **unavailable(ScreenError(code))}, ensure_ascii=False)
     if current is not None and current["task"] == task:
         _start(current, store, provider, continuation)  # a watcher, should this process be new
         return _result(task, "already_waiting",

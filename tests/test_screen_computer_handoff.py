@@ -179,6 +179,9 @@ async def test_the_agent_withdraws_a_step_the_person_gave_up_on(screen_gateway, 
     """Hakan: "I won't sign in, I give up, remove the card" must not need the screen."""
     gateway, _, browser = screen_gateway
     result = await hand_over(gateway, surfaces, "Sign in to X")
+    async with host_screen_run_scope(gateway, "desktop:chat", "run-tr"):
+        again = await tool(gateway, surfaces.continuation).execute("handoff", task="Sign in to X")
+    assert '"Sign in to X"' in again  # the step as written: Turkish below stays Turkish too
     await _until(lambda: surfaces.cards)
     async with host_screen_run_scope(gateway, "desktop:chat", "run-2"):
         withdrawn = json.loads(await tool(gateway, surfaces.continuation).execute("withdraw"))
@@ -349,3 +352,15 @@ async def test_the_continuation_is_the_conversations_own_hidden_turn(tmp_path, m
     shown = [m for m in SessionManager(home / "workspace").get_full_messages("desktop:chat")
              if m.get("role") in ("user", "assistant") and not m.get("tool_calls")]
     assert [m["role"] for m in shown] == ["assistant"]
+
+
+
+async def test_the_step_reaches_the_agent_as_written_not_escaped(screen_gateway, surfaces):
+    """2026-10-21: a Turkish step came back as X\\u2019in giri\\u015f ekran\\u0131nda...,
+    costing the model tokens and showing escapes in the tool panel."""
+    gateway, _, _ = screen_gateway
+    async with host_screen_run_scope(gateway, "desktop:chat", "run") as run:
+        assert (await gateway.send_browser_tool_request("open", "get_page_text", {}))["success"]
+        raw = await tool(gateway, surfaces.continuation).execute("handoff", task="X’in giriş ekranında oturum aç")
+        run.succeeded = True
+    assert "X’in giriş ekranında oturum aç" in raw and "\\u" not in raw
