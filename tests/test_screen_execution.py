@@ -180,3 +180,31 @@ async def test_gateway_shutdown_cancelling_worker_leaves_durable_admission(execu
     with pytest.raises(asyncio.CancelledError):
         await caller
     assert execution.authority.snapshot()["actionInFlight"]
+
+
+def test_an_action_recorded_before_owners_is_void_where_processes_can_be_told(tmp_path, monkeypatch):
+    """A screen locked by a lost command under the old record (no owner) must
+    not stay locked after the update that fixes it: that record's gateway is
+    gone with the restart that installed the fix."""
+    import json
+
+    from flowly.desktop_runtime import authority as module
+
+    authority = ScreenAuthority(tmp_path)
+    authority.start("generation")
+    path = tmp_path / "control.json"
+    record = json.loads(path.read_text())
+    record.update(schema=2, run="old-run", control="human-pending", viewer="old-view",
+                  action={"id": "lost", "nonce": "n", "epoch": record["epoch"]})
+    path.write_text(json.dumps(record))
+    # A host that can identify processes (Linux): the admitting gateway restarted.
+    monkeypatch.setattr(module, "process_identity", lambda pid, allow_init=False: {"pid": pid, "start": "1", "boot": "b"}, raising=False)
+    monkeypatch.setattr("flowly.desktop_runtime.launcher.process_identity",
+                        lambda pid, allow_init=False: {"pid": pid, "start": "1", "boot": "b"})
+    state = ScreenAuthority(tmp_path).snapshot()
+    assert not state["actionInFlight"]
+    assert ScreenAuthority(tmp_path).confirm_acquire("old-view", "generation", state["epoch"])["control"] == "human"
+    # A host with no process identities keeps it, as before.
+    path.write_text(json.dumps(record))
+    monkeypatch.setattr("flowly.desktop_runtime.launcher.process_identity", lambda pid, allow_init=False: None)
+    assert ScreenAuthority(tmp_path).snapshot()["actionInFlight"]

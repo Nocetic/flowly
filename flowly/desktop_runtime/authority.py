@@ -63,11 +63,18 @@ def _owner() -> dict | None:
 
 
 def _alive(owner: dict | None) -> bool:
-    """None (an older record, or a host with no /proc) is taken as alive."""
-    if owner is None:
-        return True
+    """Whether the process that admitted an action still exists.
+
+    No owner means the action predates owners (a version-two record). On a
+    host that can identify processes, the gateway that admitted it restarted
+    to read this code, so it is gone: such an action is void (a stuck one from
+    before the fence kept a screen locked across an update). Only a host with
+    no process identities at all (no /proc) takes it as alive.
+    """
     from flowly.desktop_runtime.launcher import process_identity
 
+    if owner is None:
+        return process_identity(os.getpid(), allow_init=True) is None
     return process_identity(owner["pid"], allow_init=True) == owner
 
 
