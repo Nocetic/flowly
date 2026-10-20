@@ -94,3 +94,23 @@ async def test_disconnecting_adapter_does_not_close_running_browser(provider):
     await provider.disconnect()
     browser.close.assert_not_awaited()
     driver.stop.assert_awaited_once()
+
+
+async def test_a_failed_action_logs_its_kind_never_its_text(provider):
+    from loguru import logger
+
+    lines = []
+    sink = logger.add(lambda message: lines.append(str(message)), level="INFO")
+    try:
+        provider._browser = Mock(is_connected=lambda: True)
+        class TargetClosedError(Exception):
+            """Shaped like a driver's error, carrying page text."""
+
+        provider._dispatch.side_effect = TargetClosedError("typed secret-credential-example into https://bank.example/login")
+        result = await provider.request("run", "type", "generation", "type", {"text": "secret-credential-example"})
+    finally:
+        logger.remove(sink)
+    assert result["error_code"] == "BROWSER_ACTION_FAILED"
+    logged = "".join(lines)
+    assert "browser action type failed: TargetClosedError" in logged
+    assert "secret-credential-example" not in logged and "bank.example" not in logged

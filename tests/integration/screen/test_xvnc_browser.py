@@ -515,6 +515,54 @@ async def test_agent_provider_uses_human_browser_and_fences_old_references(tmp_p
         await asyncio.to_thread(runtime.stop, generation)
 
 
+async def test_conversations_keep_their_own_tabs_and_capture_a_tab_behind(tmp_path, login_site):
+    """With a real browser: a conversation's tab behind another's is captured
+    (it comes forward first), old tab numbers name nothing after a restart,
+    and a run's blank tabs close when it ends."""
+    import asyncio
+
+    from flowly.desktop_runtime.browser_provider import HostBrowserProvider
+
+    runtime = ScreenRuntime(tmp_path / "tabs")
+    state = await asyncio.to_thread(runtime.start)
+    provider = HostBrowserProvider(runtime)
+    generation = state["generation"]
+    count = 0
+
+    async def call(run, owner, action, generation=generation, **params):
+        nonlocal count
+        count += 1
+        return await provider.request(run, str(count), generation, action, params, owner=owner)
+
+    try:
+        first = await call("run-a", "desktop:a", "navigate", url=f"{login_site}/first")
+        await provider.execution.finish_run("run-a", generation)
+        second = await call("run-b", "desktop:b", "navigate", url=f"{login_site}/second")
+        await provider.execution.finish_run("run-b", generation)
+        assert first["tabId"] != second["tabId"]
+        # The first conversation's tab is behind the second's.
+        shot = await call("run-c", "desktop:a", "screenshot", tabId=first["tabId"])
+        assert shot.get("success") is True, shot
+        assert len(base64.b64decode(shot["screenshot"].split(",", 1)[1])) > 2000
+        blank = await call("run-c", "desktop:a", "tabs_create")
+        await provider.close_blank_tabs("run-c", generation, "desktop:a")
+        listed = await call("run-c", "desktop:a", "tabs_list")
+        assert blank["tabId"] not in {tab["tabId"] for tab in listed["tabs"]}
+        assert {tab["tabId"]: tab["yours"] for tab in listed["tabs"]} == {first["tabId"]: True, second["tabId"]: False}
+        await provider.execution.finish_run("run-c", generation)
+    finally:
+        await provider.disconnect()
+        await asyncio.to_thread(runtime.stop, generation)
+    restarted = await asyncio.to_thread(runtime.start)
+    try:
+        stale = await call("run-d", "desktop:a", "screenshot", generation=restarted["generation"], tabId=first["tabId"])
+        assert stale["error_code"] == "TAB_NOT_FOUND"
+        await provider.execution.finish_run("run-d", restarted["generation"])
+    finally:
+        await provider.disconnect()
+        await asyncio.to_thread(runtime.stop, restarted["generation"])
+
+
 @pytest.mark.asyncio
 @pytest.mark.skipif(os.environ.get("FLOWLY_SCREEN_GATEWAY_TEST") != "1", reason="requires full Core Linux runner")
 async def test_an_agent_starts_its_stopped_screen_on_its_first_browser_action(tmp_path, login_site, monkeypatch):

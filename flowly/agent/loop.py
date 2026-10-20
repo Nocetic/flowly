@@ -911,7 +911,9 @@ _SCREEN_RUN_ERRORS = frozenset({"SCREEN_BUSY", "HUMAN_HAS_CONTROL", "STALE_GENER
 _SCREEN_TASK = (
     "[Screen task] This task runs in the browser on the user's own server screen, which they can watch and "
     "take over from Flowly Desktop. Use browser_tab for this browser: tabs_list to see open tabs, navigate "
-    "with a URL to open a site, then read_page for fresh element refs. The browser runs in an isolated "
+    "with a URL to open a site, then read_page for fresh element refs. This conversation has its own tab "
+    "(tabs_list marks it yours: true); work there, and use a tab that is not yours only when the person asks "
+    "you to. Tab numbers from earlier conversations may no longer exist. The browser runs in an isolated "
     "Screen environment; a missing shell DISPLAY or xdg-open failure does not mean it is absent. Do not "
     "search host browser binaries, scan debugging ports or write your own CDP driver. If browser_tab is "
     "unavailable under the current tool policy, report that limitation instead of bypassing it with shell "

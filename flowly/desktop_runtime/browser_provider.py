@@ -15,6 +15,8 @@ import secrets
 from typing import Any
 from urllib.parse import urlsplit
 
+from loguru import logger
+
 from flowly.desktop_runtime.authority import ScreenError
 from flowly.desktop_runtime.execution import ActionOutcomeUnknownError, ScreenExecution
 from flowly.desktop_runtime.launcher import ScreenRuntime
@@ -39,6 +41,23 @@ _LABEL = """e => {
         e.getAttribute('placeholder') || e.innerText || '';
     return {role:role.slice(0,64), name:label.slice(0,160), disabled:!!e.disabled};
 }"""
+
+
+# Actions that change a page or need the person's attention on it. Without a
+# tab of its own a conversation may not do these to whatever tab is in front.
+_ACTS = frozenset({"click", "hover", "type", "form_input", "key", "scroll", "wait", "tabs_close"})
+
+
+def _tab_base(generation: str) -> int:
+    """Where this browser's tab numbers start: one range per screen start.
+
+    A conversation keeps tab numbers in its history. Restarted, the screen's
+    browser has other tabs; numbers from a fresh range make an old one fail as
+    not found instead of quietly naming whichever tab now has it.
+    """
+    import hashlib
+
+    return 1000 + int(hashlib.sha256(generation.encode()).hexdigest()[:8], 16) % 900 * 100
 
 
 def _text(value: Any, *, maximum: int = 32768) -> str:
@@ -70,6 +89,14 @@ class HostBrowserProvider:
         self._pages: dict[int, Any] = {}
         self._next_tab = 1
         self._active_tab: int | None = None
+        # Which conversation a tab belongs to, the tab each conversation works
+        # in, and the run that opened a tab (to close it if it stayed blank).
+        # A tab the person opened belongs to nobody.
+        self._owners: dict[int, str] = {}
+        self._focus: dict[str, int] = {}
+        self._opened_by: dict[int, str] = {}
+        self._owner = ""
+        self._run = ""
         self._refs: dict[str, tuple[Any, Any]] = {}
         self._next_ref = secrets.randbelow(2**48)
 
@@ -89,6 +116,9 @@ class HostBrowserProvider:
         self._driver = self._browser = None
         self._pages.clear()
         self._active_tab = None
+        self._owners.clear()
+        self._focus.clear()
+        self._opened_by.clear()
         self._generation = self._epoch = None
 
     async def _connect(self, generation: str) -> None:
@@ -110,6 +140,7 @@ class HostBrowserProvider:
                 f"http://127.0.0.1:{state['cdpPort']}", timeout=5000,
             )
             self._generation = generation
+            self._next_tab = _tab_base(generation)
         except Exception:
             await self.disconnect()
             raise ScreenError("BROWSER_UNAVAILABLE") from None
@@ -128,31 +159,87 @@ class HostBrowserProvider:
     def _sync_pages(self) -> dict[int, Any]:
         pages = self._browser.contexts[0].pages
         self._pages = {key: page for key, page in self._pages.items() if page in pages and not page.is_closed()}
+        for mapping in (self._owners, self._opened_by):
+            for key in [key for key in mapping if key not in self._pages]:
+                del mapping[key]
+        for owner in [owner for owner, key in self._focus.items() if key not in self._pages]:
+            del self._focus[owner]
         for page in pages:
             if page not in self._pages.values():
                 self._pages[self._next_tab] = page
                 self._next_tab += 1
         return self._pages
 
-    async def _page(self, params: dict) -> tuple[int, Any]:
+    async def _new_tab(self, url: str = "about:blank") -> tuple[int, Any]:
+        if len(self._sync_pages()) >= self.MAX_TABS:
+            raise ScreenError("TAB_LIMIT_REACHED")
+        page = await self._browser.contexts[0].new_page()
+        self._sync_pages()
+        key = next(key for key, value in self._pages.items() if value is page)
+        if self._owner:
+            self._owners[key] = self._owner
+            self._focus[self._owner] = key
+            self._opened_by[key] = self._run
+        self._active_tab = key
+        await page.bring_to_front()
+        await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+        return key, page
+
+    async def _conversation_page(self, action: str, pages: dict[int, Any]) -> tuple[int, Any]:
+        """The tab this conversation works in when it names none.
+
+        Its own tab first; else the browser's untouched start tab, which it
+        takes; else, to open a page, a new tab of its own. Another
+        conversation's tab or one the person opened is never taken over
+        unnamed: reading what is in front is allowed, acting on it is not.
+        """
+        owner = self._owner
+        key = self._focus.get(owner)
+        if key is None:
+            mine = [key for key, value in self._owners.items() if value == owner]
+            key = mine[-1] if mine else None
+        if key is None:
+            start = [key for key, page in pages.items() if key not in self._owners and page.url == "about:blank"]
+            if start:
+                key = start[0]
+                self._owners[key] = owner
+        if key is not None:
+            self._focus[owner] = key
+            self._active_tab = key
+            return key, pages[key]
+        if action == "navigate":
+            return await self._new_tab()
+        if action in _ACTS:
+            raise ScreenError("TAB_SELECTION_REQUIRED")
+        return await self._front_page(pages)
+
+    async def _front_page(self, pages: dict[int, Any]) -> tuple[int, Any]:
+        focused, visible = [], []
+        for key, page in pages.items():
+            flags = await page.evaluate("({focused:document.hasFocus(), visible:document.visibilityState==='visible'})")
+            if flags["focused"]:
+                focused.append(key)
+            if flags["visible"]:
+                visible.append(key)
+        candidates = focused or visible or list(pages)
+        if len(candidates) != 1:
+            raise ScreenError("TAB_SELECTION_REQUIRED")
+        return candidates[0], pages[candidates[0]]
+
+    async def _page(self, params: dict, action: str = "") -> tuple[int, Any]:
         pages = self._sync_pages()
         requested = params.get("tabId")
         if requested is not None:
             if type(requested) is not int or requested not in pages:
                 raise ScreenError("TAB_NOT_FOUND")
             self._active_tab = requested
+            if self._owner and self._owners.get(requested) == self._owner:
+                self._focus[self._owner] = requested
+            return requested, pages[requested]
+        if self._owner:
+            return await self._conversation_page(action, pages)
         if self._active_tab not in pages:
-            focused, visible = [], []
-            for key, page in pages.items():
-                flags = await page.evaluate("({focused:document.hasFocus(), visible:document.visibilityState==='visible'})")
-                if flags["focused"]:
-                    focused.append(key)
-                if flags["visible"]:
-                    visible.append(key)
-            candidates = focused or visible or list(pages)
-            if len(candidates) != 1:
-                raise ScreenError("TAB_SELECTION_REQUIRED")
-            self._active_tab = candidates[0]
+            self._active_tab = (await self._front_page(pages))[0]
         return self._active_tab, pages[self._active_tab]
 
     async def _target(self, page, params: dict, *, text_target: bool = False):
@@ -180,7 +267,9 @@ class HostBrowserProvider:
         return target
 
     async def request(self, run_id: str, request_id: str, generation: str, action: str, params: dict, *,
-                      _refresh_epoch: int | None = None) -> dict:
+                      owner: str = "", _refresh_epoch: int | None = None) -> dict:
+        """One browser action of ``run_id``. ``owner`` is the conversation the
+        run belongs to: its tabs are its own (see ``_conversation_page``)."""
         if _refresh_epoch is not None and action != "read_page":
             raise ScreenError("RESUME_NOT_AVAILABLE")
         if not isinstance(action, str) or action not in CAPABILITIES:
@@ -189,6 +278,9 @@ class HostBrowserProvider:
             return {"error": "Invalid browser parameters.", "error_code": "INVALID_PARAMS"}
 
         async def operate():
+            # The execution admits one action at a time: the run and its
+            # conversation hold for this action only.
+            self._owner, self._run = owner, run_id
             await self._connect(generation)
             state = await asyncio.to_thread(self.runtime.authority.snapshot)
             if self._epoch != state["epoch"]:
@@ -204,11 +296,13 @@ class HostBrowserProvider:
                 raise ActionOutcomeUnknownError() from None
             except ScreenError:
                 raise
-            except Exception:
+            except Exception as exc:
                 if not self._browser or not self._browser.is_connected():
                     raise ActionOutcomeUnknownError() from None
                 # Backend errors can contain selectors, typed credentials or
-                # page URLs. They are deliberately not logged or returned.
+                # page URLs. They are deliberately not logged or returned; the
+                # kind of failure alone is, so a failure can be diagnosed.
+                logger.info("[Screen] browser action {} failed: {}", action, type(exc).__name__)
                 raise ScreenError("BROWSER_ACTION_FAILED") from None
             return {**result, "_screenObservation": {"generation": generation, "epoch": self._epoch}}
 
@@ -217,6 +311,33 @@ class HostBrowserProvider:
         except ScreenError as exc:
             return {"error": "Screen action could not complete. Observe the current state before retrying.",
                     "error_code": exc.code}
+
+    async def close_blank_tabs(self, run_id: str, generation: str, owner: str = "") -> None:
+        """Close the tabs ``run_id`` opened and left blank (about:blank).
+
+        Run when the run ends, as one more of its actions: it never touches a
+        page while the person has control, the browser's last window, or a tab
+        anyone navigated.
+        """
+        if not any(opener == run_id for opener in self._opened_by.values()):
+            return
+
+        async def operate():
+            self._owner, self._run = owner, run_id
+            await self._connect(generation)
+            pages = self._sync_pages()
+            for key in [key for key, opener in self._opened_by.items() if opener == run_id]:
+                page = pages.get(key)
+                if page is not None and page.url == "about:blank" and len(self._sync_pages()) > 1:
+                    await page.close(run_before_unload=False)
+                self._opened_by.pop(key, None)
+            self._sync_pages()
+            return {}
+
+        try:
+            await self.execution.action(run_id, secrets.token_urlsafe(16), generation, operate)
+        except ScreenError:
+            pass
 
     def observation_valid(self, result: dict) -> bool:
         observation = result.get("_screenObservation")
@@ -228,22 +349,22 @@ class HostBrowserProvider:
 
     async def _dispatch(self, action: str, params: dict) -> dict:
         if action in {"tabs_list", "tabs_context"}:
-            tabs = [{"id": key, "tabId": key, "url": page.url, "title": (await page.title())[:512]}
-                    for key, page in self._sync_pages().items()]
-            return dict(success=True, tabs=tabs, activeTabId=self._active_tab, provider=PROVIDER_ID)
+            tabs = []
+            for key, page in self._sync_pages().items():
+                tab = {"id": key, "tabId": key, "url": page.url, "title": (await page.title())[:512]}
+                if self._owner:
+                    # Whose it is: this conversation's own, or another's / the person's.
+                    tab["yours"] = self._owners.get(key) == self._owner
+                tabs.append(tab)
+            active = self._focus.get(self._owner) if self._owner else self._active_tab
+            return dict(success=True, tabs=tabs, activeTabId=active, provider=PROVIDER_ID)
         if action == "tabs_create":
             url = _url(params.get("url", "about:blank"))
-            if len(self._sync_pages()) >= self.MAX_TABS:
-                raise ScreenError("TAB_LIMIT_REACHED")
-            page = await self._browser.contexts[0].new_page()
-            self._sync_pages()
-            self._active_tab = next(key for key, value in self._pages.items() if value is page)
-            await page.bring_to_front()
-            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-            return dict(success=True, tabId=self._active_tab)
+            key, _ = await self._new_tab(url)
+            return dict(success=True, tabId=key)
         if action == "tabs_close" and params.get("tabId") is None:
             raise ScreenError("INVALID_PARAMS")
-        tab_id, page = await self._page(params)
+        tab_id, page = await self._page(params, action)
         if action == "tabs_close":
             # Keep the last window alive: closing it would terminate Chromium.
             if len(self._pages) == 1:
@@ -316,6 +437,9 @@ class HostBrowserProvider:
         elif action == "screenshot":
             if any(key in params for key in ("bbox", "ref", "selector")):
                 raise ScreenError("UNSUPPORTED_ACTION")
+            # The tab comes forward first, so the capture is what the person
+            # sees on the screen at that moment.
+            await page.bring_to_front()
             size = await page.evaluate("({width:innerWidth,height:innerHeight})")
             if not 0 < size["width"] <= 3840 or not 0 < size["height"] <= 2160:
                 raise ScreenError("OBSERVATION_TOO_LARGE")

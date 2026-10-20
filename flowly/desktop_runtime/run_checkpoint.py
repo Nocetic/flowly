@@ -20,6 +20,7 @@ class ScreenRunCheckpoint:
     def __init__(self, provider, store: RunHandoffs, execution: str, run_id: str, generation: str):
         self.provider, self.store, self.execution = provider, store, execution
         self.run_id, self.generation = run_id, generation
+        self.owner = ""
         self.provider.execution.bind_checkpoint(run_id, self.action_epoch)
 
     @classmethod
@@ -65,7 +66,7 @@ class ScreenRunCheckpoint:
                 epoch = await asyncio.to_thread(self.store.begin_refresh, self.execution)
                 if epoch is not None:
                     result = await self.provider.request(self.run_id, secrets.token_urlsafe(24), self.generation,
-                                                         "read_page", {}, _refresh_epoch=epoch)
+                                                         "read_page", {}, owner=self.owner, _refresh_epoch=epoch)
                     if result.get("error_code") in {"STALE_OBSERVATION", "STALE_EPOCH", "HUMAN_HAS_CONTROL"}:
                         # Another takeover fences the observation. Wait for that
                         # handoff; never retry a write or infer another approval.

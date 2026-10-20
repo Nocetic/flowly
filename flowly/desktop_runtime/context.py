@@ -12,4 +12,6 @@ class ScreenRunBinding:
     generation: str
     run_id: str
     checkpoint: ScreenRunCheckpoint | None = None
+    # The conversation the run belongs to: its browser tabs are its own.
+    owner: str = ""
 

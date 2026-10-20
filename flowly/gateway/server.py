@@ -4817,7 +4817,8 @@ class GatewayServer:
                 if provider_id not in (None, "host-desktop-browser"):
                     return {"error": "The requested browser is outside this screen run",
                             "error_code": "BROWSER_PROVIDER_NOT_OWNED"}
-                return await screen.provider.request(screen.run_id, request_id, screen.generation, action, params)
+                return await screen.provider.request(screen.run_id, request_id, screen.generation, action, params,
+                                                     owner=screen.owner)
         binding = _BROWSER_RUN_BINDING.get()
         if binding is not None:
             if not binding.provider_id:

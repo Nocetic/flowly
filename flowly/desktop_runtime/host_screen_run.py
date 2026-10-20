@@ -133,13 +133,19 @@ class HostScreenRun:
             # undecided, so a later action can claim the same screen.
             checkpoint = await ScreenRunCheckpoint.start(provider, identity, self.session_key,
                                                          self.run_id, generation)
-            self.binding = ScreenRunBinding(provider, generation, self.run_id, checkpoint)
+            checkpoint.owner = self.session_key
+            self.binding = ScreenRunBinding(provider, generation, self.run_id, checkpoint, owner=self.session_key)
             self.decided = True
             return self.binding
 
     async def finish(self) -> None:
         if self.binding is None or self.binding.checkpoint is None:
             return
+        # Blank tabs this run opened go while it still holds the screen.
+        try:
+            await self.binding.provider.close_blank_tabs(self.run_id, self.binding.generation, self.binding.owner)
+        except Exception:
+            logger.debug("[Screen] could not close this run's blank tabs")
         try:
             await self.binding.checkpoint.finish(cancelled=not self.succeeded)
         except (Exception, asyncio.CancelledError):

@@ -132,7 +132,7 @@ class ScreenshotTool(Tool):
             from flowly.agent.tools.browser_tab import BrowserTabTool
 
             result = await binding.provider.request(binding.run_id, str(uuid.uuid4()),
-                                                    binding.generation, "screenshot", {})
+                                                    binding.generation, "screenshot", {}, owner=binding.owner)
             if not binding.provider.observation_valid(result):
                 return json.dumps({"error": "Screen control changed", "error_code": "STALE_OBSERVATION"})
             if not result.get("screenshot"):
