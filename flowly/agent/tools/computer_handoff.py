@@ -1,22 +1,22 @@
 """Computer handoff — a step the person does on the agent's screen (browser_tab ``handoff``).
 
 Signing in, a two-factor or verification code, a CAPTCHA, approving a
-payment: the agent stops and asks the person to take control of its screen,
-do the step and give control back; this same run then continues. The request
-travels like a clarify question (``kind="computer"``), so every surface that
-shows the agent's questions shows it, in the conversation, as a card that
-opens the screen. It is done when the screen's own handoff record says the
-person took control and handed it back (whichever client they used), and it
-stops waiting after a bound.
+payment: the agent hands the screen to the person and ends its reply. The
+request travels like a clarify question (``kind="computer"``), so every
+surface that shows the agent's questions shows it in the conversation as a
+card that opens the screen. Nothing waits inside the agent's turn: a watcher
+of the screen's own control record runs on, and once the person has taken
+control and handed it back (from whichever client), the conversation gets a
+new turn of its own in which the agent looks at the page again and goes on.
+Nobody in a bound: the agent is told, once, and the card closes.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import secrets
 import time
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
@@ -25,48 +25,103 @@ from flowly.clarify.types import ClarifyRequest
 
 # Long enough to find a phone for a code, short enough not to hold the screen.
 TIMEOUT_SECONDS = 15 * 60
-# The answer the screen's own record gives; nothing a person can type.
+# Answers the screen's record gives; nothing a person can type.
 _DONE = "\x00computer-done"
+_GONE = "\x00computer-gone"
 _POLL_SECONDS = 0.5
+
+# What the agent is told to say in its conversation when the step is over.
+CONTINUE_NOTICE = (
+    "[Screen] The person did this on your screen and handed it back: {task}\n"
+    "Look at the page again (read_page, or a screenshot) and continue the task from there. "
+    "Do not ask them to do it again."
+)
+NOT_DONE_NOTICE = (
+    "[Screen] Nobody did this on your screen in time: {task}\n"
+    "Tell the person in one short sentence that the step was not done and the task is paused; "
+    "do not retry it and do not ask for passwords or codes in chat."
+)
+
+Continuation = Callable[[str, str, str, str], Awaitable[None]]
+
+# One watcher per conversation: a new handoff replaces the one before it.
+_watchers: dict[str, asyncio.Task] = {}
 
 
 def _result(task: str, outcome: str, note: str, **extra: Any) -> str:
+    import json
+
     return json.dumps({"task": task, "outcome": outcome, **extra, "note": note})
 
 
-async def _watch_handoff(checkpoint, manager, request_id: str, state: dict) -> None:
+def _snapshot(authority) -> dict | None:
+    try:
+        return authority.snapshot()
+    except Exception:
+        return None
+
+
+async def _watch_control(authority, generation: str, manager, request_id: str, start: dict) -> None:
     """Resolve the request once the person took the screen and gave it back.
 
-    Reads the run's durable handoff record and never waits in a way that can
-    be cancelled half-way (``checkpoint.wait`` would mark the run cancelled):
-    it calls it only once the person asked the run to continue, when it only
-    completes the run's fresh look at the page.
+    Read from the screen's control record (any client's release counts). The
+    epoch moves on every takeover and release: from agent control, a takeover
+    and a release are two steps; from the person already holding it, one.
+    ``start`` is the record as it was when the card was made, so a hand-back
+    right after it is not missed.
     """
-    seen = False
+    needed = start["epoch"] + (1 if start["control"] != "agent" else 2)
     while True:
-        status = await asyncio.to_thread(checkpoint.store.checkpoint, checkpoint.execution)
-        phase = status["state"]
-        if phase in {"waiting_human", "waiting_resume"}:
-            seen = True
-        elif phase in {"resume_requested", "refreshing"} or (seen and phase == "ready"):
-            state["refreshing"] = True
-            try:
-                await checkpoint.wait()
-                manager.resolve(request_id, _DONE)
-            finally:
-                state["refreshing"] = False
-            return
-        elif phase in {"finished", "cancelled"}:
-            return
         await asyncio.sleep(_POLL_SECONDS)
+        state = await asyncio.to_thread(_snapshot, authority)
+        if not state or not state["running"] or state["generation"] != generation:
+            manager.resolve(request_id, _GONE)
+            return
+        if state["control"] == "agent" and state["epoch"] >= needed:
+            manager.resolve(request_id, _DONE)
+            return
 
 
-async def computer_handoff(task: Any) -> str:
-    """browser_tab ``handoff``: wait for the person to do ``task`` on the screen.
+async def _attend(pending: ClarifyRequest, authority, generation: str, start: dict, task: str,
+                  channel: str, chat_id: str, continuation: Continuation | None) -> None:
+    """Wait for the card's outcome and start the conversation's next turn."""
+    manager = get_clarify_manager()
+    watcher = asyncio.create_task(_watch_control(authority, generation, manager, pending.id, start))
+    try:
+        answer = await manager.request_and_wait(pending)
+    except Exception as exc:
+        logger.error("[Computer] handoff request failed ({})", type(exc).__name__)
+        answer = None
+    finally:
+        watcher.cancel()
+        try:
+            await watcher
+        except (asyncio.CancelledError, Exception):
+            pass
+        if _watchers.get(pending.session_key or "") is asyncio.current_task():
+            _watchers.pop(pending.session_key or "", None)
+    if answer == _GONE:
+        logger.info("[Computer] the screen stopped before the person did: {}", task)
+        return
+    if continuation is None:
+        return
+    notice = (CONTINUE_NOTICE if answer == _DONE else NOT_DONE_NOTICE).format(task=task)
+    try:
+        await continuation(pending.session_key or "", channel, chat_id, notice)
+    except Exception as exc:
+        logger.error("[Computer] could not continue the task ({})", type(exc).__name__)
+
+
+async def computer_handoff(task: Any, channel: str = "", chat_id: str = "",
+                           continuation: Continuation | None = None) -> str:
+    """browser_tab ``handoff``: hand the screen to the person for ``task``.
 
     An action of the browser tool rather than a tool of its own: every tool's
-    schema rides every turn, and this adds one word and one argument.
+    schema rides every turn, and this adds one word and one argument. The
+    conversation is the screen run's own, never the model's to name.
     """
+    import json
+
     task = " ".join(str(task or "").split())[:300]
     if not task:
         return json.dumps({"error": "task is required for handoff", "error_code": "INVALID_PARAMS"})
@@ -78,7 +133,6 @@ async def computer_handoff(task: Any) -> str:
     run = current_screen_run()
     if run is None or not run.uses_screen():
         return _result(task, "unavailable", "There is no screen in this task. Say what is needed instead.")
-    # The run's own conversation (set by the runtime, never by the model).
     session_key = run.session_key or ""
     if not session_key.startswith(SCREEN_VIEWER_SESSION_PREFIXES):
         return _result(task, "unavailable",
@@ -86,49 +140,35 @@ async def computer_handoff(task: Any) -> str:
                        "control of your screen. Tell them they can finish it from Flowly Desktop's Computer "
                        "panel, then end your reply without waiting or retrying.")
     try:
-        binding = await run.bind()
-    except ScreenError as exc:
-        return json.dumps({"task": task, **unavailable(exc)})
-    if binding is None or binding.checkpoint is None:
-        return json.dumps({"task": task, **unavailable(ScreenError("SCREEN_NOT_RUNNING"))})
-    try:
         identity = await asyncio.to_thread(run.gateway._host_screen_checkpoint_identity)
-        profile_id = identity["profileId"]
-    except (ScreenError, OSError, KeyError):
-        profile_id = None
+        _, provider = run.gateway._get_host_screen_browser()
+        state = await asyncio.to_thread(provider.runtime.status)
+    except (ScreenError, OSError, KeyError, AttributeError) as exc:
+        code = exc.code if isinstance(exc, ScreenError) else "SCREEN_NOT_RUNNING"
+        return json.dumps({"task": task, **unavailable(ScreenError(code))})
+    if not state or state.get("phase") != "running":
+        return json.dumps({"task": task, **unavailable(ScreenError("SCREEN_NOT_RUNNING"))})
+    start = await asyncio.to_thread(_snapshot, provider.runtime.authority)
+    if not start or not start["running"] or start["generation"] != state["generation"]:
+        return json.dumps({"task": task, **unavailable(ScreenError("SCREEN_NOT_RUNNING"))})
 
     now = time.time()
     pending = ClarifyRequest(
         id=secrets.token_hex(8), question=task, choices=None, session_key=session_key,
-        created_at=now, expires_at=now + TIMEOUT_SECONDS, kind="computer", profile_id=profile_id,
+        created_at=now, expires_at=now + TIMEOUT_SECONDS, kind="computer", profile_id=identity["profileId"],
     )
-    manager = get_clarify_manager()
-    state = {"refreshing": False}
-    watcher = asyncio.create_task(_watch_handoff(binding.checkpoint, manager, pending.id, state))
-    try:
-        answer = await manager.request_and_wait(pending)
-    except Exception as exc:
-        logger.error("[Computer] handoff request failed ({})", type(exc).__name__)
-        answer = None
-    finally:
-        if not watcher.done():
-            if state["refreshing"]:
-                # The person asked to continue: let the fresh look finish.
-                await asyncio.shield(watcher)
-            else:
-                watcher.cancel()
-        try:
-            await watcher
-        except (asyncio.CancelledError, ScreenError):
-            pass
-        except Exception as exc:
-            logger.warning("[Computer] handoff watch failed ({})", type(exc).__name__)
+    previous = _watchers.get(session_key)
+    if previous is not None and not previous.done():
+        previous.cancel()
+    _watchers[session_key] = asyncio.create_task(_attend(
+        pending, provider.runtime.authority, state["generation"], start, task, channel, chat_id, continuation))
+    return _result(task, "handed_off",
+                   "The person has the card. End your reply now with one short sentence: what they should "
+                   "do on the screen, and that you will continue once they hand it back. Do not wait, poll "
+                   "the screen, or retry; the task continues in a new turn when they are done.")
 
-    if answer == _DONE:
-        return _result(task, "done", "The person did it on your screen and gave it back. Look at the "
-                       "screen again (read_page or a screenshot) before you continue.")
-    if answer is None:
-        return _result(task, "not_done", "Nobody did it in time. Say so and end your reply; do not retry "
-                       "the step or ask for the details in chat.")
-    return _result(task, "answered", "The person answered instead of taking the screen. Follow what "
-                   "they said; never ask for passwords or codes in chat.", user_response=answer)
+
+def _reset_for_tests() -> None:
+    for task in _watchers.values():
+        task.cancel()
+    _watchers.clear()

@@ -107,8 +107,13 @@ class BrowserTabTool(Tool):
         return result
 
     def __init__(self, gateway_server: Any = None, provider: Any = None, registry: Any = None,
-                 *, screen_only: bool = False, screen_enabled: bool = True):
+                 *, screen_only: bool = False, screen_enabled: bool = True, screen_continuation: Any = None):
         self._gateway = gateway_server
+        # The conversation this turn answers (set_context), and how the agent
+        # loop starts its next turn once a handed-over screen step is done.
+        self._turn_channel = ""
+        self._turn_chat_id = ""
+        self._screen_continuation = screen_continuation
         self.screen_only = screen_only
         self.screen_enabled = screen_enabled
         # Optional. When set, the `find` action transparently upgrades
@@ -586,6 +591,10 @@ class BrowserTabTool(Tool):
             "required": ["action"],
         }
 
+    def set_context(self, channel: str, chat_id: str) -> None:
+        """The conversation of the turn now running (as the message tool is told)."""
+        self._turn_channel, self._turn_chat_id = channel, chat_id
+
     async def execute(self, action: str = "", **kwargs: Any) -> str:
         from flowly.desktop_runtime.authority import ScreenError
         from flowly.desktop_runtime.host_screen_run import current_screen_run, unavailable
@@ -594,7 +603,8 @@ class BrowserTabTool(Tool):
             # The person takes over the screen for one step (agent/tools/computer_handoff.py).
             from flowly.agent.tools.computer_handoff import computer_handoff
 
-            return await computer_handoff(kwargs.get("task"))
+            return await computer_handoff(kwargs.get("task"), self._turn_channel, self._turn_chat_id,
+                                          self._screen_continuation)
         run = current_screen_run()
         if not self.screen_enabled and run is not None and run.uses_screen():
             return json.dumps({"error": "Screen browser access is disabled.", "error_code": "SCREEN_DISABLED"})

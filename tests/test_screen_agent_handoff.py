@@ -144,8 +144,8 @@ async def test_a_screen_run_is_told_to_hand_logins_and_codes_to_the_person(live_
     for guidance in (SCREEN_HANDOFF_GUIDANCE, SCREEN_HANDOFF_ELSEWHERE_GUIDANCE):
         for word in ("two-factor", "do not ask them to paste passwords"):
             assert word in guidance
-    assert "take control on the Screen" in SCREEN_HANDOFF_GUIDANCE
-    assert "take control on the Screen" not in SCREEN_HANDOFF_ELSEWHERE_GUIDANCE
+    assert "hand the screen back" in SCREEN_HANDOFF_GUIDANCE
+    assert "hand the screen back" not in SCREEN_HANDOFF_ELSEWHERE_GUIDANCE
     for word in ("not in Flowly Desktop", "Computer panel", "end your reply", "do not say you are waiting"):
         assert word in SCREEN_HANDOFF_ELSEWHERE_GUIDANCE
 

@@ -155,7 +155,9 @@ class HostScreenRun:
 
 
 _UNAVAILABLE = {
-    "HUMAN_HAS_CONTROL": "The person has control of this screen. Ask them to give control back, then try again.",
+    "HUMAN_HAS_CONTROL": "The person has control of this screen. Call browser_tab with action handoff "
+                         "(task: the step you need from them) and end your reply; the task continues once "
+                         "they hand the screen back.",
     "SCREEN_BUSY": "Another task is using this screen's browser. Try again when it finishes.",
     "INSUFFICIENT_RESOURCES": "The server does not have enough free memory to start the screen right now.",
     "INSTALL_BUSY": "The screen components are being installed. Try again when the installation finishes.",

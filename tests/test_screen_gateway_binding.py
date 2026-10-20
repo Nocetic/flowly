@@ -213,7 +213,7 @@ async def test_a_person_holding_control_is_named_and_the_next_action_claims_the_
         human = authority.acquire("human", "generation", authority.snapshot()["epoch"])
         refused = await gateway.send_browser_tool_request("read", "get_page_text", {})
         assert refused["error_code"] == "HUMAN_HAS_CONTROL"
-        assert "give control back" in refused["error"]
+        assert "hand the screen back" in refused["error"]
         assert bound_screen_run() is None and run.uses_screen()
         authority.release("human", "generation", human["epoch"])
         assert (await gateway.send_browser_tool_request("again", "get_page_text", {}))["text"] == "remote page"

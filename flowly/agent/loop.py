@@ -924,10 +924,14 @@ _SCREEN_TASK = (
 )
 # The person is in an app that shows this screen: they can take over now.
 SCREEN_HANDOFF_GUIDANCE = _SCREEN_TASK + (
-    "Call browser_tab with action handoff and the step in task (one sentence): they get a card that opens "
-    "your screen, take control on the Screen, complete it there and give control back, and this same call "
-    "returns so the task continues from a fresh look at the page."
+    "Call browser_tab with action handoff and the step in task (one sentence), then end your reply in one "
+    "short sentence: they get a card that opens your screen, take control, do it and hand the screen back, "
+    "and you continue in a new turn from a fresh look at the page. Do the same when the browser answers "
+    "HUMAN_HAS_CONTROL: the person has the screen now; hand them the step and end your reply."
 )
+# Senders whose system notices run as the conversation's own turn (a subagent's
+# report, a screen step the person finished): streamed when someone watches.
+REPORT_SENDERS = frozenset({"subagent", "screen"})
 # The person is somewhere the screen cannot be shown (Telegram, the phone app
 # before its screen viewer, a terminal): telling them to "take control" there
 # asks the impossible, and the task would sit waiting for it.
@@ -2901,6 +2905,7 @@ class AgentLoop:
                 registry=self.tools,
                 screen_only=not browser_tab_enabled,
                 screen_enabled=screen_browser_enabled,
+                screen_continuation=self._continue_screen_task,
             ))
 
         if browser_tab_enabled:
@@ -3725,7 +3730,7 @@ class AgentLoop:
         if (
             msg.channel == "web"
             or (msg.channel == "system" and msg.metadata.get(_AGENDA_ITEM))
-            or (msg.channel == "system" and msg.sender_id == "subagent"
+            or (msg.channel == "system" and msg.sender_id in REPORT_SENDERS
                 and isinstance(msg, ConversationInboundMessage))
         ):
             # An agenda wake-up may research for minutes; it must not hold up
@@ -4056,8 +4061,21 @@ class AgentLoop:
             self._report_turn_submitters: dict[str, Any] = {}
         self._report_turn_submitters[key] = submitter
 
+    async def _continue_screen_task(self, session_key: str, channel: str, chat_id: str, content: str) -> None:
+        """Start the conversation's next turn after a screen step handed to the
+        person ended (computer_handoff): live on the surface watching it, else
+        over the bus, as a subagent's report is delivered."""
+        if await self._submit_report_turn(session_key, channel, chat_id, content, sender_id="screen"):
+            return
+        from flowly.bus.events import ConversationInboundMessage
+
+        await self.bus.publish_inbound(ConversationInboundMessage(
+            channel="system", sender_id="screen", chat_id=f"{channel}:{chat_id}",
+            content=content, conversation_key=session_key,
+        ))
+
     async def _submit_report_turn(
-        self, session_key: str, channel: str, chat_id: str, content: str,
+        self, session_key: str, channel: str, chat_id: str, content: str, *, sender_id: str = "subagent",
     ) -> bool:
         """Start a subagent's notice as a live turn; False = use the bus.
 
@@ -4095,7 +4113,7 @@ class AgentLoop:
         if not access.permits(owner):
             return False
         order = ("web", "direct") if channel == "web" else ("direct", "web")
-        notice = {"content": content, "sender_id": "subagent", "chat_id": f"{channel}:{chat_id}"}
+        notice = {"content": content, "sender_id": sender_id, "chat_id": f"{channel}:{chat_id}"}
         with request_owner_scope(owner), event_access_scope(access):
             for key in order:
                 submitter = registry.get(key)
@@ -8883,6 +8901,12 @@ class AgentLoop:
         if voice_tool and hasattr(voice_tool, "set_context"):
             voice_tool.set_context(tool_channel, tool_chat_id)
 
+        # The browser tool: a screen step handed to the person continues in
+        # this conversation's own next turn.
+        browser_tool = self.tools.get("browser_tab")
+        if browser_tool and hasattr(browser_tool, "set_context"):
+            browser_tool.set_context(tool_channel, tool_chat_id)
+
         # Detect persona change and inject transition marker
         current_persona = self.context.persona
         session_persona = session.metadata.get("persona")
@@ -9697,11 +9721,11 @@ class AgentLoop:
         # owner's turn: deltas, tool steps and tool progress go to the
         # runner's callbacks, and the runner sends the one final. Without a
         # runner (the bus) the reply is delivered after the turn, as before.
-        live_report = bool(msg.metadata.get(REPORT_TURN)) and msg.sender_id == "subagent"
+        live_report = bool(msg.metadata.get(REPORT_TURN)) and msg.sender_id in REPORT_SENDERS
         # Filled only for a live report: its runner turns a provider failure
         # into the native error event, as for the owner's turn.
         provider_error: dict[str, Any] = {}
-        report_turn = msg.sender_id == "subagent" and not msg.metadata.get(_AGENDA_ITEM)
+        report_turn = msg.sender_id in REPORT_SENDERS and not msg.metadata.get(_AGENDA_ITEM)
         run_id = str(msg.metadata.get("run_id") or "")
         turn_started_at = time.monotonic()
         if report_turn:

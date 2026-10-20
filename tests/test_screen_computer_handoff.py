@@ -1,9 +1,10 @@
 """The computer card: a step the person does on the agent's screen.
 
-Grok-style (2026-10-20): instead of saying "take control" in text, the agent
-calls browser_tab's handoff action; the person gets a card that opens the screen, does the
-step and hands back, and the same run continues. Real authority and handoff
-record; the browser is a fake.
+Grok-style (2026-10-20): the agent hands the screen over through
+browser_tab's handoff action and ends its reply; the person gets a card that
+opens the screen, does the step and hands the screen back; the conversation
+then gets a new turn of its own in which the agent continues. Real authority
+and a fake browser.
 """
 
 from __future__ import annotations
@@ -13,10 +14,10 @@ import json
 
 import pytest
 
-from flowly.agent.tools.computer_handoff import computer_handoff
+from flowly.agent.tools import computer_handoff as module
+from flowly.agent.tools.browser_tab import BrowserTabTool
 from flowly.clarify.manager import get_clarify_manager
 from flowly.clarify.wire import clarify_to_wire
-from flowly.desktop_runtime.handoff import RunHandoffs
 from flowly.desktop_runtime.host_screen_run import host_screen_run_scope
 from tests.test_screen_gateway_binding import screen_gateway as gateway_fixture
 
@@ -30,118 +31,207 @@ screen_gateway = gateway_fixture
 
 
 @pytest.fixture
-def requests(monkeypatch):
-    """What surfaces are told: the requests the manager announces."""
+def surfaces(monkeypatch):
+    """What surfaces are told (the cards), and the turns the agent loop starts."""
     manager = get_clarify_manager()
-    seen: list = []
+    cards: list = []
+    closed: list = []
+    turns: list = []
 
     async def notify(pending):
-        seen.append(pending)
+        cards.append(pending)
+
+    async def close(clarify_id, reason, session_key):
+        closed.append((clarify_id, reason))
+
+    async def continuation(session_key, channel, chat_id, content):
+        turns.append((session_key, channel, chat_id, content))
 
     monkeypatch.setattr(manager, "_notify_callbacks", [notify])
-    monkeypatch.setattr(manager, "_close_callbacks", [])
-    monkeypatch.setattr("flowly.desktop_runtime.run_checkpoint.ScreenRunCheckpoint.INTERVAL", 0.005)
-    monkeypatch.setattr("flowly.agent.tools.computer_handoff._POLL_SECONDS", 0.005)
-    return manager, seen
+    monkeypatch.setattr(manager, "_close_callbacks", [close])
+    monkeypatch.setattr(module, "_POLL_SECONDS", 0.005)
+    yield cards, closed, turns, continuation
+    module._reset_for_tests()
 
 
-async def _first(seen):
-    async with asyncio.timeout(5):
-        while not seen:
+def tool(gateway, continuation, channel="desktop", chat_id="chat"):
+    instance = BrowserTabTool(gateway, screen_continuation=continuation)
+    instance.set_context(channel, chat_id)
+    return instance
+
+
+async def _until(predicate, seconds=5):
+    async with asyncio.timeout(seconds):
+        while not predicate():
             await asyncio.sleep(0.005)
-    return seen[0]
 
 
-async def _state(store, state):
-    async with asyncio.timeout(5):
-        while (await asyncio.to_thread(store.status) or {}).get("state") != state:
-            await asyncio.sleep(0.005)
-
-
-async def test_the_card_is_done_when_the_person_hands_the_screen_back(screen_gateway, requests):
+async def test_the_agent_hands_the_screen_over_and_continues_once_it_is_handed_back(screen_gateway, surfaces):
     gateway, _, browser = screen_gateway
-    manager, seen = requests
+    cards, closed, turns, continuation = surfaces
     authority = browser.runtime.authority
-    store = RunHandoffs(browser.runtime.directory, authority)
     async with host_screen_run_scope(gateway, "desktop:chat", "run") as run:
         assert (await gateway.send_browser_tool_request("open", "get_page_text", {}))["success"]
-        # The agent asks through its browser tool: one action, no tool of its own.
-        from flowly.agent.tools.browser_tab import BrowserTabTool
-
-        call = asyncio.create_task(BrowserTabTool(gateway).execute(
+        result = json.loads(await tool(gateway, continuation).execute(
             "handoff", task="Sign in to Amazon (and complete 2FA if asked), then hand back"))
-        pending = await _first(seen)
-        wire = clarify_to_wire(pending)
-        assert wire["kind"] == "computer" and wire["profileId"] == "default"
-        assert wire["question"].startswith("Sign in to Amazon") and wire["sessionKey"] == "desktop:chat"
-        # The person opens the screen, takes control, signs in, hands back.
-        human = authority.acquire("human", "generation", authority.snapshot()["epoch"])
-        await _state(store, "waiting_human")
-        await asyncio.sleep(0.03)
-        assert not call.done()
-        authority.release("human", "generation", human["epoch"])
-        await _state(store, "waiting_resume")
-        status = store.status()
-        store.request_resume(status["handoffId"], status["controlEpoch"], "continue")
-        result = json.loads(await asyncio.wait_for(call, 5))
-        assert result["outcome"] == "done"
-        # The run looked at the page again and holds the screen, ready to go on.
-        assert ("read_page", {}) in [c.args for c in browser._dispatch.await_args_list]
-        assert store.status()["state"] == "ready"
-        assert (await gateway.send_browser_tool_request("after", "get_page_text", {}))["success"]
         run.succeeded = True
-    assert not manager.list_pending()
+    # The tool answered at once and the run ended: nothing waits in the turn.
+    assert result["outcome"] == "handed_off" and "End your reply" in result["note"]
+    assert authority.snapshot()["runId"] is None
+    wire = clarify_to_wire(cards[0])
+    assert wire["kind"] == "computer" and wire["profileId"] == "default" and wire["sessionKey"] == "desktop:chat"
+    assert wire["question"].startswith("Sign in to Amazon")
+    assert turns == []
+    # The person opens the screen, takes control, signs in, hands back.
+    human = authority.acquire("human", "generation", authority.snapshot()["epoch"])
+    await asyncio.sleep(0.03)
+    assert turns == [] and get_clarify_manager().get_pending(cards[0].id) is not None
+    authority.release("human", "generation", human["epoch"])
+    await _until(lambda: turns)
+    session_key, channel, chat_id, content = turns[0]
+    assert (session_key, channel, chat_id) == ("desktop:chat", "desktop", "chat")
+    assert content.startswith("[Screen] The person did this on your screen and handed it back: Sign in to Amazon")
+    assert "read_page" in content
+    assert closed == [(cards[0].id, "answered")]
+    assert not get_clarify_manager().list_pending()
 
 
-async def test_the_person_can_answer_instead_and_the_run_goes_on(screen_gateway, requests):
+async def test_a_screen_the_person_already_holds_continues_on_the_hand_back(screen_gateway, surfaces):
     gateway, _, browser = screen_gateway
-    manager, seen = requests
-    store = RunHandoffs(browser.runtime.directory, browser.runtime.authority)
+    cards, _, turns, continuation = surfaces
+    authority = browser.runtime.authority
+    human = authority.acquire("human", "generation", authority.snapshot()["epoch"])
+    async with host_screen_run_scope(gateway, "desktop:chat", "run"):
+        # The browser refuses while the person has the screen, and says what to do.
+        refused = await gateway.send_browser_tool_request("open", "get_page_text", {})
+        assert refused["error_code"] == "HUMAN_HAS_CONTROL" and "handoff" in refused["error"]
+        result = json.loads(await tool(gateway, continuation).execute("handoff", task="Finish signing in"))
+    assert result["outcome"] == "handed_off"
+    await _until(lambda: cards)
+    authority.release("human", "generation", human["epoch"])
+    await _until(lambda: turns)
+    assert turns[0][3].startswith("[Screen] The person did this on your screen and handed it back: Finish signing in")
+
+
+async def test_nobody_in_time_tells_the_agent_once(screen_gateway, surfaces, monkeypatch):
+    gateway, _, _ = screen_gateway
+    cards, closed, turns, continuation = surfaces
+    monkeypatch.setattr(module, "TIMEOUT_SECONDS", 0.1)
     async with host_screen_run_scope(gateway, "desktop:chat", "run") as run:
         assert (await gateway.send_browser_tool_request("open", "get_page_text", {}))["success"]
-        call = asyncio.create_task(computer_handoff("Enter the code"))
-        pending = await _first(seen)
-        assert manager.resolve(pending.id, "Not now")
-        result = json.loads(await asyncio.wait_for(call, 5))
-        assert result["outcome"] == "answered" and result["user_response"] == "Not now"
-        # Stopping the watch never marked the run cancelled.
-        assert store.status()["state"] == "ready"
-        assert (await gateway.send_browser_tool_request("after", "get_page_text", {}))["success"]
+        await tool(gateway, continuation).execute("handoff", task="Solve the CAPTCHA")
         run.succeeded = True
+    await _until(lambda: turns)
+    assert turns[0][3].startswith("[Screen] Nobody did this on your screen in time: Solve the CAPTCHA")
+    assert closed == [(cards[0].id, "timeout")]
 
 
-async def test_nobody_in_time_is_not_done(screen_gateway, requests, monkeypatch):
-    gateway, _, _ = screen_gateway
-    _, seen = requests
-    monkeypatch.setattr("flowly.agent.tools.computer_handoff.TIMEOUT_SECONDS", 0.1)
+async def test_a_screen_that_stops_closes_the_card_without_a_turn(screen_gateway, surfaces):
+    gateway, _, browser = screen_gateway
+    cards, closed, turns, continuation = surfaces
     async with host_screen_run_scope(gateway, "desktop:chat", "run") as run:
         assert (await gateway.send_browser_tool_request("open", "get_page_text", {}))["success"]
-        result = json.loads(await asyncio.wait_for(
-            computer_handoff("Solve the CAPTCHA"), 5))
+        await tool(gateway, continuation).execute("handoff", task="Sign in")
         run.succeeded = True
-    assert result["outcome"] == "not_done" and len(seen) == 1
+    browser.runtime.authority.stop("generation")
+    await _until(lambda: closed)
+    assert closed == [(cards[0].id, "answered")] and turns == []
 
 
-async def test_outside_desktop_nothing_waits(screen_gateway, requests):
+async def test_a_new_handoff_in_the_conversation_replaces_the_one_before(screen_gateway, surfaces):
+    gateway, _, browser = screen_gateway
+    cards, closed, turns, continuation = surfaces
+    authority = browser.runtime.authority
+    for task in ("Sign in", "Enter the code"):
+        async with host_screen_run_scope(gateway, "desktop:chat", f"run-{task}") as run:
+            assert (await gateway.send_browser_tool_request("open", "get_page_text", {}))["success"]
+            await tool(gateway, continuation).execute("handoff", task=task)
+            run.succeeded = True
+    await _until(lambda: closed)
+    assert closed == [(cards[0].id, "cancelled")]
+    assert [p.question for p in get_clarify_manager().list_pending()] == ["Enter the code"]
+    human = authority.acquire("human", "generation", authority.snapshot()["epoch"])
+    authority.release("human", "generation", human["epoch"])
+    await _until(lambda: turns)
+    assert len(turns) == 1 and "Enter the code" in turns[0][3]
+
+
+async def test_outside_desktop_nothing_is_handed_over(screen_gateway, surfaces):
     gateway, _, _ = screen_gateway
-    _, seen = requests
+    cards, _, turns, continuation = surfaces
     async with host_screen_run_scope(gateway, "telegram:42", "run") as run:
         assert (await gateway.send_browser_tool_request("open", "get_page_text", {}))["success"]
-        result = json.loads(await computer_handoff("Sign in"))
+        result = json.loads(await tool(gateway, continuation, "telegram", "42").execute("handoff", task="Sign in"))
         run.succeeded = True
     assert result["outcome"] == "unavailable" and "Flowly Desktop" in result["note"]
-    assert seen == []
+    assert cards == [] and turns == []
 
 
-async def test_without_a_screen_there_is_no_card(requests):
-    _, seen = requests
-    result = json.loads(await computer_handoff("Sign in"))
-    assert result["outcome"] == "unavailable" and seen == []
+async def test_without_a_screen_there_is_no_card(surfaces):
+    cards, _, _, continuation = surfaces
+    result = json.loads(await BrowserTabTool(None, screen_continuation=continuation).execute("handoff", task="Sign in"))
+    assert result["outcome"] == "unavailable" and cards == []
 
 
 def test_the_handoff_costs_the_browser_tool_one_action_and_one_argument():
-    from flowly.agent.tools.browser_tab import BrowserTabTool
-
     schema = BrowserTabTool(None).parameters
     assert "handoff" in schema["properties"]["action"]["enum"]
     assert len(schema["properties"]["task"]["description"]) < 100
+
+
+async def test_the_continuation_is_the_conversations_own_hidden_turn(tmp_path, monkeypatch):
+    """What the agent loop starts once the screen is handed back: a system
+    notice of the screen runs as the conversation's own turn, the notice
+    itself stays out of the transcript, and the agent's reply is the next
+    assistant message."""
+    from typing import Any
+
+    import flowly.profile as profiles
+    from flowly.agent.loop import AgentLoop
+    from flowly.agent.tools.computer_handoff import CONTINUE_NOTICE
+    from flowly.bus.queue import MessageBus
+    from flowly.config.schema import Config
+    from flowly.providers.base import LLMProvider, LLMResponse
+    from flowly.session.manager import SessionManager
+
+    default = tmp_path / "flowly"
+    monkeypatch.setattr(profiles, "_DEFAULT_HOME", default)
+    monkeypatch.setattr(profiles, "_PROFILES_ROOT", default / "profiles")
+    home = profiles.create_profile("lovelace")
+    monkeypatch.setenv("FLOWLY_HOME", str(home))
+    seen: list = []
+
+    class Reply(LLMProvider):
+        def __init__(self) -> None:
+            super().__init__(api_key="test")
+
+        def get_default_model(self) -> str:
+            return "test/model"
+
+        async def chat(self, *args: Any, **kwargs: Any) -> LLMResponse:
+            seen.append(kwargs["messages"])
+            return LLMResponse(content="Signed in. Continuing with the order.")
+
+    loop = AgentLoop(bus=MessageBus(), provider=Reply(), workspace=home / "workspace", main_config=Config(),
+                     max_iterations=2, soft_warn_at_iteration=0)
+    try:
+        submitted: list = []
+
+        async def watching(session_key, notice):
+            submitted.append((session_key, notice))
+            return False  # nobody watching: the bus carries it
+
+        loop.register_report_turn_submitter("direct", watching)
+        published: list = []
+        monkeypatch.setattr(loop.bus, "publish_inbound", lambda msg: published.append(msg) or asyncio.sleep(0))
+        await loop._continue_screen_task("desktop:chat", "desktop", "chat", CONTINUE_NOTICE.format(task="Sign in"))
+        assert submitted[0][1]["sender_id"] == "screen"
+        assert published and published[0].sender_id == "screen" and published[0].session_key == "desktop:chat"
+        out = await loop._process_message(published[0])
+    finally:
+        loop.stop()
+    assert out is not None and out.content == "Signed in. Continuing with the order."
+    assert "[Screen] The person did this on your screen" in str(seen[0])
+    shown = [m for m in SessionManager(home / "workspace").get_full_messages("desktop:chat")
+             if m.get("role") in ("user", "assistant") and not m.get("tool_calls")]
+    assert [m["role"] for m in shown] == ["assistant"]
