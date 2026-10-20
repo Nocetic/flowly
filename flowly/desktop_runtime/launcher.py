@@ -25,6 +25,7 @@ from typing import Callable
 
 from filelock import FileLock
 
+from flowly.desktop_runtime.authority import SCHEMA as CONTROL_SCHEMA
 from flowly.desktop_runtime.authority import ScreenAuthority, ScreenError
 from flowly.desktop_runtime.resources import resource_report
 
@@ -264,7 +265,37 @@ class ScreenRuntime:
                 return {**state, "phase": "failed", "error": "RUNTIME_RECOVERY_REQUIRED"}
             if state["phase"] == "running" and not all(is_alive(child) for child in state["children"]):
                 return {**state, "phase": "failed", "error": "RUNTIME_FAILED"}
+            if self._outdated(state):
+                return {**state, "phase": "failed", "error": "SCREEN_RESTART_REQUIRED"}
         return state
+
+    @staticmethod
+    def _outdated(state: dict) -> bool:
+        """A live screen whose own services speak another control schema.
+
+        Its input and observer services read and write the control record
+        with the code the screen was started with. A Core update restarts the
+        gateway, not the screen: a screen started before 2026-10-20 could not
+        read the record the updated gateway wrote, and every takeover and view
+        failed as "connection unavailable". Such a screen is not shared; it is
+        restarted (stop, then start), by the agent when nobody holds it, by an
+        explicit recovery otherwise. Its supervisor records the schema it
+        speaks when it starts; one that recorded none predates the record.
+        """
+        return (state["phase"] == "running" and is_alive(state.get("supervisor"))
+                and state.get("controlProtocol") != CONTROL_SCHEMA)
+
+    def _end_outdated(self, state: dict) -> None:
+        """Kill an outdated screen's supervisor; the dead-screen path does the rest.
+
+        A graceful stop would run its old code against the current record.
+        """
+        signal_process(state["supervisor"], signal.SIGKILL)
+        deadline = time.monotonic() + 5
+        while is_alive(state["supervisor"]):
+            if time.monotonic() > deadline:
+                raise ScreenError("RUNTIME_RECOVERY_REQUIRED")
+            time.sleep(0.05)
 
     def start(self, *, expected_generation: str | None | object = _UNPINNED,
               identity_guard: Callable[[], None] | None = None) -> dict:
@@ -304,6 +335,15 @@ class ScreenRuntime:
                 return existing
             if existing and existing["phase"] == "starting" and is_alive(existing.get("supervisor")):
                 return self._await_start(existing["generation"])
+            if existing and self._outdated(existing):
+                # Nobody holds it (no person, no live task): restart it now
+                # instead of refusing the task that needs a browser.
+                control = self.authority.snapshot()
+                if control["control"] != "agent" or control["runId"] is not None:
+                    raise ScreenError("RUNTIME_RECOVERY_REQUIRED")
+                self._end_outdated(existing)
+                self._finish_dead(existing, existing["generation"], self.authority.snapshot())
+                existing = self.read_manifest()
             if existing and (is_alive(existing.get("supervisor"))
                              or any(is_alive(child) for child in existing["children"])
                              or existing["phase"] in {"starting", "running"}):
@@ -405,6 +445,31 @@ class ScreenRuntime:
         terminate_profile_account_processes(layout.account_name)
         return True
 
+    def _finish_dead(self, state: dict, generation: str, control: dict) -> None:
+        """End a generation whose supervisor is gone (crashed, or killed as outdated)."""
+        if state.get("resourceScope") is True:
+            from flowly.desktop_runtime.resource_scope import stop_scope
+
+            stop_scope(self.directory, generation)
+        if any(is_alive(child) for child in state["children"]):
+            # A crashed supervisor left applications behind. A
+            # dedicated-account layout identifies every one of them;
+            # otherwise only the recorded, identity-checked children.
+            if not self._reap_account_processes():
+                self._terminate_recorded(state["children"])
+            if any(is_alive(child) for child in state["children"]):
+                raise ScreenError("RUNTIME_RECOVERY_REQUIRED")
+        if control["running"] and control["generation"] == generation:
+            # Nothing of this generation runs; its human/run claims
+            # guard nothing and would otherwise block every restart.
+            self.authority.stop_dead(generation)
+        if state["phase"] != "stopped":
+            # The supervisor died without recording its stop. Nothing
+            # of this generation runs now, so finish it; otherwise the
+            # stale "running" record would refuse every later start.
+            write_state(self.manifest, {**state, "phase": "stopped", "supervisor": None,
+                                        "children": [], "error": None})
+
     def stop(self, generation: str, *, identity_guard: Callable[[], None] | None = None,
              idle_revision: int | None = None) -> None:
         self.assert_current_directory()
@@ -416,32 +481,17 @@ class ScreenRuntime:
             if state is None or state["generation"] != generation:
                 raise ScreenError("STALE_GENERATION")
             control = self.authority.snapshot()
+            if self._outdated(state):
+                if idle_revision is not None and (control["control"] != "agent" or control["runId"] is not None):
+                    raise ScreenError("SCREEN_BUSY")
+                self._end_outdated(state)
+                self._finish_dead(state, generation, control)
+                return
             if not is_alive(state.get("supervisor")):
                 if idle_revision is not None:
                     # Recovery ends human claims; only an explicit stop may.
                     raise ScreenError("RUNTIME_RECOVERY_REQUIRED")
-                if state.get("resourceScope") is True:
-                    from flowly.desktop_runtime.resource_scope import stop_scope
-
-                    stop_scope(self.directory, generation)
-                if any(is_alive(child) for child in state["children"]):
-                    # A crashed supervisor left applications behind. A
-                    # dedicated-account layout identifies every one of them;
-                    # otherwise only the recorded, identity-checked children.
-                    if not self._reap_account_processes():
-                        self._terminate_recorded(state["children"])
-                    if any(is_alive(child) for child in state["children"]):
-                        raise ScreenError("RUNTIME_RECOVERY_REQUIRED")
-                if control["running"] and control["generation"] == generation:
-                    # Nothing of this generation runs; its human/run claims
-                    # guard nothing and would otherwise block every restart.
-                    self.authority.stop_dead(generation)
-                if state["phase"] != "stopped":
-                    # The supervisor died without recording its stop. Nothing
-                    # of this generation runs now, so finish it; otherwise the
-                    # stale "running" record would refuse every later start.
-                    write_state(self.manifest, {**state, "phase": "stopped", "supervisor": None,
-                                                "children": [], "error": None})
+                self._finish_dead(state, generation, control)
                 return
             if control["running"] or idle_revision is not None:
                 self.authority.stop(generation, idle_revision=idle_revision)

@@ -39,6 +39,7 @@ from flowly.desktop_runtime.launcher import (
     process_identity,
     write_state,
 )
+from flowly.desktop_runtime.authority import SCHEMA as CONTROL_SCHEMA
 from flowly.desktop_runtime.observers import ObserverRegistry
 from flowly.desktop_runtime.tickets import StreamTickets
 from flowly.desktop_runtime.viewers import ViewerCredentials
@@ -134,6 +135,8 @@ def run(directory: Path, generation: str) -> None:
         if not state or state["generation"] != generation or state["phase"] != "starting":
             raise ScreenError("RUNTIME_STATE_INVALID")
         state["supervisor"] = process_identity(os.getpid())
+        # The control schema this screen's own services speak (launcher._outdated).
+        state["controlProtocol"] = CONTROL_SCHEMA
         write_state(runtime.manifest, state)
         processes: list[subprocess.Popen] = []
         input_service = None

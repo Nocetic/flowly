@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from flowly.desktop_runtime import launcher
+from flowly.desktop_runtime.authority import SCHEMA as CONTROL_SCHEMA
 from flowly.desktop_runtime.authority import ScreenError
 from flowly.desktop_runtime.launcher import ScreenRuntime, private_directory, write_state
 
@@ -20,8 +21,9 @@ def runtime(tmp_path, monkeypatch):
 
 
 def manifest(runtime, **updates):
+    # A screen started by this code: its supervisor records the control schema it speaks.
     value = dict(schema=1, generation="generation-1", phase="running", supervisor={"pid": 123},
-                 children=[{"pid": 124}], error=None)
+                 children=[{"pid": 124}], error=None, controlProtocol=CONTROL_SCHEMA)
     value.update(updates)
     write_state(runtime.manifest, value)
     return value
@@ -442,3 +444,85 @@ def test_a_screen_is_not_offered_over_an_unfinished_installation(monkeypatch, an
     assert ScreenRuntime.capabilities() == {"supported": False, "reason": reason, "missing": []}
     monkeypatch.setattr(install_jobs, "environment_installation_uncertain", lambda: False)
     assert ScreenRuntime.capabilities()["supported"] is True
+
+
+
+class _Processes:
+    """Which recorded processes live; a SIGKILL ends the one it names."""
+
+    def __init__(self, monkeypatch, *pids):
+        import signal
+
+        self.alive = set(pids)
+        self.signals: list = []
+        monkeypatch.setattr(launcher, "is_alive", lambda value: bool(value) and value.get("pid") in self.alive)
+
+        def signal_process(identity, signum):
+            self.signals.append((identity["pid"], signum))
+            if signum == signal.SIGKILL:
+                self.alive.discard(identity["pid"])
+
+        monkeypatch.setattr(launcher, "signal_process", signal_process)
+
+
+def outdated(runtime):
+    """A screen started before its supervisor recorded the control schema
+    (the test VPS, 2026-10-20): its own services cannot read today's record."""
+    value = manifest(runtime)
+    value.pop("controlProtocol")
+    write_state(runtime.manifest, value)
+    runtime.authority.start("generation-1")
+    return value
+
+
+def test_a_screen_speaking_another_control_schema_is_reported_for_restart(runtime, monkeypatch):
+    _Processes(monkeypatch, 123, 124)
+    outdated(runtime)
+    status = runtime.status()
+    assert (status["phase"], status["error"]) == ("failed", "SCREEN_RESTART_REQUIRED")
+    write_state(runtime.manifest, {**json.loads(runtime.manifest.read_text()), "controlProtocol": CONTROL_SCHEMA - 1})
+    assert runtime.status()["error"] == "SCREEN_RESTART_REQUIRED"
+    write_state(runtime.manifest, {**json.loads(runtime.manifest.read_text()), "controlProtocol": CONTROL_SCHEMA})
+    assert runtime.status()["phase"] == "running"
+
+
+def test_the_agent_restarts_an_outdated_screen_nobody_holds(runtime, monkeypatch):
+    import signal
+
+    processes = _Processes(monkeypatch, 123, 124)
+    outdated(runtime)
+    monkeypatch.setattr(runtime, "_reap_account_processes", lambda: processes.alive.discard(124) or True)
+    monkeypatch.setattr(launcher, "resource_report", lambda path: {"ready": True})
+    monkeypatch.setattr(runtime, "_spawn", lambda: {"generation": "new"})
+    assert runtime.start() == {"generation": "new"}
+    assert processes.signals == [(123, signal.SIGKILL)]  # never a graceful stop in old code
+    control = runtime.authority.snapshot()
+    assert (control["running"], control["control"], control["runId"]) == (False, "agent", None)
+
+
+def test_an_outdated_screen_the_person_holds_waits_for_an_explicit_recovery(runtime, monkeypatch):
+    processes = _Processes(monkeypatch, 123, 124)
+    outdated(runtime)
+    monkeypatch.setattr(runtime, "_reap_account_processes", lambda: processes.alive.discard(124) or True)
+    monkeypatch.setattr(runtime, "_spawn", lambda: pytest.fail("the person holds it"))
+    runtime.authority.acquire("viewer", "generation-1", runtime.authority.snapshot()["epoch"])
+    with pytest.raises(ScreenError, match="RUNTIME_RECOVERY_REQUIRED"):
+        runtime.start()
+    assert processes.signals == []
+    # An idle stop never ends what a person holds.
+    with pytest.raises(ScreenError, match="SCREEN_BUSY"):
+        runtime.stop("generation-1", idle_revision=runtime.authority.snapshot()["revision"])
+    assert processes.signals == []
+    # "Recover screen" (an explicit stop) ends it, the person's claim with it.
+    runtime.stop("generation-1")
+    control = runtime.authority.snapshot()
+    assert (control["running"], control["control"]) == (False, "agent")
+    assert json.loads(runtime.manifest.read_text())["phase"] == "stopped" and 123 not in processes.alive
+
+
+def test_an_unused_outdated_screen_still_idle_stops(runtime, monkeypatch):
+    processes = _Processes(monkeypatch, 123, 124)
+    outdated(runtime)
+    monkeypatch.setattr(runtime, "_reap_account_processes", lambda: processes.alive.discard(124) or True)
+    runtime.stop("generation-1", idle_revision=runtime.authority.snapshot()["revision"])
+    assert json.loads(runtime.manifest.read_text())["phase"] == "stopped"

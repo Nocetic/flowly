@@ -1,3 +1,4 @@
+import os
 import asyncio
 
 import pytest
@@ -161,7 +162,9 @@ async def test_a_dead_processs_admission_is_void(execution, monkeypatch):
     monkeypatch.setattr(module, "_alive", lambda owner: owner != {"pid": 4242, "start": "1", "boot": "b"})
     replacement = ScreenExecution(ScreenAuthority(execution.authority.directory))
     state = replacement.authority.snapshot()
-    assert not state["actionInFlight"] and state["runId"] == "run"
+    # The run went with the process that held it (2026-10-20: a run kept for
+    # 18 hours by a gateway that was gone).
+    assert not state["actionInFlight"] and state["runId"] is None
     await replacement.finish_run("run", "generation")
     assert (await replacement.acquire("viewer", "generation", 1, wait_seconds=0))["control"] == "human"
 
@@ -194,6 +197,7 @@ def test_an_action_recorded_before_owners_is_void_where_processes_can_be_told(tm
     authority.start("generation")
     path = tmp_path / "control.json"
     record = json.loads(path.read_text())
+    record.pop("runOwner")
     record.update(schema=2, run="old-run", control="human-pending", viewer="old-view",
                   action={"id": "lost", "nonce": "n", "epoch": record["epoch"]})
     path.write_text(json.dumps(record))
@@ -202,9 +206,52 @@ def test_an_action_recorded_before_owners_is_void_where_processes_can_be_told(tm
     monkeypatch.setattr("flowly.desktop_runtime.launcher.process_identity",
                         lambda pid, allow_init=False: {"pid": pid, "start": "1", "boot": "b"})
     state = ScreenAuthority(tmp_path).snapshot()
-    assert not state["actionInFlight"]
+    assert not state["actionInFlight"] and state["runId"] is None
     assert ScreenAuthority(tmp_path).confirm_acquire("old-view", "generation", state["epoch"])["control"] == "human"
     # A host with no process identities keeps it, as before.
     path.write_text(json.dumps(record))
     monkeypatch.setattr("flowly.desktop_runtime.launcher.process_identity", lambda pid, allow_init=False: None)
     assert ScreenAuthority(tmp_path).snapshot()["actionInFlight"]
+
+
+def test_a_run_whose_process_is_gone_no_longer_holds_the_screen(tmp_path, monkeypatch):
+    """The test VPS, 2026-10-20: a run's cleanup failed at 01:53 and its claim
+    outlived its gateway for 18 hours. The screen could not idle-stop, an
+    explicit stop answered SCREEN_BUSY, a takeover stayed pending and every
+    new task was refused. A run, like an action, belongs to a process."""
+    import json
+
+    alive = {"pid": 7, "start": "1", "boot": "b"}
+    monkeypatch.setattr("flowly.desktop_runtime.launcher.process_identity",
+                        lambda pid, allow_init=False: dict(alive) if pid in (7, os.getpid()) else None)
+    monkeypatch.setattr("flowly.desktop_runtime.authority.os.getpid", lambda: 7)
+    authority = ScreenAuthority(tmp_path)
+    authority.start("generation")
+    authority.claim_run("live-run", "generation")
+    # A live gateway's run holds the screen, as it must.
+    assert authority.snapshot()["runId"] == "live-run"
+    with pytest.raises(ScreenError, match="SCREEN_BUSY"):
+        authority.stop("generation")
+    # The gateway dies without finishing it.
+    alive["start"] = "2"  # pid 7 now names another process
+    state = authority.snapshot()
+    assert state["runId"] is None
+    authority.stop("generation")
+
+    # The record exactly as the VPS kept it: schema 3, no run owner, a takeover
+    # left pending by a window that is gone.
+    authority.start("generation-2")
+    path = tmp_path / "control.json"
+    record = json.loads(path.read_text())
+    record.pop("runOwner")
+    record.update(schema=3, run="1792461066801-6wekp1at", control="human-pending", viewer="old-window")
+    path.write_text(json.dumps(record))
+    state = ScreenAuthority(tmp_path).snapshot()
+    assert state["runId"] is None and state["control"] == "human-pending"
+    # Now a window can take it back, and the screen can stop again.
+    taken = ScreenAuthority(tmp_path).acquire("this-window", "generation-2", state["epoch"], reclaim=True)
+    taken = ScreenAuthority(tmp_path).confirm_acquire("this-window", "generation-2", taken["epoch"])
+    assert taken["control"] == "human"
+    released = ScreenAuthority(tmp_path).release("this-window", "generation-2", taken["epoch"])
+    ScreenAuthority(tmp_path).stop("generation-2")
+    assert json.loads(path.read_text())["schema"] == 4 and released["control"] == "agent"

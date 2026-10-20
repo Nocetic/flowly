@@ -74,7 +74,7 @@ class ScreenExecution:
                 raise
             except asyncio.CancelledError:
                 # Gateway shutdown: the admission records this process, and a
-                # dead process's admission is void (authority._void_dead_action).
+                # dead process's admission is void (authority._void_dead_claims).
                 raise
             except Exception:
                 # The adapter must not return/raise until its command has

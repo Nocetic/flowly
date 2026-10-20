@@ -50,9 +50,16 @@ def _identity(value: object) -> str:
     return value
 
 
+# The control record's schema. A screen's own services (input, observers) read
+# and write this record too, from the code the screen was started with; the
+# screen records the schema it speaks (``controlProtocol`` in its manifest) and
+# a screen speaking another one is restarted, never shared (launcher.py).
+SCHEMA = 4
+
+
 def _fresh() -> dict:
-    return dict(schema=3, generation=None, epoch=0, revision=0, running=False,
-                control="agent", viewer=None, run=None, action=None, input=None)
+    return dict(schema=SCHEMA, generation=None, epoch=0, revision=0, running=False,
+                control="agent", viewer=None, run=None, runOwner=None, action=None, input=None)
 
 
 def _owner() -> dict | None:
@@ -78,14 +85,29 @@ def _alive(owner: dict | None) -> bool:
     return process_identity(owner["pid"], allow_init=True) == owner
 
 
-def _void_dead_action(state: dict) -> None:
-    """An action admitted by a process that no longer exists has ended: its
-    backend connection died with the process, so nothing it queued can reach
-    the browser. Without this a gateway restart mid-command locked the screen
-    (takeover pending, every run busy) until a stop and start."""
+def _void_dead_claims(state: dict) -> None:
+    """Claims of a process that no longer exists have ended.
+
+    An action: its backend connection died with the process, so nothing it
+    queued can reach the browser. Without this a gateway restart mid-command
+    locked the screen (takeover pending, every run busy) until a stop and start.
+
+    A run: the task that reserved the browser is gone with its process, and
+    nothing else would ever finish it. Without this a run whose cleanup failed
+    (2026-10-20, 01:53 on the test VPS) kept the screen busy for 18 hours: no
+    idle stop, no explicit stop, every later task refused.
+    """
     action = state["action"]
     if action is not None and not _alive(action["owner"]):
         state["action"] = None
+    if state["run"] is not None and state["action"] is None and not _alive(state["runOwner"]):
+        state.update(run=None, runOwner=None)
+
+
+def _owner_shape(owner: object) -> bool:
+    return owner is None or (isinstance(owner, dict) and set(owner) == {"pid", "start", "boot"}
+                             and type(owner["pid"]) is int and owner["pid"] >= 1
+                             and isinstance(owner["start"], str) and isinstance(owner["boot"], str))
 
 
 def _validate(state: object) -> dict:
@@ -93,17 +115,21 @@ def _validate(state: object) -> dict:
         # Version one never admitted input connections. Upgrade only its exact
         # schema; a damaged version-two document must not lose its input fence.
         if (isinstance(state, dict) and type(state.get("schema")) is int and state["schema"] == 1
-                and set(state) == set(_fresh()) - {"input"}):
+                and set(state) == set(_fresh()) - {"input", "runOwner"}):
             state = {**state, "schema": 2, "input": None}
-        # Version two's actions had no owner: taken as alive, as before.
+        # Version two's actions had no owner (see _alive for what that means).
         if (isinstance(state, dict) and type(state.get("schema")) is int and state["schema"] == 2
-                and set(state) == set(_fresh())):
+                and set(state) == set(_fresh()) - {"runOwner"}):
             action = state["action"]
             state = {**state, "schema": 3,
                      "action": {**action, "owner": None} if isinstance(action, dict) and "owner" not in action else action}
+        # Version three's runs had no owner, the same way.
+        if (isinstance(state, dict) and type(state.get("schema")) is int and state["schema"] == 3
+                and set(state) == set(_fresh()) - {"runOwner"}):
+            state = {**state, "schema": 4, "runOwner": None}
         if not isinstance(state, dict) or set(state) != set(_fresh()):
             raise ValueError()
-        if type(state["schema"]) is not int or state["schema"] != 3:
+        if type(state["schema"]) is not int or state["schema"] != SCHEMA:
             raise ValueError()
         for key in ("epoch", "revision"):
             if type(state[key]) is not int or not 0 <= state[key] < 2**53:
@@ -119,16 +145,15 @@ def _validate(state: object) -> dict:
             raise ValueError()
         if state["running"] and state["generation"] is None:
             raise ValueError()
+        if not _owner_shape(state["runOwner"]) or (state["run"] is None and state["runOwner"] is not None):
+            raise ValueError()
         action = state["action"]
         if action is not None:
             if not isinstance(action, dict) or set(action) != {"id", "nonce", "epoch", "owner"}:
                 raise ValueError()
             _identity(action["id"])
             _identity(action["nonce"])
-            owner = action["owner"]
-            if owner is not None and (not isinstance(owner, dict) or set(owner) != {"pid", "start", "boot"}
-                                      or type(owner["pid"]) is not int or owner["pid"] < 1
-                                      or not isinstance(owner["start"], str) or not isinstance(owner["boot"], str)):
+            if not _owner_shape(action["owner"]):
                 raise ValueError()
             if type(action["epoch"]) is not int or not 0 <= action["epoch"] <= state["epoch"]:
                 raise ValueError()
@@ -237,13 +262,13 @@ class ScreenAuthority:
 
     def snapshot(self) -> dict:
         with self._transaction() as state:
-            _void_dead_action(state)
+            _void_dead_claims(state)
         return _public(state)
 
     def start(self, generation: str) -> dict:
         _identity(generation)
         with self._transaction() as state:
-            _void_dead_action(state)
+            _void_dead_claims(state)
             if state["generation"] == generation and state["running"]:
                 pass
             elif state["control"] != "agent":
@@ -260,7 +285,7 @@ class ScreenAuthority:
         """``idle_revision``: an idle stop, refused if anything changed since then."""
         with self._transaction() as state:
             self._check(state, generation)
-            _void_dead_action(state)
+            _void_dead_claims(state)
             if state["control"] != "agent":
                 raise ScreenError("HUMAN_HAS_CONTROL")
             if state["run"] is not None:
@@ -281,8 +306,8 @@ class ScreenAuthority:
         """
         with self._transaction() as state:
             self._check(state, generation)
-            state.update(running=False, control="agent", viewer=None, run=None, action=None, input=None,
-                         epoch=state["epoch"] + 1)
+            state.update(running=False, control="agent", viewer=None, run=None, runOwner=None, action=None,
+                         input=None, epoch=state["epoch"] + 1)
         return _public(state)
 
     def claim_run(self, run_id: str, generation: str) -> dict:
@@ -290,12 +315,12 @@ class ScreenAuthority:
         _identity(run_id)
         with self._transaction() as state:
             self._check(state, generation)
-            _void_dead_action(state)
+            _void_dead_claims(state)
             if state["control"] != "agent":
                 raise ScreenError("HUMAN_HAS_CONTROL")
             if state["run"] is not None or state["action"] is not None:
                 raise ScreenError("SCREEN_BUSY")
-            state["run"] = run_id
+            state.update(run=run_id, runOwner=_owner())
         return _public(state)
 
     def begin_action(self, run_id: str, action_id: str, generation: str, *,
@@ -304,13 +329,16 @@ class ScreenAuthority:
         _identity(action_id)
         with self._transaction() as state:
             self._check(state, generation, expected_epoch)
-            _void_dead_action(state)
+            _void_dead_claims(state)
             if state["control"] != "agent":
                 raise ScreenError("HUMAN_HAS_CONTROL")
             if state["run"] not in (None, run_id) or state["action"] is not None:
                 raise ScreenError("SCREEN_BUSY")
             nonce = secrets.token_urlsafe(24)
-            state.update(run=run_id, action=dict(id=action_id, nonce=nonce, epoch=state["epoch"], owner=_owner()))
+            owner = _owner()
+            if state["run"] is None:
+                state["runOwner"] = owner
+            state.update(run=run_id, action=dict(id=action_id, nonce=nonce, epoch=state["epoch"], owner=owner))
             admission = ActionAdmission(generation, state["epoch"], run_id, action_id, nonce)
         return admission
 
@@ -334,17 +362,17 @@ class ScreenAuthority:
         _identity(run_id)
         with self._transaction() as state:
             self._check(state, generation)
-            _void_dead_action(state)
+            _void_dead_claims(state)
             if state["run"] not in (None, run_id) or state["action"] is not None:
                 raise ScreenError("SCREEN_BUSY")
-            state["run"] = None
+            state.update(run=None, runOwner=None)
 
     def acquire(self, viewer: str, generation: str, epoch: int, *, reclaim: bool = False,
                 pending: bool = False) -> dict:
         _identity(viewer)
         with self._transaction() as state:
             self._check(state, generation, epoch)
-            _void_dead_action(state)
+            _void_dead_claims(state)
             if state["control"] != "agent" and state["viewer"] != viewer and not reclaim:
                 raise ScreenError("SCREEN_BUSY")
             if state["viewer"] != viewer:
@@ -358,7 +386,7 @@ class ScreenAuthority:
         _identity(viewer)
         with self._transaction() as state:
             self._check(state, generation, epoch)
-            _void_dead_action(state)
+            _void_dead_claims(state)
             if state["viewer"] != viewer:
                 raise ScreenError("VIEWER_MISMATCH")
             if state["action"] is not None:
