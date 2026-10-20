@@ -415,16 +415,27 @@ def test_two_profiles_have_separate_browser_cookies(tmp_path, login_site):
 def test_a_restarted_screen_opens_one_tab_and_keeps_its_logins(tmp_path, login_site):
     """A browser that continues where it left off (as Chrome for Testing on
     the x86 test VPS did) brought back every earlier tab plus one more blank
-    one on each start. Every start is now one tab; cookies stay."""
+    one on each start. Every start is now one tab, the browser's own New Tab
+    page (an about:blank start looked broken, 2026-10-20); cookies stay. The
+    screen's supervisor records the control schema it speaks, so the gateway
+    shares it instead of restarting it as outdated."""
     from playwright.sync_api import sync_playwright
+
+    from flowly.desktop_runtime.authority import SCHEMA
+    from flowly.desktop_runtime.browser_provider import _blank
 
     directory = tmp_path / "restart"
     preferences = directory / "browser" / "Default" / "Preferences"
     for round_ in range(3):
         with running_screen(directory) as screen, sync_playwright() as playwright:
+            manifest = json.loads((directory / "runtime.json").read_text())
+            assert manifest["controlProtocol"] == SCHEMA
+            assert ScreenRuntime(directory).status()["phase"] == "running"
             browser = playwright.chromium.connect_over_cdp(screen["endpoint"])
             context = browser.contexts[0]
-            assert [page.url for page in context.pages] == ["about:blank"], f"start {round_}"
+            # DevTools names it chrome://newtab/, Playwright chrome://new-tab-page/.
+            urls = [page.url for page in context.pages]
+            assert len(urls) == 1 and _blank(urls[0]) and urls[0] != "about:blank", f"start {round_}: {urls}"
             if round_:
                 context.pages[0].goto(login_site)
                 assert context.pages[0].evaluate("document.cookie") == "session=kept"

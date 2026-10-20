@@ -67,6 +67,15 @@ def _text(value: Any, *, maximum: int = 32768) -> str:
     return value
 
 
+# Pages a tab shows before anyone used it: the browser's start page (its New
+# Tab page) and a tab opened without an address.
+_BLANK_PAGES = frozenset({"about:blank", "chrome://newtab/", "chrome://new-tab-page/"})
+
+
+def _blank(url: Any) -> bool:
+    return url in _BLANK_PAGES
+
+
 def _url(value: Any) -> str:
     value = _text(value, maximum=8192)
     if value == "about:blank":
@@ -234,7 +243,7 @@ class HostBrowserProvider:
             mine = [key for key, value in self._owners.items() if value == owner]
             key = mine[-1] if mine else None
         if key is None:
-            start = [key for key, page in pages.items() if key not in self._owners and page.url == "about:blank"]
+            start = [key for key, page in pages.items() if key not in self._owners and _blank(page.url)]
             if start:
                 key = start[0]
                 self._owners[key] = owner
@@ -381,7 +390,7 @@ class HostBrowserProvider:
         return self.runtime.authority.snapshot()["epoch"]
 
     async def close_blank_tabs(self, run_id: str, generation: str, owner: str = "") -> None:
-        """Close the tabs ``run_id`` opened and left blank (about:blank).
+        """Close the tabs ``run_id`` opened and left blank (a New Tab or about:blank).
 
         Run when the run ends, as one more of its actions: it never touches a
         page while the person has control, the browser's last window, or a tab
@@ -396,7 +405,7 @@ class HostBrowserProvider:
             pages = self._sync_pages()
             for key in [key for key, opener in self._opened_by.items() if opener == run_id]:
                 page = pages.get(key)
-                if page is not None and page.url == "about:blank" and len(self._sync_pages()) > 1:
+                if page is not None and _blank(page.url) and len(self._sync_pages()) > 1:
                     await page.close(run_before_unload=False)
                 self._opened_by.pop(key, None)
             self._sync_pages()

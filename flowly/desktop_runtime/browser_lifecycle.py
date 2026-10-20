@@ -117,7 +117,10 @@ try:
                     "--no-first-run", "--no-default-browser-check",
                     # Bounded HTTP cache; cookies and logins are not cache.
                     "--disk-cache-size=268435456",
-                    "--window-position=20,20", "--window-size=1360,780", "about:blank",
+                    # No start URL: the browser opens its own New Tab page (fresh_start
+                    # sets that), with a search box. "about:blank" here showed every new
+                    # screen as an empty page that looked broken (2026-10-20).
+                    "--window-position=20,20", "--window-size=1360,780",
                 ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                    stderr=subprocess.DEVNULL, close_fds=True)
             except OSError:

@@ -68,13 +68,13 @@ class _Context:
 
 
 class _Browser:
-    """A started browser: one window with its start tab."""
+    """A started browser: one window with its start tab (its New Tab page)."""
 
-    def __init__(self):
+    def __init__(self, start_url="chrome://newtab/"):
         self.context = _Context(self)
         self.contexts = [self.context]
         self.front = None
-        start = _Page(self)
+        start = _Page(self, start_url)
         self.context.pages.append(start)
         self.front = start
 
@@ -199,3 +199,27 @@ async def test_cleanup_never_touches_a_page_while_the_person_has_control(screen)
     provider.runtime.authority.acquire("human", "generation-1", 1)
     await provider.close_blank_tabs("run-a", "generation-1", "desktop:chat-a")
     assert len(browsers["generation-1"].context.pages) == 2
+
+
+
+@pytest.mark.parametrize("start_url", ["chrome://newtab/", "about:blank"])
+async def test_the_first_conversation_takes_the_browsers_untouched_start_page(screen, start_url):
+    """A screen's browser starts on its own New Tab page (2026-10-20: it used to
+    start on about:blank, which looked broken). Either way the first
+    conversation works in that tab instead of opening a second one."""
+    provider, browsers = screen
+    browsers["generation-1"] = _Browser(start_url)
+    first = await call(provider, "desktop:chat-a", "navigate", url="https://x.com/")
+    assert [page.url for page in browsers["generation-1"].context.pages] == ["https://x.com/"]
+    assert first["tabId"]
+
+
+async def test_a_new_tab_page_a_run_opened_and_left_closes_when_it_ends(screen):
+    provider, browsers = screen
+    await call(provider, "desktop:chat-a", "navigate", url="https://arxiv.org/")
+    opened = await call(provider, "desktop:chat-a", "tabs_create")
+    tab = next(page for page in browsers["generation-1"].context.pages if page.url == "about:blank")
+    tab.url = "chrome://newtab/"  # the person pressed + in that window
+    await provider.close_blank_tabs("run-a", "generation-1", "desktop:chat-a")
+    assert [page.url for page in browsers["generation-1"].context.pages] == ["https://arxiv.org/"]
+    assert opened["tabId"] not in {t["tabId"] for t in (await call(provider, "desktop:chat-a", "tabs_list"))["tabs"]}
