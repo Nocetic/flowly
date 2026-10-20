@@ -54,7 +54,7 @@ def test_the_helper_refuses_a_pixel_format_it_cannot_read():
 
 def test_the_service_answers_one_picture_and_requests_get_it(tmp_path):
     png = b"\x89PNG\r\n\x1a\n" + b"x" * 5000
-    service = StillService(tmp_path, lambda: png)
+    service = StillService(tmp_path, lambda: png, allowed=lambda: True)
     try:
         assert (tmp_path / "still.sock").stat().st_mode & 0o777 == 0o600
         assert request_still(tmp_path / "still.sock") == png
@@ -66,10 +66,31 @@ def test_the_service_answers_one_picture_and_requests_get_it(tmp_path):
 
 @pytest.mark.parametrize("capture", [lambda: b"", lambda: b"not a png", lambda: 1 / 0])
 def test_a_failed_capture_is_an_error_not_bytes(tmp_path, capture):
-    service = StillService(tmp_path, capture)
+    service = StillService(tmp_path, capture, allowed=lambda: True)
     try:
         with pytest.raises(ScreenError, match="SCREEN_STILL_FAILED"):
             request_still(tmp_path / "still.sock")
+    finally:
+        service.close()
+
+
+def test_the_service_itself_gives_nothing_while_the_person_has_control(tmp_path):
+    authority = ScreenAuthority(tmp_path / "authority")
+    authority.start("generation")
+    taken = []
+
+    def capture():
+        taken.append(1)
+        return b"\x89PNG desktop"
+
+    service = StillService(tmp_path, capture, allowed=lambda: authority.snapshot()["control"] == "agent")
+    try:
+        assert request_still(tmp_path / "still.sock") == b"\x89PNG desktop"
+        authority.acquire("human", "generation", 1)
+        # Straight to the socket, as a shell could: refused all the same.
+        with pytest.raises(ScreenError, match="SCREEN_STILL_FAILED"):
+            request_still(tmp_path / "still.sock")
+        assert taken == [1]
     finally:
         service.close()
 

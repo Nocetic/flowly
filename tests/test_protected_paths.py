@@ -271,3 +271,52 @@ def test_filesystem_tool_allows_workspace(fake_home: Path):
         content="hello",
     ))
     assert "Successfully wrote" in result
+
+
+# --- agent screens -----------------------------------------------------------
+# A shell must never read or drive an agent screen: its display key, its
+# browser profile (cookies, logins), or the screen service sockets. Observed on
+# the test VPS (2026-10-20): an agent captured and keyed its screen with
+# ``XAUTHORITY=/run/flowly-screen/<id>/Xauthority DISPLAY=:1 ffmpeg/xdotool``.
+
+@pytest.mark.parametrize("path", [
+    "/run/flowly-screen/506920f551f47d2ec4efe27ac15ccc99/Xauthority",
+    "/var/lib/flowly-screen-runtime/screens/7f01947b/browser/Default/Cookies",
+])
+def test_screen_state_is_protected(path):
+    from flowly.protected_paths import is_protected_path
+
+    assert is_protected_path(path)
+
+
+def test_every_agents_screen_directory_is_protected(tmp_path, monkeypatch):
+    from flowly.protected_paths import is_protected_path
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for screen in (tmp_path / ".flowly" / "desktop", tmp_path / ".flowly" / "profiles" / "rhody" / "desktop"):
+        (screen / "browser" / "Default").mkdir(parents=True)
+        assert is_protected_path(screen / "browser" / "Default" / "Cookies")
+    assert not is_protected_path(tmp_path / ".flowly" / "profiles" / "rhody" / "workspace" / "notes.md")
+
+
+@pytest.mark.parametrize("command", [
+    "XAUTHORITY=/run/flowly-screen/506920f551f47d2ec4efe27ac15ccc99/Xauthority DISPLAY=:1 ffmpeg -f x11grab -i :1 out.png",
+    "export XAUTHORITY=/run/flowly-screen/5069/Xauthority DISPLAY=:1; xdotool key ctrl+1",
+    "cat --file=/run/flowly-screen/5069/Xauthority",
+    "ls /run/flowly-scr*",
+    "sqlite3 /var/lib/flowly-screen-runtime/screens/*/browser/Default/Cookies 'select * from cookies'",
+    "cp -r '/var/lib/flowly-screen-runtime' /tmp/x",
+])
+def test_shell_ways_to_reach_a_screen_are_caught(command):
+    from flowly.protected_paths import find_protected_paths_in_command
+
+    assert find_protected_paths_in_command(command)
+
+
+@pytest.mark.parametrize("command", [
+    "ls /*", "ls -la /tmp", "rm -rf /tmp/build/*", "cat /var/log/syslog", "python3 -m http.server --directory=/srv/site",
+])
+def test_ordinary_commands_are_not_flagged(command):
+    from flowly.protected_paths import find_protected_paths_in_command
+
+    assert find_protected_paths_in_command(command) == []

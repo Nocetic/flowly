@@ -109,11 +109,18 @@ def _receive(connection: socket.socket, size: int) -> bytes:
 
 
 class StillService:
-    """Supervisor side: one picture per connection, one at a time."""
+    """Supervisor side: one picture per connection, one at a time.
 
-    def __init__(self, directory: Path, capture: Callable[[], bytes]):
+    ``allowed`` is asked again here, whoever connected: the gateway admits a
+    request only for a run that holds the screen, but the socket must not be
+    a way around that (a root shell can reach it), so nothing is taken while
+    the person has control.
+    """
+
+    def __init__(self, directory: Path, capture: Callable[[], bytes], allowed: Callable[[], bool]):
         self.path = directory / "still.sock"
         self._capture = capture
+        self._allowed = allowed
         self._lock = threading.Lock()
         self._stopping = threading.Event()
         self._listener = socket.socket(socket.AF_UNIX)
@@ -143,7 +150,7 @@ class StillService:
                         continue
                     with self._lock:
                         try:
-                            picture = self._capture()
+                            picture = self._capture() if self._allowed() else b""
                         except Exception:
                             picture = b""
                     if not picture.startswith(b"\x89PNG") or len(picture) > MAX_STILL_BYTES:

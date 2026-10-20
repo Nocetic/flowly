@@ -417,7 +417,8 @@ def run(directory: Path, generation: str) -> None:
             # The desktop picture is taken inside the session by its own
             # account; the gateway asks only for a run that holds the screen.
             stills = StillService(sockets, lambda: application_output(
-                ["python3", "-I", "-c", STILL_SOURCE], env, timeout=10, limit=MAX_STILL_BYTES))
+                ["python3", "-I", "-c", STILL_SOURCE], env, timeout=10, limit=MAX_STILL_BYTES),
+                allowed=lambda: runtime.authority.snapshot()["control"] == "agent")
             state.update(phase="running", display=env["DISPLAY"], socket=str(rfb),
                          cdpPort=port, inputServiceVersion=3, observerServiceVersion=3, captureServiceVersion=1,
                          stillServiceVersion=1, error=None)
