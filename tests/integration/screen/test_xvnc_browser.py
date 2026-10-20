@@ -412,6 +412,32 @@ def test_two_profiles_have_separate_browser_cookies(tmp_path, login_site):
         assert left["profile"] != right["profile"]
 
 
+def test_a_restarted_screen_opens_one_tab_and_keeps_its_logins(tmp_path, login_site):
+    """A browser that continues where it left off (as Chrome for Testing on
+    the x86 test VPS did) brought back every earlier tab plus one more blank
+    one on each start. Every start is now one tab; cookies stay."""
+    from playwright.sync_api import sync_playwright
+
+    directory = tmp_path / "restart"
+    preferences = directory / "browser" / "Default" / "Preferences"
+    for round_ in range(3):
+        with running_screen(directory) as screen, sync_playwright() as playwright:
+            browser = playwright.chromium.connect_over_cdp(screen["endpoint"])
+            context = browser.contexts[0]
+            assert [page.url for page in context.pages] == ["about:blank"], f"start {round_}"
+            if round_:
+                context.pages[0].goto(login_site)
+                assert context.pages[0].evaluate("document.cookie") == "session=kept"
+            else:
+                context.pages[0].goto(login_site)
+                context.pages[0].evaluate("document.cookie='session=kept; max-age=3600; path=/'")
+            context.new_page().goto(f"{login_site}/?second={round_}")
+        # As the VPS's browser was set: continue where it left off.
+        data = json.loads(preferences.read_text())
+        data.setdefault("session", {})["restore_on_startup"] = 1
+        preferences.write_text(json.dumps(data))
+
+
 def test_runtime_survives_starting_client_exit_and_concurrent_adoption(tmp_path, login_site):
     from playwright.sync_api import sync_playwright
 

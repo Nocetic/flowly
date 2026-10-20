@@ -6,6 +6,7 @@ it cannot pass commands, URLs, profiles, or environment values from a client.
 """
 
 BROWSER_MANAGER_SOURCE = r'''
+import json
 import os
 import signal
 import socket
@@ -45,6 +46,45 @@ def stop(*_):
     global stopping
     stopping = True
 
+
+def fresh_start():
+    """Start with one tab, never the last session's. Some builds (Chrome for
+    Testing on a server) continue where they left off: every start brought
+    back yesterday's tabs plus one more blank one. Cookies and logins live in
+    other files and stay."""
+    default = Path(profile) / "Default"
+    if default.is_symlink() or not default.is_dir():
+        return
+    preferences = default / "Preferences"
+    try:
+        data = json.loads(preferences.read_text()) if preferences.is_file() and not preferences.is_symlink() else None
+    except (OSError, ValueError):
+        data = None
+    if isinstance(data, dict):
+        session = data.get("session") if isinstance(data.get("session"), dict) else {}
+        session["restore_on_startup"] = 5  # open the new-tab page
+        session.pop("startup_urls", None)
+        data["session"] = session
+        recorded = data.get("profile") if isinstance(data.get("profile"), dict) else {}
+        recorded.update(exit_type="Normal", exited_cleanly=True)  # no "restore pages?" either
+        data["profile"] = recorded
+        staged = default / "Preferences.flowly-start"
+        try:
+            staged.write_text(json.dumps(data))
+            os.replace(staged, preferences)
+        except OSError:
+            staged.unlink(missing_ok=True)
+    stores = [default / "Sessions", *(default / name for name in ("Current Session", "Current Tabs", "Last Session", "Last Tabs"))]
+    for store in stores:
+        if store.is_symlink():
+            continue
+        if store.is_dir():
+            for entry in store.iterdir():
+                if entry.is_file() and not entry.is_symlink():
+                    entry.unlink(missing_ok=True)
+        elif store.is_file():
+            store.unlink(missing_ok=True)
+
 signal.signal(signal.SIGTERM, stop)
 signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGCHLD, signal.SIG_DFL)
@@ -57,6 +97,10 @@ try:
             pending = False
             next_launch = time.monotonic() + 1
             port.unlink(missing_ok=True)
+            try:
+                fresh_start()
+            except OSError:
+                pass  # never keep the browser from starting
             try:
                 # Inherit the manager's process group. The supervisor retains
                 # that group's leader until final cleanup, even after a browser
