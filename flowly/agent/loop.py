@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import copy
 import json
+import math
 import os
 import re
 import sys
@@ -187,6 +188,28 @@ _AGENDA_ITEM = "agenda_item"
 _GOAL_BASE_USER_EPOCH = "_goal_base_user_epoch"
 _GOAL_KICKOFF = "_goal_kickoff"
 _GOAL_USER_EPOCH = "_goal_user_epoch"
+
+
+def _dreamer_activity_path(loop: Any) -> Path | None:
+    state_dir = getattr(loop, "_state_dir", None)
+    return None if state_dir is None else Path(state_dir) / "dreamer_activity.json"
+
+
+def _save_dreamer_activity(loop: Any) -> None:
+    """Keep the dreamer's idle bookkeeping on disk (AgentLoop._load_dreamer_activity)."""
+    path = _dreamer_activity_path(loop)
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps({
+            "lastUserAt": getattr(loop, "_dreamer_last_user_ts", 0.0),
+            "idleFiredFor": getattr(loop, "_dreamer_idle_fired_for", 0.0),
+        }), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.warning(f"[dreamer] could not save idle state: {exc}")
 
 
 def _is_user_activity_channel(channel: str) -> bool:
@@ -1355,7 +1378,16 @@ class AgentLoop:
         # Kept separate from _last_activity_ts so a background heartbeat at the
         # same cadence as idle_minutes can't keep resetting the idle clock. 0.0
         # until the first user message, so it never fires on a quiet bot.
+        # Kept on disk (``dreamer_activity.json``): a cloud machine sleeps or is
+        # recreated right when the idle pass would fire, and the pass it owes
+        # must still run after it wakes.
         self._dreamer_last_user_ts = 0.0
+        # The last-user-message time the idle (or before-sleep) pass last ran
+        # for: a pass is owed while the user wrote after it.
+        self._dreamer_idle_fired_for = 0.0
+        # Turns being processed right now, on any channel (power.status "turn").
+        self._turns_in_progress = 0
+        self._load_dreamer_activity()
         self._maybe_enable_memory_governance()
 
         self._skill_gov = None
@@ -1826,21 +1858,105 @@ class AgentLoop:
 
     async def _dreamer_idle_timer(self) -> None:
         """Fire one dreaming pass after idle_minutes of inactivity — once per
-        active→idle transition, not repeatedly while idle."""
+        active→idle transition, not repeatedly while idle. The transition is
+        remembered on disk, so activity from before a restart still gets its
+        pass."""
         idle_s = max(60, self._dreamer_idle_minutes * 60)
         check = min(idle_s, 120)
-        fired_for = 0.0
         while self._running:
             try:
                 await asyncio.sleep(check)
             except asyncio.CancelledError:
                 return
             la = getattr(self, "_dreamer_last_user_ts", 0.0)
-            if la <= fired_for:
+            if la <= getattr(self, "_dreamer_idle_fired_for", 0.0):
                 continue  # no new user activity since the last idle fire
             if (time.time() - la) >= idle_s:
-                fired_for = la
+                self._dreamer_idle_fired_for = la
+                _save_dreamer_activity(self)
                 await self._maybe_run_dreamer("idle")
+
+    # ── Power: what a sleeping cloud machine must know (flowly/power) ──
+
+    def _load_dreamer_activity(self) -> None:
+        """Restore the dreamer's idle bookkeeping; a missing or bad file is a fresh start."""
+        path = _dreamer_activity_path(self)
+        if path is None:
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            last_user = float(data.get("lastUserAt") or 0.0)
+            fired_for = float(data.get("idleFiredFor") or 0.0)
+        except (OSError, ValueError, TypeError, AttributeError):
+            return
+        if math.isfinite(last_user) and math.isfinite(fired_for):
+            self._dreamer_last_user_ts = max(0.0, last_user)
+            self._dreamer_idle_fired_for = max(0.0, fired_for)
+
+    def _note_user_activity(self, at: float) -> None:
+        self._dreamer_last_user_ts = at
+        _save_dreamer_activity(self)
+
+    def _mark_idle_dream_for(self, last_user_ts: float) -> None:
+        self._dreamer_idle_fired_for = last_user_ts
+        _save_dreamer_activity(self)
+
+    def _dream_owed(self) -> bool:
+        """An idle pass the user's latest messages have not had yet."""
+        return (
+            self._dreamer is not None
+            and self._dreamer_idle_minutes > 0
+            and self._dreamer_last_user_ts > self._dreamer_idle_fired_for
+        )
+
+    def _consolidation_owed(self) -> bool:
+        if self._memory_gov is None or self._consolidate_tool is None or not self._auto_consolidate:
+            return False
+        try:
+            return bool(self._memory_gov.is_dirty())
+        except Exception as exc:
+            logger.debug(f"[memory-gov] dirty check failed: {exc}")
+            return False
+
+    def power_snapshot(self) -> dict[str, Any]:
+        """What the agent is doing and owes, for ``power.status``.
+
+        ``nextDreamAt`` is the nightly pass, reported only while a pass is
+        owed: a machine that dreamed before it slept has nothing new to learn
+        and need not be woken for it.
+        """
+        dream_lock = getattr(self, "_dreamer_lock", None)
+        consolidate_lock = getattr(self, "_consolidate_lock", None)
+        dream_owed = self._dream_owed()
+        next_dream_at = None
+        if dream_owed and self._dreamer_daily_time:
+            delay = self._seconds_until_daily(self._dreamer_daily_time)
+            if delay is not None:
+                next_dream_at = time.time() + delay
+        last_user = self._dreamer_last_user_ts or None
+        return {
+            "turns": self._turns_in_progress,
+            "dreamRunning": bool(
+                (dream_lock is not None and dream_lock.locked())
+                or (consolidate_lock is not None and consolidate_lock.locked())
+            ),
+            "dreamOwed": dream_owed or self._consolidation_owed(),
+            "nextDreamAt": next_dream_at,
+            "lastUserActivityAt": last_user,
+        }
+
+    async def dream_before_sleep(self) -> None:
+        """Run the memory learning a sleep would otherwise skip.
+
+        The idle dreaming pass the latest user messages are owed, then a
+        consolidation if memory changed. Each is attempted once; a failure is
+        logged by the pass and does not keep the machine awake.
+        """
+        if self._dream_owed():
+            self._mark_idle_dream_for(self._dreamer_last_user_ts)
+            await self._maybe_run_dreamer("before-sleep")
+        if self._consolidation_owed():
+            await self._maybe_consolidate("before-sleep")
 
     async def _dreamer_daily_timer(self) -> None:
         """Fire one dreaming pass each day at daily_time (HH:MM local)."""
@@ -7890,6 +8006,14 @@ class AgentLoop:
             logger.warning(f"Memory flush failed: {e}")
 
     async def _process_message(self, msg: InboundMessage) -> OutboundMessage | None:
+        """Process one turn, counted for ``power.status`` while it runs."""
+        self._turns_in_progress = getattr(self, "_turns_in_progress", 0) + 1
+        try:
+            return await self._process_admitted_message(msg)
+        finally:
+            self._turns_in_progress -= 1
+
+    async def _process_admitted_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """Reserve the environment before admitting any turn or continuation."""
         from flowly.desktop_runtime.authority import ScreenError
         from flowly.desktop_runtime.installation_gate import agent_environment_activity
@@ -8251,7 +8375,7 @@ class AgentLoop:
             and not msg.metadata.get(_GOAL_CONTINUATION_ID)
             and not msg.metadata.get(_AGENT_INTRODUCTION)
         ):
-            self._dreamer_last_user_ts = time.time()
+            self._note_user_activity(time.time())
             agenda = getattr(self, "agenda", None)
             if agenda is not None:
                 # The owner's silence there is over: the agent's unanswered
