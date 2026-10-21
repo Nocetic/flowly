@@ -115,6 +115,11 @@ try:
                     *(["--test-type"] if browser.startswith("/opt/flowly-screen/chromium/") else []),
                     "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=" + str(debugging_port),
                     "--no-first-run", "--no-default-browser-check",
+                    # Pages read navigator.webdriver; this keeps it false. Without
+                    # it X refused even the person's own sign-in on a screen
+                    # (2026-10-21), from an address it accepted from a plain
+                    # Chrome. The agent's access is unchanged.
+                    "--disable-blink-features=AutomationControlled",
                     # Bounded HTTP cache; cookies and logins are not cache.
                     "--disk-cache-size=268435456",
                     # No start URL: the browser opens its own New Tab page (fresh_start
