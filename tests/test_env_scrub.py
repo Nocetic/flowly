@@ -217,3 +217,17 @@ class TestIntrospection:
             assert is_flowly_credential(name)
         assert not is_flowly_credential("AWS_ACCESS_KEY_ID")
         assert not is_flowly_credential("PATH")
+
+
+# ── Flowly server agent secret (server/PROTOCOL.md B1) ─────────────────
+
+
+@pytest.mark.parametrize("key", [
+    "FLOWLY_AGENT_SECRET",
+    "FLOWLY_CHANNELS__FLOWLY_SERVER__AGENT_SECRET",
+])
+def test_the_flowly_server_agent_secret_never_reaches_a_subprocess(key):
+    """The cloud machine gets its agent secret through the environment; a
+    command the agent runs must not be able to read it and impersonate it."""
+    assert is_flowly_credential(key)
+    assert key not in sanitize_subprocess_env({key: "secret", "PATH": "/usr/bin"})

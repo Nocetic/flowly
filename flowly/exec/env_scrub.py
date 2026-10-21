@@ -102,6 +102,9 @@ _FLOWLY_PROVIDER_ENV_BLOCKLIST: frozenset[str] = frozenset({
     "FLOWLY_GATEWAY_TOKEN",
     "FLOWLY_RELAY_TOKEN",
     "MOLTBOT_PROXY_JWT_SECRET",
+    # The Flowly server agent secret (channels.flowlyServer), env and nested form.
+    "FLOWLY_AGENT_SECRET",
+    "FLOWLY_CHANNELS__FLOWLY_SERVER__AGENT_SECRET",
 
     # ── Flowly-managed integrations ──
     "TRELLO_API_KEY",
