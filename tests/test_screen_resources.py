@@ -37,14 +37,16 @@ def test_unlimited_groups_still_obey_host_available_memory_and_do_not_create_pro
 
 def test_parent_cgroup_headroom_includes_sibling_usage(host):
     (host.group / "user/memory.max").write_text(str(3 * GIB))
-    (host.group / "user/memory.current").write_text(str(2 * GIB))
+    (host.group / "user/memory.current").write_text(str(2 * GIB + GIB // 2))
     (host.group / "user/profile/memory.max").write_text(str(2 * GIB))
-    assert host.report()["memory"]["availableBytes"] == GIB
+    assert host.report()["memory"]["availableBytes"] == GIB // 2
     assert host.report()["issues"] == ["LOW_MEMORY"]
     assert host.report()["reason"] == "INSUFFICIENT_RESOURCES"
 
 
-@pytest.mark.parametrize("used,expected", [(GIB // 2, resources.MIN_MEMORY), (3 * GIB, 0)])
+@pytest.mark.parametrize("used,expected", [(2 * GIB - resources.MIN_MEMORY, resources.MIN_MEMORY),
+                                           (2 * GIB - resources.MIN_MEMORY + 1, resources.MIN_MEMORY - 1),
+                                           (3 * GIB, 0)])
 def test_exact_floor_and_over_limit_reading(host, used, expected):
     (host.group / "memory.max").write_text(str(2 * GIB))
     (host.group / "memory.current").write_text(str(used))
@@ -157,3 +159,24 @@ def test_disk_uses_existing_ancestor_without_mkdir(tmp_path):
     path = tmp_path / "not-created/profile/desktop"
     assert resources._disk(path) > 0
     assert not path.exists()
+
+
+MIB = 1024**2
+
+
+@pytest.mark.parametrize("available,ready", [
+    (1626 * MIB, True),   # 2 GB Fly machine, gateway just started (measured)
+    (1300 * MIB, True),   # same machine, gateway warmed up
+    (1024 * MIB, True),
+    (900 * MIB, False),   # a second screen beside a busy first one
+])
+def test_a_two_gigabyte_machine_admits_one_screen(host, available, ready):
+    """2 GB Fly machine: one screen peaked at ~700 MB with five heavy sites open."""
+    (host.proc / "meminfo").write_text(f"MemTotal:       {1968 * MIB // 1024} kB\nMemAvailable:   {available // 1024} kB\n")
+    report = host.report()
+    assert report["ready"] is ready
+    assert report["issues"] == ([] if ready else ["LOW_MEMORY"])
+
+
+def test_memory_floor_stays_above_the_measured_screen_peak():
+    assert 700 * MIB < resources.MIN_MEMORY <= 1024 * MIB

@@ -11,7 +11,11 @@ import re
 import shutil
 from pathlib import Path, PurePosixPath
 
-MIN_MEMORY = 1536 * 1024**2
+# Measured on a 2 GB Fly machine (cloud/image/README.md): one screen costs
+# ~360 MB with a blank tab and ~700 MB with five heavy sites open (X, YouTube
+# playing, Google Maps, NYTimes, Reddit). 1 GiB admits a screen on a 2 GB
+# machine beside a running gateway and still keeps that peak's headroom.
+MIN_MEMORY = 1024 * 1024**2
 MIN_DISK = 1024**3
 _MAX_PUBLIC = 2**53 - 1
 
