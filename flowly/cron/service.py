@@ -293,6 +293,10 @@ class CronService:
         # rather than a single slot because a manual trigger can overlap a
         # scheduled fire of a DIFFERENT job.
         self._active_runs: dict[str, dict[str, Any]] = {}
+        # Told whenever the next due time may have moved (``_arm_timer`` runs
+        # after every schedule change and every run). The Flowly server wakes
+        # a sleeping cloud machine for the next job, so Core announces it.
+        self._schedule_listeners: list[Callable[[], None]] = []
 
     def _load_store(self) -> CronStore:
         """Load jobs from disk."""
@@ -951,6 +955,21 @@ class CronService:
         ]
         return min(times) if times else None
 
+    def add_schedule_listener(self, callback: Callable[[], None]) -> None:
+        """Call ``callback`` (sync, cheap) whenever the next due time may change."""
+        self._schedule_listeners.append(callback)
+
+    def next_due_at_ms(self) -> int | None:
+        """The earliest next run across scheduled jobs (epoch ms), or None."""
+        return self._get_next_wake_ms()
+
+    def _notify_schedule_listeners(self) -> None:
+        for callback in tuple(self._schedule_listeners):
+            try:
+                callback()
+            except Exception as exc:
+                logger.warning(f"Cron schedule listener failed: {exc}")
+
     def _arm_timer(self) -> None:
         """Schedule the next wake without owning the scheduler execution."""
         previous = self._timer_task
@@ -959,6 +978,7 @@ class CronService:
             previous.cancel()
 
         next_wake = self._get_next_wake_ms()
+        self._notify_schedule_listeners()
         if not next_wake or not self._running:
             return
 
