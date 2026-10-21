@@ -293,7 +293,13 @@ def chrome_commands(worker, installed=False, fields=b"Package: google-chrome-sta
         return apt, b""
     worker.command = command
     worker.served = {CHROME_URL: CHROME_DEB}
+    worker.GOOGLE_CHROME_POLICY_DIRECTORY = str(worker.Path(worker.BROWSER_POLICY_DIRECTORY).parents[2]
+                                                / "chrome" / "policies" / "managed")
     return calls
+
+
+def chrome_policy(worker):
+    return worker.Path(worker.GOOGLE_CHROME_POLICY_DIRECTORY) / "flowly-screen.json"
 
 
 def test_google_chrome_is_googles_package_checked_then_installed_by_apt(worker, tmp_path):
@@ -349,3 +355,41 @@ def test_an_endless_google_chrome_download_stops_at_its_limit(worker):
     with pytest.raises(worker.BrowserInstallError) as error:
         worker.add_google_chrome(["/usr/bin/apt-get"])
     assert error.value.code == "INSTALL_DOWNLOAD_FAILED"
+
+
+@pytest.mark.parametrize("installed", [False, True])
+def test_google_chrome_gets_the_policy_that_hides_its_flag_bar(worker, installed):
+    # Chrome warns about --disable-blink-features in a bar over every page;
+    # hosts that already had Chrome get the policy too.
+    chrome_commands(worker, installed=installed)
+    worker.add_google_chrome(["/usr/bin/apt-get"])
+    assert json.loads(chrome_policy(worker).read_text()) == {"CommandLineFlagSecurityWarningsEnabled": False}
+    assert stat.S_IMODE(chrome_policy(worker).stat().st_mode) == 0o644
+    assert not policy(worker).exists()  # Chrome for Testing's directory is not Chrome's
+
+
+def test_google_chrome_that_failed_to_install_gets_no_policy(worker):
+    chrome_commands(worker, apt=100)
+    with pytest.raises(worker.BrowserInstallError):
+        worker.add_google_chrome(["/usr/bin/apt-get"])
+    assert not chrome_policy(worker).exists()
+
+
+@pytest.mark.parametrize("root, browser, called", [
+    (True, "/usr/bin/google-chrome-stable", True),
+    (False, "/usr/bin/google-chrome-stable", False),
+    (True, "/usr/local/bin/google-chrome-stable", False),
+])
+def test_a_root_screen_start_gives_installed_google_chrome_its_policy(monkeypatch, root, browser, called):
+    from flowly.desktop_runtime import install_recipe
+
+    calls = []
+    monkeypatch.setattr(install_recipe.os, "geteuid", lambda: 0 if root else 1000)
+    monkeypatch.setattr("platform.machine", lambda: "x86_64")
+    monkeypatch.setitem(install_recipe._BROWSER, "install_browser_policy", lambda machine: calls.append("pinned"))
+    monkeypatch.setitem(install_recipe._BROWSER, "install_google_chrome_policy", lambda: calls.append("chrome"))
+    install_recipe.ensure_browser_policy(browser)
+    assert calls == (["chrome"] if called else [])
+    # Never fatal: the screen still starts, only with the bar.
+    monkeypatch.setitem(install_recipe._BROWSER, "install_google_chrome_policy", lambda: 1 / 0)
+    install_recipe.ensure_browser_policy(browser)

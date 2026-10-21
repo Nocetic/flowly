@@ -227,6 +227,9 @@ DOWNLOAD_SECONDS = 600
 # managed policy does; Chrome then lists itself as managed. Arm64's Chromium
 # build has no such bar.
 BROWSER_POLICY_DIRECTORY = "/etc/opt/chrome_for_testing/policies/managed"
+# Google Chrome puts an "unsupported command-line flag" bar over every page
+# for --disable-blink-features (browser_lifecycle); the same policy hides it.
+GOOGLE_CHROME_POLICY_DIRECTORY = "/etc/opt/chrome/policies/managed"
 BROWSER_POLICY_FILE = "flowly-screen.json"
 BROWSER_POLICY = {"CommandLineFlagSecurityWarningsEnabled": False}
 
@@ -324,7 +327,14 @@ def install_browser_policy(machine):
     """Publish the pinned Chrome for Testing build's policy; idempotent."""
     if PINNED_BROWSER[machine]["directory"] != "chrome-linux64":
         return
-    directory = Path(BROWSER_POLICY_DIRECTORY)
+    _publish_policy(BROWSER_POLICY_DIRECTORY)
+
+def install_google_chrome_policy():
+    """Publish Google Chrome's policy; idempotent."""
+    _publish_policy(GOOGLE_CHROME_POLICY_DIRECTORY)
+
+def _publish_policy(where):
+    directory = Path(where)
     _root_directory(directory, create=True)
     path = directory / BROWSER_POLICY_FILE
     text = json.dumps(BROWSER_POLICY, sort_keys=True) + "\n"
@@ -396,6 +406,7 @@ def add_google_chrome(apt):
     is once installed: updates come from that repository."""
     code, status = command(["/usr/bin/dpkg-query", "-W", "-f=${Status}", GOOGLE_CHROME["package"]], 30, 64)
     if code == 0 and status == b"install ok installed":
+        install_google_chrome_policy()
         return
     directory = Path(tempfile.mkdtemp(prefix="flowly-chrome-"))
     try:
@@ -433,6 +444,7 @@ def add_google_chrome(apt):
             raise BrowserInstallError("INSTALL_BROWSER_FAILED")
     finally:
         _browser_shutil.rmtree(directory, ignore_errors=True)
+    install_google_chrome_policy()
 
 def apparmor_profile_text(abi=True):
     return ("# Flowly Screen: only the pinned Chromium may create the user namespaces its\n"
@@ -491,17 +503,19 @@ def screen_browser() -> str | None:
 
 
 def ensure_browser_policy(browser: str) -> None:
-    """On a root host, give an already installed pinned browser its policy at
-    screen start, so hosts installed before it need no new installation.
-    Best effort: without it the browser only shows its testing bar."""
+    """On a root host, give an already installed pinned browser or Google
+    Chrome its policy at screen start, so hosts installed before it need no
+    new installation. Best effort: without it the browser only shows a bar."""
     import platform
 
     machine = platform.machine()
-    if (not hasattr(os, "geteuid") or os.geteuid() != 0 or machine not in PINNED_BROWSER
-            or not browser.startswith(BROWSER_ROOT + "/")):
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
         return
     try:
-        _BROWSER["install_browser_policy"](machine)
+        if browser in ("/usr/bin/" + GOOGLE_CHROME["package"], "/bin/" + GOOGLE_CHROME["package"]):
+            _BROWSER["install_google_chrome_policy"]()
+        elif machine in PINNED_BROWSER and browser.startswith(BROWSER_ROOT + "/"):
+            _BROWSER["install_browser_policy"](machine)
     except Exception:
         pass
 
