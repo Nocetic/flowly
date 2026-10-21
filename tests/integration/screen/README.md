@@ -809,6 +809,16 @@ docker run --rm --user 0 --cap-add SYS_RESOURCE --cap-add NET_ADMIN --security-o
     tests/test_screen_runtime_account.py -q -p no:cacheprovider
 ```
 
+Accounts recreated after a root filesystem reset (cloud machines, `flowly screen
+restore-accounts` at boot) run in their own fresh container:
+
+```sh
+docker run --rm --user 0 --mount "type=bind,source=$PWD,target=/workspace,readonly" \
+  -e FLOWLY_SCREEN_ACCOUNT_TEST=1 -e PYTHONPATH=/workspace -w /workspace \
+  flowly-screen-gateway-test:bookworm \
+  python -m pytest tests/integration/screen/test_runtime_account_restore.py -q -p no:cacheprovider
+```
+
 Root hosts guard each profile browser's DevTools port with nftables; `NET_ADMIN` stands in
 for a real root host here. Without it a screen refuses to start with
 `SCREEN_ISOLATION_UNAVAILABLE`. This container has no systemd, so the rule admits any root

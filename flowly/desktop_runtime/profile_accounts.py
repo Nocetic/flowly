@@ -45,34 +45,39 @@ def profile_account(name: str) -> RuntimeAccount:
                               missing="RUNTIME_RECOVERY_REQUIRED")
 
 
-def _payload(function: str, name: str) -> None:
+def _run_payload(function: str, argument: str, timeout: int) -> object:
     from flowly.desktop_runtime.runtime_account_payload import PROFILE_ACCOUNT_SOURCE
 
-    if _NAME.fullmatch(name) is None:
-        raise ScreenError("RUNTIME_STATE_INVALID")
     code = PROFILE_ACCOUNT_SOURCE + f"""
 import sys
 try:
-    {function}(sys.argv[1])
-    print(json.dumps({{"ok": True}}))
+    value = {function}(sys.argv[1])
+    print(json.dumps({{"ok": True, "value": value}}))
 except ValueError as exc:
     print(json.dumps({{"error": str(exc)}}))
 """
     try:
-        completed = subprocess.run(["/usr/bin/python3", "-I", "-c", code, name], stdin=subprocess.DEVNULL,
-                                   capture_output=True, timeout=60, cwd="/", close_fds=True,
+        completed = subprocess.run(["/usr/bin/python3", "-I", "-c", code, argument], stdin=subprocess.DEVNULL,
+                                   capture_output=True, timeout=timeout, cwd="/", close_fds=True,
                                    env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"})
     except subprocess.TimeoutExpired:
         raise ScreenError("RUNTIME_RECOVERY_REQUIRED") from None
     except OSError:
         raise ScreenError("RUNTIME_STATE_INVALID") from None
     try:
-        result = json.loads(completed.stdout[-4096:])
+        result = json.loads(completed.stdout[-65536:])
     except (ValueError, UnicodeError):
         raise ScreenError("RUNTIME_STATE_INVALID") from None
     if not isinstance(result, dict) or result.get("ok") is not True:
         code_name = result.get("error") if isinstance(result, dict) else None
         raise ScreenError(_ERRORS.get(code_name, "RUNTIME_STATE_INVALID"))
+    return result.get("value")
+
+
+def _payload(function: str, name: str) -> None:
+    if _NAME.fullmatch(name) is None:
+        raise ScreenError("RUNTIME_STATE_INVALID")
+    _run_payload(function, name, 60)
 
 
 def provision_profile_account(name: str) -> RuntimeAccount:
@@ -87,3 +92,28 @@ def retire_profile_account(name: str) -> None:
 
 def terminate_profile_account_processes(name: str) -> None:
     _payload("terminate_profile_account_processes", name)
+
+
+_RESTORED = {"present", "restored"}
+
+
+def restore_runtime_accounts() -> dict:
+    """Recreate every receipted screen account a root filesystem reset removed.
+
+    For hosts whose /etc/passwd does not persist but whose screen runtime state
+    does (a cloud machine's volume). Each account gets back exactly the UID and
+    GID in its receipt; an account or ID held by anything else is reported per
+    profile and left alone, and that profile's screen keeps failing closed.
+    Returns {"shared": "absent"|"present"|"restored",
+             "profiles": {name: "present"|"restored"|<screen error code>}}.
+    """
+    value = _run_payload("restore_runtime_accounts", "-", 600)
+    if (not isinstance(value, dict) or set(value) != {"shared", "profiles"}
+            or value["shared"] not in _RESTORED | {"absent"} or not isinstance(value["profiles"], dict)):
+        raise ScreenError("RUNTIME_STATE_INVALID")
+    profiles = {}
+    for name, outcome in value["profiles"].items():
+        if not isinstance(name, str) or _NAME.fullmatch(name) is None or not isinstance(outcome, str):
+            raise ScreenError("RUNTIME_STATE_INVALID")
+        profiles[name] = outcome if outcome in _RESTORED else _ERRORS.get(outcome, "RUNTIME_STATE_INVALID")
+    return {"shared": value["shared"], "profiles": profiles}

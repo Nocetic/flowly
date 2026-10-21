@@ -411,6 +411,144 @@ def retire_profile_account(name):
         return None
     return profile_account_locked(work)
 
+# Recreation at boot. A host whose root filesystem is reset (a cloud machine
+# redeployed or cold-started from its image) loses /etc/passwd while the
+# receipts on the persistent volume remain. Every account named by a receipt is
+# recreated with exactly the receipted UID and GID, so the volume's files keep
+# their owners. Never adopts or changes an account that differs from its
+# receipt, never takes a UID or GID that something else holds.
+
+def account_receipt(value, name):
+    if (not isinstance(value, dict)
+            or set(value) != {"accountVersion", "name", "uid", "gid", "home", "shell"}
+            or type(value["accountVersion"]) is not int or value["accountVersion"] != 1
+            or value["name"] != name or value["home"] != ACCOUNT_HOME or value["shell"] != ACCOUNT_SHELL
+            or type(value["uid"]) is not int or type(value["gid"]) is not int
+            or not account_system_uid(value["uid"]) or not account_system_uid(value["gid"])):
+        raise ValueError("INSTALL_STATE_INVALID")
+    return value
+
+def account_lookup(lookup, key):
+    try:
+        return lookup(key)
+    except KeyError:
+        return None
+
+def account_restore(name, value, marker, identity, save, sync):
+    """Under the account lock: "present" or "restored", else ValueError."""
+    value = account_receipt(value, name)
+    expected = {"accountVersion": 1, "state": "restoring", "uid": value["uid"], "gid": value["gid"]}
+    try:
+        marker.lstat()
+    except FileNotFoundError:
+        reserved = False
+    else:
+        if account_read(marker) != expected:
+            raise ValueError("INSTALL_STATE_INVALID")
+        reserved = True
+    user, group = account_lookup(pwd.getpwnam, name), account_lookup(grp.getgrnam, name)
+    if user is not None and group is not None:
+        try:
+            identity(value)
+        except (KeyError, ValueError):
+            raise ValueError("INSTALL_ACCOUNT_CONFLICT") from None
+        if not account_password_locked(name):
+            raise ValueError("INSTALL_ACCOUNT_CONFLICT")
+        if reserved:
+            marker.unlink()
+            sync()
+            return "restored"  # A previous run finished useradd, then stopped.
+        return "present"
+    if user is not None:
+        raise ValueError("INSTALL_ACCOUNT_CONFLICT")
+    holder = account_lookup(pwd.getpwuid, value["uid"])
+    if holder is not None:
+        raise ValueError("INSTALL_ACCOUNT_CONFLICT")
+    if group is None:
+        if account_lookup(grp.getgrgid, value["gid"]) is not None:
+            raise ValueError("INSTALL_ACCOUNT_CONFLICT")
+        save(marker, expected)
+        if account_run(["/usr/sbin/groupadd", "--system", "--gid", str(value["gid"]), name]):
+            raise ValueError("INSTALL_RECOVERY_REQUIRED")
+        group = account_lookup(grp.getgrnam, name)
+    elif not reserved:
+        # A group this restorer never reserved is never adopted.
+        raise ValueError("INSTALL_ACCOUNT_CONFLICT")
+    if (group is None or group.gr_gid != value["gid"] or group.gr_mem
+            or account_lookup(grp.getgrgid, value["gid"]) is None
+            or grp.getgrgid(value["gid"]).gr_name != name):
+        raise ValueError("INSTALL_ACCOUNT_CONFLICT")
+    if account_run(["/usr/sbin/useradd", "--system", "--no-user-group", "--no-create-home",
+                    "--uid", str(value["uid"]), "--gid", str(value["gid"]), "--home-dir", ACCOUNT_HOME,
+                    "--shell", ACCOUNT_SHELL, "--password", "!", name]):
+        raise ValueError("INSTALL_RECOVERY_REQUIRED")
+    try:
+        identity(value)
+    except (KeyError, ValueError):
+        raise ValueError("INSTALL_RECOVERY_REQUIRED") from None
+    if not account_password_locked(name):
+        raise ValueError("INSTALL_RECOVERY_REQUIRED")
+    marker.unlink()
+    sync()
+    return "restored"
+
+def account_lock_wait(path):
+    lock = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        info = os.fstat(lock)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077 or info.st_nlink != 1:
+            raise ValueError("INSTALL_STATE_INVALID")
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return lock
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise ValueError("INSTALL_BUSY") from None
+                time.sleep(0.05)
+    except BaseException:
+        os.close(lock)
+        raise
+
+def restore_runtime_accounts(_unused=None):
+    if os.geteuid() != 0:
+        raise ValueError("INSTALL_PRIVILEGE_REQUIRED")
+    try:
+        account_directory(ACCOUNT_ROOT)
+        account_read(ACCOUNT_ROOT / "account.json")
+    except FileNotFoundError:
+        return {"shared": "absent", "profiles": {}}  # The screen was never installed here.
+    lock = account_lock_wait(ACCOUNT_ROOT / "account.lock")
+    try:
+        receipt = account_read(ACCOUNT_ROOT / "account.json")
+        shared = account_restore(ACCOUNT_NAME, receipt, ACCOUNT_ROOT / "account.restoring",
+                                 account_identity, account_save, account_sync)
+    finally:
+        os.close(lock)
+    try:
+        account_directory(PROFILE_ACCOUNTS)
+    except FileNotFoundError:
+        return {"shared": shared, "profiles": {}}
+
+    def work():
+        profiles = {}
+        for entry in sorted(os.scandir(PROFILE_ACCOUNTS), key=lambda item: item.name):
+            if not entry.name.endswith(".json") or PROFILE_ACCOUNT.fullmatch(entry.name[:-5]) is None:
+                continue
+            name = entry.name[:-5]
+            try:
+                profiles[name] = account_restore(
+                    name, account_read(PROFILE_ACCOUNTS / entry.name), PROFILE_ACCOUNTS / (name + ".restoring"),
+                    lambda value, name=name: profile_account_identity(name, value),
+                    profile_account_save, profile_account_sync)
+            except ValueError as exc:
+                profiles[name] = str(exc) if str(exc).startswith("INSTALL_") else "INSTALL_STATE_INVALID"
+            except (OSError, KeyError, UnicodeError):
+                profiles[name] = "INSTALL_STATE_INVALID"
+        return profiles
+    return {"shared": shared, "profiles": profile_account_locked(work)}
+
 def terminate_profile_account_processes(name):
     name = profile_account_name(name)
     def work():

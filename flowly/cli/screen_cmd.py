@@ -69,6 +69,22 @@ def doctor() -> None:
         raise typer.Exit(1)
 
 
+@screen_app.command("restore-accounts")
+def restore_accounts() -> None:
+    """Recreate screen accounts a root filesystem reset removed (root, Linux; run at boot)."""
+    from flowly.desktop_runtime.profile_accounts import restore_runtime_accounts
+
+    if sys.platform != "linux" or os.geteuid() != 0:
+        _error(ScreenError("UNPRIVILEGED_RUNTIME_REQUIRED"))
+    try:
+        report = restore_runtime_accounts()
+    except ScreenError as exc:
+        _error(exc)
+    _print(report)
+    if any(outcome not in ("present", "restored") for outcome in report["profiles"].values()):
+        raise typer.Exit(1)
+
+
 @screen_app.command("install-plan")
 def installation_plan() -> None:
     """Preview the fixed host package plan; does not install or request sudo."""
