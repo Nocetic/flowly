@@ -76,7 +76,10 @@ class RelayScreenStreams:
         self._seen[channel] = None
         if len(self._seen) > 128:
             self._seen.popitem(last=False)
-        task = asyncio.create_task(self._bridge(dict(message)), name="relay-screen-stream")
+        from flowly.gateway.display import stream_trace
+
+        trace = stream_trace(message["ticket"])
+        task = asyncio.create_task(self._bridge(dict(message), trace), name="relay-screen-stream")
         self._tasks[channel] = task
 
         def completed(done):
@@ -87,7 +90,7 @@ class RelayScreenStreams:
                 if error:
                     # Neither request headers nor exception strings may disclose credentials.
                     status = getattr(error, "status", None)
-                    logger.info("[Screen] relay stream failed: {}{}", type(error).__name__,
+                    logger.info("[Screen] relay stream {} failed: {}{}", trace, type(error).__name__,
                                 f" (HTTP {status})" if isinstance(status, int) else "")
         task.add_done_callback(completed)
         return True
@@ -102,7 +105,7 @@ class RelayScreenStreams:
         finally:
             await socket.close()
 
-    async def _bridge(self, message: dict):
+    async def _bridge(self, message: dict, trace: str = "-"):
         endpoint = gateway_endpoint(self._gateway)
         if not endpoint or not self.available:
             return
@@ -141,8 +144,8 @@ class RelayScreenStreams:
                     first = next(iter(done))
                     error = None if first.cancelled() else first.exception()
                     # Which side ended it, and how: the gateway's own line says why its side did.
-                    logger.info("[Screen] relay stream ended: {} {} | {}s | gateway close {} | relay close {} | frames {}",
-                                "pixels" if first is pixels else "input",
+                    logger.info("[Screen] relay stream {} ended: {} {} | {}s | gateway close {} | relay close {} | frames {}",
+                                trace, "pixels" if first is pixels else "input",
                                 "ended" if error is None else type(error).__name__,
                                 round(time.monotonic() - opened, 1), local.close_code, remote.close_code,
                                 json.dumps(counts, separators=(",", ":")))

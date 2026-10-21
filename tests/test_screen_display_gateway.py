@@ -379,7 +379,9 @@ async def test_authenticated_binary_stream_uses_only_selected_profile_and_drops_
         logger.remove(sink)
     assert replay.value.status == 403
     # A replayed ticket is refused, and the server says so (never the ticket).
-    assert any(line.startswith("[Screen] stream refused: ") for line in lines)
+    from flowly.gateway.display import stream_trace
+
+    assert any(line.startswith(f"[Screen] stream {stream_trace(headers['X-Flowly-Screen-Ticket'])} refused: ") for line in lines)
     assert headers["X-Flowly-Screen-Ticket"] not in " ".join(lines)
 
 
@@ -422,11 +424,11 @@ async def test_human_control_revokes_viewing_without_releasing_ownership(display
     finally:
         logger.remove(sink)
     # Each end is said once, with why (2026-10-21: a server could not tell).
-    ended = [line for line in lines if line.startswith("[Screen] stream ended:")]
+    ended = [line for line in lines if line.startswith("[Screen] stream ") and " ended: " in line]
     assert len(ended) == 1 and "view-only" in ended[0] and '"pixelBytes":' in ended[0]
-    assert ended[0].split(" | ")[0] in {"[Screen] stream ended: revoked:VIEWER_REVOKED",
-                                        "[Screen] stream ended: monitor:HUMAN_HAS_CONTROL",
-                                        "[Screen] stream ended: pixels:ended", "[Screen] stream ended: viewer:ended"}
+    trace, reason = ended[0].removeprefix("[Screen] stream ").split(" | ")[0].split(" ended: ")
+    assert len(trace) == 12 and all(c in "0123456789abcdef" for c in trace)
+    assert reason in {"revoked:VIEWER_REVOKED", "monitor:HUMAN_HAS_CONTROL", "pixels:ended", "viewer:ended"}
     assert "Bearer" not in " ".join(lines)
 
 

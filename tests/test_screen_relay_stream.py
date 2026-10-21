@@ -331,8 +331,11 @@ async def test_a_relay_stream_says_which_side_ended_it_and_never_a_secret(screen
         await take(f.local_frames)
         await remote.close()
         await asyncio.gather(*f.bridge._tasks.values(), return_exceptions=True)
-    (line,) = [line for line in screen_log if "relay stream ended" in line]
-    assert line.startswith("[Screen] relay stream ended: input ended |")
+    from flowly.gateway.display import stream_trace
+
+    (line,) = [line for line in screen_log if "relay stream" in line and " ended: " in line]
+    # The same id Desktop and the gateway log for this stream.
+    assert line.startswith(f"[Screen] relay stream {stream_trace('one-use-ticket')} ended: input ended |")
     assert 'frames {"pixels":1,"input":1}' in line
     assert "secret" not in " ".join(screen_log) and "one-use-ticket" not in " ".join(screen_log)
 
@@ -342,5 +345,6 @@ async def test_a_refused_local_stream_is_logged_with_its_status(screen_log):
         assert f.bridge.open(request())
         await asyncio.gather(*f.bridge._tasks.values(), return_exceptions=True)
         await asyncio.sleep(0)
-    assert any(line.startswith("[Screen] relay stream failed: WSServerHandshakeError (HTTP 403)") for line in screen_log)
+    assert any(line.startswith("[Screen] relay stream ") and "failed: WSServerHandshakeError (HTTP 403)" in line
+               for line in screen_log)
     assert "secret" not in " ".join(screen_log)

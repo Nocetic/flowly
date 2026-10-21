@@ -9,6 +9,7 @@ Legacy raw RFB streams remain viewing-only even when a viewer holds control.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import base64
 import contextvars
 import functools
@@ -389,6 +390,13 @@ async def _stream_call(function, /, *args, **kwargs):
     return await asyncio.get_running_loop().run_in_executor(_stream_workers, call)
 
 
+def stream_trace(ticket: object) -> str:
+    """The id every hop logs for one screen stream (Desktop computes the same)."""
+    if not isinstance(ticket, str) or not ticket:
+        return "-"
+    return hashlib.sha256(ticket.encode()).hexdigest()[:12]
+
+
 def _error(code: str, status: int = 400) -> web.Response:
     return web.json_response({"error": {"code": code}}, status=status, headers={"Cache-Control": "no-store"})
 
@@ -540,6 +548,9 @@ def register_display(app: web.Application, gateway) -> None:
                   "expectedBotId": request.headers.get("X-Flowly-Bot-Id")}
         generation = request.headers.get("X-Flowly-Screen-Generation", "")
         ticket = request.headers.get("X-Flowly-Screen-Ticket", "")
+        # One id for this stream on every hop (Desktop, relay bridge, gateway):
+        # a prefix of the one-use ticket's digest, which reveals nothing.
+        trace = stream_trace(ticket)
         input_protocol = request.headers.get("X-Flowly-Screen-Input")
         if input_protocol not in (None, INPUT_PROTOCOL):
             return _error("INVALID_PARAMS")
@@ -553,13 +564,13 @@ def register_display(app: web.Application, gateway) -> None:
             if input_protocol and not _supports_input(state):
                 raise ScreenError("SCREEN_UPGRADE_REQUIRED")
         except ScreenError as exc:
-            logger.info("[Screen] stream refused: {}", exc.code)
+            logger.info("[Screen] stream {} refused: {}", trace, exc.code)
             return _error(exc.code, 403)
         except OSError:
-            logger.info("[Screen] stream refused: CONTROL_UNAVAILABLE")
+            logger.info("[Screen] stream {} refused: CONTROL_UNAVAILABLE", trace)
             return _error("CONTROL_UNAVAILABLE", 503)
         if session.attaching >= MAX_STREAMS or session.idle_stopping:
-            logger.info("[Screen] stream refused: SCREEN_BUSY")
+            logger.info("[Screen] stream {} refused: SCREEN_BUSY", trace)
             return _error("SCREEN_BUSY", 429)
         session.attaching += 1
         session.activity = time.monotonic()
@@ -709,7 +720,7 @@ def register_display(app: web.Application, gateway) -> None:
         except (ScreenError, OSError, asyncio.TimeoutError, asyncio.IncompleteReadError, ValueError) as exc:
             ended = f"{ended}:" + (getattr(exc, "code", None) or type(exc).__name__)
             if not ws.prepared:
-                logger.info("[Screen] stream failed before it opened: {}", ended)
+                logger.info("[Screen] stream {} failed before it opened: {}", trace, ended)
                 return _error("TRANSPORT_UNAVAILABLE", 503)
         finally:
             for task in tasks:
@@ -743,7 +754,7 @@ def register_display(app: web.Application, gateway) -> None:
                 session.attaching -= 1
                 session.activity = time.monotonic()
                 if ws.prepared:
-                    logger.info("[Screen] stream ended: {} | {}s | input {} | {}", ended,
+                    logger.info("[Screen] stream {} ended: {} | {}s | input {} | {}", trace, ended,
                                 round(time.monotonic() - opened, 1), "yes" if input_protocol else "view-only",
                                 json.dumps(stats, separators=(",", ":")))
         return ws
