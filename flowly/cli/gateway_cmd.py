@@ -461,6 +461,15 @@ def restore_service(port: int) -> None:
         )
 
 
+def loopback_auth_required(config, local_runtime: bool) -> bool:
+    """Whether a loopback-bound gateway still demands its token.
+
+    Desktop-managed runtimes always do; so does a gateway configured with
+    ``gateway.requireAuth`` because a same-host proxy carries remote clients.
+    """
+    return bool(local_runtime or config.gateway.require_auth)
+
+
 def gateway(
     port: int = typer.Option(0, "--port", "-p", help="Gateway port. Overrides config.gateway.port (default 18790)."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
@@ -677,7 +686,7 @@ def gateway(
     elif rotate_token:
         auth_token = generate_gateway_token()
         _token_changed = True
-    elif remote_exposed and not auth_token:
+    elif (remote_exposed or config.gateway.require_auth) and not auth_token:
         auth_token = generate_gateway_token()
         _token_changed = True
     elif not auth_token and config.channels.web.enabled and config.channels.web.relay_url:
@@ -2081,7 +2090,7 @@ Respond to the user now:"""
         host=effective_host,
         port=port,
         auth_token=auth_token,
-        require_loopback_auth=local_runtime,
+        require_loopback_auth=loopback_auth_required(config, local_runtime),
         advertise_control=not local_runtime,
         enable_profile_host=not local_runtime and current_profile_name() == "default",
         # The primary keeps its agents running unless Flowly Desktop claims

@@ -517,6 +517,10 @@ class GatewayConfig(BaseModel):
     # account). Empty = local-only, no auth. Set/rotated by ``flowly gateway``
     # when binding to a non-loopback host. See flowly/gateway/auth.py.
     token: str = ""
+    # Enforce the token even on a loopback bind. For a gateway behind a
+    # same-host proxy (a cloud machine's edge relay), where every remote client
+    # arrives from 127.0.0.1 and loopback says nothing about who is calling.
+    require_auth: bool = False
 
     @field_validator("port")
     @classmethod
