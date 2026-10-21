@@ -2181,6 +2181,25 @@ Respond to the user now:"""
         web.set_screen_gateway(gateway_server)
     if web and hasattr(web, "set_chat_commands"):
         web.set_chat_commands(gateway_server.chat_commands)
+    if web and hasattr(web, "set_power_monitor"):
+        # The Flowly server sleeps a cloud machine when it is idle and wakes it
+        # for the next scheduled work (server/PROTOCOL.md B4, flowly/power).
+        from flowly.power.monitor import (
+            PowerMonitor,
+            environment_maintenance,
+            flush_to_disk,
+            screen_watched,
+        )
+        from flowly.profile import get_flowly_home as _power_home
+
+        _power_dirs = (agent._state_dir, _power_home())
+        _power = PowerMonitor(
+            agent=agent, cron=cron, heartbeat=heartbeat,
+            flush=lambda: flush_to_disk(_power_dirs),
+        )
+        _power.add_busy_probe("screen", lambda: screen_watched(gateway_server))
+        _power.add_busy_probe("maintenance", environment_maintenance)
+        web.set_power_monitor(_power)
 
     # Freeze original authority once, then let each transport enforce its own
     # recipients. Relay mirrors must never write to the raw agent socket.

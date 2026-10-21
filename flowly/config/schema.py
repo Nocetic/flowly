@@ -147,6 +147,21 @@ class WebChannelConfig(BaseModel):
     jwt_secret: str = ""   # JWT signing secret (for relay authentication)
 
 
+class FlowlyServerChannelConfig(BaseModel):
+    """Connection to the Flowly server (server/PROTOCOL.md B), replacing the relay.
+
+    Core always dials out: ``Authorization: Bearer <agent_secret>`` and
+    ``X-Flowly-Agent-Host: <agent_host_id>``; no shared JWT secret. Empty
+    fields fall back to ``FLOWLY_SERVER_URL``, ``FLOWLY_AGENT_SECRET`` and
+    ``FLOWLY_AGENT_HOST_ID``. When enabled it takes the relay's place as the
+    ``web`` channel.
+    """
+    enabled: bool = False
+    server_url: str = "wss://cloud.useflowlyapp.com/v1/agent"
+    agent_secret: str = ""    # this agent's own secret; the server keeps only its SHA-256
+    agent_host_id: str = ""   # users/{uid}/servers/{id} document id
+
+
 class EmailConfig(BaseModel):
     """Email/Gmail channel configuration (OAuth-based)."""
     enabled: bool = False
@@ -179,6 +194,7 @@ class ChannelsConfig(BaseModel):
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
     slack: SlackConfig = Field(default_factory=SlackConfig)
     web: WebChannelConfig = Field(default_factory=WebChannelConfig)
+    flowly_server: FlowlyServerChannelConfig = Field(default_factory=FlowlyServerChannelConfig)
     email: EmailConfig = Field(default_factory=EmailConfig)
     teams: TeamsConfig = Field(default_factory=TeamsConfig)
     imessage: IMessageConfig = Field(default_factory=IMessageConfig)

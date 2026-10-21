@@ -110,8 +110,17 @@ class ChannelManager:
             except ImportError as e:
                 logger.warning(f"Slack channel not available: {e}")
 
-        # Web channel (relay mode — no SSH)
-        if self.config.channels.web.enabled:
+        # Web channel: the Flowly server when configured, else the relay (no SSH).
+        # Both serve the same "web" conversations, so only one may own the name.
+        if self.config.channels.flowly_server.enabled:
+            from flowly.channels.flowly_server import FlowlyServerChannel
+            self.channels["web"] = FlowlyServerChannel(
+                self.config.channels.flowly_server, self.bus
+            )
+            if self.config.channels.web.enabled:
+                logger.warning("Flowly server channel enabled; the relay connection is not used")
+            logger.info("Web channel enabled (Flowly server)")
+        elif self.config.channels.web.enabled:
             try:
                 from flowly.channels.web import WebChannel
                 self.channels["web"] = WebChannel(

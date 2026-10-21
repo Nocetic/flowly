@@ -943,18 +943,24 @@ class WebChannel(BaseChannel):
             fallback = fallback or key
         return fallback or f"web:{session_id}"
 
-    async def start(self) -> None:
-        """Connect outbound to relay proxy and keep reconnecting (Telegram-like)."""
+    def _ready_to_connect(self) -> bool:
+        """Whether the credentials this transport needs are present."""
         if not self.config.enabled:
-            return
+            return False
         if not self.config.auth_token:
             logger.error("[WebChannel] auth_token not set — cannot connect to relay")
-            return
+            return False
         if not self.config.server_id:
             # Try env fallback
             self.config.server_id = os.environ.get("FLOWLY_SERVER_ID", "")
         if not self.config.server_id:
             logger.error("[WebChannel] server_id not set — cannot connect to relay")
+            return False
+        return True
+
+    async def start(self) -> None:
+        """Connect outbound to relay proxy and keep reconnecting (Telegram-like)."""
+        if not self._ready_to_connect():
             return
 
         self._running = True
@@ -1783,8 +1789,12 @@ class WebChannel(BaseChannel):
         except Exception as e:
             logger.debug(f"[WebChannel] Failed to send title event: {e}")
 
-    async def _connect_and_run(self) -> None:
-        """Open one WebSocket connection to the relay proxy and process messages."""
+    def _relay_connection(self) -> tuple[str, dict[str, Any], Callable[[], str] | None]:
+        """The URL, extra ``websockets.connect`` arguments and screen-stream token.
+
+        The relay authenticates with a signed agent JWT in the query string;
+        the same signing key mints the short-lived screen-stream tokens.
+        """
         import time
 
         import jwt
@@ -1810,7 +1820,19 @@ class WebChannel(BaseChannel):
             "aud": "moltbot-proxy",
         }
         token = jwt.encode(payload, jwt_secret, algorithm="HS256")
-        url = f"{self.config.relay_url}?token={token}"
+
+        def stream_token():
+            issued = int(time.time())
+            return jwt.encode({**payload, "iat": issued, "exp": issued + 60}, jwt_secret, algorithm="HS256")
+
+        return f"{self.config.relay_url}?token={token}", {}, stream_token
+
+    def _on_connected(self, ws) -> None:
+        """Called once a new connection is open, before any frame is read."""
+
+    async def _connect_and_run(self) -> None:
+        """Open one WebSocket connection to the relay proxy and process messages."""
+        url, connect_kwargs, stream_token = self._relay_connection()
 
         logger.info(f"[WebChannel] Connecting to relay: {self.config.relay_url}")
 
@@ -1825,6 +1847,7 @@ class WebChannel(BaseChannel):
             # (clearer error path) instead of the client failing silently
             # with the websockets-library 1 MB default.
             max_size=_WS_MAX_SIZE,
+            **connect_kwargs,
         ) as ws:
             self._subagent_observers.clear()
             self._subagent_event_versions.clear()
@@ -1832,12 +1855,10 @@ class WebChannel(BaseChannel):
             self._clear_profile_subagent_observers()
             self._clear_subagent_stream_watchers()
             self._ws = ws
-            if self._screen_gateway is not None:
+            self._on_connected(ws)
+            if self._screen_gateway is not None and stream_token is not None:
                 from flowly.desktop_runtime.relay_rpc import RelayScreenRpc
                 from flowly.desktop_runtime.relay_stream import RelayScreenStreams
-                def stream_token():
-                    issued = int(time.time())
-                    return jwt.encode({**payload, "iat": issued, "exp": issued + 60}, jwt_secret, algorithm="HS256")
                 try:
                     self._screen_streams = RelayScreenStreams(
                         relay_url=self.config.relay_url, server_id=self.config.server_id,
