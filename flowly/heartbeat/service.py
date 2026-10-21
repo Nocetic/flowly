@@ -123,20 +123,21 @@ def _is_heartbeat_empty(content: str | None) -> bool:
     return not _extract_heartbeat_tasks(content)
 
 
-def _is_within_active_hours(start: str, end: str, timezone: str) -> bool:
+def _is_within_active_hours(start: str, end: str, timezone: str, at: float | None = None) -> bool:
     """
-    Return True if current time is within [start, end] window.
+    Return True if the current time (or ``at``, epoch seconds) is within [start, end].
 
     Args:
         start: "HH:MM" (24h)
         end:   "HH:MM" (24h)
         timezone: IANA tz string (e.g. "Europe/Istanbul"). Empty = system local.
+        at: the moment to test instead of now.
     """
     try:
         tz = ZoneInfo(timezone) if timezone else None
-        now = datetime.now(tz=tz)
+        now = datetime.now(tz=tz) if at is None else datetime.fromtimestamp(at, tz=tz)
     except (ZoneInfoNotFoundError, Exception):
-        now = datetime.now()
+        now = datetime.now() if at is None else datetime.fromtimestamp(at)
 
     def _parse(t: str) -> tuple[int, int]:
         parts = t.strip().split(":")
@@ -183,6 +184,57 @@ class HeartbeatService:
         self.deliver = deliver  # "none" | "message_tool"
         self._running = False
         self._task: asyncio.Task | None = None
+        # When the periodic loop runs next (epoch seconds); None while stopped.
+        # A triggered heartbeat pushes it a full interval out, so a run the
+        # Flowly server asked for is not repeated by this timer moments later.
+        self._next_tick_at: float | None = None
+        # Heartbeat turns in progress (periodic or triggered).
+        self._in_progress = 0
+        self._schedule_listener: Callable[[], None] | None = None
+
+    @property
+    def running(self) -> bool:
+        """True while a heartbeat turn is in progress."""
+        return self._in_progress > 0
+
+    def set_schedule_listener(self, callback: Callable[[], None] | None) -> None:
+        """Call ``callback`` whenever the next periodic tick moves."""
+        self._schedule_listener = callback
+
+    def _set_next_tick(self, at: float | None) -> None:
+        self._next_tick_at = at
+        if self._schedule_listener is not None:
+            try:
+                self._schedule_listener()
+            except Exception as e:
+                logger.warning(f"Heartbeat schedule listener failed: {e}")
+
+    def next_due_at(self) -> float | None:
+        """When the next heartbeat that would do work is due (epoch seconds).
+
+        None when the loop is not running, HEARTBEAT.md has no active task, or
+        no tick falls inside the active hours within a week. A tick outside
+        the active hours is skipped, so the first tick inside them is the one
+        a sleeping machine must be woken for.
+        """
+        if not self.enabled or not self._running or self.on_heartbeat is None or self._next_tick_at is None:
+            return None
+        if not _extract_heartbeat_tasks(self._read_heartbeat_file()):
+            return None
+        at = self._next_tick_at
+        if not self.active_hours:
+            return at
+        interval = max(1, int(self.interval_s))
+        for _ in range(min(10_000, 7 * 24 * 3600 // interval + 1)):
+            if _is_within_active_hours(
+                self.active_hours.get("start", "09:00"),
+                self.active_hours.get("end", "23:00"),
+                self.active_hours.get("timezone", ""),
+                at=at,
+            ):
+                return at
+            at += interval
+        return None
 
     @property
     def heartbeat_file(self) -> Path:
@@ -225,19 +277,33 @@ class HeartbeatService:
         if self._task:
             self._task.cancel()
             self._task = None
+        self._set_next_tick(None)
 
     async def _run_loop(self) -> None:
+        self._set_next_tick(time.time() + self.interval_s)
         while self._running:
             try:
                 # The wall clock: a heartbeat due while the machine was
                 # suspended runs as soon as it resumes.
-                await sleep_until_wall(time.time() + self.interval_s)
-                if self._running:
-                    await self._tick()
+                await sleep_until_wall(self._next_tick_at)
+                if not self._running:
+                    break
+                if self._next_tick_at is not None and self._next_tick_at > time.time():
+                    continue  # a triggered heartbeat pushed this tick out
+                await self._tick()
+                self._set_next_tick(time.time() + self.interval_s)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Heartbeat error: {e}")
+                self._set_next_tick(time.time() + self.interval_s)
+
+    async def _run_heartbeat(self, prompt: str) -> str:
+        self._in_progress += 1
+        try:
+            return await self.on_heartbeat(prompt)
+        finally:
+            self._in_progress -= 1
 
     async def _tick(self) -> None:
         if not self._check_active_hours():
@@ -252,11 +318,14 @@ class HeartbeatService:
         logger.info("Heartbeat: checking for tasks...")
         if not self.on_heartbeat:
             return
+        if self.running:
+            logger.debug("Heartbeat: skipped (a heartbeat is already running)")
+            return
 
         try:
             deliver = self.deliver == "message_tool"
             prompt = _build_heartbeat_prompt(deliver=deliver, tasks=tasks)
-            response = await self.on_heartbeat(prompt)
+            response = await self._run_heartbeat(prompt)
 
             if HEARTBEAT_OK_TOKEN in response.upper():
                 logger.info("Heartbeat: OK (no action needed)")
@@ -266,12 +335,38 @@ class HeartbeatService:
             logger.error(f"Heartbeat execution failed: {e}")
 
     async def trigger_now(self) -> str | None:
-        """Manually trigger a heartbeat tick."""
-        if not self.on_heartbeat:
+        """Manually trigger a heartbeat tick.
+
+        Returns the agent's reply, ``HEARTBEAT_OK`` when there is no active
+        task, or None when no agent is wired or a heartbeat is already running.
+        The periodic tick moves a full interval past this run.
+        """
+        if not self.on_heartbeat or self.running:
             return None
+        if self._running:
+            self._set_next_tick(time.time() + self.interval_s)
         tasks = _extract_heartbeat_tasks(self._read_heartbeat_file())
         if not tasks:
             return HEARTBEAT_OK_TOKEN
         deliver = self.deliver == "message_tool"
         prompt = _build_heartbeat_prompt(deliver=deliver, tasks=tasks)
-        return await self.on_heartbeat(prompt)
+        return await self._run_heartbeat(prompt)
+
+    async def trigger(self) -> str:
+        """Run a heartbeat now and say how it went.
+
+        ``"ok"`` (nothing needed attention), ``"acted"``, ``"no-tasks"``,
+        ``"busy"`` (one is already running) or ``"unavailable"`` (no agent).
+        """
+        if not self.on_heartbeat:
+            return "unavailable"
+        if self.running:
+            return "busy"
+        if not _extract_heartbeat_tasks(self._read_heartbeat_file()):
+            if self._running:
+                self._set_next_tick(time.time() + self.interval_s)
+            return "no-tasks"
+        response = await self.trigger_now()
+        if response is None:
+            return "busy"
+        return "ok" if HEARTBEAT_OK_TOKEN in response.upper() else "acted"
