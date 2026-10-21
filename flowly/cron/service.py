@@ -15,6 +15,7 @@ from typing import Any, Callable, Coroutine, Literal
 
 from loguru import logger
 
+from flowly.utils.wall_clock import sleep_until_wall
 from flowly.gateway_logs.notable import notable
 
 from flowly.cron.timezone import schedule_timezone
@@ -961,12 +962,11 @@ class CronService:
         if not next_wake or not self._running:
             return
 
-        delay_ms = max(0, next_wake - _now_ms())
-        delay_s = delay_ms / 1000
-
         async def tick() -> None:
             try:
-                await asyncio.sleep(delay_s)
+                # The wall clock, not asyncio's: a suspended machine must run
+                # a job due while it slept as soon as it resumes.
+                await sleep_until_wall(next_wake / 1000)
             except asyncio.CancelledError:
                 return
 

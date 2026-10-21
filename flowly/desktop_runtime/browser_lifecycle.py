@@ -120,6 +120,9 @@ try:
                     # (2026-10-21), from an address it accepted from a plain
                     # Chrome. The agent's access is unchanged.
                     "--disable-blink-features=AutomationControlled",
+                    # WebGL without a GPU (software rendering). A page that
+                    # gets no WebGL context reads the browser as a server.
+                    "--enable-unsafe-swiftshader",
                     # Bounded HTTP cache; cookies and logins are not cache.
                     "--disk-cache-size=268435456",
                     # No start URL: the browser opens its own New Tab page (fresh_start

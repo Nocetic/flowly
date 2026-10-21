@@ -59,6 +59,8 @@ while not (profile / 'close').exists(): time.sleep(.02)
             assert os.getpgid(first) == manager.pid
             # Sites refuse sign-in when the page reports automation.
             assert "--disable-blink-features=AutomationControlled" in (profile / "arguments").read_text().split("\n")
+            # WebGL without a GPU: a missing WebGL context reads as a server.
+            assert "--enable-unsafe-swiftshader" in (profile / "arguments").read_text().split("\n")
             with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as client:
                 client.connect(str(runtime / "browser-open.sock"))
                 for _ in range(8):

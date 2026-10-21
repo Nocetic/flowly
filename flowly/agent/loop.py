@@ -1849,7 +1849,10 @@ class AgentLoop:
             if delay is None:
                 return  # unparseable time → disable the daily trigger
             try:
-                await asyncio.sleep(delay)
+                # The wall clock: the nightly pass of a suspended machine
+                # runs when it resumes, not late by the whole time asleep.
+                from flowly.utils.wall_clock import sleep_until_wall
+                await sleep_until_wall(time.time() + delay)
             except asyncio.CancelledError:
                 return
             if not self._running:

@@ -2,12 +2,15 @@
 
 import asyncio
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Coroutine
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from loguru import logger
+
+from flowly.utils.wall_clock import sleep_until_wall
 
 # Default interval: 30 minutes
 DEFAULT_HEARTBEAT_INTERVAL_S = 30 * 60
@@ -226,7 +229,9 @@ class HeartbeatService:
     async def _run_loop(self) -> None:
         while self._running:
             try:
-                await asyncio.sleep(self.interval_s)
+                # The wall clock: a heartbeat due while the machine was
+                # suspended runs as soon as it resumes.
+                await sleep_until_wall(time.time() + self.interval_s)
                 if self._running:
                     await self._tick()
             except asyncio.CancelledError:
