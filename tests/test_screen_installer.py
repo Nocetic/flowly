@@ -63,12 +63,18 @@ def test_hosts_without_a_reviewed_recipe_are_not_offered_one(host, monkeypatch, 
     assert plan["packages"] == [] and plan["browser"] is None and plan["recipeId"] is None
 
 
-def test_ubuntu_is_offered_its_own_recipe_with_the_pinned_browser(host, monkeypatch):
+@pytest.mark.parametrize("arch,browser,repositories", [
+    ("aarch64", {"source": "pinned"}, []),
+    ("x86_64", {"source": "distribution", "package": "google-chrome-stable"}, ["google-chrome"]),
+])
+def test_ubuntu_is_offered_its_own_recipe_and_browser(host, monkeypatch, arch, browser, repositories):
     monkeypatch.setattr(installer, "os_release", lambda: {"ID": "ubuntu", "VERSION_ID": "24.04"})
-    monkeypatch.setattr(installer.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(installer.platform, "machine", lambda: arch)
     plan = installer.install_plan()
     assert plan["supported"] and plan["distribution"] == "ubuntu-24.04"
-    assert plan["browser"]["source"] == "pinned" and "chromium" not in plan["packages"]
+    assert browser.items() <= plan["browser"].items() and "chromium" not in plan["packages"]
+    # The person reviewing sees the repository Google's package adds.
+    assert plan["repositories"] == repositories
     assert plan["planId"] != host.plan["planId"]
 
 

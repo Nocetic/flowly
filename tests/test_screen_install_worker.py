@@ -272,22 +272,33 @@ def test_an_interrupted_account_creation_still_needs_repair(worker, capsys, monk
 
 UBUNTU_PROBES = APT | {"/proc/sys/kernel/apparmor_restrict_unprivileged_userns", "/usr/sbin/apparmor_parser",
                          "/etc/apparmor.d/abi/4.0"}
-UBUNTU = screen_recipe({"ID": "ubuntu", "VERSION_ID": "24.04"}, "x86_64", UBUNTU_PROBES.__contains__)
+UBUNTU = screen_recipe({"ID": "ubuntu", "VERSION_ID": "24.04"}, "aarch64", UBUNTU_PROBES.__contains__)
+UBUNTU_CHROME = screen_recipe({"ID": "ubuntu", "VERSION_ID": "24.04"}, "x86_64", UBUNTU_PROBES.__contains__)
 
 
-@pytest.fixture
-def ubuntu(worker, monkeypatch):
+def ubuntu_host(worker, monkeypatch, machine, recipe):
     worker.os_release = lambda: {"ID": "ubuntu", "VERSION_ID": "24.04"}
     worker.PROBE = UBUNTU_PROBES.__contains__
-    monkeypatch.setattr(worker.platform, "machine", lambda: "x86_64")
-    monkeypatch.setattr(worker.sys, "argv", ["worker", OPERATION, PLAN, recipe_id(UBUNTU)])
+    monkeypatch.setattr(worker.platform, "machine", lambda: machine)
+    monkeypatch.setattr(worker.sys, "argv", ["worker", OPERATION, PLAN, recipe_id(recipe)])
     order = []
     worker.command.side_effect = lambda args, *rest, **kw: (order.append(args[-1]), (0, b""))[1]
     worker.install_pinned_browser = Mock(side_effect=lambda machine: order.append("browser:" + machine))
+    worker.add_google_chrome = Mock(side_effect=lambda apt: order.append("google-chrome"))
     worker.install_apparmor_profile = Mock(side_effect=lambda: order.append("apparmor"))
     worker.provision_runtime_account = Mock(side_effect=lambda: order.append("account"))
     worker.order = order
     return worker
+
+
+@pytest.fixture
+def ubuntu(worker, monkeypatch):
+    return ubuntu_host(worker, monkeypatch, "aarch64", UBUNTU)
+
+
+@pytest.fixture
+def ubuntu_chrome(worker, monkeypatch):
+    return ubuntu_host(worker, monkeypatch, "x86_64", UBUNTU_CHROME)
 
 
 def test_ubuntu_installs_its_packages_then_the_pinned_browser_and_its_profile(ubuntu, capsys, monkeypatch):
@@ -296,7 +307,29 @@ def test_ubuntu_installs_its_packages_then_the_pinned_browser_and_its_profile(ub
     assert json.loads(capsys.readouterr().out)["state"] == "succeeded"
     install = ubuntu.command.call_args_list[2].args[0]
     assert install[-len(UBUNTU["packages"]):] == UBUNTU["packages"] and "chromium" not in install
-    assert ubuntu.order[-3:] == ["browser:x86_64", "apparmor", "account"]
+    assert ubuntu.order[-3:] == ["browser:aarch64", "apparmor", "account"]
+    ubuntu.add_google_chrome.assert_not_called()
+
+
+def test_ubuntu_x86_64_installs_its_packages_then_google_chrome(ubuntu_chrome, capsys, monkeypatch):
+    monkeypatch.setenv("SUDO_UID", "0")
+    assert ubuntu_chrome.main() == 0
+    assert json.loads(capsys.readouterr().out)["state"] == "succeeded"
+    install = ubuntu_chrome.command.call_args_list[2].args[0]
+    assert install[-len(UBUNTU_CHROME["packages"]):] == UBUNTU_CHROME["packages"]
+    assert ubuntu_chrome.order[-2:] == ["google-chrome", "account"]
+    assert ubuntu_chrome.add_google_chrome.call_args.args[0] == ubuntu_chrome.APT
+    ubuntu_chrome.install_pinned_browser.assert_not_called()
+    ubuntu_chrome.install_apparmor_profile.assert_not_called()
+
+
+@pytest.mark.parametrize("code", ["INSTALL_DOWNLOAD_FAILED", "INSTALL_BROWSER_FAILED"])
+def test_google_chrome_that_cannot_be_installed_is_a_plain_failure(ubuntu_chrome, capsys, code):
+    ubuntu_chrome.add_google_chrome.side_effect = ubuntu_chrome.BrowserInstallError(code)
+    assert ubuntu_chrome.main() == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["state"] == "failed" and result["error"] == code
+    ubuntu_chrome.provision_runtime_account.assert_not_called()
 
 
 @pytest.mark.parametrize("code", ["INSTALL_DOWNLOAD_FAILED", "INSTALL_BROWSER_FAILED"])

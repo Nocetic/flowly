@@ -55,14 +55,27 @@ def test_ubuntu_uses_the_pinned_chromium_and_that_releases_libraries(version, la
     assert len(value["packages"]) == len(set(value["packages"]))
 
 
+@pytest.mark.parametrize("version", ["22.04", "24.04", "25.04"])
+def test_ubuntu_x86_64_uses_google_chrome_from_googles_own_package(version):
+    # X refused a person's own sign-in on Chrome for Testing and accepted Google
+    # Chrome from the same server (2026-10-21).
+    value = recipe({"ID": "ubuntu", "VERSION_ID": version}, "x86_64", UBUNTU_RESTRICTED)
+    assert value["browser"] == {"source": "distribution", "package": "google-chrome-stable"}
+    assert value["repositories"] == ["google-chrome"]
+    # Google's package brings its own dependencies and is installed from its
+    # file, not the apt list; Ubuntu ships the AppArmor profile for it.
+    assert "google-chrome-stable" not in value["packages"] and "libnss3" not in value["packages"]
+    assert "xfwm4" in value["packages"] and value["apparmor"] is False
+
+
 def test_ubuntu_gets_the_apparmor_profile_only_where_the_kernel_restricts_namespaces():
     release = {"ID": "ubuntu", "VERSION_ID": "24.04"}
-    assert recipe(release, paths=UBUNTU_RESTRICTED)["apparmor"] is True
-    assert recipe(release, paths=APT)["apparmor"] is False
+    assert recipe(release, "aarch64", paths=UBUNTU_RESTRICTED)["apparmor"] is True
+    assert recipe(release, "aarch64", paths=APT)["apparmor"] is False
     # The knob without the parser cannot be satisfied; the browser would fail, so say so.
-    assert recipe(release, paths=APT | {"/proc/sys/kernel/apparmor_restrict_unprivileged_userns"})["apparmor"] is False
+    assert recipe(release, "aarch64", paths=APT | {"/proc/sys/kernel/apparmor_restrict_unprivileged_userns"})["apparmor"] is False
     # Ubuntu 22.04 on a newer kernel: the knob, but an AppArmor 3 parser that has no userns rule.
-    assert recipe({"ID": "ubuntu", "VERSION_ID": "22.04"}, paths=APT | {
+    assert recipe({"ID": "ubuntu", "VERSION_ID": "22.04"}, "aarch64", paths=APT | {
         "/proc/sys/kernel/apparmor_restrict_unprivileged_userns", "/usr/sbin/apparmor_parser"})["apparmor"] is False
 
 
@@ -95,10 +108,10 @@ def test_hosts_without_a_reviewed_recipe_get_none(release, machine, paths):
 
 
 def test_the_recipe_id_binds_every_field():
-    value = recipe({"ID": "ubuntu", "VERSION_ID": "24.04"}, paths=UBUNTU_RESTRICTED)
+    value = recipe({"ID": "ubuntu", "VERSION_ID": "24.04"}, "aarch64", paths=UBUNTU_RESTRICTED)
     original = recipe_id(value)
     assert re.fullmatch(r"[a-f0-9]{64}", original) and recipe_id(dict(value)) == original
-    for key, changed in [("apparmor", False), ("distribution", "ubuntu-22.04"), ("architecture", "aarch64"),
+    for key, changed in [("apparmor", False), ("distribution", "ubuntu-22.04"), ("architecture", "x86_64"),
                          ("packages", value["packages"][:-1]), ("browser", {**value["browser"], "sha256": "0" * 64})]:
         assert recipe_id({**value, key: changed}) != original
 

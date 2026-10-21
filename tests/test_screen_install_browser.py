@@ -163,6 +163,10 @@ def test_an_endless_download_stops_at_the_pinned_size(worker):
 
 @pytest.mark.parametrize("root,pinned,found,expected", [
     (True, True, {"chromium": "/usr/bin/chromium"}, "pinned"),
+    # Google Chrome first, even beside a published pinned build (sites read its brands).
+    (True, True, {"google-chrome-stable": "/usr/bin/google-chrome-stable", "chromium": "/usr/bin/chromium"},
+     "/usr/bin/google-chrome-stable"),
+    (False, False, {"google-chrome-stable": "/usr/bin/google-chrome-stable"}, "/usr/bin/google-chrome-stable"),
     (True, False, {"chromium": "/usr/bin/chromium"}, "/usr/bin/chromium"),
     (True, False, {"chromium-browser": "/usr/bin/chromium-browser"}, None),  # Ubuntu's snap shim
     (True, False, {}, None),
@@ -270,3 +274,78 @@ def test_a_root_screen_start_gives_an_installed_pinned_browser_its_policy(monkey
     # Never fatal: the screen still starts, only with the bar.
     monkeypatch.setitem(install_recipe._BROWSER, "install_browser_policy", lambda _machine: 1 / 0)
     install_recipe.ensure_browser_policy(browser)
+
+
+CHROME_DEB = b"!<arch>\ndebian-binary..."
+CHROME_URL = "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
+
+
+def chrome_commands(worker, installed=False, fields=b"Package: google-chrome-stable\nArchitecture: amd64\n", apt=0):
+    calls = []
+    def command(args, timeout, capture=False):
+        calls.append(list(args))
+        if args[0] == "/usr/bin/dpkg-query":
+            return (0, b"install ok installed") if installed else (1, b"")
+        if args[0] == "/usr/bin/dpkg-deb":
+            # The file is read where apt will read it, while it still exists.
+            assert worker.Path(args[2]).read_bytes() == CHROME_DEB
+            return 0, fields
+        return apt, b""
+    worker.command = command
+    worker.served = {CHROME_URL: CHROME_DEB}
+    return calls
+
+
+def test_google_chrome_is_googles_package_checked_then_installed_by_apt(worker, tmp_path):
+    calls = chrome_commands(worker)
+    worker.add_google_chrome(["/usr/bin/apt-get"])
+    install = calls[-1]
+    assert install[:-1] == ["/usr/bin/apt-get", "install", "-y", "--no-install-recommends", "--no-remove"]
+    assert install[-1].endswith("/google-chrome-stable_current_amd64.deb")
+    # Nothing is left behind.
+    assert not worker.Path(install[-1]).parent.exists()
+
+
+def test_installed_google_chrome_is_not_downloaded_again(worker):
+    calls = chrome_commands(worker, installed=True)
+    worker.served = {}
+    worker.add_google_chrome(["/usr/bin/apt-get"])
+    assert [call[0] for call in calls] == ["/usr/bin/dpkg-query"]
+
+
+@pytest.mark.parametrize("fields", [b"Package: something-else\nArchitecture: amd64\n",
+                                    b"Package: google-chrome-stable\nArchitecture: arm64\n", b""])
+def test_a_file_that_is_not_googles_chrome_package_is_never_installed(worker, fields):
+    calls = chrome_commands(worker, fields=fields)
+    with pytest.raises(worker.BrowserInstallError) as error:
+        worker.add_google_chrome(["/usr/bin/apt-get"])
+    assert error.value.code == "INSTALL_BROWSER_FAILED"
+    assert all(call[0] != "/usr/bin/apt-get" for call in calls)
+
+
+def test_google_chrome_that_cannot_be_downloaded_or_installed_says_which(worker):
+    chrome_commands(worker)
+    worker.served = {CHROME_URL: OSError("offline")}
+    with pytest.raises(worker.BrowserInstallError) as error:
+        worker.add_google_chrome(["/usr/bin/apt-get"])
+    assert error.value.code == "INSTALL_DOWNLOAD_FAILED"
+    chrome_commands(worker, apt=100)
+    with pytest.raises(worker.BrowserInstallError) as error:
+        worker.add_google_chrome(["/usr/bin/apt-get"])
+    assert error.value.code == "INSTALL_BROWSER_FAILED"
+
+
+def test_an_endless_google_chrome_download_stops_at_its_limit(worker):
+    chrome_commands(worker)
+    worker.GOOGLE_CHROME_LIMIT = 4 << 20
+    class Endless:
+        def __enter__(self):
+            return self
+        def __exit__(self, *exc):
+            return False
+        def read(self, size):
+            return b"x" * size
+    worker._browser_urllib.build_opener = lambda *handlers: types.SimpleNamespace(open=lambda request, timeout: Endless())
+    with pytest.raises(worker.BrowserInstallError) as error:
+        worker.add_google_chrome(["/usr/bin/apt-get"])
+    assert error.value.code == "INSTALL_DOWNLOAD_FAILED"

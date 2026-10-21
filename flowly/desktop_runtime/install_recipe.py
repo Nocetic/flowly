@@ -48,6 +48,14 @@ PINNED_BROWSER = {
     },
 }
 
+# Ubuntu x86_64 runs Google Chrome itself. Sites read the browser's brands:
+# X refused a person's own sign-in on Chrome for Testing (brand "Chromium"
+# under a "Chrome" user agent) and accepted Google Chrome from the same server
+# (2026-10-21). Google's package adds Google's signed repository, which keeps
+# the browser updated; Google publishes no Linux arm64 build.
+GOOGLE_CHROME = {"package": "google-chrome-stable", "repository": "google-chrome",
+                 "url": "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"}
+
 # The desktop around the browser: same names on every apt release.
 APT_DESKTOP = (
     "tigervnc-standalone-server", "xauth", "dbus-x11", "xdotool", "x11-utils", "fonts-dejavu-core",
@@ -156,6 +164,12 @@ def _apt_recipe(release, machine, exists):
         version = _release_version(label)
         if version is None or version < (22, 4):
             return None
+        if machine == "x86_64":
+            # The package brings its own libraries; Ubuntu ships its AppArmor profile.
+            return {"recipeVersion": RECIPE_VERSION, "family": "apt", "distribution": "ubuntu-%d.%02d" % version,
+                    "architecture": machine, "packages": list(APT_DESKTOP),
+                    "repositories": [GOOGLE_CHROME["repository"]],
+                    "browser": {"source": "distribution", "package": GOOGLE_CHROME["package"]}, "apparmor": False}
         libraries = UBUNTU_BROWSER_LIBRARIES["24.04" if version >= (24, 4) else "22.04"]
         pinned = PINNED_BROWSER[machine]
         # Ubuntu 23.10+ kernels can deny unprivileged user namespaces; the
@@ -186,6 +200,7 @@ os_release = _RECIPE["os_release"]
 recipe_id = _RECIPE["recipe_id"]
 PINNED_BROWSER = _RECIPE["PINNED_BROWSER"]
 BROWSER_ROOT = _RECIPE["BROWSER_ROOT"]
+GOOGLE_CHROME = _RECIPE["GOOGLE_CHROME"]
 
 
 # Root-only, stdlib-only steps of the privileged worker for a pinned browser.
@@ -373,6 +388,52 @@ def install_pinned_browser(machine):
             _browser_shutil.rmtree(staging, ignore_errors=True)
     install_browser_policy(machine)
 
+GOOGLE_CHROME_LIMIT = 512 << 20
+
+def add_google_chrome(apt):
+    """Google's own package, over verified TLS from Google, checked to be that
+    package and installed by apt; it adds Google's signed repository. Kept as
+    is once installed: updates come from that repository."""
+    code, status = command(["/usr/bin/dpkg-query", "-W", "-f=${Status}", GOOGLE_CHROME["package"]], 30, 64)
+    if code == 0 and status == b"install ok installed":
+        return
+    directory = Path(tempfile.mkdtemp(prefix="flowly-chrome-"))
+    try:
+        name = directory / GOOGLE_CHROME["url"].rsplit("/", 1)[1]
+        deadline = time.monotonic() + DOWNLOAD_SECONDS
+        context = _browser_ssl.create_default_context()
+        opener = _browser_urllib.build_opener(_browser_urllib.ProxyHandler({}),
+                                              _browser_urllib.HTTPSHandler(context=context))
+        try:
+            request = _browser_urllib.Request(GOOGLE_CHROME["url"], headers={"User-Agent": "Flowly-screen-installer"})
+            size = 0
+            with opener.open(request, timeout=60) as response, open(name, "xb") as output:
+                while True:
+                    if time.monotonic() > deadline:
+                        raise TimeoutError()
+                    chunk = response.read(1 << 20)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > GOOGLE_CHROME_LIMIT:
+                        raise ValueError()
+                    output.write(chunk)
+                output.flush()
+                os.fsync(output.fileno())
+        except Exception:
+            raise BrowserInstallError("INSTALL_DOWNLOAD_FAILED") from None
+        code, fields = command(["/usr/bin/dpkg-deb", "--field", str(name), "Package", "Architecture"], 30, 256)
+        if code or fields.split() != [b"Package:", GOOGLE_CHROME["package"].encode(), b"Architecture:", b"amd64"]:
+            raise BrowserInstallError("INSTALL_BROWSER_FAILED")
+        # apt reads a local package as its unprivileged _apt user.
+        os.chmod(directory, 0o755)
+        os.chmod(name, 0o644)
+        code, _ = command([*apt, "install", "-y", "--no-install-recommends", "--no-remove", str(name)], 600)
+        if code:
+            raise BrowserInstallError("INSTALL_BROWSER_FAILED")
+    finally:
+        _browser_shutil.rmtree(directory, ignore_errors=True)
+
 def apparmor_profile_text(abi=True):
     return ("# Flowly Screen: only the pinned Chromium may create the user namespaces its\n"
             "# sandbox needs where the kernel restricts them (Ubuntu 23.10+). Sandbox stays on.\n"
@@ -405,18 +466,22 @@ _BROWSER = _namespace(RECIPE_SOURCE + BROWSER_SOURCE)
 
 
 def screen_browser() -> str | None:
-    """The browser a screen runs: the pinned one this installer published (its
-    root-owned manifest and binary checked), else the distribution's own
-    Chromium. Root hosts look only in /usr/bin:/bin; an unprivileged agent may
+    """The browser a screen runs: Google Chrome where it is installed, else the
+    pinned one this installer published (its root-owned manifest and binary
+    checked), else the distribution's own Chromium. Root hosts look only in /usr/bin:/bin; an unprivileged agent may
     use its PATH, as before. A snap Chromium (Ubuntu's chromium-browser shim,
     /snap/bin) is never used: its confinement breaks the screen's layout."""
     import platform
     import shutil
 
     machine, version = platform.machine(), PINNED_BROWSER["version"]
+    root = hasattr(os, "geteuid") and os.geteuid() == 0
+    # Google Chrome first, even beside a published pinned build: sites read its brands.
+    found = shutil.which(GOOGLE_CHROME["package"], path="/usr/bin:/bin" if root else None)
+    if found:
+        return os.path.abspath(found)
     if machine in PINNED_BROWSER and _BROWSER["browser_manifest_valid"](version, machine):
         return os.path.join(BROWSER_ROOT, version, PINNED_BROWSER[machine]["directory"], "chrome")
-    root = hasattr(os, "geteuid") and os.geteuid() == 0
     # Debian names it chromium; Fedora and EPEL chromium-browser (a wrapper).
     for name in ("chromium", "chromium-browser"):
         found = shutil.which(name, path="/usr/bin:/bin" if root else None)

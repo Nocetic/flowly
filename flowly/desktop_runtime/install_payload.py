@@ -302,6 +302,8 @@ def main():
                         try:
                             if recipe["browser"]["source"] == "pinned":
                                 install_pinned_browser(recipe["architecture"])
+                            elif recipe["browser"]["package"] == GOOGLE_CHROME["package"]:
+                                add_google_chrome(APT)
                             if recipe["apparmor"]:
                                 install_apparmor_profile()
                             if uid == "0":
