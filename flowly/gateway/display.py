@@ -15,6 +15,7 @@ import contextvars
 import functools
 import json
 import os
+import re
 import secrets
 import sys
 import threading
@@ -68,6 +69,125 @@ IDLE_CHECK_SECONDS = 60
 ACTIVITY_METHODS = frozenset({"display.observe", "display.viewer.create", "display.control.acquire",
                               "display.control.release", "display.control.reclaim", "display.run.resume",
                               "display.start"})
+
+
+#: Fly app names: lowercase letters, digits and dashes (the machine's
+#: ``<app>.fly.dev`` host, server/PROTOCOL.md C).
+_FLY_APP_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+class ServerScreenTickets:
+    """Stream tickets issued through ``screen.ticket`` for Flowly server clients.
+
+    Only these admit a stream without the gateway token (server/PROTOCOL.md C).
+    The stream still redeems the ticket through ``StreamTickets`` (single use,
+    30 s, bound to host, profile and generation); this registry only records
+    that the ticket was minted for the server, so an owner ticket from
+    ``display.observe`` keeps needing the token. Raw tickets are not kept.
+
+    It also remembers the one viewer capability per profile that the server's
+    tickets use, so repeated tickets do not use up the viewer slots.
+    """
+
+    CAPACITY = 64
+
+    def __init__(self, clock=time.monotonic):
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._tickets: dict[str, float] = {}
+        self._viewers: dict[tuple[str, str], tuple[str, str]] = {}
+
+    @staticmethod
+    def _digest(ticket: object) -> str | None:
+        if not isinstance(ticket, str) or not ticket or len(ticket) > 256:
+            return None
+        return hashlib.sha256(ticket.encode()).hexdigest()
+
+    def remember(self, ticket: str, ttl_seconds: float) -> None:
+        digest = self._digest(ticket)
+        if digest is None:
+            return
+        with self._lock:
+            now = self._clock()
+            for key in [key for key, expires in self._tickets.items() if expires <= now]:
+                del self._tickets[key]
+            while len(self._tickets) >= self.CAPACITY:
+                self._tickets.pop(next(iter(self._tickets)))
+            self._tickets[digest] = now + ttl_seconds
+
+    def pending(self, ticket: object) -> bool:
+        """The ticket was issued for the server, is unexpired and not yet used."""
+        digest = self._digest(ticket)
+        with self._lock:
+            expires = self._tickets.get(digest) if digest else None
+            return expires is not None and expires > self._clock()
+
+    def claim(self, ticket: object) -> bool:
+        """Take the ticket out of the registry; true when it was pending."""
+        digest = self._digest(ticket)
+        with self._lock:
+            expires = self._tickets.pop(digest, None) if digest else None
+            return expires is not None and expires > self._clock()
+
+    def viewer(self, profile: str, bot: str, generation: str) -> str | None:
+        with self._lock:
+            entry = self._viewers.get((profile, bot))
+            return entry[1] if entry and entry[0] == generation else None
+
+    def keep_viewer(self, profile: str, bot: str, generation: str, token: str) -> None:
+        with self._lock:
+            self._viewers.pop((profile, bot), None)
+            while len(self._viewers) >= 16:
+                self._viewers.pop(next(iter(self._viewers)))
+            self._viewers[(profile, bot)] = (generation, token)
+
+    def forget_viewer(self, profile: str, bot: str) -> None:
+        with self._lock:
+            self._viewers.pop((profile, bot), None)
+
+
+def issue_server_ticket(gateway, profile: object) -> dict:
+    """``screen.ticket`` (server/PROTOCOL.md C): a view-only stream ticket for a server client.
+
+    Returns ``{url, ticket, expiresAt, profileId, generation, hostId, botId}``.
+    The client opens ``url`` with the ticket in ``X-Flowly-Screen-Ticket`` and
+    the rest in the usual stream headers (``X-Flowly-Profile``,
+    ``X-Flowly-Screen-Generation``, ``X-Flowly-Host-Id``, ``X-Flowly-Bot-Id``);
+    no gateway token. Blocking (disk and SQLite): call it from a worker thread.
+    """
+    app = os.environ.get("FLY_APP_NAME", "").strip()
+    if not _FLY_APP_NAME.match(app):
+        # Only a cloud machine has a public screen address.
+        raise ScreenError("SCREEN_TICKET_UNAVAILABLE")
+    if not isinstance(profile, str):
+        raise ScreenError("INVALID_PARAMS")
+    session = _resolve(gateway, {"profileId": profile})
+    capability = ScreenRuntime.capabilities()
+    if not capability["supported"]:
+        raise ScreenError(capability["reason"])
+    state = session.runtime.status()
+    if not state or state.get("phase") != "running":
+        raise ScreenError("SCREEN_NOT_RUNNING")
+    generation = state["generation"]
+    registry: ServerScreenTickets = gateway._server_screen_tickets
+    identity = session.identity
+    token = registry.viewer(identity["profileId"], identity["botId"], generation)
+    try:
+        observed = session.observe(generation, token)
+    except ScreenError as exc:
+        if token is None or exc.code not in ("VIEWER_EXPIRED", "VIEWER_REVOKED"):
+            raise
+        registry.forget_viewer(identity["profileId"], identity["botId"])
+        observed = session.observe(generation, None)
+    if observed.get("viewerToken"):
+        registry.keep_viewer(identity["profileId"], identity["botId"], generation, observed["viewerToken"])
+    ticket, lifetime_ms = observed["ticket"], observed["expiresInMs"]
+    registry.remember(ticket, lifetime_ms / 1000)
+    logger.info("[Screen] server ticket {} issued for profile {}", stream_trace(ticket), identity["profileId"])
+    return {"url": f"wss://{app}.fly.dev{STREAM_PATH}", "ticket": ticket,
+            "expiresAt": int(time.time() * 1000) + lifetime_ms,
+            "profileId": identity["profileId"], "generation": generation,
+            "hostId": identity["hostId"], "botId": identity["botId"]}
 
 
 def _supports_input(state: dict | None) -> bool:
@@ -531,13 +651,17 @@ def register_display(app: web.Application, gateway) -> None:
     gateway._display_sessions = {}
     gateway._display_resolution_lock = threading.Lock()
     gateway._display_subscriptions = DisplaySubscriptions(gateway, _resolve)
+    gateway._server_screen_tickets = ServerScreenTickets()
 
     async def stream(request: web.Request) -> web.StreamResponse:
-        # The ordinary gateway middleware checks Authorization under enforced
-        # auth. An exempt loopback gateway still requires the token here: the
-        # screen is never reachable without it, even with a ticket.
-        if not gateway._auth_token or (not gateway._require_auth and not token_matches(
-                extract_request_token(request), gateway._auth_token)):
+        # The screen always needs the gateway token, also on an exempt loopback
+        # gateway, with one exception: a ticket issued through ``screen.ticket``
+        # for a Flowly server client (PROTOCOL.md C) stands in for the token on
+        # this route only. The ticket is still redeemed below, once, for its own
+        # profile and generation. A gateway without a token never shows it.
+        if not gateway._auth_token or not (
+                token_matches(extract_request_token(request), gateway._auth_token)
+                or gateway._server_screen_tickets.claim(request.headers.get("X-Flowly-Screen-Ticket"))):
             return _error("UNAUTHORIZED", 401)
         if not _protected_socket(request) or not host_origin_allowed(request):
             return _error("SECURE_TRANSPORT_REQUIRED", 403)

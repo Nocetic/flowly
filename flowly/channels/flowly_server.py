@@ -196,6 +196,29 @@ class FlowlyServerChannel(WebChannel):
         except Exception as exc:  # noqa: BLE001 - socket may have dropped
             logger.debug(f"[FlowlyServer] heartbeat.trigger reply not sent: {exc}")
 
+    # ── screen ────────────────────────────────────────────────────────────
+
+    async def _handle_screen_ticket(self, ws, msg: dict) -> None:
+        """PROTOCOL.md C: a ticket the client presents to this machine's screen stream."""
+        from flowly.desktop_runtime.authority import ScreenError
+        from flowly.gateway.display import issue_server_ticket
+
+        params = msg.get("params")
+        profile = params.get("profile", "default") if isinstance(params, dict) else "default"
+        try:
+            if self._screen_gateway is None:
+                raise ScreenError("SCREEN_TICKET_UNAVAILABLE")
+            body: dict[str, Any] = {"result": await asyncio.to_thread(
+                issue_server_ticket, self._screen_gateway, profile)}
+        except ScreenError as exc:
+            message = ("This agent cannot share its screen directly."
+                       if exc.code == "SCREEN_TICKET_UNAVAILABLE" else "The screen ticket could not be issued.")
+            body = {"error": {"code": exc.code, "message": message, "retryable": False}}
+        except OSError:
+            body = {"error": {"code": "CONTROL_UNAVAILABLE", "message": "The screen state is unavailable.",
+                              "retryable": True}}
+        await ws.send(self._reply(msg, body))
+
     # ── frames ────────────────────────────────────────────────────────────
 
     async def _handle_relay_message(self, ws, msg: dict) -> None:
@@ -211,13 +234,7 @@ class FlowlyServerChannel(WebChannel):
             if self._power is not None and not _is_passive(method):
                 self._power.touch()
             if method == "screen.ticket":
-                # PROTOCOL.md C: the direct screen endpoint on the machine is
-                # not built yet; answer instead of letting the client time out.
-                await ws.send(self._reply(msg, {"error": {
-                    "code": "SCREEN_TICKET_UNAVAILABLE",
-                    "message": "This agent cannot share its screen directly yet.",
-                    "retryable": False,
-                }}))
+                await self._handle_screen_ticket(ws, msg)
                 return
         await super()._handle_relay_message(ws, msg)
         if isinstance(msg, dict) and msg.get("type") == "ready" and self._power is not None and ws is self._ws:

@@ -905,7 +905,9 @@ class GatewayServer:
             path = request.path
             if path in self._AUTH_PUBLIC_PATHS or path in self._AUTH_SELF_GATED_PATHS:
                 return await handler(request)
-            if not token_matches(extract_request_token(request), self._auth_token):
+            if not token_matches(extract_request_token(request), self._auth_token) and not (
+                path == self._SCREEN_STREAM_PATH and self._server_screen_ticket_pending(request)
+            ):
                 return web.json_response(
                     {"error": "unauthorized", "detail": "Missing or invalid gateway token."},
                     status=401,
@@ -913,6 +915,16 @@ class GatewayServer:
             return await handler(request)
 
         return _auth_middleware
+
+    # The screen stream (flowly/gateway/display.py) also admits a Flowly server
+    # client that presents only a ticket from ``screen.ticket`` (PROTOCOL.md C).
+    # Only that exact route, only while such a ticket is pending; the stream
+    # handler then claims and redeems it for its own profile and generation.
+    _SCREEN_STREAM_PATH = "/api/display/stream"
+
+    def _server_screen_ticket_pending(self, request: web.Request) -> bool:
+        registry = getattr(self, "_server_screen_tickets", None)
+        return registry is not None and registry.pending(request.headers.get("X-Flowly-Screen-Ticket"))
 
     async def _handle_ws_ticket(self, request: web.Request) -> web.Response:
         """Mint a single-use, short-TTL ticket for the /ws upgrade. Under
