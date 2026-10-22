@@ -34,6 +34,8 @@ POWER_METHODS = frozenset({"power.status", "power.sleep", "power.wake", "heartbe
 PASSIVE_METHODS = frozenset({
     "chat.inflight", "chat.history", "chat.command", "commands.list",
     "objectives.list", "agenda.list",
+    # A desktop says every 30 s that its owner is at the computer (flowly.push.presence).
+    "presence.report",
 })
 
 #: While backing off, look at the clocks this often for a resume.

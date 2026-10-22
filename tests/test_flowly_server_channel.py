@@ -317,6 +317,16 @@ async def test_client_chat_is_activity_but_polls_are_not():
     assert monitor.status()["lastActivityAt"] == int(clock.now * 1000)
 
 
+async def test_a_desktop_presence_report_is_not_activity():
+    # The desktop reports every 30 s while its owner is at the Mac; counted as
+    # use, an open app would keep a cloud machine awake for good.
+    channel, socket, monitor, clock = _channel()
+    await channel._handle_relay_message(socket, {"type": "rpc", "id": "r1", "sessionId": "c", "method": "presence.report",
+                                                 "params": {"sourceId": "desktop:a", "present": True, "kinds": ["chat"],
+                                                            "ttlSeconds": 90}})
+    assert monitor.status()["lastActivityAt"] is None
+
+
 async def test_power_rpcs_from_a_client_session_are_refused():
     channel, socket, monitor, _ = _channel()
     await channel._handle_relay_message(socket, {"type": "rpc", "id": "p2", "sessionId": "client-1",

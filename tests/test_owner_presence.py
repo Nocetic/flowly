@@ -27,6 +27,7 @@ def phones(monkeypatch):
 def clock(monkeypatch):
     now = [1000.0]
     monkeypatch.setattr(presence.time, 'monotonic', lambda: now[0])
+    monkeypatch.setattr(presence.time, 'time', lambda: now[0] + 1_700_000_000)
     return now
 
 
@@ -156,3 +157,31 @@ async def test_the_owner_reports_screen_and_call_over_the_feature_rpc(clock):
     })
     assert presence.owner_watching('web:conv-b')
     assert not presence.shown_at_computer('chat')
+
+
+@pytest.mark.asyncio
+async def test_a_report_from_before_a_suspend_does_not_hold_the_phone_after_it(phones, monkeypatch):
+    # A cloud machine is suspended while idle, and the monotonic clock stops
+    # with it. The desktop's "away" report, sent while it slept, never
+    # arrived; hours later a routine wakes it. The old report must not still
+    # look fresh, or the routine's notification reaches no one.
+    mono, wall = [1000.0], [1_700_000_000.0]
+    monkeypatch.setattr(presence.time, 'monotonic', lambda: mono[0])
+    monkeypatch.setattr(presence.time, 'time', lambda: wall[0])
+    presence.report('desktop-a', True, ['cron'], 90)
+    mono[0] += 5
+    wall[0] += 3 * 3600 + 5
+    await notifications.deliver(notice('cron', 'cron:j:after-wake'))
+    assert phones == ['cron:j:after-wake']
+
+
+@pytest.mark.asyncio
+async def test_a_wall_clock_set_back_does_not_stretch_a_report(phones, monkeypatch):
+    mono, wall = [1000.0], [1_700_000_000.0]
+    monkeypatch.setattr(presence.time, 'monotonic', lambda: mono[0])
+    monkeypatch.setattr(presence.time, 'time', lambda: wall[0])
+    presence.report('desktop-a', True, ['cron'], 90)
+    mono[0] += 91
+    wall[0] -= 3600
+    await notifications.deliver(notice('cron', 'cron:j:2'))
+    assert phones == ['cron:j:2']

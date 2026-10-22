@@ -40,6 +40,11 @@ _MAX_SESSION_LENGTH = 512
 @dataclass(frozen=True)
 class _Report:
     expires_at: float
+    #: The same deadline on the wall clock. A suspended machine (a cloud
+    #: agent asleep) stops the monotonic clock, so a report from before the
+    #: suspend would otherwise still look fresh after it; a wall clock set
+    #: back is caught by the monotonic deadline.
+    wall_expires_at: float
     kinds: frozenset[str]
     watching: frozenset[str]
     in_call: bool
@@ -83,14 +88,14 @@ def report(
         ttl = MIN_TTL_SECONDS
     ttl = min(MAX_TTL_SECONDS, max(MIN_TTL_SECONDS, ttl))
     _reports.pop(source, None)
-    _reports[source] = _Report(time.monotonic() + ttl, held, watched, calling)
+    _reports[source] = _Report(time.monotonic() + ttl, time.time() + ttl, held, watched, calling)
     while len(_reports) > MAX_SOURCES:
         _reports.pop(next(iter(_reports)))
 
 
 def _fresh() -> list[_Report]:
-    now = time.monotonic()
-    for source in [s for s, r in _reports.items() if r.expires_at <= now]:
+    now, wall = time.monotonic(), time.time()
+    for source in [s for s, r in _reports.items() if r.expires_at <= now or r.wall_expires_at <= wall]:
         _reports.pop(source, None)
     return list(_reports.values())
 
