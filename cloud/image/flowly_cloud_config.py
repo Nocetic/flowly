@@ -51,6 +51,13 @@ def apply(config, environ) -> list[str]:
             flowly.enabled, flowly.account_key = True, key
             changed.append("providers.flowly")
 
+    # D10: the agent drives its own screen's desktop (the computer tool goes
+    # through the screen's authority there, never this machine's display).
+    computer = getattr(getattr(config, "tools", None), "computer", None)
+    if computer is not None and not computer.enabled:
+        computer.enabled = True
+        changed.append("tools.computer.enabled")
+
     if environ.get("FLOWLY_AGENT_SECRET", "").strip():
         server = getattr(config.channels, "flowly_server", None)
         if server is None:

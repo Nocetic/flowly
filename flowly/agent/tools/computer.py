@@ -32,6 +32,42 @@ def _electron_api_file() -> Path:
 _PLATFORM = sys.platform  # "darwin", "linux", "win32"
 
 
+def _screen_desktop() -> bool:
+    """A cloud machine's screen (D10): the Linux desktop the person watches."""
+    import os
+
+    return _PLATFORM == "linux" and bool(os.environ.get("FLY_APP_NAME", "").strip())
+
+
+_COORD = {"type": "integer", "minimum": 0, "maximum": 32767}
+SCREEN_DESCRIPTION = (
+    "Use your own computer's desktop: a Linux (xfce) desktop with a dock (Terminal, Browser, Settings). "
+    "The person can watch it live and may take control at any time; then your actions are refused until "
+    "they hand it back, and you must take a new screenshot before pointing at anything.\n\n"
+    "Always take a screenshot first and plan clicks on its pixel coordinates. For web pages prefer "
+    "browser_tab; for commands prefer exec (its output is not shown on screen). Use this tool when the "
+    "person should see the work on the desktop, or for desktop apps. Actions: screenshot, click "
+    "(button left|middle|right, count 1-3), move, drag (x,y → to_x,to_y), scroll (direction up|down|left|right, "
+    "amount), type (text, into the focused window), key (X11 key or shortcut, e.g. Return, ctrl+c, alt+Tab), "
+    "open_app (name: terminal | settings). A failed action may still have happened: look before repeating it."
+)
+SCREEN_PARAMETERS = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string", "enum": ["screenshot", "click", "move", "drag", "scroll", "type", "key", "open_app"]},
+        "x": _COORD, "y": _COORD, "to_x": _COORD, "to_y": _COORD,
+        "button": {"type": "string", "enum": ["left", "middle", "right"]},
+        "count": {"type": "integer", "minimum": 1, "maximum": 3},
+        "direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
+        "amount": {"type": "integer", "minimum": 1, "maximum": 30},
+        "text": {"type": "string", "maxLength": 4000},
+        "key": {"type": "string", "pattern": "^[A-Za-z0-9_+]+$", "maxLength": 100},
+        "name": {"type": "string", "enum": ["terminal", "settings"]},
+    },
+    "required": ["action"],
+}
+
+
 # ---------------------------------------------------------------------------
 # AppleScript helpers (macOS native fallback)
 # ---------------------------------------------------------------------------
@@ -109,6 +145,49 @@ class ComputerTool(Tool):
         self._config = config or ComputerConfig()
         self._screenshot_tool = screenshot_tool
 
+    async def _screen_execute(self, screen_run: Any, action: str, params: dict) -> str:
+        """D10: this run's own screen, through its authority (desktop_act / desktop_still)."""
+        import uuid
+
+        from flowly.desktop_runtime.authority import ScreenError
+        from flowly.desktop_runtime.desktop_act import ACTIONS, POINTED, note_observation, observed_epoch
+        from flowly.desktop_runtime.host_screen_run import unavailable
+
+        if action != "screenshot" and action not in ACTIONS:
+            return json.dumps({"error": f"Unknown action {action!r} for this desktop.", "error_code": "INVALID_PARAMS"})
+        try:
+            binding = await screen_run.bind()
+        except ScreenError as exc:
+            return json.dumps(unavailable(exc))
+        if binding is None:
+            return json.dumps(unavailable(ScreenError("SCREEN_NOT_RUNNING")))
+        provider = binding.provider
+        if action == "screenshot":
+            from flowly.agent.reply_media import media_envelope
+            from flowly.agent.tools.browser_tab import BrowserTabTool
+
+            result = await provider.desktop_screenshot(binding.run_id, str(uuid.uuid4()), binding.generation)
+            if not provider.observation_valid(result):
+                return json.dumps({"error": "Screen control changed", "error_code": "STALE_OBSERVATION"})
+            if not result.get("screenshot"):
+                return json.dumps(result)
+            saved = BrowserTabTool._save_screenshot_to_file(result)
+            if not saved.get("path"):
+                return json.dumps(saved)
+            observation = result.get("_screenObservation")
+            if isinstance(observation, dict) and isinstance(observation.get("epoch"), int):
+                note_observation(binding.run_id, observation["epoch"])
+            return media_envelope([saved["path"]], "Screen captured (the whole desktop), attached to this reply.")
+        observed = observed_epoch(binding.run_id)
+        if action in POINTED and observed is None:
+            return json.dumps({"error": "Take a screenshot first, then point at what it shows.",
+                               "error_code": "OBSERVATION_REQUIRED"})
+        args = {key: value for key, value in params.items() if value is not None}
+        result = await provider.desktop_act(binding.run_id, str(uuid.uuid4()), binding.generation, action, args,
+                                            observed_epoch=observed if action in POINTED else None)
+        result.pop("_screenObservation", None)
+        return json.dumps(result)
+
     @functools.cached_property
     def _has_cliclick(self) -> bool:
         return shutil.which("cliclick") is not None
@@ -119,6 +198,8 @@ class ComputerTool(Tool):
 
     @property
     def description(self) -> str:
+        if _screen_desktop():
+            return SCREEN_DESCRIPTION
         base = (
             "Control the desktop — mouse, keyboard, screen capture, and UI automation.\n\n"
             "PRIMARY workflow is AX-direct: read the window's accessibility tree as\n"
@@ -166,6 +247,8 @@ class ComputerTool(Tool):
 
     @property
     def parameters(self) -> dict[str, Any]:
+        if _screen_desktop():
+            return SCREEN_PARAMETERS
         return {
             "type": "object",
             "properties": {
@@ -240,8 +323,7 @@ class ComputerTool(Tool):
 
         screen_run = current_screen_run()
         if screen_run is not None and screen_run.uses_screen():
-            return json.dumps({"error": "This run is bound to the remote browser. Use browser_tab for screen actions.",
-                               "error_code": "BROWSER_SCOPE_ONLY"})
+            return await self._screen_execute(screen_run, action, kwargs)
         if not self._config.enabled:
             return json.dumps({"error": "Computer use disabled. Enable: tools.computer.enabled = true"})
 

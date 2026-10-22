@@ -147,6 +147,11 @@ class ScreenshotTool(Tool):
             saved = BrowserTabTool._save_screenshot_to_file(result)
             if not saved.get("path"):
                 return json.dumps(saved)
+            observation = result.get("_screenObservation")
+            if whole and isinstance(observation, dict) and isinstance(observation.get("epoch"), int):
+                from flowly.desktop_runtime.desktop_act import note_observation
+
+                note_observation(binding.run_id, observation["epoch"])
             from flowly.agent.reply_media import media_envelope
 
             return media_envelope([saved["path"]], ("Screen captured (the whole desktop)" if whole

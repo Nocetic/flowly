@@ -386,6 +386,32 @@ class HostBrowserProvider:
             return {"error": "Screen action could not complete. Observe the current state before retrying.",
                     "error_code": exc.code}
 
+    async def desktop_act(self, run_id: str, request_id: str, generation: str, action: str, params: dict, *,
+                          observed_epoch: int | None = None) -> dict:
+        """One desktop action of ``run_id`` (D10), done by the screen's supervisor in its session.
+
+        Refused like every action while the person has control. ``observed_epoch``
+        is the epoch of the picture the action was planned on: after a takeover
+        and handback its coordinates may point at something else, so the agent
+        must look again (STALE_OBSERVATION). A failed action is never retried.
+        """
+        from flowly.desktop_runtime.desktop_act import request_act
+
+        async def operate():
+            state = await asyncio.to_thread(self.runtime.status)
+            if not state or state.get("phase") != "running" or state.get("generation") != generation:
+                raise ScreenError("SCREEN_NOT_RUNNING")
+            if observed_epoch is not None and observed_epoch != self._epoch_now():
+                raise ScreenError("STALE_OBSERVATION")
+            await asyncio.to_thread(request_act, self.runtime.socket_directory / "act.sock", action, params)
+            return {"success": True, "_screenObservation": {"generation": generation, "epoch": self._epoch_now()}}
+
+        try:
+            return await self.execution.action(run_id, request_id, generation, operate, fence=self.disconnect)
+        except ScreenError as exc:
+            return {"error": "Screen action could not complete. Observe the current state before retrying.",
+                    "error_code": exc.code}
+
     def _epoch_now(self) -> int:
         return self.runtime.authority.snapshot()["epoch"]
 

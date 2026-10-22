@@ -25,14 +25,14 @@ def test_gateway_is_loopback_with_enforced_token_and_flowly_provider(writer):
     assert (config.gateway.host, config.gateway.port) == ("127.0.0.1", 18790)
     assert config.gateway.require_auth is True and config.gateway.token == "edge-token"
     assert config.providers.flowly.enabled and config.providers.flowly.account_key == "flw_key"
-    assert changed == ["gateway.token", "providers.flowly"]
+    assert changed == ["gateway.token", "providers.flowly", "tools.computer.enabled"]
     # Names only: the boot log never carries a value.
     assert "edge-token" not in repr(changed) and "flw_key" not in repr(changed)
 
 
 def test_missing_token_is_generated_once_and_kept(writer):
     config = Config()
-    assert writer.apply(config, {}) == ["gateway.token (generated)"]
+    assert writer.apply(config, {}) == ["gateway.token (generated)", "tools.computer.enabled"]
     token = config.gateway.token
     assert len(token) >= 32
     assert writer.apply(config, {}) == [] and config.gateway.token == token
@@ -55,3 +55,11 @@ def test_agent_secret_enables_the_server_channel_when_core_has_it(writer, capsys
     else:
         assert server.enabled and "channels.flowlyServer.enabled" in changed
         assert "s" not in {getattr(server, name, None) for name in ("agent_secret",)}  # secret stays in env
+
+
+def test_the_cloud_agent_gets_the_computer_tool_for_its_screen(writer):
+    """D10: the computer tool drives the screen's desktop through its authority."""
+    config = Config()
+    assert config.tools.computer.enabled is False
+    assert "tools.computer.enabled" in writer.apply(config, {"FLOWLY_GATEWAY_TOKEN": "t"})
+    assert config.tools.computer.enabled is True

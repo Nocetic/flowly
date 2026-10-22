@@ -238,7 +238,9 @@ async def test_screen_bound_capture_cannot_fall_back_to_physical_display(screen_
         computer = json.loads(await ComputerTool().execute("click", x=10, y=10))
         provider.runtime.authority.release("human", "generation", human["epoch"])
     assert capture["error_code"] == "SCREEN_HANDOFF_REQUIRED"
-    assert computer["error_code"] == "BROWSER_SCOPE_ONLY"
+    # D10: the computer tool now drives the screen's own desktop, never the
+    # physical display; a pointed action first needs a picture of that desktop.
+    assert computer["error_code"] == "OBSERVATION_REQUIRED"
     provider._dispatch.assert_awaited_once_with("get_page_text", {})
 
 

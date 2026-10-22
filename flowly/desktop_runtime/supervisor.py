@@ -143,6 +143,7 @@ def run(directory: Path, generation: str) -> None:
         captures = None
         observers = None
         stills = None
+        acts = None
         stopping = False
         application = None
         guarded = None
@@ -422,9 +423,17 @@ def run(directory: Path, generation: str) -> None:
             stills = StillService(sockets, lambda: application_output(
                 ["python3", "-I", "-c", STILL_SOURCE], env, timeout=10, limit=MAX_STILL_BYTES),
                 allowed=lambda: runtime.authority.snapshot()["control"] == "agent")
+            from flowly.desktop_runtime.desktop_act import ACT_SOURCE, ActService
+
+            (sockets / "act.sock").unlink(missing_ok=True)
+            # The agent's desktop actions (D10), done in the session like the
+            # picture and refused the same way while the person has control.
+            acts = ActService(sockets, lambda request: application_output(
+                ["python3", "-I", "-c", ACT_SOURCE, request], env, timeout=10, limit=64),
+                allowed=lambda: runtime.authority.snapshot()["control"] == "agent")
             state.update(phase="running", display=env["DISPLAY"], socket=str(rfb),
                          cdpPort=port, inputServiceVersion=3, observerServiceVersion=3, captureServiceVersion=1,
-                         stillServiceVersion=1, error=None)
+                         stillServiceVersion=1, actServiceVersion=1, error=None)
             write_state(runtime.manifest, state)
             stamp, ticks = metadata_stamp(), 0
             while not stopping:
@@ -475,6 +484,11 @@ def run(directory: Path, generation: str) -> None:
                     stills.close()
                 except Exception:
                     pass  # a picture service that will not close stops nothing else
+            if acts is not None:
+                try:
+                    acts.close()
+                except Exception:
+                    pass  # likewise for the action service
             if captures is not None:
                 try:
                     captures.close()
