@@ -11,6 +11,18 @@ if ! flowly screen restore-accounts; then
   echo "flowly-cloud-setup: some screen accounts were not restored (see above)" >&2
 fi
 
+# Nothing of the previous boot is alive now. A screen that was running when the
+# machine stopped or was redeployed is still recorded as running, and Core
+# refuses to start over it (RUNTIME_RECOVERY_REQUIRED); close that record.
+case "$(flowly screen status 2>/dev/null)" in
+  *'"error": "RUNTIME_RECOVERY_REQUIRED"'*|*'"error": "RUNTIME_FAILED"'*)
+    if flowly screen stop >/dev/null; then
+      echo "flowly-cloud-setup: closed the screen left running by the previous boot"
+    else
+      echo "flowly-cloud-setup: could not close the previous boot's screen" >&2
+    fi ;;
+esac
+
 # Core's config from the machine's secrets. Without it the gateway cannot start.
 set -a
 . /etc/flowly/cloud/setup.env

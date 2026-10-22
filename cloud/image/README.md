@@ -37,6 +37,9 @@ Machines are created and driven by `server/src/machines/fly.ts`
      each per-profile `flowly-s-…` account from the receipts on the volume with the
      same UID/GID (the root filesystem, and `/etc/passwd` with it, is reset on every
      redeploy or cold start). The image itself ships with no screen account.
+   - A screen recorded as running by the previous boot is closed (`flowly screen stop`);
+     otherwise Core refuses to start a new one (`RUNTIME_RECOVERY_REQUIRED`). Default
+     profile only.
    - `flowly_cloud_config.py`: gateway on `127.0.0.1:18790` with `requireAuth` and its
      token, the Flowly provider with the account key, the Flowly server channel
      enabled when an agent secret is present; `flowly bootstrap` for the workspace.
