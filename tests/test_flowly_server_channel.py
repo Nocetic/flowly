@@ -476,3 +476,66 @@ def test_server_screen_status_reports_the_phase_without_a_ticket(monkeypatch):
 
     Session.runtime = Stopped()
     assert display.server_screen_status(object(), "default") == {"phase": "stopped", "generation": None}
+
+
+# ── screen RPCs (PROTOCOL.md C) ───────────────────────────────────────────
+
+
+class _Tickets:
+    def __init__(self):
+        self.remembered: list[tuple[str, float]] = []
+
+    def remember(self, ticket: str, ttl: float) -> None:
+        self.remembered.append((ticket, ttl))
+
+
+class _ScreenGateway:
+    def __init__(self):
+        self._server_screen_tickets = _Tickets()
+
+
+async def test_the_relay_screen_rpc_proxy_runs_on_the_server_connection():
+    """display.* reached Core only over the relay; the server socket carries them too now."""
+    from flowly.desktop_runtime.relay_rpc import RelayScreenRpc
+
+    channel, socket, *_ = _channel()
+    channel.set_screen_gateway(_ScreenGateway())
+    channel._on_connected(socket)
+    assert isinstance(channel._screen_rpc, RelayScreenRpc)
+    assert channel._screen_rpc.enabled is False
+    await channel._handle_relay_message(socket, {"type": "ready", "protocol": 1, "capabilities": []})
+    assert channel._screen_rpc.enabled is True
+
+
+async def test_an_observe_ticket_opens_this_machines_stream(monkeypatch):
+    monkeypatch.setenv("FLY_APP_NAME", "flowly-cloud-abc")
+    channel, socket, *_ = _channel()
+    gateway = _ScreenGateway()
+    channel.set_screen_gateway(gateway)
+    channel._on_connected(socket)
+    rpc = channel._screen_rpc
+    sent: list[dict] = []
+
+    async def capture(frame):
+        sent.append(frame)
+
+    rpc.send = capture
+    rpc.clients["c1"] = rpc.clients.get("c1") or __import__("flowly.desktop_runtime.relay_rpc", fromlist=["Client"]).Client()
+    rpc._methods[("c1", "o1")] = "display.observe"
+    rpc._methods[("c1", "s1")] = "display.status"
+    await rpc.emit("c1", {"type": "rpc", "id": "o1", "result": {"ticket": "tk-1", "expiresInMs": 30_000, "viewerId": "v"}})
+    await rpc.emit("c1", {"type": "rpc", "id": "s1", "result": {"ticket": "not-a-stream-ticket", "expiresInMs": 1}})
+    observed = sent[0]["message"]["result"]
+    assert observed["streamUrl"] == "wss://flowly-cloud-abc.fly.dev/api/display/stream"
+    assert gateway._server_screen_tickets.remembered == [("tk-1", 30.0)]
+    assert "streamUrl" not in sent[1]["message"]["result"]
+
+
+async def test_without_a_fly_app_an_observe_reply_is_left_as_the_relay_sent_it(monkeypatch):
+    monkeypatch.delenv("FLY_APP_NAME", raising=False)
+    from flowly.channels.flowly_server import _direct_stream
+
+    gateway = _ScreenGateway()
+    result = {"ticket": "tk", "expiresInMs": 30_000}
+    assert _direct_stream(gateway, result) == result
+    assert gateway._server_screen_tickets.remembered == []

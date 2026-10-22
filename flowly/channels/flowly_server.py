@@ -53,6 +53,56 @@ def _is_passive(method: str) -> bool:
     return method in PASSIVE_METHODS or method.endswith(".status")
 
 
+def _server_screen_rpc_class():
+    from flowly.desktop_runtime.relay_rpc import RelayScreenRpc
+
+    class _ServerScreenRpc(RelayScreenRpc):
+        """``RelayScreenRpc`` whose ``display.observe`` tickets open this machine's stream directly.
+
+        Over the relay a viewer redeemed its ticket through the relay's stream
+        pairing. Here the app connects to ``wss://<FLY_APP_NAME>.fly.dev`` (C), so
+        the ticket is also accepted in place of the gateway token on the stream
+        route, as ``screen.ticket``'s are, and the reply names that address.
+        """
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self._methods: dict[tuple[str, str], str] = {}
+
+        async def submit(self, session, message):
+            rpc_id = message.get("id") if isinstance(message, dict) else None
+            if isinstance(rpc_id, str) and isinstance(message.get("method"), str):
+                if len(self._methods) >= 512:
+                    self._methods.pop(next(iter(self._methods)))
+                self._methods[(session, rpc_id)] = message["method"]
+            await super().submit(session, message)
+
+        async def emit(self, session, message, client=None):
+            if isinstance(message, dict) and message.get("type") == "rpc":
+                method = self._methods.pop((session, message.get("id")), None)
+                result = message.get("result")
+                if method == "display.observe" and isinstance(result, dict):
+                    message = {**message, "result": _direct_stream(self.gateway, result)}
+            await super().emit(session, message, client)
+
+    return _ServerScreenRpc
+
+
+def _direct_stream(gateway, result: dict) -> dict:
+    """Let an observe ticket open the stream on this machine's public address."""
+    import os
+
+    from flowly.gateway.display import _FLY_APP_NAME, STREAM_PATH
+
+    app = os.environ.get("FLY_APP_NAME", "").strip()
+    ticket, lifetime = result.get("ticket"), result.get("expiresInMs")
+    registry = getattr(gateway, "_server_screen_tickets", None)
+    if not _FLY_APP_NAME.match(app) or registry is None or not isinstance(ticket, str) or not isinstance(lifetime, int):
+        return result
+    registry.remember(ticket, lifetime / 1000)
+    return {**result, "streamUrl": f"wss://{app}.fly.dev{STREAM_PATH}"}
+
+
 class FlowlyServerChannel(WebChannel):
     """``WebChannel`` connected to the Flowly server instead of the relay."""
 
@@ -101,6 +151,15 @@ class FlowlyServerChannel(WebChannel):
     def _on_connected(self, ws) -> None:
         if self._power is not None:
             self._power.mark_connected()
+        if self._screen_gateway is not None:
+            # The relay's screen RPC proxy, on this connection (PROTOCOL.md C).
+            # The relay builds it only beside its own stream transport; here the
+            # stream comes straight from this machine, so only the RPCs ride the
+            # server's socket.
+            self._screen_rpc = _server_screen_rpc_class()(
+                gateway=self._screen_gateway, current=lambda: self._ws is ws,
+                send=lambda frame: ws.send(json.dumps(frame)),
+            )
 
     async def _reconnect_wait(self, delay: float) -> bool:
         """Back off, but reconnect at once after a resume.
@@ -283,5 +342,8 @@ class FlowlyServerChannel(WebChannel):
                 await self._handle_screen_status(ws, msg)
                 return
         await super()._handle_relay_message(ws, msg)
-        if isinstance(msg, dict) and msg.get("type") == "ready" and self._power is not None and ws is self._ws:
-            await self._power.check_next_due(force=True)
+        if isinstance(msg, dict) and msg.get("type") == "ready" and ws is self._ws:
+            if self._screen_rpc is not None:
+                self._screen_rpc.enabled = True
+            if self._power is not None:
+                await self._power.check_next_due(force=True)
