@@ -736,6 +736,14 @@ class ProfileHost:
             **({"needsInput": urgent} if (urgent := most_urgent(runtime.attention)) else {}),
         }
 
+    def has_active_turns(self) -> bool:
+        """A named agent is in a turn: a run its runtime reported and has not
+        ended, or an internal turn one agent asked of another. Read by the
+        cloud machine's power probe (flowly/power/monitor.py)."""
+        return bool(self._broker_sessions) or any(
+            runtime.active_runs for runtime in list(self._runtimes.values())
+        )
+
     async def create(self, params: dict[str, Any]) -> dict[str, Any]:
         name = _required_string(params, "name").strip()
         validate_profile_name(name)

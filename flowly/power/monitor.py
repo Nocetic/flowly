@@ -4,7 +4,7 @@ A cloud machine sleeps when it is idle. The server asks Core whether it may
 (``power.status``), asks it to get ready (``power.sleep``) and wakes it again
 for the next scheduled work, which Core announces (``power.next_due``):
 
-- busy: a turn, a routine (cron run), a heartbeat, memory learning (dreamer or
+- busy: a turn (also a named agent's), a routine (cron run), a heartbeat, memory learning (dreamer or
   consolidation, running or owed), a watched screen, maintenance, recent use,
   a fresh wake, or work due within minutes;
 - next due: the earliest cron job, heartbeat (only with active tasks and inside
@@ -328,6 +328,24 @@ _UNSET = object()
 
 
 # ── probes and flush helpers used by the gateway ──────────────────────────
+
+
+def add_gateway_probes(monitor: PowerMonitor, gateway: Any) -> None:
+    """The busy probes a gateway adds: named agents' turns, a watched screen, maintenance."""
+    monitor.add_busy_probe("turn", lambda: named_agent_turns(gateway))
+    monitor.add_busy_probe("screen", lambda: screen_watched(gateway))
+    monitor.add_busy_probe("maintenance", lambda: environment_maintenance())
+
+
+def named_agent_turns(gateway: Any) -> bool:
+    """True while a named agent (a profile host runtime) is in a turn.
+
+    Those turns run in their own processes and never reach the main agent
+    loop's counters (``power_snapshot``); the profile host tracks every run
+    its runtimes report until the run's final, aborted or error event.
+    """
+    host = getattr(gateway, "profile_host", None)
+    return bool(host is not None and host.has_active_turns())
 
 
 def screen_watched(gateway: Any) -> bool:
