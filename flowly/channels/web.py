@@ -974,8 +974,15 @@ class WebChannel(BaseChannel):
                 if not self._running:
                     break
                 notable("relay.lost", delay=delay, reason=e)
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, self._max_reconnect_delay)
+                if await self._reconnect_wait(delay):
+                    delay = self._reconnect_delay
+                else:
+                    delay = min(delay * 2, self._max_reconnect_delay)
+
+    async def _reconnect_wait(self, delay: float) -> bool:
+        """Pause before the next connection attempt; True if cut short for a fresh start."""
+        await asyncio.sleep(delay)
+        return False
 
     async def stop(self) -> None:
         self._running = False

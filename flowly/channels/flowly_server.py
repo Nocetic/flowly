@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any, Callable
 
 from loguru import logger
@@ -34,6 +35,12 @@ PASSIVE_METHODS = frozenset({
     "chat.inflight", "chat.history", "chat.command", "commands.list",
     "objectives.list", "agenda.list",
 })
+
+#: While backing off, look at the clocks this often for a resume.
+RESUME_TICK_SECONDS = 0.5
+#: The wall clock ran this much further than the monotonic one within a tick:
+#: the machine was suspended (or the clock stepped; reconnecting early is harmless).
+RESUME_JUMP_SECONDS = 2.0
 
 SLEEPING_ERROR = {
     "code": "AGENT_SLEEPING",
@@ -94,6 +101,28 @@ class FlowlyServerChannel(WebChannel):
     def _on_connected(self, ws) -> None:
         if self._power is not None:
             self._power.mark_connected()
+
+    async def _reconnect_wait(self, delay: float) -> bool:
+        """Back off, but reconnect at once after a resume.
+
+        The server drops the socket as it suspends the machine, so the backoff
+        is usually running when the machine freezes; the suspend stops the
+        monotonic clock that ``asyncio.sleep`` uses, and the rest of it would
+        be waited out after the wake, while the server holds the person's
+        message. A wall-clock jump between short ticks shows the resume.
+        """
+        deadline = time.monotonic() + delay
+        wall, mono = time.time(), time.monotonic()
+        while (left := deadline - time.monotonic()) > 0:
+            await asyncio.sleep(min(RESUME_TICK_SECONDS, left))
+            now_wall, now_mono = time.time(), time.monotonic()
+            if (now_wall - wall) - (now_mono - mono) > RESUME_JUMP_SECONDS:
+                logger.info("[FlowlyServer] resumed after a suspend; reconnecting now")
+                if self._power is not None:
+                    self._power.wake()
+                return True
+            wall, mono = now_wall, now_mono
+        return False
 
     async def start(self) -> None:
         if self._power is not None and self._power_watch is None:

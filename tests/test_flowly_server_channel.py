@@ -369,3 +369,76 @@ async def test_prompts_keep_their_session_key_for_server_routing():
     await channel.send_clarify_closed("web:conv", "q1", "answered")
     assert [frame["sessionId"] for frame in sent] == ["srv-1", "srv-1"]
     assert all(frame["data"]["sessionKey"] == "web:conv" for frame in sent)
+
+
+class _SuspendingClock:
+    """time.time / time.monotonic where a suspend advances only the wall clock."""
+
+    def __init__(self):
+        self.wall = 1_000_000.0
+        self.mono = 50.0
+        self.ticks = 0
+
+    def time(self) -> float:
+        return self.wall
+
+    def monotonic(self) -> float:
+        return self.mono
+
+    async def sleep(self, seconds: float) -> None:
+        self.ticks += 1
+        if self.ticks == 3:
+            self.wall += 1800  # a 30 minute suspend: monotonic stands still
+        self.wall += seconds
+        self.mono += seconds
+
+
+def _clocked(monkeypatch, clock: _SuspendingClock) -> None:
+    import flowly.channels.flowly_server as server_module
+
+    monkeypatch.setattr(server_module.time, "time", clock.time)
+    monkeypatch.setattr(server_module.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(server_module.asyncio, "sleep", clock.sleep)
+
+
+async def test_backoff_ends_at_once_when_the_machine_resumes(monkeypatch):
+    """The suspend froze the backoff; the server is waiting with a message (wake took 11 s)."""
+    channel, socket, monitor, _ = _channel()
+    assert (await monitor.sleep(idle_minutes=1))["ok"] is True
+    clock = _SuspendingClock()
+    _clocked(monkeypatch, clock)
+    assert await channel._reconnect_wait(10) is True
+    assert clock.ticks == 3  # 1.5 s of backoff before the suspend, nothing after it
+    assert monitor.sleeping is False
+
+
+async def test_backoff_without_a_resume_waits_it_out(monkeypatch):
+    channel, *_ = _channel()
+    clock = _SuspendingClock()
+    clock.ticks = -1000  # no suspend during this wait
+    _clocked(monkeypatch, clock)
+    assert await channel._reconnect_wait(3) is False
+    assert clock.mono == pytest.approx(53.0)
+
+
+async def test_a_resume_resets_the_reconnect_backoff(monkeypatch):
+    channel, *_ = _channel()
+    delays: list[float] = []
+    attempts = 0
+
+    async def fail_then_stop():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 3:
+            channel._running = False
+        raise ConnectionError("dropped")
+
+    async def wait(delay: float) -> bool:
+        delays.append(delay)
+        return len(delays) == 1  # the first wait ends in a resume
+
+    monkeypatch.setattr(channel, "_connect_and_run", fail_then_stop)
+    monkeypatch.setattr(channel, "_reconnect_wait", wait)
+    monkeypatch.setattr(channel, "_ready_to_connect", lambda: True)
+    await WebChannel.start(channel)
+    assert delays == [5, 5]
