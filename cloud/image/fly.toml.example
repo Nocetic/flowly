@@ -1,0 +1,30 @@
+# Template for a test deployment of the cloud machine image with `fly deploy`.
+# Production machines are created by server/src/machines/fly.ts from a built
+# image; this file is for building/pushing the image and manual trials.
+#
+#   cloud/image/build-context.sh "$CTX" && cp cloud/image/fly.toml.example "$CTX/fly.toml"
+#   (set app below) && cd "$CTX" && fly deploy --remote-only --ha=false
+app = "flowly-cloud-test-CHANGEME"
+primary_region = "fra"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  FLOWLY_TZ = "Europe/Berlin"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = false
+  min_machines_running = 0
+
+[mounts]
+  source = "flowly_data"
+  destination = "/data"
+  initial_size = "10gb"
+
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "2gb"

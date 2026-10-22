@@ -1,0 +1,14 @@
+[Unit]
+Description=Flowly cloud machine setup (screen accounts, Core config)
+After=local-fs.target
+Before=user@0.service flowly-edge.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=HOME=/root
+Environment=PATH=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/local/sbin/flowly-cloud-setup
+
+[Install]
+WantedBy=multi-user.target

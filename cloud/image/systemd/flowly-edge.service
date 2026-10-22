@@ -1,0 +1,15 @@
+[Unit]
+Description=Loopback hop from Fly's TLS edge to the gateway
+After=network.target
+
+[Service]
+# Fly's edge terminates TLS and connects over its private network; the gateway
+# refuses plain non-loopback screen sockets (SECURE_TRANSPORT_REQUIRED), so the
+# edge port is relayed to the loopback-only gateway.
+ExecStart=/usr/bin/socat TCP-LISTEN:8080,fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:18790
+DynamicUser=yes
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

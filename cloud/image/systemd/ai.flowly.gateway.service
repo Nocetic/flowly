@@ -1,0 +1,20 @@
+[Unit]
+Description=Flowly Gateway Service
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/root
+Environment=PATH=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+EnvironmentFile=-/etc/flowly/cloud/gateway.env
+WorkingDirectory=/root
+# Loopback only: Fly's edge reaches it through flowly-edge (a loopback hop, so
+# the gateway's screen sockets accept it); config.gateway.token guards it.
+ExecStart=/usr/local/bin/flowly gateway --host 127.0.0.1 --port 18790
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

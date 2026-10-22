@@ -1,0 +1,18 @@
+#!/bin/sh
+# Boot step of the Flowly cloud machine (flowly-cloud-setup.service), before
+# root's user manager starts the gateway. Idempotent; runs on every boot.
+set -u
+export HOME=/root
+
+# Screen accounts live in /etc/passwd (reset with the root filesystem); their
+# receipts live on the volume. A failure here only keeps the affected screen
+# failing closed; the agent itself still starts.
+if ! flowly screen restore-accounts; then
+  echo "flowly-cloud-setup: some screen accounts were not restored (see above)" >&2
+fi
+
+# Core's config from the machine's secrets. Without it the gateway cannot start.
+set -a
+. /etc/flowly/cloud/setup.env
+set +a
+exec /opt/flowly/venv/bin/python /opt/flowly/cloud/flowly_cloud_config.py
