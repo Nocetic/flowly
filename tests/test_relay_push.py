@@ -103,3 +103,36 @@ async def test_the_summary_line_holds_counts_only(monkeypatch, tmp_path) -> None
     summary = [line for line in lines if line.startswith("[push] ") and "sent" in line]
     assert summary == ["[push] 1/2 sent, 0 dropped, 1 failed (HTTP 502)\n"]
     assert not any(token in "".join(lines) for token in ("push-", "secret", "Secret", "conv-9", "approval:a1"))
+
+
+def _config_loader(monkeypatch, config) -> None:
+    import flowly.config.loader as loader
+
+    monkeypatch.setattr(loader, "load_config", lambda *a, **k: config)
+
+
+def test_a_cloud_agent_pushes_through_the_flowly_server(monkeypatch) -> None:
+    # A cloud machine has no relay: its pushes go to the Flowly server it
+    # dials (server/PROTOCOL.md B), which serves the relay's /api/push/send.
+    from flowly.config.schema import Config
+
+    config = Config()
+    config.channels.flowly_server.enabled = True
+    monkeypatch.delenv("FLOWLY_SERVER_URL", raising=False)
+    _config_loader(monkeypatch, config)
+    assert relay_push._relay_base() == "https://cloud.useflowlyapp.com"
+
+    config.channels.flowly_server.server_url = ""
+    monkeypatch.setenv("FLOWLY_SERVER_URL", "wss://staging.flowly.test:8443/v1/agent")
+    assert relay_push._relay_base() == "https://staging.flowly.test:8443"
+
+    monkeypatch.setenv("FLOWLY_SERVER_URL", "ws://127.0.0.1:8080/v1/agent")
+    assert relay_push._relay_base() == "http://127.0.0.1:8080"
+
+
+def test_an_agent_without_the_flowly_server_still_pushes_through_the_relay(monkeypatch) -> None:
+    from flowly.config.schema import Config
+
+    monkeypatch.setenv("FLOWLY_SERVER_URL", "wss://cloud.useflowlyapp.com/v1/agent")
+    _config_loader(monkeypatch, Config())
+    assert relay_push._relay_base() == "https://relay.useflowlyapp.com"

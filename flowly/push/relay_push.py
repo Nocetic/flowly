@@ -148,11 +148,21 @@ def get_push_registry() -> PushRegistry:
 def _relay_base() -> str:
     """The relay's HTTPS origin — from config ``web.relay_url`` if set (chat
     relay), else the constant. Gateway-only bots have an empty relay_url but can
-    still reach the constant host for push."""
+    still reach the constant host for push.
+
+    A cloud agent (``channels.flowlyServer`` enabled) has no relay: the Flowly
+    server it dials serves the same ``/api/push/*`` at its own origin."""
     try:
         from urllib.parse import urlparse
         from flowly.config.loader import load_config
-        ru = (load_config().web.relay_url or "").strip()
+        config = load_config()
+        server = config.channels.flowly_server
+        if server.enabled:
+            url = server.connection_settings()[0]
+            p = urlparse(url.replace("wss://", "https://", 1).replace("ws://", "http://", 1))
+            if p.scheme and p.netloc:
+                return f"{p.scheme}://{p.netloc}"
+        ru = (config.web.relay_url or "").strip()
         if ru:
             base = ru.replace("wss://", "https://").replace("ws://", "http://")
             p = urlparse(base)
