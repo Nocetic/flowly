@@ -147,6 +147,10 @@ class WebChannelConfig(BaseModel):
     jwt_secret: str = ""   # JWT signing secret (for relay authentication)
 
 
+#: Where Core may dial the Flowly server: TLS, or plain ws:// only to this machine.
+FLOWLY_SERVER_URL_PREFIXES = ("wss://", "ws://localhost", "ws://127.0.0.1", "ws://[::1]")
+
+
 class FlowlyServerChannelConfig(BaseModel):
     """Connection to the Flowly server (server/PROTOCOL.md B), replacing the relay.
 
@@ -160,6 +164,17 @@ class FlowlyServerChannelConfig(BaseModel):
     server_url: str = "wss://cloud.useflowlyapp.com/v1/agent"
     agent_secret: str = ""    # this agent's own secret; the server keeps only its SHA-256
     agent_host_id: str = ""   # users/{uid}/servers/{id} document id
+
+    def connection_settings(self, environ=None) -> tuple[str, str, str]:
+        """``(server_url, agent_secret, agent_host_id)``: config first, then the environment."""
+        import os
+
+        env = os.environ if environ is None else environ
+        return (
+            (self.server_url or env.get("FLOWLY_SERVER_URL", "")).strip(),
+            (self.agent_secret or env.get("FLOWLY_AGENT_SECRET", "")).strip(),
+            (self.agent_host_id or env.get("FLOWLY_AGENT_HOST_ID", "")).strip(),
+        )
 
 
 class EmailConfig(BaseModel):

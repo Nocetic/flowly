@@ -18,14 +18,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from typing import Any, Callable
 
 from loguru import logger
 
 from flowly.bus.queue import MessageBus
 from flowly.channels.web import WebChannel
-from flowly.config.schema import FlowlyServerChannelConfig, WebChannelConfig
+from flowly.config.schema import FLOWLY_SERVER_URL_PREFIXES, FlowlyServerChannelConfig, WebChannelConfig
 
 #: RPCs only the server itself may call; they arrive without a client sessionId.
 POWER_METHODS = frozenset({"power.status", "power.sleep", "power.wake", "heartbeat.trigger"})
@@ -62,11 +61,7 @@ class FlowlyServerChannel(WebChannel):
 
     @staticmethod
     def _settings(config: FlowlyServerChannelConfig) -> tuple[str, str, str]:
-        return (
-            (config.server_url or os.environ.get("FLOWLY_SERVER_URL", "")).strip(),
-            (config.agent_secret or os.environ.get("FLOWLY_AGENT_SECRET", "")).strip(),
-            (config.agent_host_id or os.environ.get("FLOWLY_AGENT_HOST_ID", "")).strip(),
-        )
+        return config.connection_settings()
 
     def connection_settings(self) -> tuple[str, str, str]:
         """``(server_url, agent_secret, agent_host_id)``, config first, then env."""
@@ -81,7 +76,7 @@ class FlowlyServerChannel(WebChannel):
         if missing:
             logger.error(f"[FlowlyServer] {', '.join(missing)} not set — cannot connect to the Flowly server")
             return False
-        if not url.startswith(("wss://", "ws://localhost", "ws://127.0.0.1", "ws://[::1]")):
+        if not url.startswith(FLOWLY_SERVER_URL_PREFIXES):
             logger.error("[FlowlyServer] serverUrl must use wss:// (ws:// only to this machine)")
             return False
         self.config.relay_url, self.config.server_id = url, host

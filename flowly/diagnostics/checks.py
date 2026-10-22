@@ -357,7 +357,8 @@ def check_channels(ctx: DoctorContext) -> None:
             problems.append("slack: bot token is missing")
         if not channels.slack.app_token.strip():
             problems.append("slack: app token is missing")
-    if channels.web.enabled:
+    # The Flowly server channel replaces the relay; its own check reports it.
+    if channels.web.enabled and not channels.flowly_server.enabled:
         if not channels.web.server_id.strip():
             problems.append("web relay: serverId is missing")
         if not channels.web.auth_token.strip():
@@ -565,6 +566,9 @@ def check_relay(ctx: DoctorContext) -> None:
         ctx.skipped("relay", "Config is not valid")
         return
     web = ctx.config.channels.web
+    if ctx.config.channels.flowly_server.enabled:
+        ctx.skipped("relay", "The Flowly server channel replaces the relay")
+        return
     if not web.enabled:
         ctx.skipped("relay", "Web relay channel is disabled")
         return
@@ -581,6 +585,31 @@ def check_relay(ctx: DoctorContext) -> None:
         ctx.error("relay", f"Enabled relay is missing: {', '.join(missing)}")
     else:
         ctx.ok("relay", "Enabled relay has all dial-time config fields")
+
+
+def check_flowly_server(ctx: DoctorContext) -> None:
+    """``channels.flowlyServer`` (server/PROTOCOL.md B), which replaces the relay."""
+    if ctx.config is None:
+        ctx.skipped("flowly_server", "Config is not valid")
+        return
+    from flowly.account.health import flowly_server_state
+
+    state = flowly_server_state(ctx.config.channels.flowly_server)
+    if not state.enabled:
+        ctx.skipped("flowly_server", "Flowly server channel is disabled")
+    elif state.healthy:
+        ctx.ok("flowly_server", f"Flowly server channel is set (agent host {state.agent_host_id})")
+    elif state.missing:
+        # The cloud image hands these to the gateway only, through its
+        # environment; this command may not see them.
+        ctx.warn(
+            "flowly_server",
+            f"Flowly server channel: {', '.join(state.missing)} not in config or this environment",
+            "The gateway also reads FLOWLY_SERVER_URL, FLOWLY_AGENT_SECRET and FLOWLY_AGENT_HOST_ID "
+            "from its own environment. Without them it does not connect to the Flowly server.",
+        )
+    else:
+        ctx.error("flowly_server", state.reason)
 
 
 def _service_path() -> Path | None:
@@ -1088,6 +1117,7 @@ CHECKS = [
     DoctorCheck("account", "credentials", check_account_snapshot),
     DoctorCheck("credential_storage", "credentials", check_credential_storage),
     DoctorCheck("relay", "channels", check_relay),
+    DoctorCheck("flowly_server", "channels", check_flowly_server),
     DoctorCheck("service", "service", check_service_definition),
     DoctorCheck("linux_linger", "service", check_linux_linger),
     DoctorCheck("sessions", "data", check_sessions),

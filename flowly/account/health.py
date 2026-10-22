@@ -20,16 +20,74 @@ import time
 from dataclasses import dataclass
 
 
+# ── Flowly server channel state ─────────────────────────────────────
+
+
+@dataclass
+class FlowlyServerState:
+    """Snapshot of ``channels.flowlyServer`` (server/PROTOCOL.md B).
+
+    When enabled, this channel replaces the relay as the ``web`` channel
+    (``flowly/channels/manager.py``). Its secret and host id may live only in
+    the gateway's environment (the cloud image), so ``missing`` lists the
+    fields neither the config nor this process's environment holds.
+    """
+    enabled: bool
+    healthy: bool
+    reason: str = ""              # populated only when healthy is False
+    agent_host_id: str = ""
+    server_url: str = ""
+    missing: tuple[str, ...] = ()
+
+
+def flowly_server_state(server, environ=None) -> FlowlyServerState:
+    """State of a ``FlowlyServerChannelConfig``, with the channel's own env fallback."""
+    from flowly.config.schema import FLOWLY_SERVER_URL_PREFIXES
+
+    if not server.enabled:
+        return FlowlyServerState(enabled=False, healthy=False,
+                                 reason="channels.flowlyServer.enabled is false")
+    url, secret, host = server.connection_settings(environ)
+    missing = tuple(name for name, value in (("serverUrl", url), ("agentSecret", secret),
+                                             ("agentHostId", host)) if not value)
+    if missing:
+        return FlowlyServerState(
+            enabled=True, healthy=False, agent_host_id=host, server_url=url, missing=missing,
+            reason=f"channels.flowlyServer is missing {', '.join(missing)} "
+                   "(config or FLOWLY_SERVER_URL / FLOWLY_AGENT_SECRET / FLOWLY_AGENT_HOST_ID)",
+        )
+    if not url.startswith(FLOWLY_SERVER_URL_PREFIXES):
+        return FlowlyServerState(enabled=True, healthy=False, agent_host_id=host, server_url=url,
+                                 reason="channels.flowlyServer.serverUrl must use wss://")
+    return FlowlyServerState(enabled=True, healthy=True, agent_host_id=host, server_url=url)
+
+
+def check_flowly_server_state(environ=None) -> FlowlyServerState:
+    """The Flowly server channel of ``~/.flowly/config.json``."""
+    try:
+        from flowly.config.loader import load_config
+        server = load_config().channels.flowly_server
+    except Exception as exc:  # noqa: BLE001
+        return FlowlyServerState(enabled=False, healthy=False, reason=f"config unreadable: {exc}")
+    return flowly_server_state(server, environ)
+
+
 # ── Relay state ─────────────────────────────────────────────────────
 
 
 @dataclass
 class RelayState:
-    """Snapshot of ``channels.web`` from the gateway's perspective."""
+    """Snapshot of the remote channel from the gateway's perspective.
+
+    ``via`` says which: ``"relay"`` (``channels.web``) or ``"flowlyServer"``
+    when ``channels.flowlyServer`` is enabled and replaces the relay; then
+    the fields describe that channel (``server_id`` is its agent host id).
+    """
     healthy: bool
     reason: str = ""              # populated only when healthy is False
     server_id: str = ""
     enabled: bool = False
+    via: str = "relay"
 
 
 def check_relay_state() -> RelayState:
@@ -39,13 +97,21 @@ def check_relay_state() -> RelayState:
     notice broken" so the gap message points at the root cause. A
     missing ``relay_url`` is just as fatal as a missing
     ``auth_token`` — both cause the dial to fail silently.
+
+    With the Flowly server channel enabled the relay is not used, so its
+    fields do not matter: the server channel's state is reported instead.
     """
     try:
         from flowly.config.loader import load_config
-        web = load_config().channels.web
+        channels = load_config().channels
+        web = channels.web
     except Exception as exc:  # noqa: BLE001
         return RelayState(healthy=False, reason=f"config unreadable: {exc}")
 
+    server = flowly_server_state(channels.flowly_server)
+    if server.enabled:
+        return RelayState(healthy=server.healthy, reason=server.reason,
+                          server_id=server.agent_host_id, enabled=True, via="flowlyServer")
     if not web.enabled:
         return RelayState(healthy=False, reason="channels.web.enabled is false",
                           server_id=web.server_id, enabled=False)

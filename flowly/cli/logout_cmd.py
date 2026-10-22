@@ -37,6 +37,9 @@ def logout() -> None:
       • channels.web relay config (enabled, server_id, auth_token, jwt_secret)
       • providers.active when it points at "flowly" (BYOK keys preserved)
 
+    Keeps ``channels.flowlyServer``: that channel belongs to the machine
+    (the cloud image provides it), not to the sign-in.
+
     Idempotent: no-ops with a friendly message when no Flowly credentials
     exist. Provider-only changes hot-reload; relay removal restarts a managed
     gateway because channel credentials are boot-time state.
@@ -44,6 +47,7 @@ def logout() -> None:
     from flowly.account import audit_log
     from flowly.account.account_key import clear_account_key
     from flowly.account.auth import clear_account, load_account_sync
+    from flowly.account.health import check_flowly_server_state
     from flowly.account.relay_config import clear_relay_credentials
     from flowly.account.runtime_apply import apply_account_runtime_change
     from flowly.integrations.active_provider import clear_active_if_matches
@@ -98,6 +102,12 @@ def logout() -> None:
             "  [green]✓[/] Cleared providers.active "
             "[dim](was 'flowly'; cascade resumes)[/]"
         )
+    server_channel = check_flowly_server_state().enabled
+    if server_channel:
+        console.print(
+            "  [dim]· The Flowly server channel stays on: it belongs to this "
+            "machine, not to the sign-in.[/]"
+        )
     runtime = asyncio.run(
         apply_account_runtime_change(
             provider_reload_required=bool(
@@ -143,6 +153,7 @@ def logout() -> None:
         account_key_cleared=key_clear.changed,
         account_key_revoked=key_clear.revoked,
         relay_cleared=relay_cleared,
+        server_channel=server_channel,
         gateway_runtime_status=runtime.status,
     )
     if not runtime.ok:

@@ -94,20 +94,26 @@ async def _apply_repair(account, *, dry_run: bool) -> _RepairResult:
     from flowly.account.server import register_machine
 
     result = _RepairResult()
+    # The Flowly server channel replaces the relay: never register or wire
+    # one next to it. Its credentials belong to the machine, not the login.
+    relay = _check_relay_state()
+    server_channel = relay.via == "flowlyServer"
 
     if dry_run:
         # Don't talk to the backend or touch disk — just enumerate
         # the deltas the live path would attempt.
-        relay = _check_relay_state()
         is_active, slug = _check_provider_state()
         plan: list[str] = []
-        plan.append(
-            "would POST /api/servers (idempotent on machineId)"
-        )
-        if not relay.healthy:
-            plan.append(f"would re-wire channels.web ({relay.reason})")
+        if server_channel:
+            plan.append("would not touch the relay — the Flowly server channel replaces it")
         else:
-            plan.append("relay config already healthy — no-op")
+            plan.append(
+                "would POST /api/servers (idempotent on machineId)"
+            )
+            if not relay.healthy:
+                plan.append(f"would re-wire channels.web ({relay.reason})")
+            else:
+                plan.append("relay config already healthy — no-op")
         if not is_active:
             plan.append("would set providers.active = 'flowly' (was empty)")
         else:
@@ -119,6 +125,18 @@ async def _apply_repair(account, *, dry_run: bool) -> _RepairResult:
             relay_healthy=relay.healthy,
             relay_reason=relay.reason,
             provider_active=slug,
+        )
+        return result
+
+    if server_channel:
+        is_active, slug = _check_provider_state()
+        if not is_active:
+            _promote_flowly_provider(result)
+        audit_log.info(
+            "cli.login.repair_applied",
+            server_channel=True,
+            provider_promoted=result.provider_promoted,
+            previous_active_provider=slug,
         )
         return result
 
@@ -146,14 +164,7 @@ async def _apply_repair(account, *, dry_run: bool) -> _RepairResult:
     #    lose their LLM choice.
     is_active, slug = _check_provider_state()
     if not is_active:
-        try:
-            from flowly.integrations.active_provider import set_active_provider
-            set_active_provider("flowly")
-            result.provider_promoted = True
-            result.provider_promoted_to = "flowly"
-            result.needs_provider_reload = True
-        except Exception as exc:  # noqa: BLE001
-            result.notes.append(f"provider auto-set failed: {exc}")
+        _promote_flowly_provider(result)
 
     audit_log.info(
         "cli.login.repair_applied",
@@ -164,6 +175,31 @@ async def _apply_repair(account, *, dry_run: bool) -> _RepairResult:
         previous_active_provider=slug,
     )
     return result
+
+
+def _promote_flowly_provider(result: _RepairResult) -> None:
+    try:
+        from flowly.integrations.active_provider import set_active_provider
+        set_active_provider("flowly")
+        result.provider_promoted = True
+        result.provider_promoted_to = "flowly"
+        result.needs_provider_reload = True
+    except Exception as exc:  # noqa: BLE001
+        result.notes.append(f"provider auto-set failed: {exc}")
+
+
+def _print_server_channel(relay) -> None:
+    """One line on the Flowly server channel, which replaces the relay."""
+    if relay.healthy:
+        console.print(
+            f"  [green]✓[/] Reachable through the Flowly server "
+            f"[dim](agent host {relay.server_id})[/]"
+        )
+    else:
+        console.print(
+            f"  [yellow]⚠ Flowly server channel:[/] {relay.reason}\n"
+            "  [dim]This machine's own settings provide it; signing in does not.[/]"
+        )
 
 
 def _print_repair_summary(result: _RepairResult, *, header: str) -> None:
@@ -474,12 +510,19 @@ def login(
             key_change = _provision_account_key(account)
             relay = _check_relay_state()
             is_active, _ = _check_provider_state()
-            repair_relay_or_provider = not (relay.healthy and is_active)
+            # Repair cannot fix the Flowly server channel (the machine's
+            # settings provide it), so only the provider counts there.
+            reach_ok = relay.healthy or relay.via == "flowlyServer"
+            repair_relay_or_provider = not (reach_ok and is_active)
             if not repair_relay_or_provider and not key_change.changed:
-                console.print(
-                    "[green]✓[/] Nothing to repair — relay config and "
-                    "provider are already healthy."
-                )
+                if relay.via == "flowlyServer":
+                    console.print("[green]✓[/] Nothing to repair — the provider is already healthy.")
+                    _print_server_channel(relay)
+                else:
+                    console.print(
+                        "[green]✓[/] Nothing to repair — relay config and "
+                        "provider are already healthy."
+                    )
                 audit_log.info("cli.login.repair_skipped_healthy",
                                server_id=relay.server_id)
                 raise typer.Exit(code=3)
@@ -559,8 +602,11 @@ def login(
         )
         # Relay is opt-in: when it isn't wired, ask right here (or honour
         # --relay/--no-relay) instead of bouncing the user to --repair. A
-        # "yes" reuses the existing tokens — no browser.
-        if not relay.healthy:
+        # "yes" reuses the existing tokens — no browser. With the Flowly
+        # server channel there is no relay to offer.
+        if relay.via == "flowlyServer":
+            _print_server_channel(relay)
+        elif not relay.healthy:
             want_relay = relay_opt
             if want_relay is None and sys.stdin.isatty():
                 console.print()
@@ -625,7 +671,7 @@ def login(
             audit_log.info(
                 "cli.login.already_signed_in_with_gaps",
                 relay_healthy=relay.healthy, relay_reason=relay.reason,
-                provider_active=slug,
+                remote_channel=relay.via, provider_active=slug,
             )
         else:
             console.print(
@@ -731,7 +777,12 @@ def login(
     # server. Ask interactively unless the caller forced it with
     # --relay/--no-relay (Desktop / scripts).
     want_relay = relay_opt
-    if want_relay is None:
+    relay = _check_relay_state()
+    if relay.via == "flowlyServer":
+        # The Flowly server channel replaces the relay; never register one.
+        want_relay = False
+        _print_server_channel(relay)
+    elif want_relay is None:
         if sys.stdin.isatty():
             console.print()
             want_relay = typer.confirm(
