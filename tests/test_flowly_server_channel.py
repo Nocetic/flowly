@@ -442,3 +442,37 @@ async def test_a_resume_resets_the_reconnect_backoff(monkeypatch):
     monkeypatch.setattr(channel, "_ready_to_connect", lambda: True)
     await WebChannel.start(channel)
     assert delays == [5, 5]
+
+
+async def test_screen_status_is_answered_and_is_not_activity():
+    """A client polls screen.status while the Computer tab is open; it must not keep the machine up."""
+    channel, socket, monitor, _ = _channel()
+    before = monitor._last_activity
+    await channel._handle_relay_message(socket, {"type": "rpc", "id": "s2", "sessionId": "c", "method": "screen.status",
+                                                 "params": {"profile": "default"}})
+    assert socket.rpc("s2")["error"]["code"] == "SCREEN_TICKET_UNAVAILABLE"
+    assert monitor._last_activity == before
+
+
+def test_server_screen_status_reports_the_phase_without_a_ticket(monkeypatch):
+    from flowly.gateway import display
+
+    class Runtime:
+        def status(self):
+            return {"phase": "running", "generation": "g7"}
+
+    class Session:
+        runtime = Runtime()
+
+        def observe(self, *_args):  # pragma: no cover - must not be called
+            raise AssertionError("status must not issue a ticket")
+
+    monkeypatch.setattr(display, "_resolve", lambda gateway, params: Session())
+    assert display.server_screen_status(object(), "default") == {"phase": "running", "generation": "g7"}
+
+    class Stopped(Runtime):
+        def status(self):
+            return None
+
+    Session.runtime = Stopped()
+    assert display.server_screen_status(object(), "default") == {"phase": "stopped", "generation": None}

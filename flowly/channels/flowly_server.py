@@ -243,6 +243,25 @@ class FlowlyServerChannel(WebChannel):
                               "retryable": True}}
         await ws.send(self._reply(msg, body))
 
+    async def _handle_screen_status(self, ws, msg: dict) -> None:
+        """PROTOCOL.md C: the screen's phase, so a client knows when a ticket is worth asking for."""
+        from flowly.desktop_runtime.authority import ScreenError
+        from flowly.gateway.display import server_screen_status
+
+        params = msg.get("params")
+        profile = params.get("profile", "default") if isinstance(params, dict) else "default"
+        try:
+            if self._screen_gateway is None:
+                raise ScreenError("SCREEN_TICKET_UNAVAILABLE")
+            body: dict[str, Any] = {"result": await asyncio.to_thread(
+                server_screen_status, self._screen_gateway, profile)}
+        except ScreenError as exc:
+            body = {"error": {"code": exc.code, "message": "The screen state is unavailable.", "retryable": False}}
+        except OSError:
+            body = {"error": {"code": "CONTROL_UNAVAILABLE", "message": "The screen state is unavailable.",
+                              "retryable": True}}
+        await ws.send(self._reply(msg, body))
+
     # ── frames ────────────────────────────────────────────────────────────
 
     async def _handle_relay_message(self, ws, msg: dict) -> None:
@@ -259,6 +278,9 @@ class FlowlyServerChannel(WebChannel):
                 self._power.touch()
             if method == "screen.ticket":
                 await self._handle_screen_ticket(ws, msg)
+                return
+            if method == "screen.status":
+                await self._handle_screen_status(ws, msg)
                 return
         await super()._handle_relay_message(ws, msg)
         if isinstance(msg, dict) and msg.get("type") == "ready" and self._power is not None and ws is self._ws:

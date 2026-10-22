@@ -190,6 +190,19 @@ def issue_server_ticket(gateway, profile: object) -> dict:
             "hostId": identity["hostId"], "botId": identity["botId"]}
 
 
+def server_screen_status(gateway, profile: object) -> dict:
+    """``screen.status`` (server/PROTOCOL.md C): the screen's phase, without issuing a ticket.
+
+    Returns ``{phase, generation}``; a client polls it to learn when the
+    agent's screen comes up. Blocking (disk): call it from a worker thread.
+    """
+    if not isinstance(profile, str):
+        raise ScreenError("INVALID_PARAMS")
+    session = _resolve(gateway, {"profileId": profile})
+    state = session.runtime.status() or {}
+    return {"phase": state.get("phase") or "stopped", "generation": state.get("generation")}
+
+
 def _supports_input(state: dict | None) -> bool:
     return bool(state and state.get("phase") == "running" and state.get("inputServiceVersion") in (2, 3)
                 and state.get("observerServiceVersion") in (2, 3))
