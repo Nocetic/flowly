@@ -64,6 +64,7 @@ Set by `provisionCloudMachine`. Secrets are Fly app secrets; never bake them int
 | `FLOWLY_AGENT_SECRET` | secret | PROTOCOL.md B1 `agentSecret`. Present → `channels.flowlyServer.enabled = true`. Read by Core from the gateway env (not written to disk). The server stores only `agentSecretHash` = lowercase hex SHA-256. |
 | `FLOWLY_AGENT_HOST_ID` | secret | PROTOCOL.md B1 `agentHostId` (= the server doc id; the doc also needs `serverId` equal to it). |
 | `FLOWLY_SERVER_URL` | machine env | Optional; Core defaults to `wss://cloud.useflowlyapp.com/v1/agent`. |
+| `FLY_APP_NAME` | set by Fly | Passed to the gateway env: the machine's public screen address `wss://<app>.fly.dev` for screen tickets and `display.observe`'s `streamUrl` (server PROTOCOL.md C). |
 
 The Flowly server channel (`channels.flowlyServer.{enabled, serverUrl, agentSecret,
 agentHostId}`) comes from the core-server-channel branch; with a Core that lacks it,

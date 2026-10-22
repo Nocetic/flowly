@@ -33,8 +33,11 @@ write_env() {
 write_env /etc/flowly/cloud/setup.env FLOWLY_ACCOUNT_KEY FLOWLY_GATEWAY_TOKEN FLOWLY_TZ \
   FLOWLY_SERVER_URL FLOWLY_AGENT_SECRET FLOWLY_AGENT_HOST_ID
 # The gateway's own environment: Core reads the Flowly server channel's
-# connection from these when its config fields are empty.
-write_env /etc/flowly/cloud/gateway.env FLOWLY_SERVER_URL FLOWLY_AGENT_SECRET FLOWLY_AGENT_HOST_ID
+# connection from these when its config fields are empty, and FLY_APP_NAME
+# names this machine's public screen address (screen tickets and
+# display.observe's streamUrl, server PROTOCOL.md C). Without it every
+# screen ticket failed with SCREEN_TICKET_UNAVAILABLE.
+write_env /etc/flowly/cloud/gateway.env FLOWLY_SERVER_URL FLOWLY_AGENT_SECRET FLOWLY_AGENT_HOST_ID FLY_APP_NAME
 
 zone=${FLOWLY_TZ:-Etc/UTC}
 case "$zone" in
