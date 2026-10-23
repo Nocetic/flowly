@@ -102,7 +102,11 @@ _PROFILE_MARK_TONES = frozenset({
 _PROFILE_MARK_COLOR_RE = re.compile(r"^#[0-9a-f]{6}$")
 # The avatar body a bot wears in clients. Empty means "not chosen": clients
 # derive a shape from the mark seed, so every bot has one without a migration.
-PROFILE_MARK_SHAPES = ("pinch", "ghost", "square", "robot", "bunny", "cloud", "star")
+# Clients derive only from the first shapes; the later ones come by choice.
+PROFILE_MARK_SHAPES = (
+    "pinch", "ghost", "square", "robot", "bunny", "cloud", "star",
+    "cat", "drop", "flower", "pebble", "heart", "pumpkin",
+)
 _NAMED_PROFILE_CREDENTIAL_POLICY = "isolated"
 # The only secrets a clone may inherit. Everything else in a parent's ``.env``
 # is dropped, because ``.env`` is where identity lives and there is no way to

@@ -44,6 +44,13 @@ def test_unknown_shape_is_rejected_before_anything_is_created(roots) -> None:
     assert not (roots / "profiles" / "writer").exists()
 
 
+@pytest.mark.parametrize("shape", ["cat", "drop", "flower", "pebble", "heart", "pumpkin"])
+def test_the_chosen_only_shapes_are_accepted(roots, shape: str) -> None:
+    profiles.create_profile("writer", local_runtime=True)
+    assert profiles.update_profile_metadata("writer", mark_shape=shape).mark_shape == shape
+    assert _metadata("writer")["markShape"] == shape
+
+
 def test_update_keeps_sets_and_clears_the_shape(roots) -> None:
     profiles.create_profile("writer", local_runtime=True, mark_shape="robot")
     assert profiles.update_profile_metadata("writer", display_name="Writer").mark_shape == "robot"
