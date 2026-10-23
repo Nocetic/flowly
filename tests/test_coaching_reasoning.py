@@ -18,6 +18,7 @@ import pytest
 
 from flowly.coaching import gate
 from flowly.providers.base import LLMResponse
+from flowly.providers import openrouter_provider
 from flowly.providers.openrouter_provider import OpenRouterProvider
 
 
@@ -45,12 +46,23 @@ async def test_every_coach_call_asks_for_no_thinking():
     assert all(call.get("purpose") == "coaching" for call in provider.calls)
 
 
-def _provider(name: str) -> tuple[OpenRouterProvider, list[dict[str, Any]]]:
+@pytest.fixture(autouse=True)
+def _fresh_mandatory_models(monkeypatch):
+    monkeypatch.setattr(openrouter_provider, "_REASONING_MANDATORY_MODELS", set())
+
+
+MANDATORY = ("Error code: 400 - {'error': {'message': 'Reasoning is mandatory for this endpoint "
+             "and cannot be disabled.', 'code': 400}}")
+
+
+def _provider(name: str, refuses: set[str] = frozenset()) -> tuple[OpenRouterProvider, list[dict[str, Any]]]:
     provider = OpenRouterProvider(api_key="test-key", provider_name=name)
     sent: list[dict[str, Any]] = []
 
     async def create(**kwargs: Any) -> object:
-        sent.append(kwargs)
+        sent.append({**kwargs, "extra_body": dict(kwargs["extra_body"])} if "extra_body" in kwargs else dict(kwargs))
+        if kwargs["model"] in refuses and "reasoning" in kwargs.get("extra_body", {}):
+            raise RuntimeError(MANDATORY)
         return object()
 
     completions = SimpleNamespace(create=create)
@@ -78,3 +90,39 @@ async def test_the_default_and_other_compatible_apis_send_no_switch():
     provider, sent = _provider("openai")
     await provider.chat(messages=[{"role": "user", "content": "hi"}], reasoning=False)
     assert "extra_body" not in sent[0]
+
+
+@pytest.mark.asyncio
+async def test_a_model_that_always_thinks_is_asked_again_without_the_switch_and_remembered():
+    """Measured 2026-10-24: openai/gpt-5-mini, openai/o4-mini and google/gemini-2.5-pro answer
+    the switch with a 400 "Reasoning is mandatory"; without this every Coach call failed on them."""
+    provider, sent = _provider("flowly", refuses={"openai/gpt-5-mini"})
+    reply = await provider.chat(messages=[{"role": "user", "content": "hi"}], model="openai/gpt-5-mini",
+                                purpose="coaching", reasoning=False)
+    assert reply.content == "ok"
+    assert [call["extra_body"] for call in sent] == [
+        {"purpose": "coaching", "reasoning": {"enabled": False}},
+        {"purpose": "coaching"},
+    ]
+    # Next time it is asked without the switch at once; other models still get it.
+    sent.clear()
+    await provider.chat(messages=[{"role": "user", "content": "hi"}], model="openai/gpt-5-mini", reasoning=False)
+    await provider.chat(messages=[{"role": "user", "content": "hi"}], model="deepseek/deepseek-v4.1-flash", reasoning=False)
+    assert "extra_body" not in sent[0]
+    assert sent[1]["extra_body"] == {"reasoning": {"enabled": False}}
+
+
+@pytest.mark.asyncio
+async def test_any_other_error_is_not_retried_without_the_switch():
+    provider = OpenRouterProvider(api_key="test-key", provider_name="flowly")
+    calls: list[dict[str, Any]] = []
+
+    async def create(**kwargs: Any) -> object:
+        calls.append(kwargs)
+        raise RuntimeError("Error code: 429 - rate limited")
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    provider._client_for_key = lambda _key: SimpleNamespace(with_options=lambda **_: client)  # type: ignore[method-assign]
+    reply = await provider.chat(messages=[{"role": "user", "content": "hi"}], model="m", reasoning=False)
+    assert reply.finish_reason == "error"
+    assert len(calls) == 1

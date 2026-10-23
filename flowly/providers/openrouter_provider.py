@@ -52,6 +52,13 @@ from flowly.providers.tool_preview import ToolPreviewSnapshots
 _DEFAULT_OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 #: Backends that take ``reasoning: {"enabled": false}`` (``chat(reasoning=False)``).
 _REASONING_SWITCH_PROVIDERS = frozenset({"openrouter", "flowly"})
+#: Models that refused the switch because they always think (OpenRouter: "Reasoning
+#: is mandatory for this endpoint and cannot be disabled"): asked without it from then on.
+_REASONING_MANDATORY_MODELS: set[str] = set()
+
+
+def _reasoning_is_mandatory(exc: Exception) -> bool:
+    return "reasoning is mandatory" in str(exc).lower()
 
 
 def _strip_known_prefixes(model: str) -> str:
@@ -340,12 +347,29 @@ class OpenRouterProvider(LLMProvider):
             extra_body["purpose"] = purpose
         # OpenRouter's unified switch; the Flowly backend forwards it to
         # OpenRouter. Other OpenAI-compatible APIs may refuse an unknown field.
-        if reasoning is False and self.provider_name in _REASONING_SWITCH_PROVIDERS:
+        if (reasoning is False and self.provider_name in _REASONING_SWITCH_PROVIDERS
+                and resolved_model not in _REASONING_MANDATORY_MODELS):
             extra_body["reasoning"] = {"enabled": False}
         if extra_body:
             kwargs["extra_body"] = extra_body
 
         request_timeout = timeout or self.request_timeout_seconds
+
+        async def create(client: AsyncOpenAI) -> Any:
+            try:
+                return await client.with_options(timeout=request_timeout).chat.completions.create(**kwargs)
+            except Exception as exc:
+                # A model that always thinks refuses the switch: ask it again as it is.
+                if "reasoning" not in extra_body or not _reasoning_is_mandatory(exc):
+                    raise
+                _REASONING_MANDATORY_MODELS.add(resolved_model)
+                del extra_body["reasoning"]
+                if extra_body:
+                    kwargs["extra_body"] = extra_body
+                else:
+                    kwargs.pop("extra_body", None)
+                logger.info(f"[LLM] {resolved_model} always reasons; asking again without reasoning.enabled=false")
+                return await client.with_options(timeout=request_timeout).chat.completions.create(**kwargs)
 
         max_attempts = self._rotator.key_count() if self._rotator else 1
         last_exc: Exception | None = None
@@ -354,7 +378,7 @@ class OpenRouterProvider(LLMProvider):
             current_key = self._rotator.current_key() if self._rotator else self.api_key
             client = self._client_for_key(current_key)
             try:
-                response = await client.with_options(timeout=request_timeout).chat.completions.create(**kwargs)
+                response = await create(client)
                 return self._parse_response(response)
             except Exception as exc:
                 last_exc = exc
