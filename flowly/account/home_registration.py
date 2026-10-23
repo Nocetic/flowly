@@ -34,6 +34,8 @@ class HomeRegistration:
     agent_host_id: str
     agent_secret: str
     created: bool
+    #: A relay-era document of this machine was taken over (its conversations carry over).
+    adopted: bool = False
 
 
 def hosting() -> str:
@@ -56,12 +58,20 @@ async def register_home(
     server_url: str,
     name: str,
     host_id: str | None = None,
+    adopt_machine_id: str | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> HomeRegistration:
-    """Register (``host_id``: re-register) this Core; the secret is answered once."""
+    """Register this Core; the secret is answered once.
+
+    ``host_id`` re-registers that document. ``adopt_machine_id`` (without
+    ``host_id``) lets the server find this machine's relay-era document by its
+    fingerprint, so its conversations appear in the new apps.
+    """
     body: dict[str, str] = {"name": name[:60], "hosting": hosting()}
     if host_id:
         body["hostId"] = host_id
+    elif adopt_machine_id:
+        body["adoptMachineId"] = adopt_machine_id
     own = client is None
     client = client or httpx.AsyncClient(timeout=20.0)
     try:
@@ -84,8 +94,9 @@ async def register_home(
     host, secret = str(data.get("agentHostId") or ""), str(data.get("agentSecret") or "")
     if not host or not secret:
         raise HomeRegistrationError("MALFORMED", "the server answered without a host id or secret")
-    audit_log.info("home.register.success", host=host, created=bool(data.get("created")))
-    return HomeRegistration(agent_host_id=host, agent_secret=secret, created=bool(data.get("created")))
+    audit_log.info("home.register.success", host=host, created=bool(data.get("created")), adopted=bool(data.get("adopted")))
+    return HomeRegistration(agent_host_id=host, agent_secret=secret, created=bool(data.get("created")),
+                            adopted=bool(data.get("adopted")))
 
 
 def wire_flowly_server(registration: HomeRegistration, server_url: str) -> None:

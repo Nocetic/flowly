@@ -47,6 +47,21 @@ def test_the_agent_url_gives_the_https_origin_and_plain_ws_only_to_this_machine(
     assert refused.value.code == "INVALID_SERVER_URL"
 
 
+async def test_adopting_sends_the_fingerprint_and_a_named_entry_wins(monkeypatch):
+    bodies = []
+
+    def answer(request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"agentHostId": "macbook", "agentSecret": "s", "created": False, "adopted": True})
+
+    monkeypatch.setattr(home_registration, "hosting", lambda: "mac")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as client:
+        adopted = await register_home("t", server_url=URL, name="Mac", adopt_machine_id="fp", client=client)
+        await register_home("t", server_url=URL, name="Mac", host_id="named", adopt_machine_id="fp", client=client)
+    assert adopted.adopted is True
+    assert bodies == [{"name": "Mac", "hosting": "mac", "adoptMachineId": "fp"}, {"name": "Mac", "hosting": "mac", "hostId": "named"}]
+
+
 async def test_registration_sends_the_token_name_and_hosting_and_returns_the_secret(monkeypatch):
     seen = {}
 
@@ -107,15 +122,19 @@ def test_wiring_turns_the_server_channel_on_and_unwiring_gives_the_relay_back():
 
 class _Account:
     id_token = "id-token"
-    server_id = "relay-era-id"
+    # Empty in some sign-ins (the account exchange's empty user_id), so --adopt
+    # must not depend on it.
+    server_id = ""
 
 
-@pytest.mark.parametrize("args, existing, expected_host", [
-    ([], "", None),                       # a new home
-    (["--adopt"], "", "relay-era-id"),    # this machine's relay-era entry, with its conversations
-    (["--adopt"], "h-known", "h-known"),  # a home it already has always wins
+@pytest.mark.parametrize("args, existing, expected", [
+    ([], "", (None, None)),                                   # a new home
+    (["--adopt"], "", (None, "fingerprint-1")),               # the relay-era entry, found by fingerprint
+    (["--host-id", "named"], "", ("named", None)),            # an entry named outright
+    (["--adopt", "--host-id", "named"], "", ("named", None)),  # a name wins over the fingerprint
+    (["--adopt"], "h-known", ("h-known", None)),              # a home it already has always wins
 ])
-def test_connect_picks_the_home_to_register(monkeypatch, args, existing, expected_host):
+def test_connect_picks_the_home_to_register(monkeypatch, args, existing, expected):
     from flowly.cli import server_cmd
 
     if existing:
@@ -127,16 +146,41 @@ def test_connect_picks_the_home_to_register(monkeypatch, args, existing, expecte
     async def account():
         return _Account()
 
-    async def register(token, *, server_url, name, host_id=None):
-        calls.append((token, server_url, name, host_id))
+    async def register(token, *, server_url, name, host_id=None, adopt_machine_id=None):
+        calls.append((token, server_url, name, host_id, adopt_machine_id))
         return HomeRegistration(host_id or "h-new", "secret", host_id is None)
 
     monkeypatch.setattr("flowly.account.auth.load_account_refreshing", account)
+    monkeypatch.setattr("flowly.account.fingerprint.machine_id", lambda: "fingerprint-1")
     monkeypatch.setattr("flowly.account.home_registration.register_home", register)
     result = CliRunner().invoke(server_cmd.server_app, ["connect", "--name", "Test Mac", *args])
     assert result.exit_code == 0, result.output
-    assert calls == [("id-token", URL, "Test Mac", expected_host)]
-    assert load_config().channels.flowly_server.agent_host_id == (expected_host or "h-new")
+    assert calls == [("id-token", URL, "Test Mac", *expected)]
+    assert load_config().channels.flowly_server.agent_host_id == (expected[0] or "h-new")
+
+
+def test_connect_says_whether_the_old_conversations_carry_over(monkeypatch):
+    from flowly.cli import server_cmd
+
+    async def account():
+        return _Account()
+
+    outcomes = iter([HomeRegistration("macbook", "s", False, adopted=True), HomeRegistration("h-new", "s", True)])
+
+    async def register(token, **_):
+        return next(outcomes)
+
+    monkeypatch.setattr("flowly.account.auth.load_account_refreshing", account)
+    monkeypatch.setattr("flowly.account.home_registration.register_home", register)
+    adopted = CliRunner().invoke(server_cmd.server_app, ["connect", "--adopt"])
+    assert "conversations carry over" in adopted.output
+    from flowly.account.home_registration import unwire_flowly_server
+    unwire_flowly_server()
+    config = load_config()
+    config.channels.flowly_server.agent_host_id = ""
+    save_config(config)
+    fresh = CliRunner().invoke(server_cmd.server_app, ["connect", "--adopt"])
+    assert "No relay-era entry of this machine was found" in fresh.output
 
 
 def test_connect_needs_a_signed_in_account(monkeypatch):
