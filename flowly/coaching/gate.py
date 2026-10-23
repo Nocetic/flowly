@@ -441,6 +441,7 @@ async def relevance_gate(
             temperature=temperature,
             timeout=15.0,
             purpose="coaching",
+            reasoning=False,
         )
         return (response.content or "").strip(), response.finish_reason
 
@@ -603,6 +604,7 @@ async def generate_tip(
             temperature=0.7,
             timeout=15.0,
             purpose="coaching",
+            reasoning=False,
         )
         content = (response.content or "").strip()
         if response.finish_reason == "error" or content.startswith("Error calling LLM:"):
@@ -701,6 +703,7 @@ async def critic(
             temperature=0.0,
             timeout=15.0,
             purpose="coaching",
+            reasoning=False,
         )
         ok = _parse_bool(response.content or "")
         logger.debug(f"[Coach.gate3] useful={ok}")
@@ -759,6 +762,7 @@ async def summarize_meeting(
             temperature=0.3,
             timeout=60.0,
             purpose="coaching",
+            reasoning=False,
         )
         content = (response.content or "").strip()
         # Providers intentionally surface many failures as an LLMResponse so
@@ -842,6 +846,7 @@ async def extract_entities(
             temperature=0.0,
             timeout=45.0,
             purpose="coaching",
+            reasoning=False,
         )
         text = (response.content or "").strip()
         # Strip markdown fences if present

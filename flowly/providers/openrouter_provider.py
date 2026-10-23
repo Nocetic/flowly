@@ -50,6 +50,8 @@ from flowly.providers.tool_preview import ToolPreviewSnapshots
 
 
 _DEFAULT_OPENROUTER_BASE = "https://openrouter.ai/api/v1"
+#: Backends that take ``reasoning: {"enabled": false}`` (``chat(reasoning=False)``).
+_REASONING_SWITCH_PROVIDERS = frozenset({"openrouter", "flowly"})
 
 
 def _strip_known_prefixes(model: str) -> str:
@@ -313,6 +315,7 @@ class OpenRouterProvider(LLMProvider):
         tool_choice: str = "auto",
         timeout: float | None = None,
         purpose: str | None = None,
+        reasoning: bool | None = None,
     ) -> LLMResponse:
         """Send a non-streaming chat completion request."""
         resolved_model = self._prepare_model(model)
@@ -332,8 +335,15 @@ class OpenRouterProvider(LLMProvider):
         # coaching calls to a separate rate-limit bucket. Public OpenAI /
         # OpenRouter ignore unknown body fields; the backend strips this
         # before forwarding upstream so no leak occurs.
+        extra_body: dict[str, Any] = {}
         if purpose:
-            kwargs["extra_body"] = {"purpose": purpose}
+            extra_body["purpose"] = purpose
+        # OpenRouter's unified switch; the Flowly backend forwards it to
+        # OpenRouter. Other OpenAI-compatible APIs may refuse an unknown field.
+        if reasoning is False and self.provider_name in _REASONING_SWITCH_PROVIDERS:
+            extra_body["reasoning"] = {"enabled": False}
+        if extra_body:
+            kwargs["extra_body"] = extra_body
 
         request_timeout = timeout or self.request_timeout_seconds
 

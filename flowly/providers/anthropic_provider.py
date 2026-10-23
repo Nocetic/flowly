@@ -489,8 +489,9 @@ class AnthropicProvider(LLMProvider):
         tool_choice: str = "auto",
         timeout: float | None = None,
         purpose: str | None = None,
+        reasoning: bool | None = None,
     ) -> LLMResponse:
-        del purpose
+        del purpose, reasoning  # extended thinking is off unless asked for
         payload = self._build_payload(
             messages=messages,
             tools=tools,

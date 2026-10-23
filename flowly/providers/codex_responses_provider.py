@@ -823,10 +823,13 @@ class CodexResponsesProvider(LLMProvider):
         tool_choice: str = "auto",
         timeout: float | None = None,
         purpose: str | None = None,
+        reasoning: bool | None = None,
     ) -> LLMResponse:
         # This backend rejects max_output_tokens / temperature — accepted for
-        # interface parity, deliberately not forwarded.
-        del max_tokens, temperature, purpose
+        # interface parity, deliberately not forwarded. Without a token cap a
+        # model's thinking cannot crowd out its answer, so ``reasoning`` stays
+        # at the model's own effort.
+        del max_tokens, temperature, purpose, reasoning
         resolved_model = _normalize_codex_model(model or self.default_model)
         request_timeout = timeout or self.request_timeout_seconds
         auth_refreshed = False

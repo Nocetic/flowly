@@ -212,6 +212,7 @@ class LLMProvider(ABC):
         temperature: float = 0.7,
         timeout: float | None = None,
         purpose: str | None = None,
+        reasoning: bool | None = None,
     ) -> LLMResponse:
         """
         Send a chat completion request.
@@ -228,6 +229,11 @@ class LLMProvider(ABC):
                 screen-capture observability rather than the chat ones.
                 ``"coaching"`` is the only value the backend currently
                 routes on; anything else is treated as chat.
+            reasoning: ``False`` asks a thinking model to answer without
+                thinking first, where the backend can say so. For short,
+                capped answers (Meeting Coach), where the thinking would
+                otherwise use up ``max_tokens`` and leave the answer empty.
+                ``None`` keeps the model's default.
 
         Returns:
             LLMResponse with content and/or tool calls.

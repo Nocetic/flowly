@@ -289,8 +289,9 @@ class XAIResponsesProvider(LLMProvider):
         tool_choice: str = "auto",
         timeout: float | None = None,
         purpose: str | None = None,
+        reasoning: bool | None = None,
     ) -> LLMResponse:
-        del purpose
+        del purpose, reasoning
         resolved_model = _normalize_xai_model(model or self.default_model)
         instructions, input_items = _messages_to_responses_input(messages)
         payload: dict[str, Any] = {
