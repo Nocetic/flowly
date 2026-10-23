@@ -121,6 +121,9 @@ app.add_typer(service_app, name="service")
 
 app.add_typer(screen_app, name="screen")
 
+from flowly.cli.server_cmd import server_app
+app.add_typer(server_app, name="server")
+
 from flowly.cli.channels_cmd import channels_app
 app.add_typer(channels_app, name="channels")
 
