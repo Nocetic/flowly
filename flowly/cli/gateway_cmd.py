@@ -2573,6 +2573,11 @@ Respond to the user now:"""
             artifact_store=getattr(agent, "_artifact_store", None) or gateway_server.artifact_store,
         )
         gateway_server._coaching_manager = coaching_mgr
+        # The relay and the Flowly server carry it too (the new apps reach
+        # even this Mac's agent that way).
+        web_channel = channels.get_channel("web")
+        if web_channel is not None and hasattr(web_channel, "set_coaching_manager"):
+            web_channel.set_coaching_manager(coaching_mgr)
         console.print("[green]✓[/green] Meeting Coach: enabled")
     except Exception as e:
         logger.warning(f"[Gateway] Meeting Coach wiring failed: {e}")

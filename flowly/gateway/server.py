@@ -31,6 +31,7 @@ from flowly.agent.subagent_observation import client_event, event_version
 from flowly.artifacts.summary import artifact_summary
 from flowly.browser_annotations import append_browser_annotation_context
 from flowly.channels import feature_rpc
+from flowly.coaching import rpc as coaching_rpc
 from flowly.gateway.auth import (
     MediaTicketStore,
     WsTicketStore,
@@ -636,10 +637,9 @@ class GatewayServer:
         self._delegate_tool: Any | None = None
         self._subagent_manager: Any | None = None
         self._coaching_manager: Any | None = None
-        # Explicit ``params.sessionId`` sessions still belong to the WS client
-        # that started them. Track ownership so disconnect cleanup remains as
-        # reliable as the legacy per-client derived id path.
-        self._coaching_sessions_by_client: dict[str, set[str]] = {}
+        # Coach sessions belong to the WS client that started them; its
+        # disconnect stops them (flowly/coaching/rpc.py).
+        self._coaching_rpc = coaching_rpc.CoachingRpc(lambda: self._coaching_manager, self._send_coaching_event)
         self.artifact_store = artifact_store
         self.board_store = board_store
         self.board_orchestrator = board_orchestrator
@@ -1761,20 +1761,8 @@ class GatewayServer:
                 await self._ws_rpc_chat_undo(ws, rpc_id, params)
 
             # Meeting Coach — continuous listening
-            elif method == "coaching.start":
-                await self._ws_rpc_coaching_start(ws, client_id, rpc_id, params)
-            elif method == "coaching.segment":
-                await self._ws_rpc_coaching_segment(ws, client_id, rpc_id, params)
-            elif method == "coaching.askNow":
-                await self._ws_rpc_coaching_ask_now(ws, client_id, rpc_id, params)
-            elif method == "coaching.stop":
-                await self._ws_rpc_coaching_stop(ws, client_id, rpc_id, params)
-            elif method == "coaching.state":
-                await self._ws_rpc_coaching_state(ws, client_id, rpc_id, params)
-            elif method == "coaching.snapshot":
-                await self._ws_rpc_coaching_snapshot(ws, client_id, rpc_id, params)
-            elif method == "coaching.update":
-                await self._ws_rpc_coaching_update(ws, client_id, rpc_id, params)
+            elif method in coaching_rpc.METHODS:
+                await self._ws_rpc_coaching(ws, client_id, rpc_id, method, params)
 
             # Audit log — Activity tab history
             elif method == "audit.list":
@@ -2430,304 +2418,38 @@ class GatewayServer:
 
         await self._ws_rpc_reply(ws, rpc_id, {"tasks": tasks})
 
-    # --- RPC: coaching.* (meeting coach) ---
+    # --- RPC: coaching.* (meeting coach; flowly/coaching/rpc.py) ---
+
+    @property
+    def _coaching_sessions_by_client(self) -> dict[str, set[str]]:
+        return self._coaching_rpc.owned
 
     def _coaching_session_id(self, client_id: str, params: dict) -> str:
-        """Derive a session id. Default: per-WS-client so each desktop connection
-        is its own meeting. Allow override via params.sessionId for flexibility."""
-        override = params.get("sessionId") or params.get("session_id")
-        if override and isinstance(override, str):
-            return override
-        return f"coaching:{client_id}"
+        return self._coaching_rpc.session_id(client_id, params)
 
     def _track_coaching_session(self, client_id: str, session_id: str) -> None:
-        self._coaching_sessions_by_client.setdefault(client_id, set()).add(session_id)
+        self._coaching_rpc.track(client_id, session_id)
 
     def _untrack_coaching_session(self, client_id: str, session_id: str) -> None:
-        owned = self._coaching_sessions_by_client.get(client_id)
-        if not owned:
-            return
-        owned.discard(session_id)
-        if not owned:
-            self._coaching_sessions_by_client.pop(client_id, None)
+        self._coaching_rpc.untrack(client_id, session_id)
 
     async def _stop_client_coaching_sessions(self, client_id: str) -> None:
-        if not self._coaching_manager:
-            self._coaching_sessions_by_client.pop(client_id, None)
-            return
-        owned = self._coaching_sessions_by_client.pop(client_id, set())
-        # Backward compatibility for a session started before ownership
-        # tracking existed or by an older caller using the derived id.
-        owned.add(f"coaching:{client_id}")
-        for session_id in owned:
-            if not self._coaching_manager.is_active(session_id):
-                continue
-            try:
-                await self._coaching_manager.stop(session_id, background_finalize=True)
-                logger.info(
-                    f"[WS] auto-stopped coaching session {session_id} on disconnect"
-                )
-            except Exception as e:
-                logger.warning(f"[WS] coaching auto-stop failed for {session_id}: {e}")
+        await self._coaching_rpc.release(client_id)
 
-    async def _ws_rpc_coaching_start(
-        self, ws: web.WebSocketResponse, client_id: str, rpc_id: str, params: dict
+    async def _send_coaching_event(self, client_id: str, event: str, data: dict) -> None:
+        ws = self._ws_clients.get(client_id)
+        if ws is None or ws.closed:
+            return
+        await self._ws_send(ws, {"type": "event", "event": event, "data": data})
+
+    async def _ws_rpc_coaching(
+        self, ws: web.WebSocketResponse, client_id: str, rpc_id: str, method: str, params: dict
     ) -> None:
-        if not self._coaching_manager:
-            await self._ws_rpc_error(ws, rpc_id, "NOT_AVAILABLE", "Coaching not configured")
+        try:
+            result = await self._coaching_rpc.call(client_id, method, params)
+        except coaching_rpc.CoachingRpcError as e:
+            await self._ws_rpc_error(ws, rpc_id, e.code, e.message)
             return
-
-        session_id = self._coaching_session_id(client_id, params)
-        context = str(params.get("context", "") or "")
-        language = str(params.get("language", "auto") or "auto")
-        frequency = str(params.get("frequency", "moderate") or "moderate")
-
-        # Start (or reconfigure) the session BEFORE registering callbacks,
-        # so callback registration targets the now-existing session.
-        result = await self._coaching_manager.start(
-            session_id=session_id,
-            user_context=context,
-            language=language,
-            frequency=frequency,
-        )
-        if result.get("status") == "at_capacity":
-            await self._ws_rpc_error(
-                ws,
-                rpc_id,
-                "CAPACITY",
-                f"Max {result.get('limit')} concurrent coaching sessions",
-            )
-            return
-        self._track_coaching_session(client_id, session_id)
-
-        import time as _time
-
-        # Build callbacks bound to this specific WS. Weak-referencing ws is
-        # unnecessary because the session is cleaned up on stop/disconnect.
-        # `seq` and `timestamp` are kwargs from the manager (post-snapshot
-        # refactor); they propagate into the event payload so clients can
-        # deduplicate live events against rehydrated snapshots.
-        async def _tip_cb(
-            sid: str,
-            tip_text: str,
-            confidence: float,
-            *,
-            seq: int = -1,
-            timestamp: float | None = None,
-        ) -> None:
-            if ws.closed:
-                return
-            await self._ws_send(
-                ws,
-                {
-                    "type": "event",
-                    "event": "coaching.tip",
-                    "data": {
-                        "sessionId": sid,
-                        "text": tip_text,
-                        "confidence": confidence,
-                        "timestamp": timestamp if timestamp is not None else _time.time(),
-                        "seq": seq,
-                    },
-                },
-            )
-
-        async def _transcript_cb(sid: str, text: str, source: str, *, seq: int = -1) -> None:
-            if ws.closed:
-                return
-            await self._ws_send(
-                ws,
-                {
-                    "type": "event",
-                    "event": "coaching.transcript",
-                    "data": {"sessionId": sid, "text": text, "source": source, "seq": seq},
-                },
-            )
-
-        async def _finalized_cb(sid: str, summary: dict) -> None:
-            if ws.closed:
-                return
-            await self._ws_send(
-                ws,
-                {
-                    "type": "event",
-                    "event": "coaching.finalized",
-                    "data": {"sessionId": sid, **summary},
-                },
-            )
-
-        async def _gate_decision_cb(sid: str, **payload) -> None:
-            """Forward gate-decision events to the desktop renderer for the
-            Diagnostics panel. Best-effort — never raises."""
-            if ws.closed:
-                return
-            await self._ws_send(
-                ws,
-                {
-                    "type": "event",
-                    "event": "coaching.gate_decision",
-                    "data": {"sessionId": sid, "timestamp": _time.time(), **payload},
-                },
-            )
-
-        self._coaching_manager.on_tip(session_id, _tip_cb)
-        self._coaching_manager.on_transcript(session_id, _transcript_cb)
-        self._coaching_manager.on_finalized(session_id, _finalized_cb)
-        self._coaching_manager.on_gate_decision(session_id, _gate_decision_cb)
-
-        result["sessionId"] = session_id
-        await self._ws_rpc_reply(ws, rpc_id, result)
-
-    async def _ws_rpc_coaching_segment(
-        self, ws: web.WebSocketResponse, client_id: str, rpc_id: str, params: dict
-    ) -> None:
-        if not self._coaching_manager:
-            await self._ws_rpc_error(ws, rpc_id, "NOT_AVAILABLE", "Coaching not configured")
-            return
-
-        session_id = self._coaching_session_id(client_id, params)
-        # Transcript is produced client-side (desktop → web-app STT); gateway
-        # only sees text. Accept both "text" (new) and "transcript" (legacy).
-        text = params.get("text") or params.get("transcript") or ""
-        source = str(params.get("source", "mic") or "mic")
-        if source not in ("mic", "system"):
-            source = "mic"
-        if not text or not isinstance(text, str):
-            await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "text is required")
-            return
-
-        # Faz E: optional base64 JPEG of the user's screen at commit
-        # time. Desktop's smart-trigger decides when to attach; we
-        # forward whatever arrives. Defense-in-depth checks (type +
-        # length) so a misbehaving client can't OOM the bot process.
-        raw_screenshot = params.get("screenshot")
-        screenshot_b64: str | None = raw_screenshot if isinstance(raw_screenshot, str) else None
-        if screenshot_b64 is not None and len(screenshot_b64) > 1_500_000:
-            # Desktop ships PNG at the 1568 px Anthropic ceiling. UI
-            # screenshots compress to 200-500 KB raw → ~270-670 KB
-            # base64; 1.5 MB cap leaves headroom for busy / text-heavy
-            # screens without admitting genuinely malformed payloads.
-            # Bot still receives the transcript on overflow, just no
-            # image.
-            logger.warning(
-                f"[Coach] segment session={session_id} screenshot too large "
-                f"({len(screenshot_b64)} bytes); dropping image"
-            )
-            screenshot_b64 = None
-        logger.info(
-            f"[Coach] segment.rpc session={session_id} "
-            f"text_len={len(text)} source={source} "
-            f"screenshot={'present(' + str(len(screenshot_b64)) + 'b)' if screenshot_b64 else 'none'}"
-        )
-
-        result = await self._coaching_manager.add_transcript(
-            session_id=session_id,
-            text=text,
-            source=source,
-            screenshot_b64=screenshot_b64,
-        )
-        await self._ws_rpc_reply(ws, rpc_id, result)
-
-    async def _ws_rpc_coaching_ask_now(
-        self, ws: web.WebSocketResponse, client_id: str, rpc_id: str, params: dict
-    ) -> None:
-        """Hotkey-triggered "force a tip" path. Skips gate1; runs gate2
-        directly against the session's cached transcript + the
-        (optionally fresh) screenshot.
-
-        Defense-in-depth: bound the screenshot length same as the
-        regular segment RPC. The backend schema already caps at 500 KB
-        but a misbehaving client could OOM the bot before reaching
-        backend.
-        """
-        if not self._coaching_manager:
-            await self._ws_rpc_error(ws, rpc_id, "NOT_AVAILABLE", "Coaching not configured")
-            return
-
-        session_id = self._coaching_session_id(client_id, params)
-
-        raw_screenshot = params.get("screenshot")
-        screenshot_b64: str | None = raw_screenshot if isinstance(raw_screenshot, str) else None
-        if screenshot_b64 is not None and len(screenshot_b64) > 1_500_000:
-            # See coaching.segment for the rationale on the 1.5 MB cap.
-            logger.warning(
-                f"[Coach] askNow session={session_id} screenshot too large "
-                f"({len(screenshot_b64)} bytes); dropping image"
-            )
-            screenshot_b64 = None
-        logger.info(
-            f"[Coach] askNow.rpc session={session_id} "
-            f"screenshot={'present(' + str(len(screenshot_b64)) + 'b)' if screenshot_b64 else 'none'}"
-        )
-
-        result = await self._coaching_manager.ask_now(
-            session_id=session_id,
-            screenshot_b64=screenshot_b64,
-        )
-        await self._ws_rpc_reply(ws, rpc_id, result)
-
-    async def _ws_rpc_coaching_stop(
-        self, ws: web.WebSocketResponse, client_id: str, rpc_id: str, params: dict
-    ) -> None:
-        if not self._coaching_manager:
-            await self._ws_rpc_error(ws, rpc_id, "NOT_AVAILABLE", "Coaching not configured")
-            return
-        session_id = self._coaching_session_id(client_id, params)
-        result = await self._coaching_manager.stop(session_id)
-        self._untrack_coaching_session(client_id, session_id)
-        result["sessionId"] = session_id
-        await self._ws_rpc_reply(ws, rpc_id, result)
-
-    async def _ws_rpc_coaching_state(
-        self, ws: web.WebSocketResponse, client_id: str, rpc_id: str, params: dict
-    ) -> None:
-        if not self._coaching_manager:
-            await self._ws_rpc_reply(ws, rpc_id, {"active": False})
-            return
-        session_id = self._coaching_session_id(client_id, params)
-        info = self._coaching_manager.session_info(session_id)
-        if info:
-            await self._ws_rpc_reply(ws, rpc_id, {"active": True, **info})
-        else:
-            await self._ws_rpc_reply(ws, rpc_id, {"active": False})
-
-    async def _ws_rpc_coaching_snapshot(
-        self, ws: web.WebSocketResponse, client_id: str, rpc_id: str, params: dict
-    ) -> None:
-        """Full session snapshot for client rehydration.
-
-        Unlike `coaching.state` (counts only), this returns the actual
-        transcript segments and tip records buffered in memory. Clients
-        use this on reconnect / page navigation to rebuild the live UI
-        without losing what already happened.
-        """
-        if not self._coaching_manager:
-            await self._ws_rpc_reply(ws, rpc_id, {"active": False})
-            return
-        session_id = self._coaching_session_id(client_id, params)
-        snap = self._coaching_manager.session_snapshot(session_id)
-        if snap:
-            await self._ws_rpc_reply(ws, rpc_id, {"active": True, **snap})
-        else:
-            await self._ws_rpc_reply(ws, rpc_id, {"active": False, "session_id": session_id})
-
-    async def _ws_rpc_coaching_update(
-        self, ws: web.WebSocketResponse, client_id: str, rpc_id: str, params: dict
-    ) -> None:
-        """Live-update an in-progress coaching session (context/frequency/lang)."""
-        if not self._coaching_manager:
-            await self._ws_rpc_error(ws, rpc_id, "NOT_AVAILABLE", "Coaching not configured")
-            return
-        session_id = self._coaching_session_id(client_id, params)
-        user_context = params.get("context")
-        frequency = params.get("frequency")
-        language = params.get("language")
-        result = await self._coaching_manager.update_session(
-            session_id,
-            user_context=user_context if isinstance(user_context, str) else None,
-            frequency=frequency if isinstance(frequency, str) else None,
-            language=language if isinstance(language, str) else None,
-        )
         await self._ws_rpc_reply(ws, rpc_id, result)
 
     # --- RPC: sessions.list ---

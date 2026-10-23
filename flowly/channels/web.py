@@ -31,6 +31,7 @@ from flowly.bus.events import InboundMessage as _Base
 from flowly.bus.events import OutboundMessage
 from flowly.bus.queue import MessageBus
 from flowly.channels import feature_rpc
+from flowly.coaching import rpc as coaching_rpc
 from flowly.agent.subagent_observation import client_event, event_version
 from flowly.channels.base import BaseChannel
 from flowly.config.schema import WebChannelConfig
@@ -87,6 +88,10 @@ _OBJECTIVES_WATCH_METHODS = frozenset({
 _AGENT_FIRST_OPEN_ATTEMPTS = 6
 _AGENT_FIRST_OPEN_TIMEOUT = 10.0
 _AGENT_FIRST_OPEN_RETRY_SECONDS = 10.0
+# A device that drops off comes back as a new client session; its desktop then
+# starts its Coach session again from there. Until then the session keeps
+# running instead of being finalized under it.
+_COACHING_RELEASE_GRACE_SECONDS = 60.0
 _PROFILE_LONG_RUNNING_METHODS = frozenset({
     "profiles.connect",
     "profiles.configure",
@@ -354,6 +359,9 @@ class WebChannel(BaseChannel):
         self._subagent_event_versions: dict[str, int] = {}
         # Relay sessions showing this agent's goals → when their watch ends.
         self._objectives_watchers: dict[str, float] = {}
+        # Meeting Coach over this connection, per client session (set by the gateway).
+        self._coaching_manager: Any | None = None
+        self._coaching_rpc = coaching_rpc.CoachingRpc(lambda: self._coaching_manager, self._send_coaching_event)
         self._profile_subagent_observers: dict[tuple[str, str], tuple[int, float]] = {}
         self._profile_subagent_reads: dict[object, str] = {}
         # subagent:<threadId> → {relay session: lease expiry (monotonic)}: who
@@ -468,6 +476,10 @@ class WebChannel(BaseChannel):
         lightweight liveness signals without joining the relay conversation.
         """
         self._local_event_callback = callback
+
+    def set_coaching_manager(self, manager: Any | None) -> None:
+        """Serve ``coaching.*`` here too, with the gateway's Coach."""
+        self._coaching_manager = manager
 
     def set_profile_host(self, host: Any | None) -> None:
         """Attach the primary gateway's authenticated isolated-profile host."""
@@ -1914,6 +1926,8 @@ class WebChannel(BaseChannel):
                             and (
                                 msg.get("method") in feature_rpc.LONG_RUNNING_METHODS
                                 or msg.get("method") in _PROFILE_LONG_RUNNING_METHODS
+                                # A segment waits on the model; a stop writes the summary.
+                                or msg.get("method") in coaching_rpc.METHODS
                             )
                         ):
                             # Keep receiving relay pings and other sessions'
@@ -2119,6 +2133,7 @@ class WebChannel(BaseChannel):
             self._subagent_observers.pop(session_id, None)
             self._subagent_event_versions.pop(session_id, None)
             self._objectives_watchers.pop(session_id, None)
+            await self._coaching_rpc.release(session_id, grace_seconds=_COACHING_RELEASE_GRACE_SECONDS)
             self._clear_profile_subagent_observers(session_id)
             self._clear_subagent_stream_watchers(session_id)
             self._remove_profile_relay_session(session_id)
@@ -2591,6 +2606,9 @@ class WebChannel(BaseChannel):
         elif method.startswith("profiles."):
             await self._handle_profile_rpc(ws, msg)
 
+        elif method in coaching_rpc.METHODS:
+            await self._handle_coaching_rpc(ws, rpc_id, session_id, method, params)
+
         elif method in feature_rpc.FEATURE_METHODS:
             # Every desktop/iOS feature RPC (connections, config, memory, kg,
             # sessions, audit, persona, provider, skills, assistants, pairing)
@@ -2615,6 +2633,30 @@ class WebChannel(BaseChannel):
                     "retryable": False,
                 },
             }))
+
+    async def _handle_coaching_rpc(self, ws, rpc_id: str, session_id: str, method: str, params: dict) -> None:
+        """Meeting Coach (flowly/coaching/rpc.py): the client session that starts one owns it."""
+        reply: dict[str, Any] = {"type": "rpc", "id": rpc_id, "sessionId": session_id}
+        if not session_id:
+            reply["error"] = {"code": "INVALID_REQUEST", "message": "Coach needs a client session."}
+        else:
+            try:
+                reply["result"] = await self._coaching_rpc.call(
+                    session_id, method, params if isinstance(params, dict) else {})
+            except coaching_rpc.CoachingRpcError as e:
+                reply["error"] = {"code": e.code, "message": e.message}
+            except Exception as e:
+                logger.exception(f"[WebChannel] {method} failed")
+                reply["error"] = {"code": "INTERNAL", "message": str(e)}
+        await ws.send(json.dumps(reply))
+
+    async def _send_coaching_event(self, session_id: str, event: str, data: dict) -> None:
+        """A Coach event to the client session that owns the Coach session."""
+        if not self._ws:
+            return
+        frame = json.dumps({"type": "event", "event": event, "data": data, "sessionId": session_id})
+        pending = RelayOutbound(frame, self._outbound_event_access(frame))
+        await asyncio.wait_for(self._deliver_relay_outbound(pending), timeout=5)
 
     async def _handle_feature_rpc(
         self, ws, rpc_id: str, session_id: str, method: str, params: dict
