@@ -141,9 +141,7 @@ class VoiceMemorySnapshot:
         if memory:
             sections.append(Section('memory', 'Memory', memory, 'memory://governance'))
         # Where the owner and the agent left off: a call continues it.
-        latest = self._latest_conversation(governed, sources, request.get('conversationId'))
-        if latest:
-            sections.append(latest)
+        sections.extend(self._conversations(governed, sources, request.get('conversationId')))
         file_section('notes', 'Notes', 'memory/MEMORY.md')
 
         # Without memory search the agent's prompt carries its recent notes.
@@ -162,28 +160,45 @@ class VoiceMemorySnapshot:
                 'partial': any(source.get('status') == 'unavailable' for source in sources.values()),
                 'sources': sources}
 
-    def _latest_conversation(self, governed: GovernedMemory, sources: dict,
-                             conversation: str | None = None) -> Section | None:
-        from flowly.live_voice.recent_chat import bound_chat, latest_chat
+    def _conversations(self, governed: GovernedMemory, sources: dict,
+                       conversation: str | None = None) -> list[Section]:
+        """The call's conversations: its own chat first when it is bound (§7.6), then the latest other one.
+
+        Both are ``recent`` sections (the kinds clients accept), told apart by
+        title and source, and the same chat is never shown twice. A call of
+        its own keeps the single "Latest …" section it always had.
+        """
+        from flowly.live_voice.recent_chat import bound_chat, chat_tail, latest_chat
 
         directory = self.sessions_dir()
         if directory is None:
-            return None
+            return []
+        sections: list[Section] = []
         try:
-            chat = latest_chat(directory, prefer=bound_chat(directory, conversation))
+            bound = bound_chat(directory, conversation)
+            own = chat_tail(directory, bound) if bound else None
+            latest = latest_chat(directory, exclude=bound)
         except Exception:  # noqa: BLE001 — memory never fails on a conversation read
             sources['conversation'] = {'status': 'unavailable'}
-            return None
-        if chat is None:
+            return []
+        if bound:
+            text = self._safe(own.text, 'this chat', governed) if own else ''
+            sources['chat'] = {'status': 'ok' if text else 'empty', 'revision': revision_of(text)}
+            if text:
+                title = f"This chat — the call is part of it{': ' + own.title if own.title else ''} ({own.updated_at:%Y-%m-%d %H:%M})"
+                sections.append(Section('recent', title[:200], text, 'memory://conversation/this-chat'))
+        if latest is None:
             sources['conversation'] = {'status': 'empty'}
-            return None
-        text = self._safe(chat.text, 'latest conversation', governed)
+            return sections
+        text = self._safe(latest.text, 'latest conversation', governed)
         sources['conversation'] = {'status': 'ok' if text else 'empty', 'revision': revision_of(text)}
         if not text:
-            return None
-        kind = 'call' if chat.is_call else 'conversation'
-        title = f"Latest {kind}{': ' + chat.title if chat.title else ''} ({chat.updated_at:%Y-%m-%d %H:%M})"
-        return Section('recent', title[:200], text, 'memory://conversation/latest')
+            return sections
+        kind = 'call' if latest.is_call else 'conversation'
+        label = f"Your last other {kind}" if bound else f"Latest {kind}"
+        title = f"{label}{': ' + latest.title if latest.title else ''} ({latest.updated_at:%Y-%m-%d %H:%M})"
+        sections.append(Section('recent', title[:200], text, 'memory://conversation/latest'))
+        return sections
 
     def _safe(self, text: str, name: str, governed: GovernedMemory, *, stated: set[str] = frozenset()) -> str:
         """The paragraphs a call may see, through the agent's injection scan,

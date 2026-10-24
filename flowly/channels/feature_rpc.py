@@ -1999,9 +1999,12 @@ async def voice_memory_snapshot(params: dict) -> dict:
         raise FeatureRpcError(exc.code, str(exc)) from exc
     # Shape only, never content: what a call started with.
     sections = result.get("sections") or []
+    sources = result.get("sources") if isinstance(result.get("sources"), dict) else {}
     logger.info(
-        "Live Voice memory snapshot served: sections={} bytes={} profileBytes={} truncated={} partial={} unchanged={}",
+        "Live Voice memory snapshot served: sections={} thisChat={} bytes={} profileBytes={} truncated={} partial={} unchanged={}",
         ",".join(section.get("kind", "?") for section in sections),
+        # A bound call (chat-wire-protocol §7.6): "ok", "empty", or "unbound".
+        (sources.get("chat") or {}).get("status", "unbound"),
         sum(len(str(section.get("text", "")).encode()) for section in sections),
         len(str(result.get("profile", "")).encode()), bool(result.get("truncated")),
         bool(result.get("partial")), bool(result.get("unchanged")),

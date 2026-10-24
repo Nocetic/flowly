@@ -82,10 +82,31 @@ def bound_chat(sessions_dir: Path, conversation_id: str | None) -> str | None:
     return chat if isinstance(chat, str) and session_visible(key, metadata) else None
 
 
-def latest_chat(sessions_dir: Path, *, prefer: str | None = None) -> RecentChat | None:
+def chat_tail(sessions_dir: Path, key: str) -> RecentChat | None:
+    """One chat's tail (a bound call's own chat, chat-wire-protocol §7.6); None when it has nothing to show."""
+    from flowly.session.keys import read_session_header
+    from flowly.session.ownership import session_visible
+
+    path = _session_path(sessions_dir, key)
+    try:
+        header = read_session_header(path)
+    except (OSError, ValueError):
+        return None
+    metadata = header.get('metadata') if isinstance(header.get('metadata'), dict) else {}
+    if not is_owner_chat(key) or not session_visible(key, metadata):
+        return None
+    lines = _tail_messages(path)
+    if not lines:
+        return None
+    title = str(metadata.get('title') or '').strip()
+    return RecentChat(key=key, title=' '.join(title.split())[:120], text='\n\n'.join(lines),
+                      updated_at=datetime.fromtimestamp(_mtime(path)), is_call=False)
+
+
+def latest_chat(sessions_dir: Path, *, exclude: str | None = None) -> RecentChat | None:
     """The most recently active owner conversation the requester may see,
-    as ``User:``/``Agent:`` lines; None when there is none. ``prefer``: a
-    bound call's chat, taken first when it has anything to show."""
+    as ``User:``/``Agent:`` lines; None when there is none. ``exclude``: a
+    bound call's own chat, which the snapshot shows on its own."""
     from flowly.session.keys import read_session_header, session_key_from_header
     from flowly.session.manager import iter_session_files
     from flowly.session.ownership import session_visible
@@ -93,9 +114,8 @@ def latest_chat(sessions_dir: Path, *, prefer: str | None = None) -> RecentChat 
     if not sessions_dir.is_dir():
         return None
     files = sorted(iter_session_files(sessions_dir), key=_mtime, reverse=True)
-    if prefer:
-        preferred = _session_path(sessions_dir, prefer)
-        files = [preferred, *[path for path in files if path != preferred]] if preferred.exists() else files
+    if exclude:
+        files = [path for path in files if path != _session_path(sessions_dir, exclude)]
     for path in files[:CANDIDATES]:
         try:
             header = read_session_header(path)

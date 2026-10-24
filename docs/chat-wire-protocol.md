@@ -401,5 +401,17 @@ assignment. The reply is that run's `final`. Bound calls do
 not use `voice.tasks.dispatch` or `voice.chats.open`.
 
 **7.6 — Startup context.** `voice.memory.snapshot` accepts `conversationId`.
-For a bound call, its "latest conversation" section is the bound chat.
+A bound call gets two `recent` sections (the kinds clients accept), told
+apart by title and `sourceRef`:
+- `This chat — the call is part of it: <title>` (`memory://conversation/this-chat`);
+- `Your last other conversation|call: <title>` (`memory://conversation/latest`).
+The bound chat is never shown twice. A call of its own keeps its single
+`Latest conversation|call` section. Each section is at most 6000 bytes. The
+served-log line says `thisChat=ok|empty|unbound`.
+
+**7.7 — Who may read a call for its chat.** A turn in the chat may run as the
+host (a typed message over the Flowly server) while the call is an account's.
+The call's words are read for that chat in the trusted scope, only for calls
+bound to it: the owner bound the call there, and `voice.open` checked that
+chat.
 

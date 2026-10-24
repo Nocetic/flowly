@@ -295,15 +295,25 @@ class VoiceChatBindings:
         return True
 
     def on_turn_start(self, session: Session) -> None:
-        """A turn starts in a chat: put its live calls into this turn's own session object."""
-        for call_id in sorted(self._chats.get(session.key, ())):
-            ledger = self.sessions.read(voice_session_key(call_id))
-            record = call_record(ledger, now=self.now()) if ledger else None
-            if record is None or record["phase"] != "live":
-                continue  # an ended call's context is written by finish()
-            turns, _ = transcript(ledger)
-            if turns:
-                upsert_context(session, call_id, context_text(record, turns))
+        """A turn starts in a chat: put its live calls into this turn's own session object.
+
+        The ledger is read in the trusted scope: the turn may run as the host
+        (a typed message over the Flowly server) while the call is an
+        account's, and the call's words belong to this chat because its owner
+        bound it here (``voice.open`` checked that chat). Only calls bound to
+        this very chat are read.
+        """
+        from flowly.live_voice.authority import request_owner_scope
+
+        with request_owner_scope(None):
+            for call_id in sorted(self._chats.get(session.key, ())):
+                ledger = self.sessions.read(voice_session_key(call_id))
+                record = call_record(ledger, now=self.now()) if ledger else None
+                if record is None or record["phase"] != "live":
+                    continue  # an ended call's context is written by finish()
+                turns, _ = transcript(ledger)
+                if turns:
+                    upsert_context(session, call_id, context_text(record, turns))
 
     async def sweep(self) -> None:
         """End abandoned bound calls; finish any chat context an end left unwritten."""

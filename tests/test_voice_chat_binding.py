@@ -16,7 +16,7 @@ from flowly.live_voice.chat_binding import (
 )
 from flowly.live_voice.events import current_event_access
 from flowly.live_voice.memory_snapshot import validate_snapshot
-from flowly.live_voice.recent_chat import bound_chat, latest_chat
+from flowly.live_voice.recent_chat import bound_chat, chat_tail, latest_chat
 from flowly.live_voice.service import LiveVoiceService
 from flowly.live_voice.sessions import VoiceError, VoiceSessions
 from flowly.session.history_rows import history_row
@@ -327,7 +327,8 @@ def test_a_bound_calls_snapshot_takes_its_chat_as_the_latest_conversation(manage
     directory = manager.sessions_dir
     assert bound_chat(directory, 'call-1') == CHAT
     assert bound_chat(directory, 'nope') is None
-    assert latest_chat(directory, prefer=CHAT).key == CHAT
+    assert chat_tail(directory, CHAT).key == CHAT
+    assert latest_chat(directory, exclude=CHAT).key == 'web:newer'
     assert validate_snapshot({'conversationId': 'call-1'}) == {'knownRevision': None, 'conversationId': 'call-1'}
     with pytest.raises(VoiceError):
         validate_snapshot({'conversationId': 'a/b'})
@@ -507,3 +508,58 @@ async def test_a_named_agents_gateway_marks_the_user_row_and_refuses_a_bad_mark(
     socket = Socket()
     await server._ws_rpc_chat_send(socket, 'a', 'rpc-2', {**ask, 'idempotencyKey': 'voice-w2', 'voiceCallId': 'a/b'})
     assert socket.sent[-1]['error']['code'] == 'INVALID_REQUEST'
+
+
+def test_a_typed_turn_during_a_live_account_call_gets_the_call_even_as_the_host(manager, voice):
+    """Hakan, 2026-10-24 05:24: a typed turn over the Flowly server runs as the host,
+    the call is the account's; reading its ledger refused (SessionAccessError) and
+    the turn went without the call."""
+    from flowly.live_voice.authority import HOST_OWNER
+
+    bindings = VoiceChatBindings(manager)
+    bindings.bind('call-1', CHAT)
+    account = voice.for_principal(VoicePrincipal('account-1', 'host-1', 9999999999, 'cred'))
+    with request_owner_scope(RequestOwner('account-1')):
+        open_call(account)
+        say(account, 1, 'user', 'Yarın dokuzda toplantı')
+    with request_owner_scope(HOST_OWNER):
+        turn = manager.get_or_create(CHAT)
+        bindings.on_turn_start(turn)
+    rows = [m for m in turn.messages if m.get('kind') == CONTEXT_KIND]
+    assert len(rows) == 1 and 'Yarın dokuzda toplantı' in rows[0]['content']
+
+
+def test_a_bound_calls_snapshot_has_this_chat_and_the_last_other_conversation_labelled_apart(manager, voice, tmp_path):
+    """Hakan: keep both. The bound chat first, then the owner's last other conversation."""
+    from flowly.live_voice.memory_snapshot import VoiceMemorySnapshot
+
+    workspace = tmp_path / 'workspace'
+    workspace.mkdir(exist_ok=True)
+    chat = manager.get_or_create(CHAT)
+    chat.add_message('user', 'Bu sohbette rapor konuştuk')
+    chat.add_message('assistant', 'Evet, raporu hazırladım')
+    manager.save(chat)
+    other = manager.get_or_create('web:newer')
+    other.add_message('user', 'Başka bir sohbet')
+    other.add_message('assistant', 'Tamam')
+    manager.save(other)
+    open_call(voice)
+    snapshot = VoiceMemorySnapshot(workspace, state_db=lambda name: tmp_path / name, profile=lambda: ('default', 'agent-1'),
+                                   sessions_dir=lambda: manager.sessions_dir)
+    monkeypatched = snapshot._safe
+    snapshot._safe = lambda text, *args, **kwargs: text  # governance is not under test here
+    bound = snapshot._conversations(None, {}, 'call-1')
+    assert [section.source for section in bound] == ['memory://conversation/this-chat', 'memory://conversation/latest']
+    assert bound[0].kind == bound[1].kind == 'recent'
+    assert bound[0].title.startswith('This chat') and 'rapor' in bound[0].text
+    assert bound[1].title.startswith('Your last other conversation') and 'Başka bir sohbet' in bound[1].text
+    # When this chat is also the latest, it is said once.
+    chat.add_message('user', 'şimdi')
+    manager.save(chat)
+    once = snapshot._conversations(None, {}, 'call-1')
+    assert [section.source for section in once].count('memory://conversation/this-chat') == 1
+    assert all('Bu sohbette rapor' not in section.text for section in once[1:])
+    # A call of its own keeps today's single section, worded as before.
+    unbound = snapshot._conversations(None, {}, None)
+    assert len(unbound) == 1 and unbound[0].title.startswith('Latest conversation')
+    snapshot._safe = monkeypatched
