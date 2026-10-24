@@ -106,18 +106,20 @@ def _build_tools() -> dict[str, Any]:
     except Exception:
         logger.debug("WebExtractTool unavailable", exc_info=True)
 
-    # web_search — needs the web tool config (api key) or the web
-    # channel relay creds (proxy). Build from config when present.
+    # web_search — needs the web tool config (api key), the web channel
+    # relay creds or the Flowly account key (proxy). Build from config.
     try:
         from flowly.agent.tools.web import WebSearchTool
         web_cfg = getattr(getattr(cfg, "tools", None), "web", None)
         chan = getattr(getattr(cfg, "channels", None), "web", None)
+        flowly_provider = getattr(getattr(cfg, "providers", None), "flowly", None)
         tools["web_search"] = WebSearchTool(
             api_key=getattr(web_cfg, "api_key", "") or None,
             max_results=getattr(web_cfg, "max_results", 5) or 5,
             proxy_url=getattr(web_cfg, "proxy_url", "") or None,
             server_id=getattr(chan, "server_id", "") or None,
             auth_token=getattr(chan, "auth_token", "") or None,
+            account_key=getattr(flowly_provider, "account_key", "") or None,
         )
     except Exception:
         logger.debug("WebSearchTool unavailable", exc_info=True)

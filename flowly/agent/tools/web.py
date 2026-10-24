@@ -190,9 +190,15 @@ class WebSearchTool(Tool):
         server_id: str | None = None,
         auth_token: str | None = None,
         enabled: bool = True,
+        account_key: str | None = None,
     ):
         self.api_key = api_key or os.environ.get("BRAVE_API_KEY", "")
         self.max_results = max_results
+        # The Flowly account key (``flw_…``): the proxy's credential on a Mac
+        # signed in through the app and on a cloud computer, which have no
+        # relay creds. See ``web_providers/brave.py``.
+        key = (account_key or "").strip()
+        self._account_key = key if key.startswith("flw_") else ""
         self._proxy_url = proxy_url
         self._server_id = server_id
         self._auth_token = auth_token
@@ -207,7 +213,7 @@ class WebSearchTool(Tool):
         # backfill in ``account/relay_config.py``. (A self-host who set a
         # custom proxy_url keeps it; an own BRAVE_API_KEY still wins in
         # ``execute`` since the direct path is checked first.)
-        if not self._proxy_url and self._server_id and self._auth_token:
+        if not self._proxy_url and ((self._server_id and self._auth_token) or self._account_key):
             base = os.environ.get("FLOWLY_API_BASE", "https://useflowlyapp.com")
             self._proxy_url = base.rstrip("/") + "/api/v1/search"
 
@@ -240,6 +246,7 @@ class WebSearchTool(Tool):
         if not (
             self.api_key
             or (self._proxy_url and self._server_id and self._auth_token)
+            or (self._proxy_url and self._account_key)
         ):
             return None
         return BraveWebSearchProvider(
@@ -248,6 +255,7 @@ class WebSearchTool(Tool):
             server_id=self._server_id,
             auth_token=self._auth_token,
             max_results=self.max_results,
+            account_key=self._account_key,
         )
 
 

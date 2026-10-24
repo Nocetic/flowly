@@ -2774,12 +2774,20 @@ class AgentLoop:
         web_search_enabled = True
         if self._main_config and hasattr(self._main_config, "tools"):
             web_search_enabled = bool(self._main_config.tools.web.search.enabled)
+            if self._main_config.tools.web.search.proxy_url and not web_proxy_url:
+                web_proxy_url = self._main_config.tools.web.search.proxy_url
+        # The Flowly account key: search for a Mac signed in through the app
+        # and for a cloud computer, which have no relay creds.
+        web_account_key = None
+        if self._main_config and hasattr(self._main_config, "providers"):
+            web_account_key = getattr(self._main_config.providers.flowly, "account_key", "") or None
         self.tools.register(WebSearchTool(
             api_key=self.brave_api_key,
             proxy_url=web_proxy_url,
             server_id=web_server_id,
             auth_token=web_auth_token,
             enabled=web_search_enabled,
+            account_key=web_account_key,
         ))
         self.tools.register(WebFetchTool())
         self.tools.register(WebExtractTool())
@@ -2788,6 +2796,7 @@ class AgentLoop:
         self.subagents._web_search_proxy_url = web_proxy_url
         self.subagents._web_search_server_id = web_server_id
         self.subagents._web_search_auth_token = web_auth_token
+        self.subagents._web_search_account_key = web_account_key
         
         # Message tool
         message_tool = MessageTool(send_callback=self.bus.publish_outbound)

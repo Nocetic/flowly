@@ -507,6 +507,8 @@ class SubagentManager:
         self._web_search_proxy_url = web_search_proxy_url
         self._web_search_server_id = web_search_server_id
         self._web_search_auth_token = web_search_auth_token
+        # The Flowly account key for the search proxy; set by the agent loop.
+        self._web_search_account_key: str | None = None
         self._artifact_on_change: Any | None = None  # Broadcast callback for S3 sync
         # Builds the artifact tool a child uses. A named profile sets this to
         # the same shared-Library tool its main agent uses, so what a child
@@ -2029,6 +2031,7 @@ class SubagentManager:
                 proxy_url=self._web_search_proxy_url,
                 server_id=self._web_search_server_id,
                 auth_token=self._web_search_auth_token,
+                account_key=self._web_search_account_key,
             ),
             "web_fetch": lambda: WebFetchTool(),
             "web_extract": lambda: WebExtractTool(),

@@ -1,13 +1,20 @@
 """Brave Search provider — Flowly's default web search backend.
 
-Search-only. Two auth paths, checked in this order:
+Search-only. Three auth paths, checked in this order:
 
 1. **Direct** — a Brave Search API key (``tools.web.search.apiKey`` or the
    ``BRAVE_API_KEY`` env var). Used by self-hosters with their own key.
-2. **Flowly proxy** — the account relay creds (``channels.web.serverId`` +
-   ``authToken``, written by ``flowly login``) POST to the Flowly Cloud
-   search proxy. ``proxy_url`` is backfilled to the canonical endpoint when
-   the account is registered but no explicit proxy URL was configured.
+2. **Flowly proxy, relay creds** — ``channels.web.serverId`` + ``authToken``
+   (a relay-registered bot) POST to the Flowly search proxy.
+3. **Flowly proxy, account key** — the ``flw_…`` key in
+   ``providers.flowly.accountKey``, the same bearer the hosted model provider
+   uses. A Mac signed in through the app and a Flowly cloud computer have it
+   but no relay creds, so without this path their search was "not available"
+   while their chat worked. Relay creds stay first while both exist, so a
+   proxy that does not take the account key yet keeps working.
+
+``proxy_url`` is backfilled to the canonical endpoint when either proxy
+credential is present but no explicit proxy URL was configured.
 
 Returns the standard provider envelope plus Brave's enrichments
 (``extra_snippets``, ``age``, ``source``, top-level ``summary`` / ``news``),
@@ -53,12 +60,14 @@ class BraveWebSearchProvider(WebSearchProvider):
         server_id: str | None = None,
         auth_token: str | None = None,
         max_results: int = 5,
+        account_key: str | None = None,
     ) -> None:
         self._api_key = api_key
         self._proxy_url = proxy_url
         self._server_id = server_id
         self._auth_token = auth_token
         self._max_results = max_results
+        self._account_key = account_key
 
     @property
     def name(self) -> str:
@@ -100,11 +109,26 @@ class BraveWebSearchProvider(WebSearchProvider):
         if auth_token is None:
             auth_token = getattr(chan, "auth_token", "") or ""
 
-        if not proxy_url and server_id and auth_token:
+        if not proxy_url and ((server_id and auth_token) or self._resolve_account_key()):
             base = os.environ.get("FLOWLY_API_BASE", "https://useflowlyapp.com")
             proxy_url = base.rstrip("/") + "/api/v1/search"
 
         return api_key, proxy_url, server_id, auth_token
+
+    def _resolve_account_key(self) -> str:
+        """The Flowly account key (``flw_…``) for the proxy, or ``""``.
+
+        An explicit value wins. A provider built with explicit relay creds and
+        no account key (the tool's fallback, older callers) has none; one built
+        with nothing explicit reads ``providers.flowly.accountKey``.
+        """
+        if self._account_key is not None:
+            return self._account_key.strip()
+        if any(v is not None for v in (self._api_key, self._proxy_url, self._server_id, self._auth_token)):
+            return ""
+        flowly = getattr(getattr(_cfg(), "providers", None), "flowly", None)
+        key = (getattr(flowly, "account_key", "") or "").strip()
+        return key if key.startswith("flw_") else ""
 
     def _config_enabled(self) -> bool:
         """Honour the connections-card toggle (``tools.web.search.enabled``).
@@ -122,7 +146,7 @@ class BraveWebSearchProvider(WebSearchProvider):
         if not self._config_enabled():
             return False
         api_key, proxy_url, server_id, auth_token = self._resolve_creds()
-        return bool(api_key) or bool(proxy_url and server_id and auth_token)
+        return bool(api_key) or bool(proxy_url and ((server_id and auth_token) or self._resolve_account_key()))
 
     # -- search ----------------------------------------------------------
 
@@ -137,6 +161,9 @@ class BraveWebSearchProvider(WebSearchProvider):
             return self._search_direct(query, n, api_key)
         if proxy_url and server_id and auth_token:
             return self._search_proxy(query, n, proxy_url, server_id, auth_token)
+        account_key = self._resolve_account_key()
+        if proxy_url and account_key:
+            return self._search_proxy(query, n, proxy_url, account_key=account_key)
         return {
             "success": False,
             "error": "Error: Web search not available. No API key or proxy configured.",
@@ -166,17 +193,24 @@ class BraveWebSearchProvider(WebSearchProvider):
 
     @staticmethod
     def _search_proxy(
-        query: str, n: int, proxy_url: str, server_id: str, auth_token: str
+        query: str, n: int, proxy_url: str, server_id: str = "", auth_token: str = "",
+        account_key: str = "",
     ) -> dict:
+        # Relay creds go as the two headers; an account key as the bearer the
+        # model proxy takes too (``Authorization: Bearer flw_…``).
+        if account_key:
+            headers = {"Authorization": f"Bearer {account_key}", "Content-Type": "application/json"}
+        else:
+            headers = {
+                "X-Flowly-Server-Id": server_id,
+                "X-Flowly-API-Key": auth_token,
+                "Content-Type": "application/json",
+            }
         try:
             r = httpx.post(
                 proxy_url,
                 json={"query": query, "count": n},
-                headers={
-                    "X-Flowly-Server-Id": server_id,
-                    "X-Flowly-API-Key": auth_token,
-                    "Content-Type": "application/json",
-                },
+                headers=headers,
                 timeout=15.0,
             )
             if r.status_code == 429:
@@ -200,7 +234,7 @@ class BraveWebSearchProvider(WebSearchProvider):
         return {
             "name": "Brave Search",
             "badge": "default",
-            "tag": "Direct Brave API key, or the Flowly Cloud search proxy when logged in.",
+            "tag": "Direct Brave API key, or the Flowly search proxy when signed in to a Flowly account.",
             "env_vars": [
                 {
                     "key": "BRAVE_API_KEY",

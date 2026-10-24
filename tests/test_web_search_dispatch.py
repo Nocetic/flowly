@@ -204,3 +204,72 @@ def test_bundled_web_brave_plugin_registers(tmp_path, monkeypatch):
     assert reg.get_provider("brave") is not None
 
     _reset_for_tests()
+
+
+# ── Flowly account key (Mac signed in through the app, cloud computer) ──
+
+
+def test_account_key_searches_through_the_proxy_with_its_bearer(monkeypatch):
+    """No relay creds, only the ``flw_…`` key the model provider uses: the
+    proxy is reached with that key as its bearer (it was "not available")."""
+    import flowly.agent.tools.web_providers.brave as bmod
+    captured = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["url"], captured["headers"] = url, headers
+        return _FakeResp({"results": [{"title": "A", "url": "http://a", "description": "ad"}]})
+
+    monkeypatch.setattr(bmod.httpx, "post", fake_post)
+    tool = WebSearchTool(account_key="flw_abc")
+    assert tool._proxy_url == "https://useflowlyapp.com/api/v1/search"
+    out = asyncio.run(tool.execute("q"))
+    assert "A" in out
+    assert captured["url"] == "https://useflowlyapp.com/api/v1/search"
+    assert captured["headers"]["Authorization"] == "Bearer flw_abc"
+    assert "X-Flowly-Server-Id" not in captured["headers"]
+
+
+def test_relay_creds_stay_first_while_both_exist(monkeypatch):
+    """A proxy that does not take the account key yet keeps working."""
+    import flowly.agent.tools.web_providers.brave as bmod
+    captured = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["headers"] = headers
+        return _FakeResp({"results": []})
+
+    monkeypatch.setattr(bmod.httpx, "post", fake_post)
+    BraveWebSearchProvider(proxy_url="http://proxy", server_id="s", auth_token="t",
+                           account_key="flw_abc").search("q", 3)
+    assert captured["headers"]["X-Flowly-Server-Id"] == "s"
+    assert "Authorization" not in captured["headers"]
+
+
+def test_only_a_flowly_account_key_counts():
+    """Anything that is not an ``flw_…`` key is not a Flowly account."""
+    assert not WebSearchTool(account_key="sk-other")._proxy_url
+    assert BraveWebSearchProvider(proxy_url="http://p", account_key="flw_k").is_available()
+    assert not BraveWebSearchProvider(api_key="", proxy_url="", server_id="", auth_token="",
+                                      account_key="").is_available()
+
+
+def test_the_configured_provider_reads_the_account_key(monkeypatch):
+    """The plugin-registered provider (built with nothing explicit) reads
+    ``providers.flowly.accountKey`` from config, as the main gateway does."""
+    import types
+
+    import flowly.agent.tools.web_providers.brave as bmod
+
+    cfg = types.SimpleNamespace(
+        tools=types.SimpleNamespace(web=types.SimpleNamespace(search=types.SimpleNamespace(
+            api_key="", proxy_url="", enabled=True))),
+        channels=types.SimpleNamespace(web=types.SimpleNamespace(server_id="", auth_token="")),
+        providers=types.SimpleNamespace(flowly=types.SimpleNamespace(account_key="flw_cfg")),
+    )
+    monkeypatch.setattr(bmod, "_cfg", lambda: cfg)
+    monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+    provider = BraveWebSearchProvider()
+    assert provider.is_available()
+    assert provider._resolve_creds()[1] == "https://useflowlyapp.com/api/v1/search"
+    cfg.providers.flowly.account_key = ""
+    assert not BraveWebSearchProvider().is_available()
