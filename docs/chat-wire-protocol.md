@@ -361,7 +361,7 @@ revisions, tools. A conversation is bound once; another key later is
 `CONFLICT`. Bound calls are left out of `voice.list`.
 
 **7.3 — The record.** Core emits `chat {state:"voice_call", sessionKey,
-callId, phase:"live"|"ended", startedAt, endedAt, durationMs, turns?,
+callId, phase:"live"|"ended"|"discarded", startedAt, endedAt, durationMs, turns?,
 truncated?}` as a shared conversation event, never a private
 (`voiceDelivery`) one and never with a `runId`:
 - `live`: on every `voice.open` of the call; no `turns`.
@@ -370,6 +370,9 @@ truncated?}` as a shared conversation event, never a private
   utterance, in order, as `{role, text, at, interrupted?}`. The limits are
   400 utterances, 2000 characters each and 200 KB in all. Over a limit, the
   newest utterances are kept and the record says `truncated: true`.
+- `discarded` instead of `ended` when nobody spoke. It has no `turns`. The
+  server removes the row, clients drop the live one, and no context row is
+  written.
 - Records for one `callId` replace each other, so the last one wins. The
   Flowly server stores them as one history row (`kind:"voice_call"`);
   clients draw that row, not individual spoken lines.
@@ -390,7 +393,11 @@ context:
 `chat.send` in the bound chat: `{sessionKey, message, idempotencyKey,
 origin:"voice", voiceCallId}`. `origin` accepts only `"voice"`; `voiceCallId`
 must name a call bound to this chat. Both are stored on the user row, and
-`chat.history` returns them. The reply is that run's `final`. Bound calls do
+`chat.history` returns them. For a named agent, the request goes through
+`profiles.rpc` `chat.send` into that agent's own chat. The primary host
+checks that the call is one of its bound calls and assigns the fields
+itself (`host_assigned_origin`); the agent's runtime trusts only that
+assignment. The reply is that run's `final`. Bound calls do
 not use `voice.tasks.dispatch` or `voice.chats.open`.
 
 **7.6 — Startup context.** `voice.memory.snapshot` accepts `conversationId`.

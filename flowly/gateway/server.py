@@ -2879,6 +2879,18 @@ class GatewayServer:
             return
         collaboration_metadata["turn_origin"] = turn_origin
 
+        # A request a voice call made (chat-wire-protocol §7.5), marked on the user row.
+        if params.get("origin") is not None:
+            from flowly.live_voice.chat_binding import runtime_chat_origin
+            from flowly.runtime_capabilities import resolve_runtime_capabilities
+
+            try:
+                collaboration_metadata["_user_extras"] = runtime_chat_origin(
+                    params, session_key, owns_voice=resolve_runtime_capabilities().owns_shared_board)
+            except ValueError as exc:
+                await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", str(exc))
+                return
+
         # A tapped setup choice carries its meaning as identifiers, validated
         # here for shape and later, inside the turn lock, against the agent's
         # current question. Only the agent's own conversation accepts one.

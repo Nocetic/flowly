@@ -237,6 +237,7 @@ async def test_the_service_binds_checks_the_chat_and_sends_live_then_ended(manag
               'botId': 'agent-1', 'chatSessionKey': CHAT}
     assert service.call('voice.open', params)['chatSessionKey'] == CHAT
     assert bindings.chat_of('call-1') == CHAT
+    say(voice, 1, 'user', 'Merhaba')
     service.call('voice.end', {'conversationId': 'call-1', 'connectionId': 'connection-1'})
     await bindings.wait()
     assert records == ['live', 'ended']
@@ -357,6 +358,7 @@ async def test_records_go_out_in_the_order_the_call_changed(manager, voice):
     bindings.bind('call-1', CHAT)
     open_call(voice)
     bindings.changed('call-1')
+    say(voice, 1, 'user', 'Merhaba')
     end(voice)
     bindings.changed('call-1')
     await bindings.wait()
@@ -419,3 +421,89 @@ async def test_a_call_where_nobody_spoke_leaves_no_context_and_no_session_behind
     assert await bindings.finish('call-1') is True
     assert not any(m.get('kind') == CONTEXT_KIND for m in manager.read(CHAT).messages)
     assert [m['content'] for m in manager.read(CHAT).messages] == ['merhaba']
+
+
+def test_an_ended_call_where_nobody_spoke_takes_its_live_record_back(voice, manager):
+    open_call(voice)
+    end(voice)
+    record = call_record(ledger(manager))
+    assert record['phase'] == 'discarded' and 'turns' not in record and record['endedAt']
+
+
+def test_a_named_agent_gets_a_voice_request_only_through_the_host_that_knows_the_call(manager, monkeypatch):
+    from flowly.live_voice.chat_binding import host_assigned_origin, runtime_chat_origin
+
+    bindings = VoiceChatBindings(manager)
+    bindings.bind('call-1', CHAT)
+    monkeypatch.setattr(chat_binding, '_active', bindings)
+    # The primary host checks the call and assigns the fields.
+    params = {'sessionKey': 'desktop:profile-home', 'message': 'x', 'origin': 'voice', 'voiceCallId': 'call-1'}
+    assert host_assigned_origin(params) == {'origin': 'voice', 'voiceCallId': 'call-1'}
+    assert 'origin' not in params and 'voiceCallId' not in params
+    for wrong in ({'origin': 'voice', 'voiceCallId': 'call-9'}, {'origin': 'email', 'voiceCallId': 'call-1'},
+                  {'origin': 'voice'}):
+        with pytest.raises(ValueError):
+            host_assigned_origin(dict(wrong))
+    stray = {'message': 'x', 'voiceCallId': 'call-1'}
+    assert host_assigned_origin(stray) == {} and 'voiceCallId' not in stray
+    # The named agent's runtime trusts the host's assignment (format only)…
+    assert runtime_chat_origin({'origin': 'voice', 'voiceCallId': 'call-1'}, 'desktop:profile-home',
+                               owns_voice=False) == {'origin': 'voice', 'voiceCallId': 'call-1'}
+    with pytest.raises(ValueError):
+        runtime_chat_origin({'origin': 'voice', 'voiceCallId': 'a/b'}, 'desktop:profile-home', owns_voice=False)
+    # …while the primary's own gateway checks the call belongs to that chat.
+    assert runtime_chat_origin({'origin': 'voice', 'voiceCallId': 'call-1'}, CHAT, owns_voice=True)['origin'] == 'voice'
+    with pytest.raises(ValueError):
+        runtime_chat_origin({'origin': 'voice', 'voiceCallId': 'call-1'}, 'desktop:profile-home', owns_voice=True)
+
+
+@pytest.mark.asyncio
+async def test_the_host_forwards_a_named_agents_voice_request_only_for_its_own_calls(manager, monkeypatch):
+    import flowly.profile_host as profile_host
+    from flowly.profile_host import ProfileHost, ProfileHostError
+
+    bindings = VoiceChatBindings(manager)
+    bindings.bind('call-1', CHAT)
+    monkeypatch.setattr(chat_binding, '_active', bindings)
+    monkeypatch.setattr(profile_host, '_validate_profile_selector', lambda name: None)
+    monkeypatch.setattr(profile_host, 'list_profiles', lambda: [SimpleNamespace(name='default'), SimpleNamespace(name='writer')])
+    forwarded = []
+
+    async def target_rpc(name, method, params, timeout, **_options):
+        forwarded.append((name, method, params))
+        return {'runId': params.get('idempotencyKey')}
+
+    host = ProfileHost.__new__(ProfileHost)
+    host._target_rpc = target_rpc
+    ask = {'sessionKey': 'desktop:profile-home', 'message': 'Taslağı yaz', 'idempotencyKey': 'voice-w1',
+           'origin': 'voice', 'voiceCallId': 'call-1'}
+    await ProfileHost.rpc(host, 'writer', 'chat.send', dict(ask))
+    name, method, params = forwarded[0]
+    assert (name, method) == ('writer', 'chat.send')
+    assert params['origin'] == 'voice' and params['voiceCallId'] == 'call-1' and params['turnOrigin'] == 'user'
+    with pytest.raises(ProfileHostError) as refused:
+        await ProfileHost.rpc(host, 'writer', 'chat.send', {**ask, 'voiceCallId': 'call-9', 'idempotencyKey': 'voice-w2'})
+    assert refused.value.code == 'INVALID_PARAMS'
+    assert len(forwarded) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_named_agents_gateway_marks_the_user_row_and_refuses_a_bad_mark(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    import flowly.runtime_capabilities as capabilities
+    from flowly.gateway.server import GatewayServer
+    from tests.test_chat_command_transport import Socket
+
+    monkeypatch.setattr(capabilities, 'resolve_runtime_capabilities', lambda: SimpleNamespace(owns_shared_board=False))
+    run = AsyncMock(return_value=('tamam', {}))
+    server = GatewayServer(on_chat_message=run)
+    ask = {'sessionKey': 'desktop:profile-home', 'message': 'Taslağı yaz', 'idempotencyKey': 'voice-w1',
+           'origin': 'voice', 'voiceCallId': 'call-1'}
+    await server._ws_rpc_chat_send(Socket(), 'a', 'rpc-1', ask)
+    await asyncio.gather(*list(server._active_tasks.values()), return_exceptions=True)
+    extra = run.await_args.args[-1]
+    assert extra['_user_extras'] == {'origin': 'voice', 'voiceCallId': 'call-1'}
+    socket = Socket()
+    await server._ws_rpc_chat_send(socket, 'a', 'rpc-2', {**ask, 'idempotencyKey': 'voice-w2', 'voiceCallId': 'a/b'})
+    assert socket.sent[-1]['error']['code'] == 'INVALID_REQUEST'

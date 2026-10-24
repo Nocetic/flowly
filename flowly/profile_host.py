@@ -1116,6 +1116,14 @@ class ProfileHost:
             safe.pop("allowedTools", None)
             safe.pop("disabledTools", None)
             safe["turnOrigin"] = "user"
+            # A voice call asking this agent (chat-wire-protocol §7.5): this
+            # host knows its calls; the agent's runtime trusts only what it assigns.
+            from flowly.live_voice.chat_binding import host_assigned_origin
+
+            try:
+                safe.update(host_assigned_origin(safe))
+            except ValueError as exc:
+                raise ProfileHostError("INVALID_PARAMS", str(exc)) from None
         target_options: dict[str, Any] = {"expected_bot_id": expected_bot_id} if guarded else {}
         if if_running:
             target_options["if_running"] = True

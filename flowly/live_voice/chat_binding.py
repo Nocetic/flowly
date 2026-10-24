@@ -114,15 +114,18 @@ def call_record(session: Session, *, now: datetime | None = None) -> dict | None
         if opened is not None and closed > opened:
             duration += (closed - opened).total_seconds()
     ended = all(c.get("endedAt") for c in connections)
+    turns, truncated = transcript(session) if ended else ([], False)
+    # An ended call where nobody spoke takes its live record back (§7.3).
+    phase = ("ended" if turns else "discarded") if ended else "live"
     record: dict[str, Any] = {
         "state": "voice_call", "sessionKey": chat, "callId": session.metadata.get("voiceConversationId"),
-        "phase": "ended" if ended else "live",
+        "phase": phase,
         "startedAt": _wire_time(_utc(connections[0].get("openedAt"))),
         "endedAt": _wire_time(_utc(connections[-1].get("endedAt"))) if ended else None,
         "durationMs": int(duration * 1000),
     }
-    if ended:
-        record["turns"], record["truncated"] = transcript(session)
+    if phase == "ended":
+        record["turns"], record["truncated"] = turns, truncated
     return record
 
 
@@ -211,19 +214,12 @@ class VoiceChatBindings:
         Raises ``ValueError`` for an origin Core does not know or a call that
         does not belong to this chat.
         """
-        origin = params.get("origin")
-        if origin is None:
+        if params.get("origin") is None:
             return {}
-        if origin != "voice":
-            raise ValueError("origin must be \"voice\".")
-        call_id = params.get("voiceCallId")
-        try:
-            identity(call_id, "voiceCallId")
-        except VoiceError as exc:
-            raise ValueError(str(exc)) from None
-        if self.chat_of(call_id) != session:
+        fields = _origin_fields(params)
+        if self.chat_of(fields["voiceCallId"]) != session:
             raise ValueError("voiceCallId is not a call of this chat.")
-        return {"origin": "voice", "voiceCallId": call_id}
+        return fields
 
     # ── the record and the chat ───────────────────────────────────────────
 
@@ -270,7 +266,7 @@ class VoiceChatBindings:
                     await self.emit(record)
                 except Exception as exc:  # noqa: BLE001 — the sweep sends the end again
                     logger.warning("[voice] call record not sent: {}", type(exc).__name__)
-            if record["phase"] == "ended":
+            if record["phase"] != "live":
                 await self.finish(call_id)
 
     async def finish(self, call_id: str) -> bool:
@@ -280,11 +276,11 @@ class VoiceChatBindings:
         if chat is None or session is None or self.between_turns is None:
             return False
         record = call_record(session, now=self.now())
-        if record is None or record["phase"] != "ended":
+        if record is None or record["phase"] == "live":
             return False
         revision = session.metadata["voice"].get("revision", 0)
-        # Nobody spoke: no row (and none is created for a chat Core has never seen).
-        text = context_text(record, record["turns"]) if record["turns"] else None
+        # Nobody spoke (discarded): no row, and none is created for a chat Core has never seen.
+        text = context_text(record, record["turns"]) if record["phase"] == "ended" else None
         try:
             if text is not None or _has_context(self.sessions.read(chat), call_id):
                 await self.between_turns(chat, lambda chat_session: upsert_context(chat_session, call_id, text))
@@ -347,6 +343,54 @@ class VoiceChatBindings:
             await asyncio.gather(*tuple(self._tasks), return_exceptions=True)
 
 
+def _origin_fields(params: dict) -> dict:
+    origin = params.get("origin")
+    if origin != "voice":
+        raise ValueError("origin must be \"voice\".")
+    call_id = params.get("voiceCallId")
+    try:
+        identity(call_id, "voiceCallId")
+    except VoiceError as exc:
+        raise ValueError(str(exc)) from None
+    return {"origin": "voice", "voiceCallId": call_id}
+
+
+def host_assigned_origin(params: dict) -> dict:
+    """A named agent's ``chat.send`` from a call (§7.5): the primary host checks the call, then assigns.
+
+    Pops the client's fields; returns the ones the host vouches for (``{}``
+    without an origin). Raises ``ValueError`` when the call is not a bound
+    call of this host.
+    """
+    if params.get("origin") is None:
+        params.pop("voiceCallId", None)
+        return {}
+    fields = _origin_fields(params)
+    params.pop("origin", None)
+    params.pop("voiceCallId", None)
+    bindings = active_bindings()
+    if bindings is None or bindings.chat_of(fields["voiceCallId"]) is None:
+        raise ValueError("voiceCallId is not a call of this agent host.")
+    return fields
+
+
+def runtime_chat_origin(params: dict, session: str, *, owns_voice: bool) -> dict:
+    """``chat.send``'s ``origin`` on a runtime's own gateway.
+
+    The primary runtime knows its calls: the call must belong to this chat.
+    A named agent's runtime is reached only through the primary host, which
+    checked the call and assigned the fields (``host_assigned_origin``).
+    """
+    if params.get("origin") is None:
+        return {}
+    if not owns_voice:
+        return _origin_fields(params)
+    bindings = active_bindings()
+    if bindings is None:
+        raise ValueError("Voice calls cannot join a chat on this agent.")
+    return bindings.chat_send_origin(params, session)
+
+
 _active: VoiceChatBindings | None = None
 
 
@@ -368,5 +412,6 @@ def public_binding(session: Session) -> dict:
 
 __all__ = [
     "ABANDONED_SECONDS", "CHAT_BINDING_VERSION", "CONTEXT_KIND", "VoiceChatBindings", "call_record", "chat_key",
-    "active_bindings", "context_text", "public_binding", "set_active_bindings", "transcript", "upsert_context",
+    "active_bindings", "context_text", "host_assigned_origin", "public_binding", "runtime_chat_origin",
+    "set_active_bindings", "transcript", "upsert_context",
 ]
