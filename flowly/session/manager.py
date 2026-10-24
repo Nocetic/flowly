@@ -2007,6 +2007,7 @@ class SessionManager:
                                     "voiceProfile": ((data.get("metadata") or {}).get("voice") or {}).get("profile"),
                                     "voiceBotId": ((data.get("metadata") or {}).get("voice") or {}).get("botId"),
                                     "voiceOwner": (data.get("metadata") or {}).get("voiceOwner", {"kind": "host"}),
+                                    "voiceChatSessionKey": ((data.get("metadata") or {}).get("voice") or {}).get("chatSessionKey"),
                                 } if (data.get("metadata") or {}).get("kind") == "voice" else {}),
                                 "last_assistant_run_id": (
                                     data.get("metadata") or {}

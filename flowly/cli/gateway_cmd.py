@@ -2227,6 +2227,40 @@ Respond to the user now:"""
 
     _set_media_on_change(_broadcast_media)
 
+    # A voice call that belongs to its chat (chat-wire-protocol §7): its
+    # record goes out as a shared chat event; its context reaches the chat
+    # only between turns.
+    from flowly.live_voice.chat_binding import VoiceChatBindings, set_active_bindings
+
+    async def _voice_call_record(record: dict) -> None:
+        await mirror_event(gateway_server, channels.get_channel("web"), "chat", record)
+
+    try:
+        _live_voice = live_voice
+    except NameError:  # Live Voice did not set up on this host (the block above logs nothing)
+        _live_voice = None
+    voice_chats = VoiceChatBindings(agent.sessions, emit=_voice_call_record,
+                                    between_turns=agent.mutate_between_turns) if _live_voice is not None else None
+    if voice_chats is not None:
+        _live_voice.chats = voice_chats
+        agent._voice_chat_turn_hook = voice_chats.on_turn_start
+    set_active_bindings(voice_chats)
+
+    async def _voice_chat_sweeper() -> None:
+        """Learn bound calls, then end abandoned ones and finish unwritten chat context."""
+        if voice_chats is None:
+            return
+        try:
+            await asyncio.to_thread(voice_chats.rebuild)
+        except Exception:
+            logger.exception("[voice] bound calls could not be read")
+        while True:
+            try:
+                await voice_chats.sweep()
+            except Exception:
+                logger.exception("[voice] bound call sweep failed")
+            await asyncio.sleep(120)
+
     async def _broadcast_flowlet(event_name: str, data: dict) -> None:
         await mirror_event(gateway_server, channels.get_channel("web"), event_name, data)
 
@@ -2769,6 +2803,7 @@ Respond to the user now:"""
             # due sources (screen-open / pull-to-refresh trigger the rest).
             if _source_engine is not None:
                 _source_task = asyncio.create_task(_source_engine.run_heartbeat(interval_s=120))
+            _voice_chat_task = asyncio.create_task(_voice_chat_sweeper())
 
             # Start voice plugin if available
             if voice_plugin:

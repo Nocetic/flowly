@@ -2310,6 +2310,25 @@ class WebChannel(BaseChannel):
             idempotency_key = params.get("idempotencyKey") or str(uuid.uuid4())
             from flowly.session.commands import ChatCommandConflictError
 
+            # A request a voice call made in its chat (chat-wire-protocol
+            # §7.5): marked on the user row, refused before it is accepted
+            # when the call does not belong to this chat.
+            user_extras: dict = {}
+            if params.get("origin") is not None:
+                from flowly.live_voice.chat_binding import active_bindings
+
+                bindings = active_bindings()
+                try:
+                    if bindings is None:
+                        raise ValueError("Voice calls cannot join a chat on this agent.")
+                    user_extras = bindings.chat_send_origin(params, session_key)
+                except ValueError as exc:
+                    await ws.send(json.dumps({
+                        "type": "rpc", "id": rpc_id, "sessionId": session_id,
+                        "error": {"code": "INVALID_REQUEST", "message": str(exc)},
+                    }))
+                    return
+
             try:
                 created, receipt = self.chat_commands.accept(session_key, idempotency_key, params)
             except (ChatCommandConflictError, ValueError, TypeError) as exc:
@@ -2424,6 +2443,8 @@ class WebChannel(BaseChannel):
                     media,
                     voice_mode,
                     render_capabilities,
+                    # loop.TURN_USER_EXTRAS; an ordinary message keeps the call's old shape.
+                    **({"extra_metadata": {"_user_extras": user_extras}} if user_extras else {}),
                 )
             )
             self._track_chat_publish(task, session_key, run_id)

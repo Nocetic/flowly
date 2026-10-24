@@ -54,12 +54,19 @@ class Section:
 
 
 def validate_snapshot(params: dict) -> dict:
-    if set(params) - {'knownRevision'}:
-        raise VoiceError('INVALID_PARAMS', 'The snapshot accepts only knownRevision; the runtime owns its scope.')
+    if set(params) - {'knownRevision', 'conversationId'}:
+        raise VoiceError('INVALID_PARAMS', 'The snapshot accepts only knownRevision and conversationId; the runtime owns its scope.')
     known = params.get('knownRevision')
     if known is not None and (not isinstance(known, str) or not re.fullmatch(r'[0-9a-f]{24}', known)):
         raise VoiceError('INVALID_PARAMS', 'knownRevision must be a snapshot revision.')
-    return {'knownRevision': known}
+    # The call this snapshot opens: a call bound to a chat (chat-wire-protocol
+    # §7.6) takes that chat as its latest conversation. The binding is read
+    # from the call's own ledger here, never taken from the client.
+    conversation = params.get('conversationId')
+    if conversation is not None and (not isinstance(conversation, str)
+                                     or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.-]{0,127}', conversation)):
+        raise VoiceError('INVALID_PARAMS', 'conversationId must be a voice conversation id.')
+    return {'knownRevision': known, **({'conversationId': conversation} if conversation else {})}
 
 
 def _bytes(text: str) -> int:
@@ -134,7 +141,7 @@ class VoiceMemorySnapshot:
         if memory:
             sections.append(Section('memory', 'Memory', memory, 'memory://governance'))
         # Where the owner and the agent left off: a call continues it.
-        latest = self._latest_conversation(governed, sources)
+        latest = self._latest_conversation(governed, sources, request.get('conversationId'))
         if latest:
             sections.append(latest)
         file_section('notes', 'Notes', 'memory/MEMORY.md')
@@ -155,14 +162,15 @@ class VoiceMemorySnapshot:
                 'partial': any(source.get('status') == 'unavailable' for source in sources.values()),
                 'sources': sources}
 
-    def _latest_conversation(self, governed: GovernedMemory, sources: dict) -> Section | None:
-        from flowly.live_voice.recent_chat import latest_chat
+    def _latest_conversation(self, governed: GovernedMemory, sources: dict,
+                             conversation: str | None = None) -> Section | None:
+        from flowly.live_voice.recent_chat import bound_chat, latest_chat
 
         directory = self.sessions_dir()
         if directory is None:
             return None
         try:
-            chat = latest_chat(directory)
+            chat = latest_chat(directory, prefer=bound_chat(directory, conversation))
         except Exception:  # noqa: BLE001 — memory never fails on a conversation read
             sources['conversation'] = {'status': 'unavailable'}
             return None

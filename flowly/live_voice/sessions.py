@@ -72,6 +72,8 @@ def _public(session: Session) -> dict:
         "lastConnection": copy.deepcopy(voice["connections"][-1]),
         "spokenLanguage": voice.get("spokenLanguage", voice["connections"][-1]["language"]),
         "createdAt": session.created_at.isoformat(), "updatedAt": voice.get("updatedAt", session.created_at.isoformat()),
+        # The chat the call belongs to (chat-wire-protocol §7); absent for a call of its own.
+        **({"chatSessionKey": voice["chatSessionKey"]} if isinstance(voice.get("chatSessionKey"), str) else {}),
     }
 
 
@@ -97,7 +99,8 @@ class VoiceSessions:
             raise VoiceError('NOT_FOUND', 'Voice conversation not found.')
         return _metadata(session)
 
-    def open(self, params: dict, *, profile: str, bot_id: str) -> dict:
+    def open(self, params: dict, *, profile: str, bot_id: str, chat: str | None = None) -> dict:
+        """Open a connection; ``chat`` binds a new call to the chat it belongs to (§7), once."""
         key = session_key(params.get("conversationId"))
         connection_id = identity(params.get("connectionId"), "connectionId")
         candidate_run_id = params.get('voiceRunId')
@@ -124,11 +127,16 @@ class VoiceSessions:
                     "kind": "voice", "voiceConversationId": params["conversationId"],
                     "voiceOwner": dict(self._owner),
                     "title": {"tr": "Sesli sohbet", "es": "Conversación de voz", "en": "Voice chat"}[language],
-                    "voice": {"profile": profile, "botId": bot_id, "revision": 0, "connections": [], "spokenLanguage": spoken},
+                    "voice": {"profile": profile, "botId": bot_id, "revision": 0, "connections": [], "spokenLanguage": spoken,
+                              **({"chatSessionKey": chat} if chat else {})},
                 })
             voice = self._metadata(session)
             if (voice["profile"], voice["botId"]) != (profile, bot_id):
                 raise VoiceError("TARGET_CONFLICT", "Resume this conversation with its original agent.")
+            # A call is bound once, when it is created. Reopening without the
+            # key (an older client) keeps the binding.
+            if chat is not None and voice.get("chatSessionKey") != chat:
+                raise VoiceError("CONFLICT", "This call belongs to another chat or to none.")
             existing = next((c for c in voice["connections"] if c["id"] == connection_id), None)
             if existing:
                 if existing["language"] != language or existing.get("client") != client:
@@ -186,6 +194,8 @@ class VoiceSessions:
                 continue
             if row.get('voiceOwner', {'kind': 'host'}) != self._owner:
                 continue
+            if row.get("voiceChatSessionKey"):
+                continue  # a call that belongs to a chat is shown in that chat
             conversation_id = row.get("voiceConversationId")
             if not isinstance(conversation_id, str) or not _ID.fullmatch(conversation_id):
                 continue

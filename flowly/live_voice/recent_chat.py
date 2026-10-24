@@ -58,9 +58,34 @@ def is_open_call(key: str, metadata: dict) -> bool:
     return bool(connections) and isinstance(connections[-1], dict) and not connections[-1].get('endedAt')
 
 
-def latest_chat(sessions_dir: Path) -> RecentChat | None:
+def _session_path(sessions_dir: Path, key: str) -> Path:
+    from flowly.utils.helpers import safe_filename
+
+    return sessions_dir / (safe_filename(key.replace(':', '_')) + '.jsonl')
+
+
+def bound_chat(sessions_dir: Path, conversation_id: str | None) -> str | None:
+    """The chat a voice call belongs to (chat-wire-protocol §7.6), from the call's own ledger."""
+    from flowly.session.keys import read_session_header
+    from flowly.session.ownership import session_visible
+
+    if not conversation_id:
+        return None
+    key = f"{CALL_PREFIX}{conversation_id}"
+    try:
+        header = read_session_header(_session_path(sessions_dir, key))
+    except (OSError, ValueError):
+        return None
+    metadata = header.get('metadata') if isinstance(header.get('metadata'), dict) else {}
+    voice = metadata.get('voice') if isinstance(metadata.get('voice'), dict) else {}
+    chat = voice.get('chatSessionKey')
+    return chat if isinstance(chat, str) and session_visible(key, metadata) else None
+
+
+def latest_chat(sessions_dir: Path, *, prefer: str | None = None) -> RecentChat | None:
     """The most recently active owner conversation the requester may see,
-    as ``User:``/``Agent:`` lines; None when there is none."""
+    as ``User:``/``Agent:`` lines; None when there is none. ``prefer``: a
+    bound call's chat, taken first when it has anything to show."""
     from flowly.session.keys import read_session_header, session_key_from_header
     from flowly.session.manager import iter_session_files
     from flowly.session.ownership import session_visible
@@ -68,6 +93,9 @@ def latest_chat(sessions_dir: Path) -> RecentChat | None:
     if not sessions_dir.is_dir():
         return None
     files = sorted(iter_session_files(sessions_dir), key=_mtime, reverse=True)
+    if prefer:
+        preferred = _session_path(sessions_dir, prefer)
+        files = [preferred, *[path for path in files if path != preferred]] if preferred.exists() else files
     for path in files[:CANDIDATES]:
         try:
             header = read_session_header(path)
@@ -77,6 +105,8 @@ def latest_chat(sessions_dir: Path) -> RecentChat | None:
             continue
         if not is_owner_chat(key) or is_open_call(key, metadata) or not session_visible(key, metadata):
             continue
+        if key.startswith(CALL_PREFIX) and isinstance((metadata.get('voice') or {}).get('chatSessionKey'), str):
+            continue  # a call that belongs to a chat is part of that chat already
         lines = _tail_messages(path)
         if not lines:
             continue

@@ -2030,6 +2030,12 @@ async def voice_context(params: dict) -> dict:
     return result
 
 
+def _chat_binding_version() -> int:
+    from flowly.live_voice.chat_binding import CHAT_BINDING_VERSION, active_bindings
+
+    return CHAT_BINDING_VERSION if active_bindings() is not None else 0
+
+
 def set_voice_provider(provider) -> None:
     """Register the primary runtime's Live Voice service for both transports."""
     global _voice_provider
@@ -5525,6 +5531,8 @@ def system_capabilities() -> dict:
                 "accountAccessVersion": 1,
                 "eventLeaseVersion": 1,
                 "steerMode": "next_turn",
+                # A call can belong to a chat (chat-wire-protocol §7).
+                **({"chatBindingVersion": _chat_binding_version()} if _chat_binding_version() else {}),
             },
         } if runtime.owns_shared_board else {}),
     }

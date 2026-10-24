@@ -45,6 +45,11 @@ def history_row(m: dict[str, Any], *, attachments: AttachmentBuilder | None = No
         msg["voice"] = m["voice"]
     if m.get("kind") == "agent_setup_card" and isinstance(m.get("setupCard"), dict):
         msg["setupCard"] = m["setupCard"]
+    # A request a voice call made in this chat (chat-wire-protocol §7.5).
+    if m.get("role") == "user" and m.get("origin") == "voice":
+        msg["origin"] = "voice"
+        if isinstance(m.get("voiceCallId"), str):
+            msg["voiceCallId"] = m["voiceCallId"]
     if isinstance(m.get("goal_cards"), list) and m["goal_cards"]:
         msg["goalCards"] = m["goal_cards"]
     if m.get("boundaryKind"):

@@ -37,18 +37,43 @@ def target(params: dict) -> tuple[str, str]:
 
 class LiveVoiceService:
     def __init__(self, sessions: VoiceSessions, board: Callable[[], tuple[Any, Any]],
-                 worker: Callable[[], Any] | None = None, executor: Callable[[], Any] | None = None):
+                 worker: Callable[[], Any] | None = None, executor: Callable[[], Any] | None = None,
+                 chats: Any = None):
         self.sessions = sessions
         self.board = board
         self.worker = worker
         self.executor = executor
+        # Calls that belong to a chat (chat_binding.VoiceChatBindings); None: none can.
+        self.chats = chats
 
     def for_principal(self, principal: VoicePrincipal | None) -> LiveVoiceService:
         """Keep simultaneous account requests out of each other's mutable state."""
-        return LiveVoiceService(self.sessions.for_principal(principal), self.board, self.worker, self.executor)
+        return LiveVoiceService(self.sessions.for_principal(principal), self.board, self.worker, self.executor, self.chats)
 
     def for_owner(self, owner: RequestOwner) -> LiveVoiceService:
-        return LiveVoiceService(self.sessions.for_owner(owner), self.board, self.worker, self.executor)
+        return LiveVoiceService(self.sessions.for_owner(owner), self.board, self.worker, self.executor, self.chats)
+
+    def _open(self, params: dict) -> dict:
+        profile, bot_id = target(params)
+        chat = None
+        if params.get('chatSessionKey') is not None:
+            from flowly.live_voice.chat_binding import chat_key
+            from flowly.session.ownership import SessionAccessError, require_session_file
+
+            if self.chats is None:
+                raise VoiceError('UNAVAILABLE', 'Calls cannot join a chat on this agent host.')
+            chat = chat_key(params['chatSessionKey'], profile=profile)
+            manager = self.sessions.sessions
+            try:
+                require_session_file(manager._get_session_path(chat), chat)
+            except SessionAccessError:
+                raise VoiceError('NOT_FOUND', 'Chat not found.') from None
+        result = self.sessions.open(params, profile=profile, bot_id=bot_id, chat=chat)
+        bound = result.get('chatSessionKey')
+        if self.chats is not None and isinstance(bound, str):
+            self.chats.bind(result['conversationId'], bound)
+            self.chats.changed(result['conversationId'])
+        return result
 
     def call(self, method: str, params: dict) -> dict | Awaitable[dict]:
         if method == 'voice.exec':
@@ -112,8 +137,7 @@ class LiveVoiceService:
             return {'workChats': entries,
                     'nextOffset': offset + limit if len(cards) > limit else None}
         if method == 'voice.open':
-            profile, bot_id = target(params)
-            return self.sessions.open(params, profile=profile, bot_id=bot_id)
+            return self._open(params)
         if method == 'voice.language':
             return self.sessions.set_language(params)
         if method == 'voice.get':
@@ -123,7 +147,10 @@ class LiveVoiceService:
         if method == 'voice.append':
             return self.sessions.append(params)
         if method == 'voice.end':
-            return self.sessions.end(params)
+            result = self.sessions.end(params)
+            if self.chats is not None and isinstance(result.get('chatSessionKey'), str):
+                self.chats.changed(result['conversationId'])
+            return result
         if method == 'voice.focus':
             self.sessions.require_connection(params)
             task_id = params.get('taskId')

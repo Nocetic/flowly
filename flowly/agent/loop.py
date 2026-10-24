@@ -999,6 +999,18 @@ def screen_handoff_guidance(session_key: str) -> str:
     return SCREEN_HANDOFF_ELSEWHERE_GUIDANCE
 
 
+
+#: A channel's marks for a turn's user row (a voice request's ``origin``,
+#: chat-wire-protocol §7.5). Only these keys, only these shapes.
+TURN_USER_EXTRAS = "_user_extras"
+
+
+def _turn_user_extras(metadata: dict) -> dict[str, Any]:
+    extras = metadata.get(TURN_USER_EXTRAS)
+    if not isinstance(extras, dict) or extras.get("origin") != "voice" or not isinstance(extras.get("voiceCallId"), str):
+        return {}
+    return {"origin": "voice", "voiceCallId": extras["voiceCallId"][:128]}
+
 class AgentLoop:
     """
     The agent loop is the core processing engine.
@@ -2400,6 +2412,21 @@ class AgentLoop:
                 await self._on_session_titled(key, title)
             except Exception as e:
                 logger.debug(f"[title] notify callback failed for {key!r}: {e}")
+
+    async def mutate_between_turns(self, session_key: str, operation):
+        """Apply ``operation`` to a chat session while no turn runs in it.
+
+        A turn holds its session object for the whole turn and saves it with
+        compare-and-swap; a write beside it makes that save fail and the turn
+        be lost. Under the chat's turn lock the write waits for a running
+        turn to finish, and ``mutate`` refreshes the cached object, so the
+        next turn starts from it.
+        """
+        if not hasattr(self, "_session_turn_locks"):
+            self._session_turn_locks = {}
+        lock = self._session_turn_locks.setdefault(session_key, asyncio.Lock())
+        async with lock:
+            return self.sessions.mutate(session_key, operation)
 
     async def delete_session(self, session_key: str) -> bool:
         """Cancel background writers, then durably delete one conversation."""
@@ -8908,6 +8935,15 @@ class AgentLoop:
             # fallback welcome). Adopt a newer canonical revision so this
             # turn's compare-and-swap saves do not fail as stale.
             self.sessions.refresh(session)
+        voice_calls = getattr(self, '_voice_chat_turn_hook', None)
+        if voice_calls is not None:
+            # A live voice call in this chat (chat-wire-protocol §7.4): its
+            # words so far go into this turn's own session object, saved with
+            # the turn. Never a write beside a running turn.
+            try:
+                voice_calls(session)
+            except Exception as exc:  # noqa: BLE001 — a call never fails a turn
+                logger.warning("[voice] call context skipped for this turn: {}", type(exc).__name__)
         introduction_turn = is_introduction_turn(msg.session_key, msg.metadata)
         display_content = str(msg.metadata.get("_display_content") or msg.content)
         tool_policy = resolve_turn_tool_policy(msg.metadata, display_content)
@@ -8975,8 +9011,9 @@ class AgentLoop:
         # Firestore, so this is effectively the gateway's equivalent.)
         if not introduction_turn:
             self._set_provisional_title(session, display_content)
+        user_extras = _turn_user_extras(msg.metadata)
         try:
-            _pending_user: dict[str, Any] = {"role": "user", "content": display_content}
+            _pending_user: dict[str, Any] = {"role": "user", "content": display_content, **user_extras}
             if msg.media:
                 _pending_user["media"] = list(msg.media)
             if msg.metadata.get(_GOAL_CONTINUATION_ID) or introduction_turn:
@@ -9622,6 +9659,7 @@ class AgentLoop:
         if not introduction_failed:
             session.extend_with_turn_messages(
                 goal_cards=goal_cards or None,
+                user_extras=user_extras or None,
                 user_content=display_content,
                 new_messages=turn_messages,
                 final_content=final_content,
