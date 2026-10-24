@@ -397,3 +397,25 @@ async def test_over_the_relay_channel_a_voice_request_reaches_the_turn_marked_an
                                        'params': {'sessionKey': CHAT, 'idempotencyKey': 'm-1', 'message': 'yazılı'}})
     await asyncio.gather(*list(channel._active_tasks.values()))
     assert '_user_extras' not in bus.publish_inbound.await_args.args[0].metadata
+
+
+@pytest.mark.asyncio
+async def test_a_call_where_nobody_spoke_leaves_no_context_and_no_session_behind(manager, voice):
+    loop_like = SimpleNamespace(sessions=manager, _session_turn_locks={})
+    bindings = VoiceChatBindings(manager, between_turns=lambda key, op: AgentLoop.mutate_between_turns(loop_like, key, op))
+    bindings.bind('call-1', CHAT)
+    open_call(voice)
+    turn = manager.get_or_create(CHAT)
+    bindings.on_turn_start(turn)
+    assert not any(m.get('kind') == CONTEXT_KIND for m in turn.messages)
+    end(voice)
+    assert await bindings.finish('call-1') is True
+    assert manager.read(CHAT) is None  # an empty chat Core never saw stays unseen
+    # A row written by an earlier finish (the call had words, then they were corrected away) is removed.
+    chat = manager.get_or_create(CHAT)
+    chat.add_message('user', 'merhaba')
+    upsert_context(chat, 'call-1', '[Voice call] User: x')
+    manager.save(chat)
+    assert await bindings.finish('call-1') is True
+    assert not any(m.get('kind') == CONTEXT_KIND for m in manager.read(CHAT).messages)
+    assert [m['content'] for m in manager.read(CHAT).messages] == ['merhaba']

@@ -138,16 +138,29 @@ def context_text(record: dict, turns: list[dict]) -> str:
     return f"{head}\n{body}" if body else f"{head}\n(nothing was said yet)"
 
 
-def upsert_context(session: Session, call_id: str, text: str) -> bool:
-    """Put the call's hidden context row into this chat session, in place when it is there."""
-    for message in session.messages:
+def upsert_context(session: Session, call_id: str, text: str | None) -> bool:
+    """Put the call's hidden context row into this chat session, in place when it is there.
+
+    ``text`` None removes it: a call where nobody spoke leaves nothing.
+    """
+    for index, message in enumerate(session.messages):
         if message.get("kind") == CONTEXT_KIND and message.get("voiceCallId") == call_id:
+            if text is None:
+                del session.messages[index]
+                return True
             if message.get("content") == text:
                 return False
             message["content"] = text
             return True
+    if text is None:
+        return False
     session.add_message("user", text, kind=CONTEXT_KIND, voiceCallId=call_id, _display_hidden=True)
     return True
+
+
+def _has_context(session: Session | None, call_id: str) -> bool:
+    return bool(session) and any(m.get("kind") == CONTEXT_KIND and m.get("voiceCallId") == call_id
+                                 for m in session.messages)
 
 
 class VoiceChatBindings:
@@ -270,9 +283,11 @@ class VoiceChatBindings:
         if record is None or record["phase"] != "ended":
             return False
         revision = session.metadata["voice"].get("revision", 0)
-        text = context_text(record, record["turns"])
+        # Nobody spoke: no row (and none is created for a chat Core has never seen).
+        text = context_text(record, record["turns"]) if record["turns"] else None
         try:
-            await self.between_turns(chat, lambda chat_session: upsert_context(chat_session, call_id, text))
+            if text is not None or _has_context(self.sessions.read(chat), call_id):
+                await self.between_turns(chat, lambda chat_session: upsert_context(chat_session, call_id, text))
         except Exception as exc:  # noqa: BLE001 — the sweep tries again
             logger.warning("[voice] call context not written to its chat: {}", type(exc).__name__)
             return False
@@ -291,7 +306,8 @@ class VoiceChatBindings:
             if record is None or record["phase"] != "live":
                 continue  # an ended call's context is written by finish()
             turns, _ = transcript(ledger)
-            upsert_context(session, call_id, context_text(record, turns))
+            if turns:
+                upsert_context(session, call_id, context_text(record, turns))
 
     async def sweep(self) -> None:
         """End abandoned bound calls; finish any chat context an end left unwritten."""
