@@ -73,6 +73,7 @@ Discriminated by `data.state`.
 | `final` | **Terminal.** The turn's durable assistant message. | `message.content[]`, `model`, `usage`, `completedAt`, `durationMs`, `aborted?`, `attachments?`, `toolMessages?` |
 | `aborted` | Legacy early terminal. The authoritative `final, aborted:true` still follows. | — |
 | `error` | **Terminal.** Provider/agent failure as a product state. | `errorCode`, `errorTitle`, `errorMessage`, `retryable` |
+| `voice_call` | A Live Voice call bound to this chat started, continued or ended (§7). **Not a turn: no `runId`, not a terminal.** | `callId`, `phase`, `startedAt`, `endedAt`, `durationMs`, `turns?`, `truncated?` |
 
 ### `compaction` — history being summarised
 
@@ -340,3 +341,58 @@ copy only). Messages appended while summarising ride across the commit.
 5. **Every external call is bounded.** Providers hang; a call inside a session
    lock inside a user's turn blocks the message and ignores Stop. Bound it and
    let the failure path handle it.
+
+---
+
+## 7. A voice call belongs to the chat it starts in
+
+Design: Flowly server repo `docs/cloud/design/voice-in-chat.md`; the server's
+side is its `PROTOCOL.md` H3. v1 covers the main agent's `web:<id>` chats;
+a call with a named agent still opens its own voice chat.
+
+**7.1 — Support.** `system.capabilities.voice.chatBindingVersion: 1`. Clients
+send `chatSessionKey` (and `origin`) only when they see it: an older Core
+ignores both without an error.
+
+**7.2 — Binding.** `voice.open` takes `chatSessionKey: "web:<id>"` (main agent
+only, a chat this owner can see). The call's own session
+(`desktop:voice:<conversationId>`) stays its ledger: connections, transcript
+revisions, tools. A conversation is bound once; another key later is
+`CONFLICT`. Bound calls are left out of `voice.list`.
+
+**7.3 — The record.** Core emits `chat {state:"voice_call", sessionKey,
+callId, phase:"live"|"ended", startedAt, endedAt, durationMs, turns?,
+truncated?}` as a shared conversation event, never a private
+(`voiceDelivery`) one and never with a `runId`:
+- `live`: on every `voice.open` of the call; no `turns`.
+- `ended`: on every `voice.end`, and when a sweep finds the last connection
+  open and silent for 10 minutes. It carries `turns`: the final text of each
+  utterance, in order, as `{role, text, at, interrupted?}`. The limits are
+  400 utterances, 2000 characters each and 200 KB in all. Over a limit, the
+  newest utterances are kept and the record says `truncated: true`.
+- Records for one `callId` replace each other, so the last one wins. The
+  Flowly server stores them as one history row (`kind:"voice_call"`);
+  clients draw that row, not individual spoken lines.
+
+**7.4 — What the text agent sees.** Spoken lines are never appended to the
+chat session one by one: a write while a turn is running would fail that
+turn's save (`ConcurrentSessionWriteError`). Instead, one hidden row per call
+(`kind:"voice_call_context"`, `_display_hidden`, role `user`, keyed by
+`voiceCallId`, updated in place) carries the transcript into the model's
+context:
+- When a turn starts in a chat with a live bound call, the row is put into
+  that turn's own session object and saved with the turn.
+- When the call ends, the row is written under the chat's turn lock in the
+  background. The ledger records how far it got (`chatMirror.revision`), and
+  the startup and periodic sweep finish an interrupted write.
+
+**7.5 — Asking from the call.** Work the voice cannot do is an ordinary
+`chat.send` in the bound chat: `{sessionKey, message, idempotencyKey,
+origin:"voice", voiceCallId}`. `origin` accepts only `"voice"`; `voiceCallId`
+must name a call bound to this chat. Both are stored on the user row, and
+`chat.history` returns them. The reply is that run's `final`. Bound calls do
+not use `voice.tasks.dispatch` or `voice.chats.open`.
+
+**7.6 — Startup context.** `voice.memory.snapshot` accepts `conversationId`.
+For a bound call, its "latest conversation" section is the bound chat.
+
