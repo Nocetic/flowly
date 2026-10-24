@@ -2124,12 +2124,13 @@ Respond to the user now:"""
     # wait for a turn: they live only in this process's queue.
     gateway_server._maintenance_backlog = lambda: bus.inbound_size
 
-    # Profiles collaborate through the Desktop process, which is the only
-    # authority that can see and start sibling runtimes. The tool is restricted
-    # to the direct ``desktop`` platform and its reverse-RPC binding is scoped
-    # to the authenticated socket, so relay/web turns never see or invoke it.
-    # Registering on the primary gateway too lets the default profile take part
-    # alongside Desktop-managed named profiles.
+    # Profiles collaborate through this host's ProfileHost
+    # (docs/gateway-profile-messaging.md). A direct run is bound to it by the
+    # gateway; a turn that arrives over the bus (relay, Flowly server: the
+    # ``web`` channel) gets the same authority from the host when the agent
+    # loop starts it, after the session lock. Background turns (system, cron,
+    # heartbeat, agenda) get none. Managed child runtimes keep the reverse-RPC
+    # protocol to their controller.
     from flowly.agent.tools.message_profile import MessageProfileTool
 
     agent.tools.register(MessageProfileTool(gateway_server))
