@@ -38,6 +38,11 @@ PASSIVE_METHODS = frozenset({
     "presence.report",
 })
 
+#: What Core asks the server for on connect (server PROTOCOL H1): the relay's
+#: voice account identity handshake. A server never offers it to a Core that
+#: does not ask, because after it Core drops a client's unwrapped frames.
+VOICE_AUTHORITY_FEATURE = "voice-authority-v1"
+
 #: While backing off, look at the clocks this often for a resume.
 RESUME_TICK_SECONDS = 0.5
 #: The wall clock ran this much further than the monotonic one within a tick:
@@ -53,6 +58,12 @@ SLEEPING_ERROR = {
 
 def _is_passive(method: str) -> bool:
     return method in PASSIVE_METHODS or method.endswith(".status")
+
+
+def _server_own_call(msg: dict) -> bool:
+    """A call the server itself made: no client session, or one of its inbox delivery sessions."""
+    session = msg.get("sessionId")
+    return session is None or session == "" or (isinstance(session, str) and session.startswith("srv-"))
 
 
 def _server_screen_rpc_class():
@@ -148,6 +159,7 @@ class FlowlyServerChannel(WebChannel):
         return url, {"additional_headers": {
             "Authorization": f"Bearer {secret}",
             "X-Flowly-Agent-Host": host,
+            "X-Flowly-Agent-Features": VOICE_AUTHORITY_FEATURE,
         }}, None
 
     def _on_connected(self, ws) -> None:
@@ -325,7 +337,28 @@ class FlowlyServerChannel(WebChannel):
 
     # ── frames ────────────────────────────────────────────────────────────
 
+    def _decode_relay_message(self, ws, msg: object) -> dict | None:
+        """The relay's rule, except for the server's own calls (PROTOCOL H1).
+
+        After the voice identity handshake a client's frames arrive only in
+        signed ``relay.browser`` envelopes and an unwrapped one is dropped,
+        as with the relay. Unlike the relay, the server also calls this agent
+        itself, unwrapped: power and provider calls carry no ``sessionId``,
+        inbox ``chat.send`` deliveries a ``srv-`` one (client connections are
+        ``c-``). They run as the host, as before; one that names an account
+        certificate is refused later, having no attested sender.
+        """
+        if (self._relay_authority_enabled and type(msg) is dict and msg.get("type") == "rpc"
+                and self._ws is ws and _server_own_call(msg)):
+            return msg
+        return super()._decode_relay_message(ws, msg)
+
     async def _handle_relay_message(self, ws, msg: dict) -> None:
+        # Decoded once here (a verified envelope comes back as itself), so the
+        # power and screen rules below also see a client's wrapped request.
+        msg = self._decode_relay_message(ws, msg)
+        if msg is None:
+            return
         if isinstance(msg, dict) and msg.get("type") == "rpc":
             method = msg.get("method")
             method = method if isinstance(method, str) else ""

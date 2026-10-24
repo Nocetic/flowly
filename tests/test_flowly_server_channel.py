@@ -185,6 +185,7 @@ async def test_connects_with_agent_secret_headers_and_no_jwt(monkeypatch):
     assert kwargs["additional_headers"] == {
         "Authorization": "Bearer s3cret",
         "X-Flowly-Agent-Host": "host-1",
+        "X-Flowly-Agent-Features": "voice-authority-v1",
     }
     assert channel.cron_session_id == "cron-1"
     # After ready, Core announces when it is next due.
