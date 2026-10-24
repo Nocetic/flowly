@@ -285,6 +285,18 @@ class ScreenRuntime:
         return (state["phase"] == "running" and is_alive(state.get("supervisor"))
                 and state.get("controlProtocol") != CONTROL_SCHEMA)
 
+    def _died_unheld(self, state: dict) -> bool:
+        """A running screen whose supervisor and every child are gone, that no
+        person holds and no live task claims (a dead task's claim is dropped
+        when the record is read). An orphaned browser, an interrupted start or
+        a person's claim still waits for an explicit recovery."""
+        if state["phase"] != "running" or state.get("supervisor") is None:
+            return False
+        if is_alive(state.get("supervisor")) or any(is_alive(child) for child in state["children"]):
+            return False
+        control = self.authority.snapshot()
+        return control["control"] == "agent" and control["runId"] is None
+
     def _end_outdated(self, state: dict) -> None:
         """Kill an outdated screen's supervisor; the dead-screen path does the rest.
 
@@ -342,6 +354,14 @@ class ScreenRuntime:
                 if control["control"] != "agent" or control["runId"] is not None:
                     raise ScreenError("RUNTIME_RECOVERY_REQUIRED")
                 self._end_outdated(existing)
+                self._finish_dead(existing, existing["generation"], self.authority.snapshot())
+                existing = self.read_manifest()
+            if existing and self._died_unheld(existing):
+                # Its processes died with the machine (a restart, a new cloud
+                # image, a crash, the OOM killer): nothing of it runs and
+                # nobody holds it. Finish it and start anew, instead of
+                # refusing every task until someone presses Recover (owner's
+                # cloud agent after an image update, 2026-10-24).
                 self._finish_dead(existing, existing["generation"], self.authority.snapshot())
                 existing = self.read_manifest()
             if existing and (is_alive(existing.get("supervisor"))

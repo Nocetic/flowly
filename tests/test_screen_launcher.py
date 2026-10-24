@@ -246,6 +246,34 @@ def test_dead_supervisor_never_launches_over_orphaned_browser(runtime, monkeypat
         runtime.start()
 
 
+def test_a_screen_that_died_with_the_machine_starts_again_when_nobody_holds_it(runtime, monkeypatch):
+    """A restart or a new cloud image kills the supervisor and every child;
+    the record still says running. The agent's next start finishes it and
+    starts anew instead of answering RUNTIME_RECOVERY_REQUIRED forever."""
+    manifest(runtime)
+    runtime.authority.start("generation-1")
+    monkeypatch.setattr(launcher, "is_alive", lambda value: False)
+    monkeypatch.setattr(launcher, "signal_process", lambda *args: pytest.fail("nothing runs to signal"))
+    monkeypatch.setattr(launcher, "resource_report", lambda path: {"ready": True})
+    monkeypatch.setattr(runtime, "_spawn", lambda: {"generation": "new"})
+    assert runtime.status()["error"] == "RUNTIME_RECOVERY_REQUIRED"
+    assert runtime.start() == {"generation": "new"}
+    assert json.loads(runtime.manifest.read_text())["phase"] == "stopped"
+    control = runtime.authority.snapshot()
+    assert (control["running"], control["control"], control["runId"]) == (False, "agent", None)
+
+
+def test_a_dead_screen_the_person_holds_waits_for_an_explicit_recovery(runtime, monkeypatch):
+    manifest(runtime)
+    runtime.authority.start("generation-1")
+    runtime.authority.acquire("viewer", "generation-1", runtime.authority.snapshot()["epoch"])
+    monkeypatch.setattr(launcher, "is_alive", lambda value: False)
+    monkeypatch.setattr(runtime, "_spawn", lambda: pytest.fail("the person holds it"))
+    with pytest.raises(ScreenError, match="RUNTIME_RECOVERY_REQUIRED"):
+        runtime.start()
+    assert json.loads(runtime.manifest.read_text())["phase"] == "running"
+
+
 def test_interrupted_start_reservation_is_not_silently_replaced(runtime, monkeypatch):
     manifest(runtime, phase="starting", supervisor=None, children=[])
     monkeypatch.setattr(launcher, "is_alive", lambda value: False)
