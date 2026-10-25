@@ -415,3 +415,43 @@ The call's words are read for that chat in the trusted scope, only for calls
 bound to it: the owner bound the call there, and `voice.open` checked that
 chat.
 
+
+---
+
+## 8. One chat per agent, through the Flowly server (v2, 2026-10-25)
+
+Server contract: `flowly-server` `server/PROTOCOL.md` A7 and B7. Engineering
+record: `docs/cloud/engineering/conversations-v2.md` there.
+
+**Capability.** `system.capabilities` answers `conversations: {version: 2}`.
+The Flowly server sends the fields below only to a Core that advertises it.
+
+**A named agent's chat from the server.** The server delivers a message to a
+named agent as a `chat.send` with `params.profile` and the agent's home session
+(`params.sessionKey = "desktop:profile-home"`). Core passes it to that
+profile's own `chat.send`. It also binds the delivery `sessionId` to that
+profile conversation, so the profile's events for it leave **once**, as plain
+`event` frames carrying `profile` beside `sessionId`, and the server stores and
+fans them out. `chat.history`, `chat.inflight`, `chat.abort` and `chat.steer`
+take `params.profile` the same way. The `profiles.rpc` path and its
+`profile.event` copies stay for older clients.
+
+**`seq`.** Every `streaming`, `iteration_step` and `tool_progress` event of a
+run carries `seq`, an integer that grows by one per event within the run,
+starting at 1. `chat.inflight` answers `inflight.seq`: the last event its
+snapshot includes. A client shows the snapshot, then only events with a
+greater `seq`, and never applies a `seq` twice. Without `seq` (an older Core)
+clients keep today's merge.
+
+**Interrupted turns.** When an agent's connection drops and it does not come
+back within the server's grace period with the turn still running, the server
+ends the turn for every client: `chat {state:"aborted", reason:"agent_restarted",
+runId, sessionKey}`. This is a server event; Core never sends it. A `final`
+for that `runId` arriving later still wins. On start Core marks command
+records left `accepted`/`running` by a dead process `aborted`, so
+`chat.inflight` reports no run for them.
+
+**Migration.** On connecting to the Flowly server, Core sends each profile's
+home history that is not yet migrated with `conversations.import` frames (at
+most 100 messages each, oldest first, keyed by message id so a resend is a
+no-op) and `done: true` on the last.
