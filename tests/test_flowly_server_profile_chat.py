@@ -202,3 +202,22 @@ async def test_a_scheduled_tasks_result_in_the_agents_chat_reaches_the_server(ho
                                         "message": {"role": "assistant", "content": [{"type": "text", "text": "Daily report"}]}})
     assert [(f["sessionId"], f["event"], f["data"]["state"], f["data"]["proactive"]) for f in forwarded] == [
         (SESSION, "chat", "final", True)]
+
+
+@pytest.mark.asyncio
+async def test_the_server_reads_the_agents_chat_with_exact_times(home):
+    # Sessions store local time with no zone; the server (UTC) gets epoch milliseconds.
+    from datetime import datetime
+
+    local = datetime(2026, 10, 1, 9, 30, 0)
+    channel, host, _ = make_channel({"messages": [
+        {"id": "e1", "role": "user", "content": [{"type": "text", "text": "hi"}], "timestamp": local.isoformat()},
+        {"id": "e2", "role": "assistant", "content": [], "timestamp": "not a time"},
+    ], "hasOlder": False, "before": None})
+    socket = Socket()
+    await channel._handle_rpc(socket, {"type": "rpc", "id": "h1", "method": "chat.history",
+                                       "params": {"profile": "writer", "sessionKey": HOME_SESSION, "limit": 100}})
+    assert host.dispatch.await_args.args[1]["method"] == "chat.history"
+    rows = socket.sent[-1]["result"]["messages"]
+    assert rows[0]["timestampMs"] == int(local.astimezone().timestamp() * 1000)
+    assert "timestampMs" not in rows[1]

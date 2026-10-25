@@ -54,7 +54,11 @@ RESUME_JUMP_SECONDS = 2.0
 
 #: A named agent's chat calls the server sends with ``params.profile`` (server
 #: PROTOCOL B7): Core runs them in that agent, in its one conversation.
-PROFILE_CHAT_METHODS = frozenset({"chat.send", "chat.inflight", "chat.abort", "chat.steer", "chat.command"})
+PROFILE_CHAT_METHODS = frozenset({
+    "chat.send", "chat.inflight", "chat.abort", "chat.steer", "chat.command",
+    # The server reads the agent's chat from Core only to move it over (B7 "Taşıma").
+    "chat.history",
+})
 _PROFILE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 #: The server's delivery session for a named agent's chat: ``srv-p:<profile>:<conversationId>``.
 _PROFILE_DELIVERY_SESSION = re.compile(r"^srv-p:([A-Za-z0-9._-]{1,64}):([A-Za-z0-9_-]{1,128})$")
@@ -132,6 +136,30 @@ def _direct_stream(gateway, result: dict) -> dict:
         return result
     registry.remember(ticket, lifetime / 1000)
     return {**result, "streamUrl": f"wss://{app}.fly.dev{STREAM_PATH}"}
+
+
+def _with_exact_times(history: dict[str, Any]) -> dict[str, Any]:
+    """History rows with ``timestampMs``: the stored time in epoch milliseconds.
+
+    Sessions store ``datetime.now().isoformat()``, this machine's local time
+    with no zone. Read elsewhere (the server runs in UTC) it would shift by
+    the machine's offset; here it is read as what it is.
+    """
+    from datetime import datetime
+
+    rows = history.get("messages")
+    if not isinstance(rows, list):
+        return history
+    exact = []
+    for row in rows:
+        if isinstance(row, dict) and isinstance(row.get("timestamp"), str):
+            try:
+                stamp = datetime.fromisoformat(row["timestamp"])
+                row = {**row, "timestampMs": int(stamp.astimezone().timestamp() * 1000)}
+            except ValueError:
+                pass
+        exact.append(row)
+    return {**history, "messages": exact}
 
 
 class FlowlyServerChannel(WebChannel):
@@ -253,6 +281,8 @@ class FlowlyServerChannel(WebChannel):
             await reply({"error": {"code": "INTERNAL", "message": "The agent could not take this request.", "retryable": True}})
             return
         session_key = str(inner.get("sessionKey") or "")
+        if method == "chat.history" and isinstance(result, dict):
+            result = _with_exact_times(result)
         if method in {"chat.send", "chat.inflight"} and session_key and isinstance(result, dict):
             # Events that name only their run still find the conversation.
             receipt = result if method == "chat.send" else result.get("inflight")
