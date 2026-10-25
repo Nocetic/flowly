@@ -189,3 +189,16 @@ async def test_a_saved_session_that_names_another_agent_is_ignored(home):
     channel, host, forwarded = make_channel()
     await host._emit("writer", "chat", {"state": "final", "runId": "m", "sessionKey": HOME_SESSION, "message": {}})
     assert forwarded == []
+
+
+@pytest.mark.asyncio
+async def test_a_scheduled_tasks_result_in_the_agents_chat_reaches_the_server(home):
+    # A job made in the agent's chat delivers to its home session as a
+    # proactive final (cli/gateway_cmd.py); it is the agent's chat like any reply.
+    channel, host, forwarded = make_channel()
+    await deliver(channel, Socket())
+    await host._emit("writer", "chat", {"state": "final", "proactive": True, "runId": "proactive-1a2b",
+                                        "sessionKey": HOME_SESSION,
+                                        "message": {"role": "assistant", "content": [{"type": "text", "text": "Daily report"}]}})
+    assert [(f["sessionId"], f["event"], f["data"]["state"], f["data"]["proactive"]) for f in forwarded] == [
+        (SESSION, "chat", "final", True)]
