@@ -265,8 +265,11 @@ class FlowlyServerChannel(WebChannel):
         except ProfileHostError as exc:
             await reply({"error": {"code": exc.code, "message": exc.message, "retryable": exc.retryable}})
             return
-        if method == "chat.send" and isinstance(session_id, str):
+        if method in ("chat.send", "chat.inflight") and isinstance(session_id, str):
             # Before dispatch: the first event may follow the acknowledgement at once.
+            # The server also names the session with a read-only chat.inflight when it
+            # learns the agent, so the agent's words before its first message (its
+            # introduction) reach the server too. Only `srv-p:` sessions are kept.
             self._remember_profile_session(profile, session_id)
         try:
             result = await host.dispatch("profiles.rpc", {"name": profile, "method": method, "params": inner})

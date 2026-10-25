@@ -170,6 +170,20 @@ async def test_the_agents_other_chat_calls_run_in_it(home, method):
 
 
 @pytest.mark.asyncio
+async def test_the_servers_inflight_names_the_session_before_any_message(home):
+    """A new agent introduces itself before anyone writes to it: the server binds
+    its session with a read-only chat.inflight, so those first words reach it."""
+    channel, host, forwarded = make_channel({"inflight": None})
+    socket = Socket()
+    await channel._handle_rpc(socket, {"type": "rpc", "id": "i1", "sessionId": SESSION, "method": "chat.inflight",
+                                       "params": {"profile": "writer", "sessionKey": HOME_SESSION}})
+    saved = json.loads((home / "flowly_server" / "profile_sessions.json").read_text())
+    assert saved == {"writer": SESSION}
+    await host._emit("writer", "agent", {"runId": "intro-1", "sessionKey": HOME_SESSION, "stream": "assistant", "data": {"text": "Hi"}})
+    assert [(f["sessionId"], f["data"]["state"]) for f in forwarded] == [(SESSION, "streaming")]
+
+
+@pytest.mark.asyncio
 async def test_a_bad_agent_name_or_no_profile_host_is_refused(home):
     channel, _host, _ = make_channel()
     socket = Socket()
