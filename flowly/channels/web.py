@@ -800,6 +800,10 @@ class WebChannel(BaseChannel):
                 "event": "profile.event",
                 "data": envelope,
             }))
+        resolved = envelope.get("data")
+        await self._forward_profile_event_to_server(
+            profile, event_type, resolved if isinstance(resolved, dict) else {}
+        )
 
         if (
             run_id
@@ -807,6 +811,19 @@ class WebChannel(BaseChannel):
             and payload.get("state") in {"final", "aborted", "error"}
         ):
             self._profile_run_bindings.pop((profile, run_id), None)
+
+    async def _forward_profile_event_to_server(
+        self, profile: str, event_type: str, payload: dict[str, Any]
+    ) -> None:
+        """A named agent's own chat, once, to the Flowly server (FlowlyServerChannel).
+
+        The relay has no such path: its devices follow a named agent through
+        ``profiles.rpc`` and get the ``profile.event`` copies above.
+        """
+
+    def _server_capabilities(self) -> dict[str, Any]:
+        """What this transport adds to ``system.capabilities`` (FlowlyServerChannel)."""
+        return {}
 
     async def _handle_profile_rpc(self, ws, msg: dict[str, Any]) -> None:
         rpc_id = str(msg.get("id") or "")
@@ -2745,6 +2762,8 @@ class WebChannel(BaseChannel):
             self._watch_objectives(session_id)
         if method == "system.capabilities" and self._profile_host is not None:
             result = {**result, "profileHost": self._profile_host.capabilities()}
+        if method == "system.capabilities":
+            result = {**result, **self._server_capabilities()}
         await ws.send(
             json.dumps(
                 {

@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import re
 import time
+from pathlib import Path
 from typing import Any, Callable
 
 from loguru import logger
@@ -48,6 +51,21 @@ RESUME_TICK_SECONDS = 0.5
 #: The wall clock ran this much further than the monotonic one within a tick:
 #: the machine was suspended (or the clock stepped; reconnecting early is harmless).
 RESUME_JUMP_SECONDS = 2.0
+
+#: A named agent's chat calls the server sends with ``params.profile`` (server
+#: PROTOCOL B7): Core runs them in that agent, in its one conversation.
+PROFILE_CHAT_METHODS = frozenset({"chat.send", "chat.inflight", "chat.abort", "chat.steer", "chat.command"})
+_PROFILE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+#: The server's delivery session for a named agent's chat: ``srv-p:<profile>:<conversationId>``.
+_PROFILE_DELIVERY_SESSION = re.compile(r"^srv-p:([A-Za-z0-9._-]{1,64}):([A-Za-z0-9_-]{1,128})$")
+#: A named agent's events the server stores and fans out as its chat (B7).
+#: Roster and connection events stay on the ``profiles.rpc`` path.
+PROFILE_CHAT_EVENTS = frozenset({
+    "chat", "agent", "compaction", "goal.updated", "queue",
+    "exec.approval.requested", "exec.approval.closed",
+    "agent.clarify.requested", "agent.clarify.closed",
+    "plan.updated", "plan.approval.requested",
+})
 
 SLEEPING_ERROR = {
     "code": "AGENT_SLEEPING",
@@ -126,6 +144,161 @@ class FlowlyServerChannel(WebChannel):
         self._power = None
         self._power_tasks: set[asyncio.Task] = set()
         self._power_watch: asyncio.Task | None = None
+        # profile → the server's delivery session for its chat; read from disk once.
+        self._profile_server_sessions: dict[str, str] | None = None
+
+    # ── one chat per agent (server PROTOCOL A7, B7) ────────────────────────
+
+    def _server_capabilities(self) -> dict[str, Any]:
+        # The server routes a named agent's chat here only when it sees this.
+        return {"conversations": {"version": 2}}
+
+    @staticmethod
+    def _profile_sessions_path() -> Path:
+        from flowly.profile import get_flowly_home
+
+        return get_flowly_home() / "flowly_server" / "profile_sessions.json"
+
+    def _profile_sessions(self) -> dict[str, str]:
+        """Each named agent's delivery session, kept across restarts.
+
+        Core learns it from the server's first delivery to that agent. An
+        agent also speaks by itself (its introduction, a goal's next step,
+        a scheduled check-in); after a restart those turns still reach the
+        server only because the session was written down.
+        """
+        if self._profile_server_sessions is None:
+            sessions: dict[str, str] = {}
+            try:
+                raw = json.loads(self._profile_sessions_path().read_text())
+            except (OSError, ValueError):
+                raw = {}
+            if isinstance(raw, dict):
+                for profile, session_id in raw.items():
+                    match = _PROFILE_DELIVERY_SESSION.match(session_id) if isinstance(session_id, str) else None
+                    if match and match.group(1) == profile:
+                        sessions[profile] = session_id
+            self._profile_server_sessions = sessions
+        return self._profile_server_sessions
+
+    def _remember_profile_session(self, profile: str, session_id: str) -> None:
+        match = _PROFILE_DELIVERY_SESSION.match(session_id)
+        if not match or match.group(1) != profile:
+            return
+        sessions = self._profile_sessions()
+        if sessions.get(profile) == session_id:
+            return
+        sessions[profile] = session_id
+        path = self._profile_sessions_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(sessions, sort_keys=True))
+            os.replace(tmp, path)
+        except OSError as exc:
+            # Live delivery still works; only an agent's own turns after a restart would miss the server.
+            logger.warning("[FlowlyServer] profile session not saved: {}", exc)
+
+    async def _dispatch_rpc(self, ws, msg: dict) -> None:
+        params = msg.get("params")
+        profile = params.get("profile") if isinstance(params, dict) else None
+        if msg.get("method") in PROFILE_CHAT_METHODS and profile not in (None, "", "default"):
+            await self._dispatch_profile_chat(ws, msg, profile)
+            return
+        await super()._dispatch_rpc(ws, msg)
+
+    async def _dispatch_profile_chat(self, ws, msg: dict, profile: Any) -> None:
+        """A named agent's chat call from the server: run it in that agent.
+
+        Unlike ``profiles.rpc`` it binds no ``profile.event`` copies to the
+        calling session (the server fans the chat out itself); a delivery
+        names the session the agent's chat events go to (B7).
+        """
+        from flowly.profile_host_contract import ProfileHostError, validate_profile_rpc
+
+        rpc_id = msg.get("id", "")
+        session_id = msg.get("sessionId", "")
+        method = msg["method"]
+
+        async def reply(body: dict[str, Any]) -> None:
+            await ws.send(json.dumps({"type": "rpc", "id": rpc_id, "sessionId": session_id, **body}))
+
+        host = self._profile_host
+        if not isinstance(profile, str) or not _PROFILE_NAME.match(profile):
+            await reply({"error": {"code": "INVALID_PARAMS", "message": "Unknown agent.", "retryable": False}})
+            return
+        if host is None:
+            await reply({"error": {"code": "PROFILE_HOST_UNAVAILABLE",
+                                   "message": "This agent host does not manage isolated profiles.", "retryable": False}})
+            return
+        inner = {key: value for key, value in msg["params"].items() if key != "profile"}
+        try:
+            method, inner = validate_profile_rpc(method, inner)
+        except ProfileHostError as exc:
+            await reply({"error": {"code": exc.code, "message": exc.message, "retryable": exc.retryable}})
+            return
+        if method == "chat.send" and isinstance(session_id, str):
+            # Before dispatch: the first event may follow the acknowledgement at once.
+            self._remember_profile_session(profile, session_id)
+        try:
+            result = await host.dispatch("profiles.rpc", {"name": profile, "method": method, "params": inner})
+        except ProfileHostError as exc:
+            await reply({"error": {"code": exc.code, "message": exc.message, "retryable": exc.retryable}})
+            return
+        except FileNotFoundError:
+            await reply({"error": {"code": "PROFILE_NOT_FOUND", "message": "The agent no longer exists.", "retryable": False}})
+            return
+        except Exception as exc:
+            logger.error("[FlowlyServer] {} for agent {} failed ({})", method, profile, type(exc).__name__)
+            await reply({"error": {"code": "INTERNAL", "message": "The agent could not take this request.", "retryable": True}})
+            return
+        session_key = str(inner.get("sessionKey") or "")
+        if method in {"chat.send", "chat.inflight"} and session_key and isinstance(result, dict):
+            # Events that name only their run still find the conversation.
+            receipt = result if method == "chat.send" else result.get("inflight")
+            run_id = str(receipt.get("runId") or "") if isinstance(receipt, dict) else ""
+            if run_id:
+                self._profile_run_bindings[(profile, run_id)] = (session_key, time.monotonic())
+                self._prune_profile_bindings()
+        await reply({"result": result})
+
+    async def _forward_profile_event_to_server(
+        self, profile: str, event_type: str, payload: dict[str, Any]
+    ) -> None:
+        """A named agent's own chat, once, under its profile (B7).
+
+        Only its one conversation (the home session), only to the session the
+        server delivered its messages on, and in the shape the main agent's
+        chat has on this socket: a stream delta is ``chat`` ``streaming``.
+        """
+        from flowly.agent_home import HOME_SESSION
+
+        if profile in ("", "default") or event_type not in PROFILE_CHAT_EVENTS:
+            return
+        if payload.get("sessionKey") != HOME_SESSION:
+            return
+        run_id = str(payload.get("runId") or "")
+        if run_id and (profile, run_id) not in self._profile_run_bindings:
+            # A turn the agent started itself (no chat.send bound it): its
+            # later events that name only the run still find this chat.
+            self._profile_run_bindings[(profile, run_id)] = (HOME_SESSION, time.monotonic())
+        session_id = self._profile_sessions().get(profile)
+        if not session_id:
+            return
+        name, data = event_type, payload
+        if event_type == "agent":
+            text = payload.get("data", {}).get("text") if isinstance(payload.get("data"), dict) else None
+            if payload.get("stream") != "assistant" or not isinstance(text, str):
+                return
+            name = "chat"
+            data = {
+                "state": "streaming", "runId": payload.get("runId") or "", "sessionKey": HOME_SESSION, "delta": text,
+                **({"seq": payload["seq"]} if isinstance(payload.get("seq"), int) else {}),
+                **({"turnOrigin": payload["turnOrigin"]} if isinstance(payload.get("turnOrigin"), str) else {}),
+            }
+        await self._send_or_queue(json.dumps({
+            "type": "event", "sessionId": session_id, "event": name, "profile": profile, "data": data,
+        }))
 
     # ── connection ────────────────────────────────────────────────────────
 

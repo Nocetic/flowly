@@ -423,33 +423,60 @@ chat.
 Server contract: `flowly-server` `server/PROTOCOL.md` A7 and B7. Engineering
 record: `docs/cloud/engineering/conversations-v2.md` there.
 
-**Capability.** `system.capabilities` answers `conversations: {version: 2}`.
-The Flowly server sends the fields below only to a Core that advertises it.
+**Capability.** `system.capabilities` answers `conversations: {version: 2}` on
+the Flowly server's socket (`FlowlyServerChannel`; the relay's `WebChannel`
+does not). The Flowly server sends the fields below only to a Core that
+advertises it.
 
 **A named agent's chat from the server.** The server delivers a message to a
 named agent as a `chat.send` with `params.profile` and the agent's home session
-(`params.sessionKey = "desktop:profile-home"`). Core passes it to that
-profile's own `chat.send`. It also binds the delivery `sessionId` to that
-profile conversation, so the profile's events for it leave **once**, as plain
-`event` frames carrying `profile` beside `sessionId`, and the server stores and
-fans them out. `chat.history`, `chat.inflight`, `chat.abort` and `chat.steer`
-take `params.profile` the same way. The `profiles.rpc` path and its
-`profile.event` copies stay for older clients.
+(`params.sessionKey = "desktop:profile-home"`) on its delivery session
+`srv-p:<profile>:<conversationId>`. Core runs it as that profile's own
+`chat.send` (`flowly/channels/flowly_server.py` `_dispatch_profile_chat`).
+`chat.inflight`, `chat.abort`, `chat.steer` and `chat.command` take
+`params.profile` the same way (from any session: the server forwards an app's
+call). None of these binds the calling session to `profile.event` copies.
 
-**`seq`.** Every `streaming`, `iteration_step` and `tool_progress` event of a
-run carries `seq`, an integer that grows by one per event within the run,
-starting at 1. `chat.inflight` answers `inflight.seq`: the last event its
-snapshot includes. A client shows the snapshot, then only events with a
-greater `seq`, and never applies a `seq` twice. Without `seq` (an older Core)
-clients keep today's merge.
+- Core remembers each profile's delivery session on disk
+  (`<FLOWLY_HOME>/flowly_server/profile_sessions.json`). An agent also speaks by
+  itself (its introduction, a goal's next step, a scheduled check-in); after a
+  restart those turns still reach the server only because of it.
+- The profile's events for its home session leave **once**, on that session,
+  as plain `event` frames with `profile` beside `sessionId`, in the main agent's
+  shape on this socket: an `agent` `stream:"assistant"` delta becomes
+  `chat {state:"streaming", runId, sessionKey, delta, seq?}`; `chat`,
+  `compaction`, `goal.updated`, `queue`, `exec.approval.*`,
+  `agent.clarify.*`, `plan.updated` and `plan.approval.requested` pass as they
+  are. Roster and connection events (`directory`, `tool.activity`,
+  `connection`, `error`, `needsInput`, `objectives.changed`) and other
+  conversations of the agent do not.
+- An event that names only its run finds the conversation from the run's
+  first event that named it (or the delivery receipt).
+- The `profiles.rpc` path and its `profile.event` copies stay for older
+  clients; a device on it and the server each get their own copy, once.
+
+**`seq`.** Every piece of a run that the in-flight registry records carries
+`seq`, an integer that grows by one per piece within the run, starting at 1:
+`chat` `streaming` deltas (and on the direct gateway `agent`
+`stream:"assistant"` deltas), `iteration_step` and `tool_progress`. The
+registry assigns it where it records the piece (`flowly/agent/inflight.py`),
+so the stream and the snapshot always agree. `chat.inflight` answers
+`inflight.seq`: the last piece its snapshot includes (its stored steps and tool
+progress carry their own `seq`). A client shows the snapshot, then only pieces
+with a greater `seq`, and never applies a `seq` twice. A piece the registry did
+not keep (a tool progress snapshot no newer than the one held) goes without
+`seq` and is applied as before; so does everything from an older Core.
 
 **Interrupted turns.** When an agent's connection drops and it does not come
 back within the server's grace period with the turn still running, the server
 ends the turn for every client: `chat {state:"aborted", reason:"agent_restarted",
 runId, sessionKey}`. This is a server event; Core never sends it. A `final`
-for that `runId` arriving later still wins. On start Core marks command
-records left `accepted`/`running` by a dead process `aborted`, so
-`chat.inflight` reports no run for them.
+for that `runId` arriving later still wins. The server learns that a turn died
+from `chat.command`: Core reads a command record left `accepted`/`running` by a
+process that is gone as `status_unknown` (`flowly/session/commands.py`
+`_receipt`). Core does not rewrite such records on start: nothing stops two
+gateways from sharing a home directory, and rewriting another live process's
+records would end its turns.
 
 **Migration.** On connecting to the Flowly server, Core sends each profile's
 home history that is not yet migrated with `conversations.import` frames (at
