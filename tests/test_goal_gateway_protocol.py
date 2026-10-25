@@ -294,6 +294,8 @@ async def test_relay_autonomous_turn_streams_through_the_shared_callback() -> No
             "runId": "run-1",
             "sessionKey": "web:stable-chat",
             "delta": "working",
+            # Its place in the run (agent/inflight.py; chat-wire-protocol §8).
+            "seq": 1,
         },
     }]
     # The embedded desktop bot listens on the local ``agent`` event; a goal

@@ -1169,6 +1169,12 @@ class WebChannel(BaseChannel):
                         if isinstance(iter_event.get("turnOrigin"), str)
                         else {}
                     ),
+                    # The step's place in its run (agent/inflight.py), so a client never shows it twice.
+                    **(
+                        {"seq": iter_event["seq"]}
+                        if isinstance(iter_event.get("seq"), int)
+                        else {}
+                    ),
                 },
             }
             await self._send_or_queue(json.dumps(event_msg))
@@ -2968,12 +2974,13 @@ class WebChannel(BaseChannel):
         async def stream_callback(delta: str) -> None:
             from flowly.agent import inflight
 
-            inflight.append(session_key, run_id, delta)
+            seq = inflight.append(session_key, run_id, delta)
             data = {
                 "state": "streaming",
                 "runId": run_id,
                 "sessionKey": session_key,
                 "delta": delta,
+                **({"seq": seq} if seq else {}),
                 **fields,
             }
             await self._send_or_queue(json.dumps({
@@ -3169,7 +3176,9 @@ class WebChannel(BaseChannel):
 
             async def on_iteration(event: dict) -> None:
                 wrapped = {**event, 'runId': run_id, 'state': 'iteration_step', **turn_fields}
-                inflight.append_iteration(session_key, run_id, wrapped)
+                seq = inflight.append_iteration(session_key, run_id, wrapped)
+                if seq:
+                    wrapped = {**wrapped, 'seq': seq}
                 await self.send(OutboundMessage(
                     channel='web', chat_id=session_id, content='',
                     metadata={'iteration_event': wrapped, 'session_key': session_key},

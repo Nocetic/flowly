@@ -100,7 +100,8 @@ def test_inflight_replay_is_scoped_revisioned_and_detached():
     inflight.append_tool_progress(key, "run", {**event, "revision": 1})
     snapshot = inflight.get(key)
     assert snapshot["text"] == "Narration"
-    assert snapshot["toolProgress"] == [event]
+    # The kept snapshot carries its place in the run (after the narration delta).
+    assert snapshot["toolProgress"] == [{**event, "seq": 2}]
     snapshot["toolProgress"][0]["call"]["state"] = "mutated"
     assert inflight.get(key)["toolProgress"][0]["call"]["state"] == "running"
     inflight.finish(key, "run")

@@ -525,6 +525,13 @@ def _reply_media_attachments(media_paths: list, assets: dict | None = None) -> l
     return out
 
 
+
+def _stream_seq_field() -> dict:
+    """The delta's ``seq`` in its run (agent/inflight.py), for a stream event."""
+    from flowly.agent.inflight import stream_seq_field
+
+    return stream_seq_field()
+
 class GatewayServer:
     """
     HTTP + WebSocket API server for gateway integrations.
@@ -2998,6 +3005,7 @@ class GatewayServer:
                         "sessionKey": session_key,
                         "stream": "assistant",
                         "data": {"text": delta},
+                        **_stream_seq_field(),
                     },
                 },
             )
@@ -3065,8 +3073,14 @@ class GatewayServer:
                     "event": "agent",
                     "data": {
                         "runId": run_id,
+                        # Every other turn's delta names its conversation; a
+                        # goal turn's did not, so whoever forwards it (the
+                        # profile host to a phone, to the Flowly server) could
+                        # not tell which chat it belonged to.
+                        "sessionKey": session_key,
                         "stream": "assistant",
                         "data": {"text": delta},
+                        **_stream_seq_field(),
                     },
                 },
             )
@@ -3153,6 +3167,7 @@ class GatewayServer:
                         "turnOrigin": REPORT_TURN_ORIGIN,
                         "stream": "assistant",
                         "data": {"text": delta},
+                        **_stream_seq_field(),
                     },
                 },
             )
@@ -3211,6 +3226,7 @@ class GatewayServer:
                         "sessionKey": HOME_SESSION,
                         "stream": "assistant",
                         "data": {"text": delta},
+                        **_stream_seq_field(),
                     },
                 },
             )
@@ -3297,8 +3313,12 @@ class GatewayServer:
         async def tracking_callback(delta: str) -> None:
             nonlocal accumulated_text
             accumulated_text += delta
-            inflight.append(session_key, run_id, delta)
-            await stream_callback(delta)
+            # The delta's place in its run, read by the stream callback (inflight.stream_seq_field).
+            token = inflight._stream_seq.set(inflight.append(session_key, run_id, delta))
+            try:
+                await stream_callback(delta)
+            finally:
+                inflight._stream_seq.reset(token)
 
         # Live per-iteration tool-turn events. The agent loop emits one of these
         # after each assistant_with_tool_calls / tool_result; we forward it as a
@@ -3310,7 +3330,10 @@ class GatewayServer:
         async def iteration_callback(event: dict) -> None:
             if event.get("state") == "tool_progress":
                 wrapped = {**event, "runId": run_id, **turn_fields}
-                inflight.append_tool_progress(session_key, run_id, wrapped)
+                # The loop records it first when its run id is this one (and the seq rides along).
+                seq = inflight.append_tool_progress(session_key, run_id, wrapped)
+                if seq:
+                    wrapped["seq"] = seq
                 await self._session_send(
                     session_key, ws, {"type": "event", "event": "chat", "data": wrapped}
                 )
@@ -3320,7 +3343,9 @@ class GatewayServer:
             # can rebuild the live tool-call panel (chat.inflight returns these),
             # not just the assistant text. Store BEFORE the send so a dropped
             # socket doesn't lose it.
-            inflight.append_iteration(session_key, run_id, wrapped)
+            seq = inflight.append_iteration(session_key, run_id, wrapped)
+            if seq:
+                wrapped["seq"] = seq
             await self._session_send(
                 session_key, ws, {"type": "event", "event": "chat", "data": wrapped}
             )

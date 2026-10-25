@@ -5897,7 +5897,9 @@ class AgentLoop:
     ) -> None:
         from flowly.agent import inflight
 
-        inflight.append_tool_progress(session_key, event["runId"], event)
+        seq = inflight.append_tool_progress(session_key, event["runId"], event)
+        if seq:
+            event = {**event, "seq": seq}
         if on_tool_progress is not None:
             await on_tool_progress(event)
         elif on_iteration is None and outbound_channel == "web" and outbound_chat_id:

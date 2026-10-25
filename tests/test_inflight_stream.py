@@ -19,7 +19,7 @@ def test_begin_append_get():
     inflight.begin("web:c1", "run1")
     inflight.append("web:c1", "run1", "Hello")
     inflight.append("web:c1", "run1", " world")
-    assert inflight.get("web:c1") == {"runId": "run1", "text": "Hello world", "user": "", "iterations": []}
+    assert inflight.get("web:c1") == {"runId": "run1", "text": "Hello world", "seq": 2, "user": "", "iterations": []}
 
 
 def test_begin_records_user_message():
@@ -28,7 +28,7 @@ def test_begin_records_user_message():
     inflight.begin("web:c1", "run1", "research X for me")
     inflight.append("web:c1", "run1", "On it…")
     assert inflight.get("web:c1") == {
-        "runId": "run1", "text": "On it…", "user": "research X for me", "iterations": [],
+        "runId": "run1", "text": "On it…", "seq": 1, "user": "research X for me", "iterations": [],
     }
 
 
@@ -118,7 +118,7 @@ def test_finish_clears():
 
 def test_append_without_begin_still_tracks():
     inflight.append("web:c2", "run9", "late")
-    assert inflight.get("web:c2") == {"runId": "run9", "text": "late", "user": "", "iterations": []}
+    assert inflight.get("web:c2") == {"runId": "run9", "text": "late", "seq": 1, "user": "", "iterations": []}
 
 
 def test_new_run_replaces_old():
@@ -126,7 +126,7 @@ def test_new_run_replaces_old():
     inflight.append("web:c1", "run1", "old")
     inflight.begin("web:c1", "run2")
     inflight.append("web:c1", "run2", "new")
-    assert inflight.get("web:c1") == {"runId": "run2", "text": "new", "user": "", "iterations": []}
+    assert inflight.get("web:c1") == {"runId": "run2", "text": "new", "seq": 1, "user": "", "iterations": []}
 
 
 def test_stale_finish_does_not_wipe_newer_run():
@@ -134,7 +134,7 @@ def test_stale_finish_does_not_wipe_newer_run():
     inflight.append("web:c1", "run2", "current")
     # A late finish from the previous run must not clear run2.
     inflight.finish("web:c1", "run1")
-    assert inflight.get("web:c1") == {"runId": "run2", "text": "current", "user": "", "iterations": []}
+    assert inflight.get("web:c1") == {"runId": "run2", "text": "current", "seq": 1, "user": "", "iterations": []}
 
 
 def test_empty_session_key_noop():
@@ -151,7 +151,7 @@ async def test_chat_inflight_rpc():
 
     result, restart = await feature_rpc.dispatch("chat.inflight", {"sessionKey": "web:c1"})
     assert restart is False
-    assert result["inflight"] == {"runId": "run1", "text": "partial answer", "user": "", "iterations": []}
+    assert result["inflight"] == {"runId": "run1", "text": "partial answer", "seq": 1, "user": "", "iterations": []}
 
     empty, _ = await feature_rpc.dispatch("chat.inflight", {"sessionKey": "web:none"})
     assert empty["inflight"] is None
@@ -160,3 +160,34 @@ async def test_chat_inflight_rpc():
 def test_chat_inflight_in_feature_methods():
     from flowly.channels import feature_rpc
     assert "chat.inflight" in feature_rpc.FEATURE_METHODS
+
+
+def test_every_piece_of_a_run_gets_the_next_seq_and_the_snapshot_names_the_last():
+    # docs/chat-wire-protocol.md §8: a client shows the snapshot, then adds
+    # only pieces with a higher seq, so none is shown twice or skipped.
+    inflight.begin("web:c1", "run1", "go")
+    assert inflight.append("web:c1", "run1", "Look") == 1
+    assert inflight.append_iteration("web:c1", "run1", {"role": "assistant", "iterationIdx": 0, "tool_calls": []}) == 2
+    call = {"id": "t1", "name": "web_search"}
+    assert inflight.append_tool_progress("web:c1", "run1", {"iterationIdx": 0, "call": call, "revision": 1}) == 3
+    assert inflight.append_tool_progress("web:c1", "run1", {"iterationIdx": 0, "call": call, "revision": 1}) == 0, \
+        "a snapshot not newer than the one held is not a new piece"
+    assert inflight.append("web:c1", "run1", "ing") == 4
+    got = inflight.get("web:c1")
+    assert got["seq"] == 4
+    assert got["iterations"][0]["seq"] == 2
+    assert got["toolProgress"][0]["seq"] == 3
+
+
+def test_a_new_run_starts_its_seq_again():
+    inflight.begin("web:c1", "run1")
+    inflight.append("web:c1", "run1", "a")
+    inflight.append("web:c1", "run1", "b")
+    inflight.begin("web:c1", "run2")
+    assert inflight.append("web:c1", "run2", "c") == 1
+
+
+def test_an_empty_delta_is_no_piece():
+    inflight.begin("web:c1", "run1")
+    assert inflight.append("web:c1", "run1", "") == 0
+    assert inflight.get("web:c1")["seq"] == 0

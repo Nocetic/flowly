@@ -14,11 +14,18 @@ so one registry + one RPC covers every surface.
 
 In-memory only: if the bot restarts, the run is gone anyway and the
 final message (persisted to history) is the fallback.
+
+Every piece of a run (a delta, a tool step, a tool's progress) gets the next
+``seq`` of that run here, where it is recorded, and the transport sends it
+with the piece. The snapshot names the last piece it holds (``seq``), so a
+client that shows the snapshot adds only pieces with a higher ``seq`` and
+never shows one twice (docs/chat-wire-protocol.md §8).
 """
 
 from __future__ import annotations
 
 import time
+from contextvars import ContextVar
 
 from flowly.session.control_access import SessionControlScope
 
@@ -43,7 +50,7 @@ def _fresh(run_id: str, user: str = "", goal_run: bool | None = None,
     extra = {key: fields[key] for key in _EXTRA_FIELDS if fields and key in fields}
     return {
         "runId": run_id, "text": "", "user": user or "",
-        "iterations": [], "updatedAt": time.time(),
+        "iterations": [], "updatedAt": time.time(), "seq": 0,
         **({'goalRun': goal_run} if goal_run is not None else {}),
         **({'turnOrigin': turn_origin} if turn_origin else {}),
         **({'extra': extra} if extra else {}),
@@ -77,33 +84,54 @@ def begin(session_key: str, run_id: str, user: str = "", *, goal_run: bool | Non
     _control_scopes[session_key] = (run_id, scope)
 
 
-def append(session_key: str, run_id: str, delta: str) -> None:
-    """Accumulate a streamed delta. Tolerates a missing ``begin`` (e.g. a
-    run whose first delta arrives before tracking was set up)."""
+# The ``seq`` of the delta being sent, for a transport whose stream callback
+# only receives the text (gateway/server.py ``_run_chat``): set around the call.
+_stream_seq: ContextVar[int] = ContextVar("inflight_stream_seq", default=0)
+
+
+def stream_seq_field() -> dict:
+    """``{"seq": n}`` for the delta being sent, or ``{}`` when none was recorded."""
+    seq = _stream_seq.get()
+    return {"seq": seq} if seq else {}
+
+
+def _next_seq(cur: dict) -> int:
+    cur["seq"] = cur.get("seq", 0) + 1
+    return cur["seq"]
+
+
+def append(session_key: str, run_id: str, delta: str) -> int:
+    """Accumulate a streamed delta and return its ``seq`` (0: not recorded).
+    Tolerates a missing ``begin`` (e.g. a run whose first delta arrives
+    before tracking was set up)."""
     if not session_key or not delta:
-        return
+        return 0
     cur = _runs.get(session_key)
     if cur is None or cur.get("runId") != run_id:
         begin(session_key, run_id)
         cur = _runs[session_key]
     cur["text"] += delta
     cur["updatedAt"] = time.time()
+    return _next_seq(cur)
 
 
-def append_iteration(session_key: str, run_id: str, event: dict) -> None:
+def append_iteration(session_key: str, run_id: str, event: dict) -> int:
     """Accumulate one tool-turn (``iteration_step``) event so a client that
     re-enters mid-stream can rebuild the live tool-call panel — not just the
     assistant text. The event is stored as the transport already forwards it
     (``{runId, iterationIdx, role, content, tool_calls?, ...}``), so the client
-    replays it through the same iteration→tool-turn mapping it uses live."""
+    replays it through the same iteration→tool-turn mapping it uses live.
+
+    Returns the step's ``seq`` (0: not recorded); the stored step carries it."""
     if not session_key or not isinstance(event, dict):
-        return
+        return 0
     cur = _runs.get(session_key)
     if cur is None or cur.get("runId") != run_id:
         begin(session_key, run_id)
         cur = _runs[session_key]
+    seq = _next_seq(cur)
     iters = cur.setdefault("iterations", [])
-    iters.append(event)
+    iters.append({**event, "seq": seq})
     if len(iters) > _MAX_ITERATIONS:
         del iters[: len(iters) - _MAX_ITERATIONS]
     # A tool-call boundary MOVES the streamed preamble out of the live
@@ -118,25 +146,31 @@ def append_iteration(session_key: str, run_id: str, event: dict) -> None:
     if event.get("role") == "assistant" and isinstance(event.get("tool_calls"), list):
         cur["text"] = ""
     cur["updatedAt"] = time.time()
+    return seq
 
 
-def append_tool_progress(session_key: str, run_id: str, event: dict) -> None:
-    """Retain latest per-call display snapshots without resetting streamed text."""
+def append_tool_progress(session_key: str, run_id: str, event: dict) -> int:
+    """Retain latest per-call display snapshots without resetting streamed text.
+
+    Returns the snapshot's ``seq``, or 0 when it was not kept (another run,
+    or not newer than the one held): a client applies it as it does today."""
     cur = _runs.get(session_key)
     if cur is None or cur.get("runId") != run_id:
-        return
+        return 0
     call = event.get("call")
     if not isinstance(call, dict) or not call.get("id"):
-        return
+        return 0
     progress = cur.setdefault("toolProgress", {})
     key = (event.get("iterationIdx"), call["id"])
     previous = progress.get(key)
     if previous and previous.get("revision", 0) >= event.get("revision", 0):
-        return
-    progress[key] = {**event, "call": dict(call)}
+        return 0
+    seq = _next_seq(cur)
+    progress[key] = {**event, "call": dict(call), "seq": seq}
     while len(progress) > _MAX_ITERATIONS:
         del progress[next(iter(progress))]
     cur["updatedAt"] = time.time()
+    return seq
 
 
 def clear_text(session_key: str, run_id: str, steering_sequence: int = 0) -> None:
@@ -202,6 +236,8 @@ def get(session_key: str) -> dict | None:
     return {
         "runId": cur["runId"],
         "text": cur["text"],
+        # The last piece this snapshot holds: a client adds only higher ones.
+        "seq": cur.get("seq", 0),
         "user": cur.get("user", ""),
         "iterations": list(cur.get("iterations", [])),
         **({"toolProgress": [{**event, "call": dict(event["call"])}
