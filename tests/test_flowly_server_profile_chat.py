@@ -221,3 +221,19 @@ async def test_the_server_reads_the_agents_chat_with_exact_times(home):
     rows = socket.sent[-1]["result"]["messages"]
     assert rows[0]["timestampMs"] == int(local.astimezone().timestamp() * 1000)
     assert "timestampMs" not in rows[1]
+
+
+@pytest.mark.asyncio
+async def test_a_final_names_its_reply_apart_from_the_persons_message(home):
+    # The server stores the reply under the final's runId: the direct gateway's
+    # (the turn, = the person's message id) would overwrite the person's row.
+    channel, host, forwarded = make_channel()
+    await deliver(channel, Socket())
+    await host._emit("writer", "chat", {"state": "final", "runId": "run-1", "sessionKey": HOME_SESSION,
+                                        "message": {"role": "assistant", "content": []}})
+    assert forwarded[0]["data"]["runId"] == "run-1:reply"
+    assert forwarded[0]["data"]["streamRunId"] == "run-1"
+    # A final already in the main agent's shape passes as it is.
+    await host._emit("writer", "chat", {"state": "final", "runId": "m-9", "streamRunId": "run-2", "sessionKey": HOME_SESSION,
+                                        "message": {"role": "assistant", "content": []}})
+    assert (forwarded[1]["data"]["runId"], forwarded[1]["data"]["streamRunId"]) == ("m-9", "run-2")

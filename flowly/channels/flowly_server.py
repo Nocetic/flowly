@@ -316,6 +316,12 @@ class FlowlyServerChannel(WebChannel):
         if not session_id:
             return
         name, data = event_type, payload
+        if event_type == "chat" and payload.get("state") == "final" and not payload.get("streamRunId") and payload.get("runId"):
+            # The direct gateway's final names the turn (= the person's message
+            # id) as `runId`; the main agent's names its stored reply there and
+            # the turn as `streamRunId` (wire §2). Sent as is, the server would
+            # store the reply over the person's message.
+            data = {**payload, "streamRunId": payload["runId"], "runId": f"{payload['runId']}:reply"}
         if event_type == "agent":
             text = payload.get("data", {}).get("text") if isinstance(payload.get("data"), dict) else None
             if payload.get("stream") != "assistant" or not isinstance(text, str):
