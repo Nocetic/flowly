@@ -61,6 +61,24 @@ async def test_the_daily_review_names_the_conversation():
 
 
 @pytest.mark.asyncio
+async def test_a_bare_schedule_is_told_every_gap_at_once_with_the_conversations_it_may_name():
+    """The daily review sent {"action": "schedule"} four times when told only of the conversation."""
+    store = get_agenda_store()
+    store.owner_wrote("web:older", now_ms=1_000)
+    store.owner_wrote("web:latest", now_ms=2_000)
+    store.owner_wrote("cron:job", now_ms=3_000)
+    bare = await _call(FollowUpTool(), "agenda:review", action="schedule")
+    assert bare.startswith("Error:")
+    assert "when" in bare and "note" in bare and "conversation" in bare
+    assert "web:latest, web:older" in bare, "the owner's conversations, most recent first"
+    assert "cron:job" not in bare
+    # In an owner's chat only what is missing is named: the chat is the conversation.
+    in_chat = await _call(FollowUpTool(), CHAT, action="schedule", note="Compare laptops")
+    assert in_chat.startswith("Error:") and "when" in in_chat and "conversation" not in in_chat and "note (" not in in_chat
+    assert get_agenda_store().pending() == []
+
+
+@pytest.mark.asyncio
 async def test_a_time_in_quiet_hours_is_told_as_it_will_happen():
     """The agent must not promise 00:57 when the policy may hold it to 09:00."""
     get_agenda_store().update_settings({"quietStart": "22:00", "quietEnd": "09:00"})

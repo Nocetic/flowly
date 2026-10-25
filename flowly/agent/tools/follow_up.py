@@ -47,6 +47,31 @@ def resolve_conversation(requested: Any) -> str:
     return key
 
 
+def schedule_gaps(kwargs: dict[str, Any]) -> str:
+    """Everything a schedule call lacks, said at once, with the conversations it
+    may name. Told one gap at a time, a model repeats the same call: the daily
+    review sent a bare ``{"action": "schedule"}`` four times (2026-10-25)."""
+    from flowly.agenda.store import get_agenda_store, is_owner_conversation
+
+    gaps: list[str] = []
+    if not str(kwargs.get("when") or "").strip():
+        gaps.append("when (e.g. '+1d' or 'tomorrow 09:00')")
+    if not str(kwargs.get("note") or "").strip():
+        gaps.append("note (what to look at and why, for your future self)")
+    if not is_owner_conversation(calling_conversation()) and not is_owner_conversation(
+        str(kwargs.get("conversation") or "").strip()
+    ):
+        stats = get_agenda_store().snapshot().get("conversations") or {}
+        recent = sorted(
+            (key for key in stats if is_owner_conversation(key)),
+            key=lambda key: int((stats.get(key) or {}).get("lastOwnerAt") or 0),
+            reverse=True,
+        )[:8]
+        known = f": one of {', '.join(recent)}" if recent else ""
+        gaps.append(f"conversation (the owner's conversation's session key, as listed in your review{known})")
+    return f"schedule needs {'; '.join(gaps)}." if gaps else ""
+
+
 def owner_now() -> tuple[dt.datetime, dt.tzinfo]:
     from flowly.agenda.store import get_agenda_store
     from flowly.agenda.timeparse import owner_zone
@@ -127,6 +152,9 @@ class FollowUpTool(Tool):
         store = get_agenda_store()
         try:
             if action == "schedule":
+                gaps = schedule_gaps(kwargs)
+                if gaps:
+                    return f"Error: {gaps}"
                 key = resolve_conversation(kwargs.get("conversation"))
                 now, zone = owner_now()
                 due = parse_when(kwargs.get("when"), now=now)
