@@ -4594,12 +4594,6 @@ class AgentLoop:
 
         return controller.submit(params, prepare, stopped=self.is_run_aborted(run_id))
 
-    def steering_receipt(self, session_key: str, message_id: str) -> dict | None:
-        """The receipt of guidance already accepted under ``message_id``, or None."""
-        receipts = self.sessions.get_or_create(session_key).metadata.get("steering_receipts", {})
-        receipt = receipts.get(message_id) if isinstance(receipts, dict) else None
-        return dict(receipt) if isinstance(receipt, dict) else None
-
     def is_run_aborted(self, run_id: str) -> bool:
         """Test whether a run_id has been marked aborted."""
         return self._run_aborts.is_requested(run_id)
@@ -6348,22 +6342,6 @@ class AgentLoop:
                 checkpoint = guidance.pop("_steering_checkpoint", None)
                 if checkpoint:
                     _record_turn_message(checkpoint)
-                    # What the agent had said when the message came in is a
-                    # step of its own on every surface: the server keeps it as
-                    # its own row (`<run>:step:<n>`), where a client that reads
-                    # the conversation (iOS, Android) would otherwise never see
-                    # the words it watched stream. The interrupted provider call
-                    # emits no step, so this index is the next one.
-                    if (checkpoint.get("content") or "").strip():
-                        await emit_iteration(
-                            outbound_channel=outbound_channel,
-                            outbound_chat_id=outbound_chat_id,
-                            outbound_run_id=outbound_run_id,
-                            iteration_idx=_iteration_event_idx,
-                            message={"role": "assistant", "content": checkpoint["content"], "_step_boundary": True},
-                            on_iteration=on_iteration,
-                        )
-                        _iteration_event_idx += 1
                 # Durable text/media stays distinct from the provider's image
                 # blocks and extracted document content.
                 provider_message = {"role": "user", "content": self.context._build_user_content(

@@ -58,77 +58,11 @@ class FeatureRpcError(Exception):
 
 
 _chat_steering_callback = None
-_steering_receipt_lookup = None
 
 
-def set_chat_steering_callback(callback, receipt_lookup=None) -> None:
-    """``callback`` steers a running reply (``AgentLoop.steer_chat``);
-    ``receipt_lookup(session_key, message_id)`` reads a steer already
-    accepted (``AgentLoop.steering_receipt``), so a resent message is
-    answered with its first acceptance (see :func:`steer_running_turn`)."""
-    global _chat_steering_callback, _steering_receipt_lookup
+def set_chat_steering_callback(callback) -> None:
+    global _chat_steering_callback
     _chat_steering_callback = callback
-    _steering_receipt_lookup = receipt_lookup
-
-
-def _steerable(params: dict) -> bool:
-    """A message that can join a running reply as guidance: plain words or
-    files from the person. A voice call's request, a setup answer, a slash
-    command and a turn a subagent reports keep their own turn."""
-    if params.get("origin") is not None or params.get("voiceMode") or params.get("setupAnswer") is not None:
-        return False
-    message = params.get("message", "")
-    if not isinstance(message, str) or message.lstrip().startswith("/"):
-        return False
-    attachments = params.get("attachments") or []
-    return bool(message.strip() or attachments)
-
-
-def steer_running_turn(session_key: str, params: dict, command_status=None) -> dict | None:
-    """A message sent while its conversation's reply is still running joins
-    that reply as guidance (``run_steering``): it is in the conversation at
-    once and the agent reads it at its next step, instead of a turn queued
-    behind the reply (Hakan, 2026-10-27; as Muse and Claude Code do).
-
-    Returns the ``chat.send`` acknowledgement, or None when no running reply
-    takes it (none runs, it is ending, the message keeps its own turn, this
-    runtime has no steering): the caller then sends it as its own turn.
-
-    A message sent again (a lost acknowledgement) is answered with its first
-    acceptance and never becomes a second turn; ``command_status(session_key,
-    run_id)`` gives the status of the reply it joined."""
-    from flowly.agent import inflight
-    from flowly.agent.run_steering import SteeringError
-
-    key = params.get("idempotencyKey")
-    if _chat_steering_callback is None or not isinstance(key, str) or not key.strip():
-        return None
-    if _steering_receipt_lookup is not None:
-        earlier = _steering_receipt_lookup(session_key, key)
-        if isinstance(earlier, dict) and isinstance(earlier.get("runId"), str):
-            run_id = earlier["runId"]
-            active = inflight.get(session_key)
-            if active and active.get("runId") == run_id:
-                status = "running"
-            else:
-                status = ((command_status(session_key, run_id) if command_status else None) or {}).get("status") or "completed"
-            return {"accepted": True, "steered": True, "replayed": True, "runId": run_id, "status": status, "messageId": key}
-    if not _steerable(params):
-        return None
-    active = inflight.get(session_key)
-    if not active or not isinstance(active.get("runId"), str):
-        return None
-    try:
-        receipt = _chat_steering_callback({
-            "runId": active["runId"], "sessionKey": session_key, "idempotencyKey": key,
-            "message": params.get("message", ""), "attachments": params.get("attachments") or [],
-        })
-    except SteeringError as exc:
-        if exc.code in {"RUN_NOT_ACTIVE", "STEERING_LIMIT"}:
-            return None
-        raise
-    return {"accepted": True, "steered": True, "runId": receipt.get("runId", active["runId"]),
-            "status": "running", "messageId": key}
 
 
 def chat_steer(params: dict) -> dict:

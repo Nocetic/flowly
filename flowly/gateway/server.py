@@ -2735,18 +2735,6 @@ class GatewayServer:
         if isinstance(session_key, str) and session_key.startswith("desktop:voice:"):
             await self._ws_rpc_error(ws, rpc_id, "VOICE_TRANSCRIPT_ONLY", "Resume voice to continue this conversation.")
             return
-        # A message for a conversation whose reply is still running joins that
-        # reply (the agent reads it at its next step) instead of a turn queued
-        # behind it; a resent one gets its first acceptance (web channel too).
-        from flowly.agent.run_steering import SteeringError
-        try:
-            steered = feature_rpc.steer_running_turn(session_key, params, self.chat_commands.lookup)
-        except SteeringError as exc:
-            await self._ws_rpc_error(ws, rpc_id, exc.code, str(exc))
-            return
-        if steered is not None:
-            await self._ws_rpc_reply(ws, rpc_id, steered)
-            return
         idempotency_key = params.get("idempotencyKey") or str(uuid.uuid4())
         run_id = idempotency_key
 
