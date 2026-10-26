@@ -389,6 +389,50 @@ async def _fetch_openrouter() -> list[Model]:
     return out
 
 
+def _flowly_catalog_row(item: object) -> Model | None:
+    """One row of the Flowly proxy's ``/v1/models`` as a picker row (``locked``
+    and ``plan:<id>`` tags for a model the account's plan does not have)."""
+    if not isinstance(item, dict):
+        return None
+    mid = str(item.get("id") or "").strip()
+    if not mid:
+        return None
+    pricing = item.get("pricing") or {}
+    # Same defensive read as OpenRouter direct — Flowly proxy passes
+    # through OR's schema, but a future proxy change could move ctx
+    # into top_provider only.
+    ctx = (
+        item.get("context_length")
+        or (item.get("top_provider") or {}).get("context_length")
+    )
+    tags = _openrouter_tags(item, pricing)
+    # Plan-aware: the proxy marks each entry ``allowed`` for the
+    # caller's tier. Greyed-out entries get a ``locked`` tag so the
+    # picker can render them differently — and we sort allowed
+    # entries to the top so the user's working choices come first.
+    if item.get("allowed") is False:
+        tags.append("locked")
+        # The plan that opens it (the proxy's per-plan lists): "plan:pro".
+        required = str(item.get("required_plan") or "").strip().lower()
+        if required in ("starter", "pro", "business"):
+            tags.append(f"plan:{required}")
+    if pricing.get("prompt") in (None, "", "0") and pricing.get("completion") in (None, "", "0"):
+        if "free" not in tags:
+            tags.append("free")
+    vision = _vision_capability(item)
+    return Model(
+        id=mid,
+        name=item.get("name") or mid,
+        description=str(item.get("description") or "")[:140],
+        context_window=int(ctx) if isinstance(ctx, int) else None,
+        pricing_in=_per_million(pricing.get("prompt")),
+        pricing_out=_per_million(pricing.get("completion")),
+        pricing_cache_read=_per_million(pricing.get("input_cache_read")),
+        tags=tags,
+        supports_vision=vision,
+    )
+
+
 async def _fetch_flowly_hosted() -> list[Model]:
     """Fetch the model catalog from the Flowly proxy.
 
@@ -447,41 +491,9 @@ async def _fetch_flowly_hosted() -> list[Model]:
 
     out: list[Model] = []
     for item in payload.get("data", []):
-        if not isinstance(item, dict):
-            continue
-        mid = str(item.get("id") or "").strip()
-        if not mid:
-            continue
-        pricing = item.get("pricing") or {}
-        # Same defensive read as OpenRouter direct — Flowly proxy passes
-        # through OR's schema, but a future proxy change could move ctx
-        # into top_provider only.
-        ctx = (
-            item.get("context_length")
-            or (item.get("top_provider") or {}).get("context_length")
-        )
-        tags = _openrouter_tags(item, pricing)
-        # Plan-aware: the proxy marks each entry ``allowed`` for the
-        # caller's tier. Greyed-out entries get a ``locked`` tag so the
-        # picker can render them differently — and we sort allowed
-        # entries to the top so the user's working choices come first.
-        if item.get("allowed") is False:
-            tags.append("locked")
-        if pricing.get("prompt") in (None, "", "0") and pricing.get("completion") in (None, "", "0"):
-            if "free" not in tags:
-                tags.append("free")
-        vision = _vision_capability(item)
-        out.append(Model(
-            id=mid,
-            name=item.get("name") or mid,
-            description=str(item.get("description") or "")[:140],
-            context_window=int(ctx) if isinstance(ctx, int) else None,
-            pricing_in=_per_million(pricing.get("prompt")),
-            pricing_out=_per_million(pricing.get("completion")),
-            pricing_cache_read=_per_million(pricing.get("input_cache_read")),
-            tags=tags,
-            supports_vision=vision,
-        ))
+        row = _flowly_catalog_row(item)
+        if row is not None:
+            out.append(row)
     # Allowed first, then alphabetical within each bucket.
     out.sort(key=lambda m: (1 if "locked" in m.tags else 0, m.id.lower()))
     return out

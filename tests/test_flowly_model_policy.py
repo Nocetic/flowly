@@ -192,3 +192,22 @@ def test_flowly_fetch_retains_plan_and_default(monkeypatch) -> None:
         plan="free",
         default_model="anthropic/claude-haiku-4.5",
     )
+
+
+def test_a_model_the_plan_lacks_is_locked_with_the_plan_that_opens_it() -> None:
+    row = catalog._flowly_catalog_row({
+        "id": "anthropic/claude-sonnet-5.5", "name": "Claude Sonnet 5.5", "allowed": False,
+        "required_plan": "pro", "pricing": {"prompt": "0.000002", "completion": "0.00001"},
+    })
+    assert row is not None
+    assert "locked" in row.tags and "plan:pro" in row.tags
+
+
+def test_an_allowed_model_carries_no_lock_and_odd_rows_are_skipped() -> None:
+    row = catalog._flowly_catalog_row({"id": "deepseek/deepseek-v4-flash", "allowed": True, "required_plan": "starter", "pricing": {}})
+    assert row is not None
+    assert "locked" not in row.tags and not any(tag.startswith("plan:") for tag in row.tags)
+    assert catalog._flowly_catalog_row({"id": ""}) is None
+    assert catalog._flowly_catalog_row("nope") is None
+    weird = catalog._flowly_catalog_row({"id": "x/y", "allowed": False, "required_plan": "galaxy"})
+    assert weird is not None and "locked" in weird.tags and not any(tag.startswith("plan:") for tag in weird.tags)
