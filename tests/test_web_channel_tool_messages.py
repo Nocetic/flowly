@@ -435,3 +435,33 @@ async def test_unknown_rpc_method_is_answered_not_dropped(channel) -> None:
     assert reply["sessionId"] == "sess-1"
     assert reply["error"]["code"] == "METHOD_NOT_FOUND"
     assert reply["error"]["retryable"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_message_for_a_chat_whose_reply_runs_joins_that_reply(channel, monkeypatch) -> None:
+    """A chat.send while its conversation's reply runs is guidance for that
+    reply, acknowledged at once, not a turn queued behind it (2026-10-27)."""
+    from flowly.agent import inflight
+    from flowly.channels import feature_rpc
+
+    steered: list[dict] = []
+    monkeypatch.setattr(feature_rpc, "_chat_steering_callback", lambda params: steered.append(params) or {"runId": params["runId"]})
+    monkeypatch.setattr(feature_rpc, "_steering_receipt_lookup", lambda *_: None)
+    published: list = []
+
+    async def publish(message):
+        published.append(message)
+
+    channel.bus.publish_inbound = publish  # type: ignore[method-assign]
+    inflight.begin("web:c1", "run-1", "Write the report")
+    ws = AsyncMock()
+    try:
+        await channel._handle_rpc(ws, {"type": "rpc", "id": "rpc-1", "sessionId": "srv-1", "method": "chat.send",
+                                       "params": {"sessionKey": "web:c1", "message": "Add a summary", "idempotencyKey": "m2"}})
+    finally:
+        inflight.finish("web:c1", "run-1")
+    ack = json.loads(ws.send.await_args.args[0])
+    assert ack["result"] == {"accepted": True, "steered": True, "runId": "run-1", "status": "running", "messageId": "m2"}
+    assert [p["message"] for p in steered] == ["Add a summary"]
+    assert published == [], "never a second turn"
+    assert channel.chat_commands.lookup("web:c1", "m2") is None

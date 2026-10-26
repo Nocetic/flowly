@@ -2323,6 +2323,22 @@ class WebChannel(BaseChannel):
                     "error": {"code": "VOICE_TRANSCRIPT_ONLY", "message": "Resume voice to continue this conversation."},
                 }))
                 return
+            # A message for a conversation whose reply is still running joins
+            # that reply (the agent reads it at its next step) instead of a
+            # turn queued behind it; a resent one gets its first acceptance.
+            from flowly.agent.run_steering import SteeringError
+            try:
+                steered = feature_rpc.steer_running_turn(session_key, params, self.chat_commands.lookup)
+            except SteeringError as exc:
+                await ws.send(json.dumps({
+                    "type": "rpc", "id": rpc_id, "sessionId": session_id,
+                    "error": {"code": exc.code, "message": str(exc)},
+                }))
+                return
+            if steered is not None:
+                self._session_key_to_relay_id[session_key] = session_id
+                await ws.send(json.dumps({"type": "rpc", "id": rpc_id, "sessionId": session_id, "result": steered}))
+                return
             if not params.get("sessionKey"):
                 logger.warning(
                     "[WebChannel] chat.send without sessionKey; using "

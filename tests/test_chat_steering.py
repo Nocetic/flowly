@@ -205,9 +205,17 @@ async def test_real_turn_continues_after_guidance_and_receipt_survives_reload(
         return
     assert len(provider.calls) == (3 if use_tools else 2)
     assert provider.calls[1][-1] == {"role": "user", "content": "Make it shorter"}
+    # What it had said when the guidance came is a step of its own (the
+    # server keeps it as its own row for the apps that read the chat).
+    assert events[0]["role"] == "assistant" and events[0]["content"] == "Once upon a time"
+    assert events[0]["iterationIdx"] == 0
+    # A step boundary: apps close the streamed bubble here, so the rest of the
+    # reply comes after the person's message, not inside the earlier bubble.
+    assert events[0]["tool_calls"] == []
     if use_tools:
         assert result == "A short ending."
-        assert events[0]["content"] == "Looking up."
+        assert events[1]["content"] == "Looking up."
+        assert events[1]["iterationIdx"] == 1
     else:
         assert result == "A short ending."
         assert "".join(chunks) == "Once upon a timeA short ending."
@@ -365,3 +373,118 @@ def test_multiple_guidance_checkpoints_preserve_tool_ownership_and_idempotency()
         one["checkpoint"]["content"] = "tampered"
         assert controller.submit(request(), lambda: {})["checkpoint"]["content"] == "Old"
     inflight.finish("chat", "run")
+
+
+# ── A message sent while its conversation's reply runs (Hakan, 2026-10-27) ──
+
+
+def _wired(monkeypatch, steer, receipt=lambda *_: None):
+    from flowly.channels import feature_rpc
+    monkeypatch.setattr(feature_rpc, "_chat_steering_callback", steer)
+    monkeypatch.setattr(feature_rpc, "_steering_receipt_lookup", receipt)
+    return feature_rpc
+
+
+def test_a_message_keeps_its_own_turn_when_no_reply_runs_or_it_is_not_plain_words(monkeypatch):
+    from flowly.agent import inflight
+
+    calls = []
+    feature_rpc = _wired(monkeypatch, lambda params: calls.append(params) or {"runId": params["runId"]})
+    plain = {"idempotencyKey": "m1", "message": "Make it shorter"}
+    assert feature_rpc.steer_running_turn("web:c", plain) is None, "no reply runs"
+    inflight.begin("web:c", "run-1", "Tell me a story")
+    try:
+        for kept in (
+            {**plain, "origin": "voice"},
+            {**plain, "voiceMode": True},
+            {**plain, "setupAnswer": {"id": "a"}},
+            {**plain, "message": "/compact"},
+            {"idempotencyKey": "m1", "message": "   "},
+            {"message": "no identity"},
+        ):
+            assert feature_rpc.steer_running_turn("web:c", kept) is None, kept
+        assert calls == []
+        ack = feature_rpc.steer_running_turn("web:c", plain)
+        assert ack == {"accepted": True, "steered": True, "runId": "run-1", "status": "running", "messageId": "m1"}
+        assert calls == [{"runId": "run-1", "sessionKey": "web:c", "idempotencyKey": "m1",
+                          "message": "Make it shorter", "attachments": []}]
+    finally:
+        inflight.finish("web:c", "run-1")
+
+
+def test_a_reply_that_is_ending_lets_the_message_take_its_own_turn(monkeypatch):
+    from flowly.agent import inflight
+
+    def refuse(params):
+        raise SteeringError("RUN_NOT_ACTIVE", "ended")
+
+    feature_rpc = _wired(monkeypatch, refuse)
+    inflight.begin("web:c", "run-1", "x")
+    try:
+        assert feature_rpc.steer_running_turn("web:c", {"idempotencyKey": "m1", "message": "hi"}) is None
+    finally:
+        inflight.finish("web:c", "run-1")
+
+
+@pytest.mark.asyncio
+async def test_a_message_sent_during_a_reply_joins_it_and_a_resend_is_never_a_second_turn(tmp_path, monkeypatch):
+    from flowly.agent import inflight
+    from flowly.agent.loop import AgentLoop
+    from flowly.bus.queue import MessageBus
+    from flowly.config.schema import Config
+    from flowly.providers.base import LLMProvider, LLMResponse
+
+    monkeypatch.setenv("FLOWLY_HOME", str(tmp_path / "home"))
+    waiting = asyncio.Event()
+
+    class Provider(LLMProvider):
+        def __init__(self):
+            super().__init__(api_key="test")
+            self.calls = []
+
+        def get_default_model(self):
+            return "test/model"
+
+        async def chat(self, **kwargs):
+            return LLMResponse(content="ok")
+
+        async def chat_stream(self, **kwargs):
+            self.calls.append(kwargs["messages"].copy())
+            if len(self.calls) == 1:
+                yield LLMResponse(content="Once upon a time")
+                waiting.set()
+                await asyncio.Event().wait()
+            else:
+                yield LLMResponse(content="A short ending.", finish_reason="stop")
+
+    provider = Provider()
+    agent = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, main_config=Config(),
+                      max_iterations=3, soft_warn_at_iteration=0)
+    feature_rpc = _wired(monkeypatch, agent.steer_chat, agent.steering_receipt)
+
+    async def chunk(text):
+        pass
+
+    inflight.begin("web:story", "story", "Tell me a story.")
+    task = asyncio.create_task(agent.process_direct(
+        "Tell me a story.", session_key="web:story", run_id="story", stream_callback=chunk,
+        skip_memory=True, skip_context_files=True, tools_allowed=False, return_metadata=True,
+    ))
+    await asyncio.wait_for(waiting.wait(), 5)
+    sent = {"idempotencyKey": "shorter", "message": "Make it shorter"}
+    ack = feature_rpc.steer_running_turn("web:story", sent)
+    assert ack["steered"] is True and ack["runId"] == "story" and ack["status"] == "running"
+    # A lost acknowledgement, sent again while the reply runs: the same acceptance.
+    again = feature_rpc.steer_running_turn("web:story", sent)
+    assert again["replayed"] is True and again["runId"] == "story" and again["status"] == "running"
+    result, _ = await asyncio.wait_for(task, 5)
+    inflight.finish("web:story", "story")
+    assert result == "A short ending."
+    assert len(provider.calls) == 2
+    assert provider.calls[1][-1] == {"role": "user", "content": "Make it shorter"}
+    # Sent again after the reply ended: still its first acceptance, with the reply's
+    # status, so the caller neither runs it again nor waits for a reply.
+    late = feature_rpc.steer_running_turn("web:story", sent, lambda key, run: {"status": "completed"})
+    assert late["replayed"] is True and late["runId"] == "story" and late["status"] == "completed"
+    assert len(provider.calls) == 2
+

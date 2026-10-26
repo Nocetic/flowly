@@ -201,6 +201,11 @@ def project_tool_messages_for_ui(
     return projected_messages
 
 
+# Marks an assistant message that closes the text streamed before it without
+# calling tools (the words said when a person's message joined the reply).
+STEP_BOUNDARY = "_step_boundary"
+
+
 def iteration_event_payload(
     message: Mapping[str, Any],
     *,
@@ -234,7 +239,7 @@ def iteration_event_payload(
     }
     if role == "assistant" and ui_message.get("tool_calls"):
         payload["tool_calls"] = ui_message["tool_calls"]
-    elif role == "assistant" and message.get("tool_calls"):
+    elif role == "assistant" and (message.get("tool_calls") or message.get(STEP_BOUNDARY)):
         payload["tool_calls"] = []
     if role == "tool":
         if ui_message.get("tool_call_id"):
