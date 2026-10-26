@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any, AsyncIterator
 
 import httpx
@@ -69,15 +70,18 @@ def _normalize_base_url(api_base: str | None) -> str:
     return base
 
 
+# OpenRouter and Flowly write a Claude version with a dot ("claude-haiku-5.5");
+# Anthropic's API ids use a dash ("claude-haiku-5-5").
+_DOTTED_CLAUDE_VERSION = re.compile(r"\b(claude-(?:haiku|sonnet|opus|fable)-\d+)\.(\d+)\b")
+
+
 def _strip_known_prefixes(model: str) -> str:
     resolved = model
     for prefix in ("openrouter/anthropic/", "anthropic/"):
         if resolved.startswith(prefix):
             resolved = resolved[len(prefix):]
             break
-    return resolved.replace("claude-haiku-4.5", "claude-haiku-4-5").replace(
-        "claude-sonnet-4.5", "claude-sonnet-4-5"
-    ).replace("claude-opus-4.5", "claude-opus-4-5")
+    return _DOTTED_CLAUDE_VERSION.sub(r"\1-\2", resolved)
 
 
 def _strip_internal_keys(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

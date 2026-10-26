@@ -341,7 +341,9 @@ class AgentDefaults(BaseModel):
     workspace. ``~`` is expanded. Overridden per-call by an explicit
     ``working_dir``, per-session by the gateway, and by the ``FLOWLY_CWD``
     env var. See flowly/runtime_cwd.py for the full resolution order."""
-    model: str = "anthropic/claude-haiku-4.5"
+    # Every new agent's model: in every Flowly plan's list (Free included) and
+    # Flowly's default for paid plans (flowly-app PAID_DEFAULT_MODEL).
+    model: str = "anthropic/claude-haiku-5.5"
     max_tokens: int = 8192
     # Per-request LLM call timeout (seconds). A hung or slow provider call is
     # aborted after this instead of hanging and accumulating token charges.

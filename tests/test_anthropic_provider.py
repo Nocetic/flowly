@@ -356,3 +356,19 @@ async def test_chat_stream_accumulates_text_usage_and_tool_calls(monkeypatch):
     assert final.tool_calls[0].id == "toolu_1"
     assert final.tool_calls[0].name == "get_weather"
     assert final.tool_calls[0].arguments == {"city": "Istanbul"}
+
+
+def test_a_dotted_claude_version_is_sent_with_anthropic_s_dash():
+    """Flowly and OpenRouter write "claude-haiku-5.5"; Anthropic's API id is "claude-haiku-5-5".
+
+    The default model (anthropic/claude-haiku-5.5) reaches a fresh Anthropic
+    key as it is, so its version must be translated, not only 4.5's.
+    """
+    from flowly.providers.anthropic_provider import _strip_known_prefixes
+
+    assert _strip_known_prefixes("anthropic/claude-haiku-5.5") == "claude-haiku-5-5"
+    assert _strip_known_prefixes("openrouter/anthropic/claude-sonnet-5.5") == "claude-sonnet-5-5"
+    assert _strip_known_prefixes("anthropic/claude-haiku-4.5") == "claude-haiku-4-5"
+    assert _strip_known_prefixes("claude-opus-4-5-20251101") == "claude-opus-4-5-20251101"
+    assert _strip_known_prefixes("claude-haiku-4-5") == "claude-haiku-4-5"
+
