@@ -1053,6 +1053,16 @@ def _resize_image_b64(path: Path, mime: str, max_px: int = 768) -> tuple[str, st
         return base64.b64encode(raw).decode(), mime
 
 
+# The language rule, at the very end of every system prompt (build_system_prompt).
+REPLY_LANGUAGE_BLOCK = """## Language
+
+Reply in the language of the user's most recent message, for the whole reply. A
+short greeting already tells you: "Selam" and "Merhaba" are Turkish, "Hola" is
+Spanish. These instructions and the files above are written in English; that
+never decides the language you answer in. When a message has no words to go by
+(an attachment, a number), keep the language of the conversation."""
+
+
 class ContextBuilder:
     """
     Builds the context (system prompt + messages) for the agent.
@@ -1539,8 +1549,8 @@ class ContextBuilder:
                 "## Getting to know the user\n\n"
                 "USER.md isn't filled in yet. You MAY — once, lightly — offer to "
                 "learn a few things about them (their name, what they do, how they "
-                "like you to work) so you can be more useful. Mention that /help "
-                "shows commands.\n"
+                "like you to work) so you can be more useful, in the language "
+                "they write in. Mention that /help shows commands.\n"
                 "- OFFER, don't interrogate. Never block the user's actual request "
                 "on this — if they just want to get to work, or decline, drop it "
                 "immediately and continue normally.\n"
@@ -1818,6 +1828,12 @@ Skills with available="false" need dependencies — try installing with apt/brew
         #   2. The OS line and the WSL/Termux/Docker hints were
         #      duplicated in ``build_platform_block`` at the top of
         #      the prompt. One source of truth.
+
+        # The reply's language, last so it is the freshest rule. Mid-prompt
+        # ("Mirror the user's language", inside the identity paragraph) it
+        # lost to the English instructions around it: a first "Selam" got an
+        # English introduction.
+        parts.append(REPLY_LANGUAGE_BLOCK)
 
         return "\n\n---\n\n".join(parts)
 
