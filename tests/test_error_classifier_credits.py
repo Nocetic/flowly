@@ -68,3 +68,34 @@ class TestCreditsTakesPriority:
         # 402 stop must win so we don't fall through to a retryable bucket.
         msg = "429-ish wording but really: 402 insufficient_credits, service unavailable"
         assert classify_response(_err(msg)) is ErrorCategory.INSUFFICIENT_CREDITS
+
+
+class TestWeeklyLimit:
+    """The proxy's weekly limit (WEEKLY_LIMITS) is a 402 too: a hard stop, said as a weekly limit."""
+
+    WEEKLY = (
+        'Error calling LLM: {"error":{"message":"Weekly usage limit reached. It resets Mon, 02 Nov 2026 '
+        '12:30:00 GMT. Buy extra usage to keep going now.","type":"insufficient_credits","code":"weekly_limit"}}'
+    )
+
+    def test_is_a_hard_stop_like_any_402(self) -> None:
+        from flowly.agent.error_classifier import is_weekly_limit
+
+        response = _err(self.WEEKLY)
+        assert classify_response(response) == ErrorCategory.INSUFFICIENT_CREDITS
+        assert backoff_for(ErrorCategory.INSUFFICIENT_CREDITS, 0) is None
+        assert is_weekly_limit(response) is True
+
+    def test_says_weekly_limit_not_out_of_credits(self) -> None:
+        from flowly.agent.error_classifier import present_provider_error
+
+        presentation = present_provider_error(_err(self.WEEKLY))
+        assert presentation.code == "WEEKLY_LIMIT_REACHED"
+        assert presentation.title == "Weekly usage limit reached"
+        assert presentation.retryable is False
+
+    def test_plain_out_of_credits_is_unchanged(self) -> None:
+        from flowly.agent.error_classifier import present_provider_error
+
+        presentation = present_provider_error(_err('Error calling LLM: {"error":{"type":"insufficient_credits"}}'))
+        assert presentation.code == "INSUFFICIENT_CREDITS"

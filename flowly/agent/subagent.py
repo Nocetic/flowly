@@ -57,7 +57,13 @@ from flowly.agent.subagent_checkpoint import (
     task_index,
     tool_class,
 )
-from flowly.agent.error_classifier import ErrorCategory, backoff_for, classify_response, extract_input_limit_tokens
+from flowly.agent.error_classifier import (
+    ErrorCategory,
+    backoff_for,
+    classify_response,
+    extract_input_limit_tokens,
+    is_weekly_limit,
+)
 from flowly.compaction.pruning import iteration_strip_passes, microcompact_tool_results
 from flowly.compaction.request_guard import (
     ProviderRequestCoordinator,
@@ -2805,6 +2811,11 @@ class SubagentManager:
                             final_result = (
                                 "Error: Authentication failed. "
                                 "Check the provider API key."
+                            )
+                        elif _category == ErrorCategory.INSUFFICIENT_CREDITS and is_weekly_limit(response):
+                            final_result = (
+                                "Error: Weekly usage limit reached. It resets "
+                                "by itself; extra usage keeps going now."
                             )
                         elif _category == ErrorCategory.INSUFFICIENT_CREDITS:
                             final_result = (

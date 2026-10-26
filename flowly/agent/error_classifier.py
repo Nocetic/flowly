@@ -112,6 +112,20 @@ class ProviderErrorPresentation:
         }
 
 
+def is_weekly_limit(response: "LLMResponse") -> bool:
+    """True when an out-of-credits stop is the plan's weekly usage limit.
+
+    The Flowly proxy (WEEKLY_LIMITS) still answers 402 ``insufficient_credits``
+    so every Core stops; ``code: weekly_limit`` says the week is spent, and it
+    resets by itself.
+    """
+    info = getattr(response, "error_info", None)
+    if info is not None and str(info.code or "").strip().lower().replace("-", "_") == "weekly_limit":
+        return True
+    lowered = (response.content or "").lower()
+    return "weekly_limit" in lowered or "weekly usage limit" in lowered
+
+
 def is_insufficient_credits(error_msg: str) -> bool:
     """True when the error is a hard out-of-credits (HTTP 402) stop."""
     lowered = error_msg.lower()
@@ -262,6 +276,14 @@ def present_provider_error(response: "LLMResponse") -> ProviderErrorPresentation
             code="PROVIDER_AUTHENTICATION_FAILED",
             title="Model provider needs attention",
             message="Check the provider connection or API key in Settings, then try again.",
+            retryable=False,
+            category=category,
+        )
+    if category == ErrorCategory.INSUFFICIENT_CREDITS and is_weekly_limit(response):
+        return ProviderErrorPresentation(
+            code="WEEKLY_LIMIT_REACHED",
+            title="Weekly usage limit reached",
+            message="It resets by itself. Extra usage keeps your agent going now.",
             retryable=False,
             category=category,
         )
