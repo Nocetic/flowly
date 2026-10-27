@@ -4952,6 +4952,23 @@ class GatewayServer:
         except Exception:
             logger.exception("[GatewayWS] post-delivery callback failed")
 
+    async def broadcast_reaction(self, session_key: str, emoji: str) -> None:
+        """The agent's reaction on the user's latest message (``react`` tool).
+
+        To the conversation's own clients; a named agent's host is one of them
+        and carries it on to the Flowly server (chat-one-log.md §13).
+        """
+        payload = self._scoped_event({
+            "type": "event",
+            "event": "chat.reaction",
+            "data": {"sessionKey": session_key, "emoji": emoji},
+        })
+        targets = [ws for ws in self._session_targets(session_key, None) if not ws.closed]
+        if targets:
+            await asyncio.gather(*(self._ws_send(ws, payload) for ws in targets))
+            return
+        await self._broadcast_clients(payload)
+
     async def broadcast_goal_updated(
         self,
         session_key: str,

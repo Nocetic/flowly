@@ -1675,6 +1675,23 @@ class WebChannel(BaseChannel):
         # Retiring a prompt matters as much as raising it — queue on a flap.
         await self._send_or_queue(json.dumps(event_msg))
 
+    async def send_reaction_event(self, session_key: str, emoji: str) -> None:
+        """The agent's reaction (``react`` tool) to the conversation's relay session.
+
+        The Flowly server puts it on the user's newest message there and tells
+        the apps (chat-one-log.md §13); the relay passes it on as is.
+        """
+        relay_id = self._relay_id_for(session_key)
+        if not relay_id:
+            return
+        event_msg = {
+            "type": "event",
+            "sessionId": relay_id,
+            "event": "chat.reaction",
+            "data": {"sessionKey": session_key, "emoji": emoji},
+        }
+        await self._send_or_queue(json.dumps(event_msg))
+
     async def send_clarify_event(self, session_key: str, pending) -> None:
         """Push an agent clarify question to the browser/iOS via relay."""
         if not self._ws:

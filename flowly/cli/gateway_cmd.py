@@ -2920,6 +2920,21 @@ Respond to the user now:"""
 
             _clarify_mgr.add_notify_callback(_notify_clarify)
 
+            # The agent's reactions (react tool) reach the chat they belong to:
+            # the Flowly server / relay through the web channel, the local
+            # clients (and a named agent's host) through the gateway.
+            from flowly.agent.reactions import get_reaction_hub
+
+            async def _carry_reaction(session_key: str, emoji: str) -> None:
+                if session_key.startswith("web:"):
+                    web = channels.get_channel("web")
+                    if web and hasattr(web, "send_reaction_event"):
+                        await web.send_reaction_event(session_key, emoji)
+                    return
+                await gateway_server.broadcast_reaction(session_key, emoji)
+
+            get_reaction_hub().add_callback(_carry_reaction)
+
             async def _close_clarify(
                 clarify_id: str, reason: str, session_key: str
             ) -> None:

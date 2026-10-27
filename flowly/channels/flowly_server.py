@@ -66,6 +66,8 @@ _PROFILE_DELIVERY_SESSION = re.compile(r"^srv-p:([A-Za-z0-9._-]{1,64}):([A-Za-z0
 #: Roster and connection events stay on the ``profiles.rpc`` path.
 PROFILE_CHAT_EVENTS = frozenset({
     "chat", "agent", "compaction", "goal.updated", "queue",
+    # The agent's reaction on the person's message (server A8, chat-one-log.md §13).
+    "chat.reaction",
     "exec.approval.requested", "exec.approval.closed",
     "agent.clarify.requested", "agent.clarify.closed",
     "plan.updated", "plan.approval.requested",

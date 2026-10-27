@@ -2821,6 +2821,10 @@ class AgentLoop:
         # back an answer; see flowly.clarify.
         from flowly.agent.tools.clarify import ClarifyTool
         self.tools.register(ClarifyTool())
+        # React tool — one emoji on the user's latest message (chat-one-log.md
+        # §13). Carried by whichever surfaces registered with the reaction hub.
+        from flowly.agent.tools.react import ReactTool
+        self.tools.register(ReactTool())
         from flowly.agent.tools.google_connection import GoogleConnectionTool
         self.tools.register(GoogleConnectionTool())
         from flowly.agent.tools.mcp_connection import MCPConnectionRequestTool
@@ -7356,8 +7360,9 @@ class AgentLoop:
                                 "artifact",
                                 "session_search",
                                 "goal",
+                                "react",
                             )
-                            and ("session_key" not in call_args or _effective_tool_name == "artifact")
+                            and ("session_key" not in call_args or _effective_tool_name in ("artifact", "react"))
                         ):
                             call_args["session_key"] = _current_session_key
 
