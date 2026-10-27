@@ -74,6 +74,9 @@ def history_row(m: dict[str, Any], *, attachments: AttachmentBuilder | None = No
         msg["id"] = m["id"]
     if m.get("steering_run_id"):
         msg["steeringRunId"] = m["steering_run_id"]
+    if m.get("turn_steer") is True:
+        # Sent while its run worked and taken into it (run_steering): no turn of its own.
+        msg["turnSteer"] = True
     for source, target in (
         ("steering_sequence", "steeringSequence"),
         ("steering_source_run_id", "steeringSourceRunId"),

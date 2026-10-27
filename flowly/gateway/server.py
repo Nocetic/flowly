@@ -2735,6 +2735,18 @@ class GatewayServer:
         if isinstance(session_key, str) and session_key.startswith("desktop:voice:"):
             await self._ws_rpc_error(ws, rpc_id, "VOICE_TRANSCRIPT_ONLY", "Resume voice to continue this conversation.")
             return
+        # A message for a conversation whose reply is still running joins that
+        # reply (the agent reads it at its next step) instead of a turn queued
+        # behind it; a resent one gets its first acceptance (web channel too).
+        from flowly.agent.run_steering import SteeringError
+        try:
+            steered = feature_rpc.steer_running_turn(session_key, params, self.chat_commands.lookup)
+        except SteeringError as exc:
+            await self._ws_rpc_error(ws, rpc_id, exc.code, str(exc))
+            return
+        if steered is not None:
+            await self._ws_rpc_reply(ws, rpc_id, steered)
+            return
         idempotency_key = params.get("idempotencyKey") or str(uuid.uuid4())
         run_id = idempotency_key
 
@@ -3621,6 +3633,14 @@ class GatewayServer:
         self, ws: web.WebSocketResponse, rpc_id: str, params: dict
     ) -> None:
         from flowly.session.commands import validate_command_control
+        # Stop with no run named stops whatever runs in the conversation.
+        target = feature_rpc.abort_target(params)
+        if target is None:
+            await self._ws_rpc_reply(ws, rpc_id, {"ok": True, "cancelled": False, "hadActiveRun": False})
+            return
+        # A Stop that named no run is told which one it stopped.
+        found = {} if target is params else {"runId": target["runId"]}
+        params = target
         try:
             validate_command_control(self.chat_commands, params)
         except ValueError as exc:
@@ -3631,7 +3651,8 @@ class GatewayServer:
 
         with run_control_guard(self.chat_commands, params, sessions_dir=self.sessions.sessions_dir if self.sessions else None):
             cancelled = self._abort_chat_run(run_id)
-        await self._ws_rpc_reply(ws, rpc_id, {"ok": True, "cancelled": cancelled})
+        await self._ws_rpc_reply(ws, rpc_id, {"ok": True, "cancelled": cancelled,
+                                              **({"hadActiveRun": cancelled, **found} if found else {})})
 
     def _abort_chat_run(self, run_id: str) -> bool:
         """Synchronous mutation while the actual session owner is locked."""

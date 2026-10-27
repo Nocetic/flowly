@@ -212,13 +212,28 @@ def iteration_event_payload(
 
     ``{runId, iterationIdx, role, content, tool_calls?, tool_call_id?, name?,
     tool_activity?}`` — the shape the relay writes to ``tool_turns/`` and every
-    client maps to its tool panel. None for what is not shown: the agent's own
+    client maps to its tool panel; ``{role: "user", turnSteer, messageId}`` for
+    a message the run took in while it worked. None for what is not shown: the agent's own
     bookkeeping (an internal call and its result) and any role but
     ``assistant`` / ``tool``. An assistant step whose calls were all hidden
     still carries ``tool_calls: []``: it is a step boundary for the text
     streamed before it. Shared by the main loop and a subagent's live turn
     (flowly.agent.subagent_stream), so both send the same steps.
     """
+    if message.get("role") == "user":
+        # A message the user sent while the run worked, the moment the agent
+        # reads it (run_steering; Grok's turn_steer): clients bind its bubble
+        # to this run. Any other user row is no step.
+        if message.get("turn_steer") is not True or not message.get("id"):
+            return None
+        return {
+            "runId": run_id,
+            "iterationIdx": iteration_idx,
+            "role": "user",
+            "content": message.get("content") if isinstance(message.get("content"), str) else "",
+            "turnSteer": True,
+            "messageId": message["id"],
+        }
     projected = project_tool_messages_for_ui([message], internal_call_ids=internal_call_ids)
     if not projected:
         return None

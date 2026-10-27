@@ -100,3 +100,25 @@ async def test_a_piece_that_was_not_recorded_goes_without_seq(tmp_path, monkeypa
         "iteration_event": {"runId": "r1", "iterationIdx": 0, "role": "assistant", "content": "", "tool_calls": []},
     }))
     assert "seq" not in sent[0]["data"]
+
+
+@pytest.mark.asyncio
+async def test_a_message_the_run_took_in_reaches_the_server_as_joined(tmp_path, monkeypatch):
+    # run_steering: every client binds the message to the running reply.
+    monkeypatch.setenv("FLOWLY_HOME", str(tmp_path / "home"))
+    channel = WebChannel(config=WebChannelConfig(enabled=True), bus=MessageBus())
+    sent: list[dict] = []
+
+    async def capture(payload: str) -> None:
+        sent.append(json.loads(payload))
+
+    channel._send_or_queue = capture  # type: ignore[method-assign]
+    await channel.send(OutboundMessage(channel="web", chat_id="relay-1", content="", metadata={
+        "session_key": "web:c",
+        "iteration_event": {"runId": "r1", "iterationIdx": 2, "role": "user", "content": "stop",
+                            "turnSteer": True, "messageId": "m2"},
+    }))
+    assert sent[0]["data"] | {"source": None} == {
+        "state": "iteration_step", "runId": "r1", "sessionKey": "web:c", "source": None, "iterationIdx": 2,
+        "role": "user", "content": "stop", "turnSteer": True, "messageId": "m2",
+    }

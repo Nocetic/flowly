@@ -104,8 +104,16 @@ from flowly.agent.prompt_blocks import (
 from flowly.render_capabilities import normalize_render_capabilities
 from flowly.agent.reply_media import extract_reply_media, extract_reply_media_assets, publish_reply_file
 from flowly.media.assets import ASSETS_META_KEY, assets_to_meta
-from flowly.agent.run_abort import RunAbortedError, RunAbortController
-from flowly.agent.run_steering import ProviderSteeredError, RunSteeringController, SteeringError
+from flowly.agent.run_abort import RunAbortedError, RunAbortController, RunPreemptedError
+from flowly.agent.run_steering import (
+    ProviderSteeredError,
+    RunSteeringController,
+    NON_PREEMPTIBLE_TOOLS,
+    STEERING_INTERRUPTED_RESULT,
+    STEERING_SKIPPED_RESULT,
+    SteeringError,
+    steered_message_text,
+)
 from flowly.agent.delegation import (
     DelegationTurn,
     conversation_from_history,
@@ -4594,6 +4602,12 @@ class AgentLoop:
 
         return controller.submit(params, prepare, stopped=self.is_run_aborted(run_id))
 
+    def steering_receipt(self, session_key: str, message_id: str) -> dict | None:
+        """The receipt of guidance already accepted under ``message_id``, or None."""
+        receipts = self.sessions.get_or_create(session_key).metadata.get("steering_receipts", {})
+        receipt = receipts.get(message_id) if isinstance(receipts, dict) else None
+        return dict(receipt) if isinstance(receipt, dict) else None
+
     def is_run_aborted(self, run_id: str) -> bool:
         """Test whether a run_id has been marked aborted."""
         return self._run_aborts.is_requested(run_id)
@@ -5286,6 +5300,7 @@ class AgentLoop:
             name, args = call.name, dict(call.arguments)
             task = asyncio.create_task(self._run_aborts.run_cancellable(
                 outbound_run_id, lambda: self.tools.execute(name, args, **kwargs),
+                preemptible=name not in NON_PREEMPTIBLE_TOOLS,
             ))
             # A read the loop never awaits (the turn stopped or failed) must
             # not surface as an unretrieved task error.
@@ -6339,15 +6354,25 @@ class AgentLoop:
                 break
             iteration += 1
             for guidance in steering.take(outbound_run_id):
-                checkpoint = guidance.pop("_steering_checkpoint", None)
-                if checkpoint:
-                    _record_turn_message(checkpoint)
                 # Durable text/media stays distinct from the provider's image
-                # blocks and extracted document content.
+                # blocks and extracted document content. Only the provider
+                # learns the message came while it worked (Grok's turn_steer);
+                # history and every client keep the user's own words.
                 provider_message = {"role": "user", "content": self.context._build_user_content(
-                    guidance["content"], guidance.get("media"))}
+                    steered_message_text(guidance["content"]), guidance.get("media"))}
                 messages.append(provider_message)
                 _record_turn_message(guidance)
+                # The moment the agent reads it: every client binds the bubble
+                # to this run, so it never waits for a reply of its own.
+                await emit_iteration(
+                    outbound_channel=outbound_channel,
+                    outbound_chat_id=outbound_chat_id,
+                    outbound_run_id=outbound_run_id,
+                    iteration_idx=_iteration_event_idx,
+                    message=guidance,
+                    on_iteration=on_iteration,
+                )
+                _iteration_event_idx += 1
                 turn_content = guidance["content"] or turn_content
                 continuity_state.clear()
                 if provider_state_out is not None:
@@ -6672,8 +6697,8 @@ class AgentLoop:
             # tags the OutboundMessage with ``aborted: true`` so
             # the UI can render the [Aborted] marker.
             if outbound_run_id and self.is_run_aborted(outbound_run_id):
-                # Accepted guidance already sealed this partial as a checkpoint.
-                # Stop before the next call must not duplicate it as the final.
+                # A message the user sent dropped this partial; Stop before the
+                # next call must not bring it back as the final.
                 final_content = "" if steering.has_pending(outbound_run_id) else response.content or ""
                 logger.info(
                     f"[loop] aborted at iteration {iteration}, "
@@ -6728,8 +6753,8 @@ class AgentLoop:
                 )
 
             if outbound_run_id and self.is_run_aborted(outbound_run_id):
-                # Accepted guidance already sealed this partial as a checkpoint.
-                # Stop before the next call must not duplicate it as the final.
+                # A message the user sent dropped this partial; Stop before the
+                # next call must not bring it back as the final.
                 final_content = "" if steering.has_pending(outbound_run_id) else response.content or ""
                 break
 
@@ -6737,11 +6762,8 @@ class AgentLoop:
                 await progress.settle("stopped")
                 if response.usage:
                     _merge_turn_usage(total_usage, response.usage)
-                if response.content:
-                    # This partial has its own durable checkpoint before the
-                    # guidance. Keep it once in provider context, never glue
-                    # it back onto the next assistant reply.
-                    messages.append({"role": "assistant", "content": response.content})
+                # What it had half written is dropped (run_steering): the agent
+                # writes again with the message in mind.
                 # A partial tool call is never executable. Continue the same
                 # run with the guidance at the next provider boundary.
                 iteration -= 1
@@ -6962,6 +6984,26 @@ class AgentLoop:
                     # N+1 after the user has stopped the run.
                     if outbound_run_id and self.is_run_aborted(outbound_run_id):
                         break
+                    # A message the user sent while the agent works: nothing
+                    # else in this batch runs before the agent has read it.
+                    if steering.has_pending(outbound_run_id):
+                        accumulated_tool_results.append({
+                            "tool": tool_call.name, "success": False, "skipped": True,
+                            "result": STEERING_SKIPPED_RESULT,
+                        })
+                        messages = _add_tool_turn_message(
+                            messages, tool_call.id, tool_call.name, STEERING_SKIPPED_RESULT
+                        )
+                        await emit_iteration(
+                            outbound_channel=outbound_channel,
+                            outbound_chat_id=outbound_chat_id,
+                            outbound_run_id=outbound_run_id,
+                            iteration_idx=_iteration_event_idx,
+                            message=messages[-1],
+                            on_iteration=on_iteration,
+                        )
+                        _iteration_event_idx += 1
+                        continue
                     _protocol_tool_name = tool_call.name
                     _effective_tool_name = _protocol_tool_name
                     call_args = dict(tool_call.arguments)
@@ -7340,6 +7382,7 @@ class AgentLoop:
                                     call_args,
                                     **_execute_kwargs,
                                 ),
+                                preemptible=_effective_tool_name not in NON_PREEMPTIBLE_TOOLS,
                             )
                         # Reply-media envelope: a tool (image_generate, screenshot)
                         # produced file(s) for THIS turn's reply. Peel the paths onto
@@ -7378,6 +7421,19 @@ class AgentLoop:
                             "result": _tool_result[:500] if len(_tool_result) > 500 else _tool_result,
                         })
                         result = _tool_result
+                    except RunPreemptedError:
+                        result = STEERING_INTERRUPTED_RESULT
+                        _tool_result = result
+                        _tool_success = False
+                        logger.info(
+                            f"Tool cut by a new message: {_effective_tool_name} run_id={outbound_run_id}"
+                        )
+                        accumulated_tool_results.append({
+                            "tool": _effective_tool_name,
+                            "success": False,
+                            "interrupted": True,
+                            "result": result,
+                        })
                     except RunAbortedError:
                         result = "Stopped by user."
                         _tool_result = result
@@ -9022,7 +9078,10 @@ class AgentLoop:
         # Firestore, so this is effectively the gateway's equivalent.)
         if not introduction_turn:
             self._set_provisional_title(session, display_content)
-        user_extras = _turn_user_extras(msg.metadata)
+        # The user row keeps the time the message came, not the time the turn
+        # was saved: a message sent while the turn ran (run_steering) is
+        # written at its own time and must sort after this one.
+        user_extras = {"timestamp": msg.timestamp.isoformat(), **_turn_user_extras(msg.metadata)}
         try:
             _pending_user: dict[str, Any] = {"role": "user", "content": display_content, **user_extras}
             if msg.media:
@@ -9595,7 +9654,9 @@ class AgentLoop:
         )
         self._bind_subagent_turn(msg, msg.session_key, delegation_turn)
         with tool_execution_scope(msg.session_key, allowed_tools=allowed_tools if tools_allowed else frozenset()), self._steering().register(
-            msg.metadata.get("run_id") or "", msg.session_key, persist_guidance
+            msg.metadata.get("run_id") or "", msg.session_key, persist_guidance,
+            # A message the user sends now cuts the running tool (a send or a write finishes).
+            lambda run_id=msg.metadata.get("run_id") or "": self._run_aborts.preempt(run_id),
         ), delegation_turn_scope(delegation_turn):
             final_content, tool_results, _executed_tools, usage, _loop_messages = await self._run_llm_tool_loop(
                 messages=messages,

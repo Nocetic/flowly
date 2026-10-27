@@ -668,6 +668,7 @@ class Session:
                     "name", "id", "steering_run_id", "media", "timestamp",
                     "run_id", "aborted", "steering_source_run_id", "steering_message_id", "steering_iteration_idx",
                     "steering_previous_iteration_idx", "steering_tool_call_ids", "steering_sequence",
+                    "turn_steer",
                     PROVIDER_REPLAY_KEY,
                     *carry_keys,
                 )

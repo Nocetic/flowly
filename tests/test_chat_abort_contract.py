@@ -225,6 +225,30 @@ async def test_gateway_abort_uses_cooperative_callback_without_cancelling_turn()
 
 
 @pytest.mark.asyncio
+async def test_stop_with_no_run_named_stops_what_runs_in_the_conversation() -> None:
+    # Grok's interruptAgentRun: the app never guesses the run (2026-10-27,
+    # Stop aimed at a run that never existed and did nothing).
+    server = object.__new__(GatewayServer)
+    observed: list[str] = []
+    server.on_chat_abort = lambda run_id: observed.append(run_id) or True
+    server.sessions = None
+    server._ws_rpc_reply = AsyncMock()
+    ws = object()
+    await server._ws_rpc_chat_abort(ws, "rpc-1", {"sessionKey": "web:c"})
+    assert observed == []
+    server._ws_rpc_reply.assert_awaited_once_with(ws, "rpc-1", {"ok": True, "cancelled": False, "hadActiveRun": False})
+    inflight.begin("web:c", "run-live", "Delete the old files")
+    try:
+        server._ws_rpc_reply = AsyncMock()
+        await server._ws_rpc_chat_abort(ws, "rpc-2", {"sessionKey": "web:c"})
+        assert observed == ["run-live"]
+        server._ws_rpc_reply.assert_awaited_once_with(
+            ws, "rpc-2", {"ok": True, "cancelled": True, "hadActiveRun": True, "runId": "run-live"})
+    finally:
+        inflight.finish("web:c", "run-live")
+
+
+@pytest.mark.asyncio
 async def test_gateway_emits_one_aborted_final_with_partial_and_duration() -> None:
     server = object.__new__(GatewayServer)
     server._session_ws = {}

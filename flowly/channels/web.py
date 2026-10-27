@@ -1186,6 +1186,12 @@ class WebChannel(BaseChannel):
                         if isinstance(iter_event.get("turnOrigin"), str)
                         else {}
                     ),
+                    # A message the run took in while it worked (run_steering).
+                    **(
+                        {"turnSteer": True, "messageId": iter_event["messageId"]}
+                        if iter_event.get("turnSteer") is True and isinstance(iter_event.get("messageId"), str)
+                        else {}
+                    ),
                     # The step's place in its run (agent/inflight.py), so a client never shows it twice.
                     **(
                         {"seq": iter_event["seq"]}
@@ -2323,6 +2329,22 @@ class WebChannel(BaseChannel):
                     "error": {"code": "VOICE_TRANSCRIPT_ONLY", "message": "Resume voice to continue this conversation."},
                 }))
                 return
+            # A message for a conversation whose reply is still running joins
+            # that reply (the agent reads it at its next step) instead of a
+            # turn queued behind it; a resent one gets its first acceptance.
+            from flowly.agent.run_steering import SteeringError
+            try:
+                steered = feature_rpc.steer_running_turn(session_key, params, self.chat_commands.lookup)
+            except SteeringError as exc:
+                await ws.send(json.dumps({
+                    "type": "rpc", "id": rpc_id, "sessionId": session_id,
+                    "error": {"code": exc.code, "message": str(exc)},
+                }))
+                return
+            if steered is not None:
+                self._session_key_to_relay_id[session_key] = session_id
+                await ws.send(json.dumps({"type": "rpc", "id": rpc_id, "sessionId": session_id, "result": steered}))
+                return
             if not params.get("sessionKey"):
                 logger.warning(
                     "[WebChannel] chat.send without sessionKey; using "
@@ -2492,6 +2514,14 @@ class WebChannel(BaseChannel):
 
         elif method == "chat.abort":
             from flowly.session.commands import validate_command_control
+            target = feature_rpc.abort_target(params)
+            if target is None:
+                await ws.send(json.dumps({'type': 'rpc', 'id': rpc_id, 'sessionId': session_id,
+                                          'result': {'ok': True, 'cancelled': False, 'hadActiveRun': False}}))
+                return
+            # A Stop that named no run is told which one it stopped.
+            found = {} if target is params else {"runId": target["runId"]}
+            params = target
             try:
                 validate_command_control(self.chat_commands, params)
             except ValueError as exc:
@@ -2553,7 +2583,8 @@ class WebChannel(BaseChannel):
                 "type": "rpc",
                 "id": rpc_id,
                 "sessionId": session_id,
-                "result": {"ok": True, "cancelled": cancelled},
+                "result": {"ok": True, "cancelled": cancelled,
+                           **({"hadActiveRun": cancelled, **found} if found else {})},
             }
             await ws.send(json.dumps(ack))
             if legacy_cancelled:
