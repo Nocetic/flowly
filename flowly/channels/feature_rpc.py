@@ -5567,6 +5567,7 @@ def system_capabilities() -> dict:
     method itself, so its mere presence already signals a capable bot.
     """
     from flowly import __version__
+    from flowly.agent.turn_notes import CHAT_NOTES_VERSION
     from flowly.objectives import events as objective_events
     from flowly.runtime_capabilities import resolve_runtime_capabilities
 
@@ -5588,6 +5589,10 @@ def system_capabilities() -> dict:
         "version": __version__,
         "featureMethods": sorted(methods),
         "chatSteeringVersion": 2 if _chat_steering_callback is not None else 0,
+        # 1: ``chat.send`` takes ``notes``, what the app adds for the agent
+        # apart from the person's words (flowly/agent/turn_notes.py). The
+        # Flowly server folds them into the message for a Core without it.
+        "chatNotesVersion": CHAT_NOTES_VERSION,
         # 2: ``sessions.list`` pages by cursor (``limit``/``before`` → ``next``).
         # Clients send ``limit`` only to a bot that says so: an old gateway
         # cut its list at ``limit`` and returned no way to the rest.

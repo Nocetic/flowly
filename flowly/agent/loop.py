@@ -9017,6 +9017,13 @@ class AgentLoop:
             except Exception as exc:  # noqa: BLE001 — a call never fails a turn
                 logger.warning("[voice] call context skipped for this turn: {}", type(exc).__name__)
         introduction_turn = is_introduction_turn(msg.session_key, msg.metadata)
+        # The app's notes for this turn (flowly/agent/turn_notes.py): read by
+        # the model, never stored or shown as the person's words. A turn of
+        # notes only is app-authored, like the introduction: its row is hidden.
+        from flowly.agent.turn_notes import is_notes_only, model_prompt
+        notes_prompt = model_prompt(msg.metadata)
+        notes_only_turn = bool(notes_prompt) and is_notes_only(msg.metadata)
+        hidden_user_turn = introduction_turn or notes_only_turn
         display_content = str(msg.metadata.get("_display_content") or msg.content)
         tool_policy = resolve_turn_tool_policy(msg.metadata, display_content)
         tools_allowed = tool_policy.allowed
@@ -9081,17 +9088,18 @@ class AgentLoop:
         # lands after the turn. Marked provisional so the post-turn auto-title
         # still overrides it. (Relay already seeds its own first-message title on
         # Firestore, so this is effectively the gateway's equivalent.)
-        if not introduction_turn:
+        if not hidden_user_turn:
             self._set_provisional_title(session, display_content)
         # The user row keeps the time the message came, not the time the turn
         # was saved: a message sent while the turn ran (run_steering) is
         # written at its own time and must sort after this one.
         user_extras = {"timestamp": msg.timestamp.isoformat(), **_turn_user_extras(msg.metadata)}
         try:
-            _pending_user: dict[str, Any] = {"role": "user", "content": display_content, **user_extras}
+            _pending_user: dict[str, Any] = {
+                "role": "user", "content": notes_prompt if notes_only_turn else display_content, **user_extras}
             if msg.media:
                 _pending_user["media"] = list(msg.media)
-            if msg.metadata.get(_GOAL_CONTINUATION_ID) or introduction_turn:
+            if msg.metadata.get(_GOAL_CONTINUATION_ID) or hidden_user_turn:
                 # The introduction's trigger is app-authored: it stays in the
                 # model context but is never shown as something the owner said.
                 _pending_user["_display_hidden"] = True
@@ -9308,11 +9316,12 @@ class AgentLoop:
                 coverage_sidecar,
                 tool_policy_sidecar,
                 profile_collaboration_sidecar,
+                notes_prompt,
             )
             if block
         ]
         covered_current_message = "\n\n".join(
-            [*request_sidecars, msg.content]
+            [*request_sidecars, *([msg.content] if msg.content or not request_sidecars else [])]
         )
         llm_current_message = (
             f"{group_context_block}\n---\n{covered_current_message}"
@@ -9737,7 +9746,9 @@ class AgentLoop:
             session.extend_with_turn_messages(
                 goal_cards=goal_cards or None,
                 user_extras=user_extras or None,
-                user_content=display_content,
+                # A turn of notes only keeps them as its (hidden) prompt, so the
+                # agent's later turns still see why it answered.
+                user_content=notes_prompt if notes_only_turn else display_content,
                 new_messages=turn_messages,
                 final_content=final_content,
                 usage=usage if not provider_error and not turn_aborted else None,
@@ -9754,7 +9765,7 @@ class AgentLoop:
                 # way). Hiding it produced replies with no visible cause. The
                 # introduction's trigger is different: the owner did not ask
                 # anything, the agent speaks first.
-                user_display_hidden=introduction_turn,
+                user_display_hidden=hidden_user_turn,
                 # Provider failures are terminal, but they are not successful
                 # assistant completions. Keep their visible error text in history
                 # without advancing the cross-client unread identity.
@@ -9782,7 +9793,7 @@ class AgentLoop:
         # Auto-title the session from the first exchange so every
         # client — CLI, desktop, iOS — shows the SAME descriptive name instead
         # of a random session-key suffix. Fire-and-forget; never blocks.
-        if not introduction_turn:
+        if not hidden_user_turn:
             self._maybe_autotitle_session(session, display_content, final_content)
 
         # Trajectory export (opt-in via config)

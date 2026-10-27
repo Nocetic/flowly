@@ -2330,6 +2330,20 @@ class WebChannel(BaseChannel):
                 await ws.send(json.dumps({'type': 'rpc', 'id': rpc_id, 'sessionId': session_id, 'error': queue_error}))
                 return
             message_text = params.get("message", "")
+            # What the app adds for the agent, apart from the person's words
+            # (flowly/agent/turn_notes.py): refused whole when malformed.
+            from flowly.agent import turn_notes
+            try:
+                notes_metadata = turn_notes.inbound_metadata(
+                    params, message_text if isinstance(message_text, str) else "",
+                    bool(params.get("attachments")))
+            except ValueError as exc:
+                await ws.send(json.dumps({
+                    "type": "rpc", "id": rpc_id, "sessionId": session_id,
+                    "error": {"code": "INVALID_REQUEST", "message": str(exc)},
+                }))
+                return
+            notes_only = turn_notes.is_notes_only(notes_metadata)
             # A stable sessionKey (the chat document id, not the
             # short-lived WebSocket session_id) is what keeps the same
             # conversation's history together across reconnects,
@@ -2351,7 +2365,9 @@ class WebChannel(BaseChannel):
             # turn queued behind it; a resent one gets its first acceptance.
             from flowly.agent.run_steering import SteeringError
             try:
-                steered = feature_rpc.steer_running_turn(session_key, params, self.chat_commands.lookup)
+                # A message with notes keeps its own turn: steering passes on only the words.
+                steered = (None if notes_metadata else
+                           feature_rpc.steer_running_turn(session_key, params, self.chat_commands.lookup))
             except SteeringError as exc:
                 await ws.send(json.dumps({
                     "type": "rpc", "id": rpc_id, "sessionId": session_id,
@@ -2480,7 +2496,8 @@ class WebChannel(BaseChannel):
             from flowly.agent import inflight
 
             if getattr(self, 'supports_turn_start', False) is not True:
-                inflight.begin(session_key, run_id, message_text)
+                # A turn of notes only has no words of the person's to restore.
+                inflight.begin(session_key, run_id, "" if notes_only else message_text)
 
             # ONE streaming implementation, shared with autonomous goal turns
             # (see ``_make_stream_callback``). Two copies drifted before: the
@@ -2505,8 +2522,9 @@ class WebChannel(BaseChannel):
                     media,
                     voice_mode,
                     render_capabilities,
-                    # loop.TURN_USER_EXTRAS; an ordinary message keeps the call's old shape.
-                    **({"extra_metadata": {"_user_extras": user_extras}} if user_extras else {}),
+                    # loop.TURN_USER_EXTRAS and the turn's notes; an ordinary message keeps the call's old shape.
+                    **({"extra_metadata": {**({"_user_extras": user_extras} if user_extras else {}), **notes_metadata}}
+                       if user_extras or notes_metadata else {}),
                 )
             )
             self._track_chat_publish(task, session_key, run_id)
@@ -3227,9 +3245,13 @@ class WebChannel(BaseChannel):
         if getattr(self, 'supports_turn_start', False) is True:
             from flowly.agent import inflight
 
+            from flowly.agent.turn_notes import is_notes_only
+
+            hidden_prompt = report_turn or is_notes_only(metadata)
+
             async def on_turn_started(text: str) -> None:
                 self.chat_commands.settle(session_key, run_id, 'running')
-                inflight.begin(session_key, run_id, "" if report_turn else text,
+                inflight.begin(session_key, run_id, "" if hidden_prompt else text,
                                goal_run=bool(metadata.get('goal_run')),
                                turn_origin=turn_fields.get("turnOrigin"))
                 if report_turn:

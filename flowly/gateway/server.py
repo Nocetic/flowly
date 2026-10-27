@@ -2726,7 +2726,16 @@ class GatewayServer:
             return
         message = params.get("message", "")
         attachments = params.get("attachments") or []
-        if not message and not attachments:
+        # What the app adds that the person did not say (turn_notes): read by
+        # the model, never kept as their words. Notes alone make a turn too.
+        from flowly.agent.turn_notes import inbound_metadata as notes_inbound_metadata
+        try:
+            notes_metadata = notes_inbound_metadata(
+                params, message if isinstance(message, str) else "", bool(attachments))
+        except ValueError as exc:
+            await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", str(exc))
+            return
+        if not message and not attachments and not notes_metadata:
             await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "Empty message")
             return
         message = append_browser_annotation_context(message, attachments)
@@ -2739,8 +2748,10 @@ class GatewayServer:
         # reply (the agent reads it at its next step) instead of a turn queued
         # behind it; a resent one gets its first acceptance (web channel too).
         from flowly.agent.run_steering import SteeringError
+        # A message with notes keeps its own turn: joining would pass on only its words.
         try:
-            steered = feature_rpc.steer_running_turn(session_key, params, self.chat_commands.lookup)
+            steered = (None if notes_metadata
+                       else feature_rpc.steer_running_turn(session_key, params, self.chat_commands.lookup))
         except SteeringError as exc:
             await self._ws_rpc_error(ws, rpc_id, exc.code, str(exc))
             return
@@ -2897,6 +2908,7 @@ class GatewayServer:
             await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "turnOrigin is invalid")
             return
         collaboration_metadata["turn_origin"] = turn_origin
+        collaboration_metadata.update(notes_metadata)
 
         # A request a voice call made (chat-wire-protocol §7.5), marked on the user row.
         if params.get("origin") is not None:
@@ -3299,8 +3311,12 @@ class GatewayServer:
 
         # A subagent's report is the agent's own turn: its notice is hidden,
         # every event says whose run it is, and it opens with run_started.
+        from flowly.agent.turn_notes import is_notes_only
+
         report_turn = bool((extra_metadata or {}).get(REPORT_TURN))
-        hidden_prompt = bool((extra_metadata or {}).get(AGENT_INTRODUCTION)) or report_turn
+        # A turn of the app's notes alone is the app's prompt, like an introduction.
+        hidden_prompt = (bool((extra_metadata or {}).get(AGENT_INTRODUCTION)) or report_turn
+                         or is_notes_only(extra_metadata or {}))
         turn_fields = report_turn_fields(session_key) if report_turn else {}
 
         async def on_turn_started(text: str) -> None:

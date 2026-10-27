@@ -546,7 +546,19 @@ def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]
                 "INVALID_PARAMS",
                 "A bot message can contain up to 32,000 characters.",
             )
-        if not message and not attachments:
+        notes: list[str] = []
+        if method == "chat.send":
+            # The Flowly server's notes for the turn (turn_notes): a reaction
+            # that asks the agent to answer comes with notes and no words.
+            from flowly.agent.turn_notes import turn_notes
+
+            try:
+                notes = turn_notes(value)
+            except ValueError as exc:
+                raise ProfileHostError("INVALID_PARAMS", str(exc)) from None
+            if "notes" in value:
+                value["notes"] = notes
+        if not message and not attachments and not notes:
             raise ProfileHostError("INVALID_PARAMS", "A bot message cannot be empty.")
         if value.get("setupAnswer") is not None:
             from flowly.agent_home import AgentHomeError, validate_setup_answer

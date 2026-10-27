@@ -123,9 +123,11 @@ def test_goal_prompts_are_persisted_visibly():
     import inspect
 
     source = inspect.getsource(inspect.getmodule(AgentLoop))
-    # Only a named agent's app-authored introduction trigger is hidden; the
-    # flag is derived from that marker alone, never from a goal marker.
-    assert "user_display_hidden=introduction_turn," in source
+    # Only app-authored prompts are hidden (a named agent's introduction, a
+    # turn of the app's notes alone); the flag is derived from those markers
+    # alone, never from a goal marker.
+    assert "user_display_hidden=hidden_user_turn," in source
+    assert "hidden_user_turn = introduction_turn or notes_only_turn" in source
     assert "introduction_turn = is_introduction_turn(msg.session_key, msg.metadata)" in source
     assert "user_display_hidden=bool(msg.metadata.get(_GOAL_CONTINUATION_ID))" not in source
 
