@@ -56,12 +56,16 @@ def turn_notes(params: dict[str, Any]) -> list[str]:
 
 
 def notes_block(notes: list[str]) -> str:
-    """What the model reads of the notes: from the app, unseen by the person."""
+    """What the model reads of the notes: what the person did in the app, as
+    the app reports it. Their own actions, not their words, and unseen by them.
+
+    "From the app, not from the user" read as "not the user's": Tsuki took a
+    reaction for a system note someone else wrote (2026-10-28)."""
     lines = "\n".join(f"- {note}" for note in notes)
     return (
         "<app_notes>\n"
-        "From the Flowly app, not from the user; the user does not see these notes. "
-        "Never quote or repeat them.\n"
+        "What the user just did in the Flowly app, as the app reports it. These are the user's own "
+        "actions, not words they typed, and they do not see this block. Never quote or repeat it.\n"
         f"{lines}\n"
         "</app_notes>"
     )

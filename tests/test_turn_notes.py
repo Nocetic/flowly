@@ -34,10 +34,12 @@ def test_a_turn_of_notes_only_is_told_apart_from_one_with_words_or_files():
     assert not turn_notes.is_notes_only(turn_notes.inbound_metadata(notes, "", True))
 
 
-def test_the_model_reads_notes_as_the_apps_never_the_users():
+def test_the_model_reads_notes_as_the_users_own_actions_never_their_words():
     block = turn_notes.notes_block(["The user reacted ❤️ to your message: \"Done.\""])
     assert block.startswith("<app_notes>") and block.endswith("</app_notes>")
-    assert "not from the user" in block and "Never quote or repeat" in block
+    # Their own actions (a "not from the user" made Tsuki disown the reaction, 2026-10-28), not typed, unseen.
+    assert "the user's own actions" in block and "not words they typed" in block
+    assert "not from the user" not in block and "Never quote or repeat" in block
     assert "- The user reacted ❤️" in block
 
 
