@@ -222,11 +222,11 @@ def _inline_setup_field(field: Field, value: object) -> InlineSetupField:
 # (codex_approval, codex_sandbox)).
 # codex approval values are the FLOWLY policy names (on-request / never /
 # auto-review / granular) — codex.policy.set maps them to codex's own
-# approval vocabulary. auto-review → codex on-request answered by its
-# auto_review reviewer; never → run unattended.
+# approval vocabulary. on-request → codex asks the user; auto-review → codex
+# on-request answered by its auto_review reviewer; never → run unattended.
 _PERMISSION_LEVELS: tuple[tuple[str, str, tuple[str, str] | None, tuple[str, str] | None], ...] = (
-    ("ask",  "🔒 Ask",  ("full", "always"),       ("auto-review", "workspace-write")),
-    ("auto", "⚖️ Auto", ("allowlist", "on-miss"), ("on-request",  "workspace-write")),
+    ("ask",  "🔒 Ask",  ("full", "always"),       ("on-request",  "workspace-write")),
+    ("auto", "⚖️ Auto", ("allowlist", "on-miss"), ("auto-review", "workspace-write")),
     ("yolo", "🚀 YOLO", ("full", "off"),          ("never",       "full-access")),
     # Plan mode — a standing mode like the levels above but orthogonal to the
     # exec policy: every task is planned and approved BEFORE any side effect

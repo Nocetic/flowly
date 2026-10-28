@@ -114,7 +114,7 @@ async def test_cycle_applies_next_level_and_updates_badge():
 
     assert app._client.calls == [
         ("exec", "allowlist", "on-miss"),
-        ("codex", "on-request", "workspace-write"),
+        ("codex", "auto-review", "workspace-write"),
     ]
     # The indicator lives on the status bar, NOT in the transcript.
     assert app._status.permission == "auto"
@@ -253,3 +253,14 @@ async def test_sync_skips_while_a_manual_cycle_is_applying():
     app._perm_cycling = True
     await FlowlyTUI._sync_permission_badge(app)
     assert app._status.permission == "ask"  # poll skipped, no clobber
+
+
+def test_ask_leaves_codex_approvals_to_the_user_and_auto_to_its_reviewer():
+    # "auto-review" means Codex's own reviewer answers its approval prompts,
+    # so it belongs to Auto. Ask must leave every prompt to the user.
+    from flowly.codex.tool_migration import _approvals_reviewer_for
+    from flowly.tui.app import _PERMISSION_LEVELS
+
+    codex = {key: pair for key, _label, _exec, pair in _PERMISSION_LEVELS if pair}
+    assert _approvals_reviewer_for(codex["ask"][0]) is None
+    assert _approvals_reviewer_for(codex["auto"][0]) == "auto_review"
