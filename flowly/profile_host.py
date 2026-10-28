@@ -22,6 +22,7 @@ import uuid
 from weakref import WeakValueDictionary
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -40,6 +41,7 @@ from flowly.profile import (
     list_profiles,
     profile_display_names,
     read_profile_settings,
+    read_runtime_lease,
     reconcile_runtime_lease,
     resolve_profile_reference,
     set_profile_stopped_by_user,
@@ -57,6 +59,7 @@ from flowly.profile_host_contract import (
     is_internal_profile_session,
     validate_profile_rpc,
 )
+from flowly.self_restart import RESTART_CLOSE_CODE
 from flowly.session.attention import KINDS as _ATTENTION_KINDS, clean_subject, most_urgent
 
 ProfileEventCallback = Callable[[dict[str, Any]], Awaitable[None]]
@@ -68,6 +71,7 @@ TaskStartedCallback = Callable[[str], Awaitable[None] | None]
 _READY_PREFIX = "FLOWLY_LOCAL_RUNTIME_READY "
 _START_TIMEOUT_SECONDS = 90
 _STOP_TIMEOUT_SECONDS = 8
+_RESTART_POLL_SECONDS = 0.25
 _DELETE_CONFIRM_TTL_SECONDS = 60
 _DELETE_CONFIRM_MAX = 128
 # Keeping the agents running. Flowly Desktop manages its machine's agents (it
@@ -1859,7 +1863,13 @@ class ProfileHost:
             await session.close()
             raise
 
-    async def _attach_runtime(self, name: str, lease: dict[str, Any]) -> _Runtime:
+    async def _attach_runtime(
+        self,
+        name: str,
+        lease: dict[str, Any],
+        *,
+        recheck: Callable[[Path], dict | None] | None = None,
+    ) -> _Runtime:
         """Attach to a live Desktop-owned gateway instead of spawning twice.
 
         The runtime lease is owner-only and authenticated.  Attaching never
@@ -1902,7 +1912,11 @@ class ProfileHost:
                 error_message="The running bot did not accept a secure manager connection.",
             )
             profile = describe_profile(name)
-            current = reconcile_runtime_lease(profile.path, profile_name=name)
+            current = (
+                recheck(profile.path)
+                if recheck is not None
+                else reconcile_runtime_lease(profile.path, profile_name=name)
+            )
             if (
                 not current
                 or str(current.get("instanceId") or "") != instance_id
@@ -2209,16 +2223,25 @@ class ProfileHost:
             logger.exception("Profile runtime reader failed for {}", runtime.profile)
         finally:
             owns_runtime = self._runtimes.get(runtime.profile) is runtime
+            # The bot is restarting itself in place (a settings change): its
+            # process stays, so it is waited for, never stopped.
+            restarting = (
+                owns_runtime
+                and not self._closed
+                and runtime.ws.close_code == RESTART_CLOSE_CODE
+            )
             if owns_runtime:
                 self._runtimes.pop(runtime.profile, None)
             if owns_runtime and not self._closed:
-                await self._emit(runtime.profile, "connection", {"state": "error"})
+                await self._emit(runtime.profile, "connection", {"state": "starting" if restarting else "error"})
             for future in runtime.pending.values():
                 if not future.done():
                     future.set_exception(ProfileHostError(
                         "PROFILE_OFFLINE", "The profile runtime disconnected.", retryable=True
                     ))
-            if owns_runtime:
+            if restarting:
+                self._follow_restart(runtime)
+            elif owns_runtime:
                 await self._close_runtime(runtime)
 
     def _resolve_rpc(self, runtime: _Runtime, frame: dict[str, Any]) -> None:
@@ -2915,7 +2938,7 @@ class ProfileHost:
                 target_runtime.active_runs.add(run_id)
         return result
 
-    async def _close_runtime(self, runtime: _Runtime) -> None:
+    async def _close_runtime(self, runtime: _Runtime, *, keep_process: bool = False) -> None:
         self._cancel_profile_message_requests(runtime.profile)
         for future in runtime.pending.values():
             if not future.done():
@@ -2929,15 +2952,82 @@ class ProfileHost:
             runtime.reader_task.cancel()
         await runtime.ws.close()
         await runtime.session.close()
-        if runtime.owned and runtime.process is not None:
+        if runtime.owned and runtime.process is not None and not keep_process:
             await self._terminate_process(runtime.process)
+        # A kept process keeps its pipes read, or a full one would block it.
+        streams = () if keep_process else (runtime.stdout_task, runtime.stderr_task)
         tasks = [
-            task for task in (runtime.reader_task, runtime.stdout_task, runtime.stderr_task)
+            task for task in (runtime.reader_task, *streams)
             if task and task is not current
         ]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _follow_restart(self, old: _Runtime) -> None:
+        """Wait for a bot restarting itself in place, then take it back.
+
+        It counts as starting meanwhile, so a request for it waits for it
+        instead of spawning a second process next to the one coming back.
+        """
+        name = old.profile
+        task = asyncio.create_task(self._reattach_restarted(old), name=f"profile-restart:{name}")
+        self._starting[name] = task
+        self._background_tasks.add(task)
+
+        def done(finished: asyncio.Task[_Runtime]) -> None:
+            self._background_tasks.discard(finished)
+            if self._starting.get(name) is finished:
+                self._starting.pop(name, None)
+            if not finished.cancelled() and finished.exception() is not None:
+                logger.warning("Profile runtime {} did not come back after restarting: {}", name, finished.exception())
+
+        task.add_done_callback(done)
+
+    async def _reattach_restarted(self, old: _Runtime) -> _Runtime:
+        name = old.profile
+        process = old.process
+        await self._close_runtime(old, keep_process=True)
+        attaching = False
+        try:
+            profile_dir = describe_profile(name).path
+            deadline = time.monotonic() + _START_TIMEOUT_SECONDS
+            while True:
+                if self._closed:
+                    raise ProfileHostError("HOST_STOPPED", "The profile host is shutting down.")
+                if process is not None and process.returncode is not None:
+                    raise ProfileHostError("PROFILE_START_FAILED", "The bot stopped while restarting.", retryable=True)
+                # Read, never reconcile: reconciling retires a runtime this
+                # host started, which the restarted one still is.
+                lease = await asyncio.to_thread(read_runtime_lease, profile_dir)
+                if (
+                    lease
+                    and str(lease.get("instanceId") or "") != old.instance_id
+                    and (process is None or lease.get("pid") == process.pid)
+                ):
+                    break
+                if time.monotonic() >= deadline:
+                    raise ProfileHostError(
+                        "PROFILE_START_FAILED", "The bot did not come back after restarting.", retryable=True
+                    )
+                await asyncio.sleep(_RESTART_POLL_SECONDS)
+            attaching = True
+            runtime = await self._attach_runtime(name, lease, recheck=read_runtime_lease)
+        except BaseException as exc:
+            if old.owned and process is not None:
+                await self._terminate_process(process)
+            for task in (old.stdout_task, old.stderr_task):
+                if task is not None:
+                    task.cancel()
+            # An attach reports its own failure.
+            if not attaching and isinstance(exc, ProfileHostError) and exc.code != "HOST_STOPPED":
+                await self._emit(name, "error", {"message": exc.message})
+            raise
+        runtime.owned = old.owned
+        runtime.process = process
+        runtime.stdout_task = old.stdout_task
+        runtime.stderr_task = old.stderr_task
+        return runtime
 
     async def _terminate_process(self, process: asyncio.subprocess.Process) -> None:
         if process.returncode is not None:

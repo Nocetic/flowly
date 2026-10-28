@@ -4251,6 +4251,12 @@ class GatewayServer:
 
         async def _run() -> None:
             await asyncio.sleep(0.5)
+            from flowly import self_restart
+
+            # In place first: it restarts this very process under any owner.
+            # The service manager is left for a process that cannot (Windows).
+            if self_restart.request():
+                return
             try:
                 from flowly.integrations.service_control import restart_gateway
 
@@ -4260,8 +4266,11 @@ class GatewayServer:
                     expected_pid=os.getpid(),
                 )
                 if not result.ok:
+                    # Nothing is coming back: a later stop must read as a stop.
+                    self._restarting = False
                     logger.warning("[Gateway] feature restart was not completed: {}", result.detail)
             except Exception:
+                self._restarting = False
                 logger.exception("[Gateway] feature restart failed")
 
         asyncio.create_task(_run())
@@ -5453,11 +5462,13 @@ class GatewayServer:
         and stops them at once on a stop. Best effort: a crash says nothing,
         and an app that misses this falls back to a short grace.
         """
+        from flowly import self_restart
         from flowly.integrations.service_control import restart_requested
 
+        restarting = self._restarting or restart_requested() or self_restart.requested()
         try:
             await asyncio.wait_for(
-                self.broadcast_event("gateway.stopping", {"restarting": self._restarting or restart_requested()}),
+                self.broadcast_event("gateway.stopping", {"restarting": restarting}),
                 timeout=1.0,
             )
         except Exception as exc:  # noqa: BLE001 — stopping must never fail on a goodbye
@@ -5966,9 +5977,16 @@ class GatewayServer:
             task.cancel()
         await asyncio.gather(*active_tasks, return_exceptions=True)
         self._active_tasks.clear()
-        # Close all WebSocket connections.
+        # Close all WebSocket connections. A restart says so in the close code:
+        # a host gateway waits for its agent to come back instead of stopping it.
+        from flowly import self_restart
+
+        restarting = self_restart.requested()
         for ws in list(self._ws_clients.values()):
-            await ws.close()
+            if restarting:
+                await ws.close(code=self_restart.RESTART_CLOSE_CODE)
+            else:
+                await ws.close()
         self._ws_clients.clear()
         if self._site:
             await self._site.stop()

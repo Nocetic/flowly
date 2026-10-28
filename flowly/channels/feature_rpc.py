@@ -5528,12 +5528,13 @@ async def gateway_restart() -> dict:
 
     The reply is sent before the restart, which the transport schedules once
     ``willRestart`` is acked, so the app hears "restarting" rather than a cut
-    connection. A gateway that is not its machine's installed service (one
-    started in a terminal) cannot restart itself, and says so instead.
+    connection. A running gateway restarts itself in place, whoever started
+    it; only one that cannot (Windows, not the installed service) says so.
     """
+    from flowly import self_restart
     from flowly.integrations.service_control import service_runs_this_process
 
-    if not await service_runs_this_process():
+    if not self_restart.available() and not await service_runs_this_process():
         raise FeatureRpcError(
             "RESTART_UNAVAILABLE",
             "This Flowly was started by hand, so it can only be restarted where it runs.",

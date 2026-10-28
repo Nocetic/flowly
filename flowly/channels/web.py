@@ -3035,10 +3035,17 @@ class WebChannel(BaseChannel):
 
         async def _run() -> None:
             await asyncio.sleep(0.5)
+            from flowly import self_restart
+
+            # Same as a direct app's restart: this process, in place.
+            if self_restart.request():
+                return
             try:
                 from flowly.integrations.service_control import restart_gateway
 
-                await restart_gateway()
+                result = await restart_gateway(expected_pid=os.getpid())
+                if not result.ok:
+                    logger.warning("[WebChannel] feature restart was not completed: {}", result.detail)
             except Exception:
                 logger.exception("[WebChannel] feature restart failed")
 

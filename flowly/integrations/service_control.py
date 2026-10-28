@@ -156,6 +156,14 @@ async def restart_gateway(
                     f"terminal and run `flowly gateway` again."
                 ),
             )
+        old_pid = await _launchd_pid(label)
+        if expected_pid is not None and old_pid != expected_pid:
+            # A named agent, or a gateway Desktop or a terminal runs: kicking
+            # the service would bounce some other gateway, never this one.
+            return RestartResult(
+                ok=False, method="no_service",
+                detail="This gateway is not the launchd service — restart this gateway manually",
+            )
         # kickstart -k = SIGTERM the running job + start a fresh one. Atomic;
         # avoids the "stop, then load, then start" race in our older code.
         uid = os.getuid()
@@ -168,10 +176,12 @@ async def restart_gateway(
                 ok=False, method="error",
                 detail=f"launchctl kickstart failed: {(err or out).strip()}",
             )
-        # Wait for the new process to bind its port — otherwise the next
-        # WS reconnect would race the relaunch and fail.
-        came_back = await _wait_for_port(
-            health_check_host, health_check_port, health_check_timeout,
+        # Wait for a NEW service process to bind its port — otherwise the next
+        # WS reconnect would race the relaunch and fail. The port alone is not
+        # enough: whatever held it before (the old process still exiting, a
+        # gateway started by hand) answers just the same.
+        came_back = await _wait_for_new_service(
+            label, old_pid, health_check_host, health_check_port, health_check_timeout,
         )
         elapsed = asyncio.get_event_loop().time() - started
         if not came_back:
@@ -286,9 +296,7 @@ async def service_runs_this_process(label: str = DEFAULT_LABEL) -> bool:
     system = platform.system().lower()
     try:
         if system == "darwin":
-            rc, out, _ = await _run(["launchctl", "list", label])
-            match = re.search(r'"PID"\s*=\s*(\d+);', out) if rc == 0 else None
-            return bool(match) and int(match.group(1)) == pid
+            return await _launchd_pid(label) == pid
         if system == "linux":
             if shutil.which("systemctl") is None:
                 return False
@@ -308,6 +316,27 @@ async def service_runs_this_process(label: str = DEFAULT_LABEL) -> bool:
 
 
 # ── helpers ────────────────────────────────────────────────────────
+
+
+async def _launchd_pid(label: str) -> int | None:
+    """The process launchd runs for ``label`` now, or None (none, or unknown)."""
+    rc, out, _ = await _run(["launchctl", "list", label])
+    match = re.search(r'"PID"\s*=\s*(\d+);', out) if rc == 0 else None
+    return int(match.group(1)) if match else None
+
+
+async def _wait_for_new_service(
+    label: str, old_pid: int | None, host: str, port: int, timeout: float,
+) -> bool:
+    """Until launchd runs a process other than ``old_pid`` and the port answers."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        pid = await _launchd_pid(label)
+        if pid is not None and pid != old_pid:
+            remaining = deadline - asyncio.get_event_loop().time()
+            return await _wait_for_port(host, port, max(remaining, 0.0))
+        await asyncio.sleep(0.25)
+    return False
 
 
 async def _launchctl_loaded(label: str) -> bool:

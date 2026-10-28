@@ -652,7 +652,11 @@ def gateway(
     # If the installed background service holds this port, offer to take it
     # over for this session (and restore it on exit). This is the entire
     # "develop from a checkout" story: no separate script, no second config.
-    service_taken_over = False if local_runtime else take_over_port(port)
+    from flowly import self_restart
+
+    # A gateway restarted in place inherits the takeover of the one it replaced.
+    inherited_takeover = os.environ.pop(self_restart.RESTORE_SERVICE_ENV, "") == str(port)
+    service_taken_over = False if local_runtime else (inherited_takeover or take_over_port(port))
 
     console.print(f"Starting gateway on port {port}...")
 
@@ -2676,6 +2680,9 @@ Respond to the user now:"""
             loop = asyncio.get_running_loop()
             for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(sig, signal_handler)
+            # A settings change stops the gateway the way a signal does, then
+            # starts it again in place (see flowly.self_restart).
+            self_restart.install(shutdown_event.set, drop_flags=("--rotate-token",))
 
         _watch_task: asyncio.Task | None = None
         _source_task: asyncio.Task | None = None
@@ -3067,9 +3074,16 @@ Respond to the user now:"""
     try:
         asyncio.run(run())
     finally:
+        self_restart.uninstall()
         if _local_runtime_instance:
             from flowly.profile import release_runtime_lease
 
             release_runtime_lease(_local_runtime_instance)
         if service_taken_over:
-            restore_service(port)
+            if self_restart.requested():
+                # The service comes back when the restarted gateway exits.
+                os.environ[self_restart.RESTORE_SERVICE_ENV] = str(port)
+            else:
+                restore_service(port)
+    if self_restart.requested():
+        self_restart.reexec()
