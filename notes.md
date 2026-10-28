@@ -34,6 +34,22 @@ teaches you something the code alone does not say.
   `home_id` (`flowly.gateway.identity.home_id`). Port 18790 on a developer's
   machine is their real gateway, also while tests run.
 
+## Account and sign-in
+
+- **An agent Desktop carries signs in through Desktop, not a browser:**
+  `flowly login --token-stdin` with a custom token Desktop minted
+  (`/api/auth/desktop-token`). A secret goes on stdin, never in argv, where any
+  process can read it. The old Desktop never signed Core in, so anything that
+  needs `load_account_refreshing()` (`server connect`) failed on those Macs.
+- **Web search and Flowly models bill to `providers.flowly.accountKey`.** No
+  one writes a search endpoint: Brave goes through the Flowly proxy with that
+  key, and with no key search falls back to DuckDuckGo. Getting the key onto a
+  machine is the job of sign-in (`ensure_account_key_change`), which never
+  replaces a provider the person chose.
+- **A Typer command function called directly gets `OptionInfo` defaults,**
+  which are truthy. Test new boolean options with `is True` when other code
+  calls the command as a function (`onboard_cmd._run_managed_login`).
+
 ## Config
 
 - **`config.json` is read directly by the Electron Desktop** (15+ places,
