@@ -78,6 +78,11 @@ class DDGSWebSearchProvider(WebSearchProvider):
             return False
         return _ddgs_importable()
 
+    def is_last_resort(self) -> bool:
+        """Usable when nothing else is: on unless its owner turned it off."""
+        section = provider_section("ddgs")
+        return getattr(section, "enabled", None) is not False and _ddgs_importable()
+
     def search(self, query: str, limit: int = 5) -> dict[str, Any]:
         if not _ddgs_importable():
             return {

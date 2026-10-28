@@ -548,8 +548,13 @@ class GatewayConfig(BaseModel):
 
 
 class DdgsProviderConfig(BaseModel):
-    """DuckDuckGo (ddgs) backend — no key, opt-in toggle."""
-    enabled: bool = False
+    """DuckDuckGo (ddgs) backend — no key.
+
+    ``enabled`` left unset makes it the keyless last resort: used only when
+    no other search backend works, so a fresh install without a Flowly
+    account or any key can still search. ``False`` turns it off for good.
+    """
+    enabled: bool | None = None
     default: bool = False  # mark as the active web search backend
 
 

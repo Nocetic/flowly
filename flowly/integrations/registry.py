@@ -704,7 +704,8 @@ _WEB_SEARCH: list[IntegrationCard] = [
                     "(`pip install ddgs` or `flowly[search]`).",
         docs_url="https://pypi.org/project/ddgs/",
         config_path="tools.web.search.ddgs",
-        fields=[_enabled_field(default=False), _default_backend_field()],
+        # On until turned off: unset, it is the keyless last resort.
+        fields=[_enabled_field(default=True), _default_backend_field()],
         probe=probe_ddgs,
         needs_gateway_restart=False,
     ),

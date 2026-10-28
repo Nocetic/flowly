@@ -16,7 +16,9 @@ Active selection precedence (per capability):
    available, use it.
 3. Default preference order (:data:`_DEFAULT_PREFERENCE`), filtered by
    availability.
-4. Otherwise ``None`` — the tool surfaces a setup hint.
+4. For search, DuckDuckGo as the keyless last resort unless it was turned
+   off.
+5. Otherwise ``None`` — the tool surfaces a setup hint.
 """
 
 from __future__ import annotations
@@ -233,6 +235,17 @@ def _resolve(configured: str, *, capability: str) -> Optional[WebSearchProvider]
             and _is_available_safe(provider)
         ):
             return provider
+
+    # 4. Nothing configured works: search with the keyless backend rather
+    #    than not at all (a fresh install with no account and no key).
+    if capability == "search":
+        fallback = snapshot.get("ddgs")
+        last_resort = getattr(fallback, "is_last_resort", None)
+        try:
+            if last_resort is not None and last_resort():
+                return fallback
+        except Exception as exc:  # noqa: BLE001 — resolution must not fail on one provider
+            logger.debug("provider ddgs.is_last_resort() raised {}", exc)
 
     return None
 

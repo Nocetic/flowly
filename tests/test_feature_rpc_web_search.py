@@ -99,10 +99,10 @@ def test_searxng_card_round_trips_url(isolated_home):
     assert card["probeStatus"] == "ok"
 
 
-def test_ddgs_card_default_disabled(isolated_home):
-    # Opt-in: ddgs starts disabled until the user toggles it on.
+def test_ddgs_card_default_on_until_turned_off(isolated_home):
+    # Unset, ddgs is the keyless last resort, so the card shows it on.
     card = _list_by_key()["web_ddgs"]
-    assert card["enabled"] is False
+    assert card["enabled"] is True
 
 
 def test_default_backend_toggle_round_trips(isolated_home):
