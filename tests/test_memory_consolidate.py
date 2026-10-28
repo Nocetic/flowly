@@ -156,3 +156,57 @@ def test_run_applies_and_refreshes_memory_md(gov, tmp_path):
     assert gov.get_item(drop.id).status == STATUS_SUPERSEDED
     md = ms.read_long_term()
     assert "keep me" in md and "drop me" not in md  # MEMORY.md reflects survivors
+
+
+# -- whose memory it is ------------------------------------------------------
+# Memories name the owner both ways ("User prefers Turkish." / "Hakan wants
+# answers in Turkish."); the proposer must be told they are one person.
+
+OWNER_MD = "# User Profile — Hakan\n\n- **Name:** Hakan\n- **Language:** Turkish\n"
+
+
+def test_the_proposer_is_told_whose_memory_it_is(gov, tmp_path):
+    workspace = tmp_path / "ws"
+    store = MemoryStore(workspace)
+    (workspace / "USER.md").write_text(OWNER_MD, encoding="utf-8")
+    _active(gov, kind="preference", text="User prefers replies in Turkish.")
+    seen = {}
+
+    def propose(ctx):
+        seen.update(ctx)
+        return []
+
+    Consolidator(gov, propose, memory_store=store).run()
+
+    assert seen["owner"] == OWNER_MD.strip()
+
+
+def test_no_profile_means_no_owner(gov, tmp_path):
+    seen = {}
+    Consolidator(gov, lambda ctx: seen.update(ctx) or [], memory_store=MemoryStore(tmp_path / "ws")).run()
+    assert seen["owner"] == ""
+
+
+async def test_the_agents_consolidate_tool_sends_the_owner_too(gov, tmp_path):
+    from types import SimpleNamespace
+
+    from flowly.agent.tools.memory_consolidate import MemoryConsolidateTool
+
+    workspace = tmp_path / "ws"
+    store = MemoryStore(workspace)
+    (workspace / "USER.md").write_text(OWNER_MD, encoding="utf-8")
+    _active(gov, kind="preference", text="Hakan wants answers in Turkish.")
+    prompts: list[str] = []
+
+    class Provider:
+        async def chat_stream(self, messages, **kwargs):
+            prompts.append(messages[0]["content"])
+            yield SimpleNamespace(content='{"operations": []}')
+
+    tool = MemoryConsolidateTool(
+        facade=SimpleNamespace(gov=gov, memory_store=store, kg_mirror=None),
+        provider=Provider(), model="test-model",
+    )
+    await tool.execute(dry_run=True)
+
+    assert prompts and "**Name:** Hakan" in prompts[0]

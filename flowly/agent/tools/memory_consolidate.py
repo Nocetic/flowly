@@ -18,6 +18,7 @@ from flowly.memory.consolidate import (
     PROMPT,
     apply_operations,
     build_context,
+    owner_profile,
     parse_operations,
 )
 
@@ -59,7 +60,8 @@ class MemoryConsolidateTool(Tool):
     async def execute(self, dry_run: bool = False, **kwargs: Any) -> str:
         gov = self._facade.gov
         kg_summary = self._kg_summary_fn()
-        ctx = build_context(gov, kg_summary)
+        workspace = getattr(getattr(self._facade, "memory_store", None), "workspace", None)
+        ctx = build_context(gov, kg_summary, owner_profile(workspace))
         if not ctx["items"]:
             return "Memory is empty — nothing to consolidate."
 

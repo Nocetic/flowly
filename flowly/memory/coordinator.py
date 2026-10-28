@@ -39,6 +39,17 @@ def _injection_flagged(text: str) -> bool:
         return True
 
 
+def _same_words(text: str) -> str:
+    """Text as compared for duplicates: case, spacing and punctuation ignored.
+
+    "User prefers Turkish." and "user prefers turkish" are one memory; the
+    consolidation pass only has to judge different wordings.
+    """
+    import re
+
+    return " ".join(re.sub(r"[^\w\s]", " ", text.lower()).split())
+
+
 class MemoryGovernance:
     def __init__(
         self,
@@ -307,9 +318,9 @@ class MemoryGovernance:
         content = (content or "").strip()
         if not content:
             return None
-        norm = " ".join(content.split()).lower()
+        norm = _same_words(content)
         for it in self.gov.list_items(status=STATUS_ACTIVE):
-            if " ".join(it.text.split()).lower() == norm:
+            if _same_words(it.text) == norm:
                 self.gov.touch_seen(it.id)
                 return None
         flagged = _injection_flagged(content)

@@ -53,6 +53,16 @@ teaches you something the code alone does not say.
   Changing what a mode does is a Core change; changing its values breaks
   every app's preset table.
 
+## Memory
+
+- **Tell any model that judges memories whose memory it is.** Notes call the
+  owner "User" and by name; without the owner's profile (workspace `USER.md`)
+  a careful model will not assume they are one person
+  (`consolidate.owner_profile`).
+- **Measure a prompt change with a live model before shipping it.** Rewording
+  the consolidation prompt felt right and changed nothing; the missing input
+  was the fix. Keep the measurement as a `real_llm` test.
+
 ## Search
 
 - **`tools.web.search.ddgs.enabled` is tri-state**: unset = last resort when

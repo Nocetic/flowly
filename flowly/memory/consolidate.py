@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from loguru import logger
@@ -57,8 +58,28 @@ class ConsolidateResult:
         return self.superseded + self.staled + self.merged
 
 
-def build_context(gov: GovernanceStore, kg_summary: str = "") -> dict[str, Any]:
-    """Snapshot of active items + KG for the proposer LLM."""
+# How much of the owner's profile (workspace USER.md) the proposer sees.
+_OWNER_PROFILE_CHARS = 1200
+
+
+def owner_profile(workspace: Path | str | None) -> str:
+    """Who the memory belongs to, from the workspace's USER.md ("" if none).
+
+    Memories name the owner both ways ("User prefers Turkish." and "Hakan
+    wants answers in Turkish."). Not knowing they are one person, the
+    proposer kept both: 2 of 10 such duplicates merged over five runs with
+    a cheap model, 10 of 10 once it was told who the owner is.
+    """
+    if not workspace:
+        return ""
+    try:
+        return (Path(workspace) / "USER.md").read_text(encoding="utf-8").strip()[:_OWNER_PROFILE_CHARS]
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+def build_context(gov: GovernanceStore, kg_summary: str = "", owner: str = "") -> dict[str, Any]:
+    """Snapshot of active items + KG + whose memory it is, for the proposer LLM."""
     items = [
         {
             "id": it.id, "kind": it.kind, "text": it.text,
@@ -67,7 +88,7 @@ def build_context(gov: GovernanceStore, kg_summary: str = "") -> dict[str, Any]:
         }
         for it in gov.list_items(status=STATUS_ACTIVE)
     ]
-    return {"items": items, "kg_summary": kg_summary}
+    return {"owner": owner, "items": items, "kg_summary": kg_summary}
 
 
 PROMPT = """You consolidate an agent's long-term memory. You are given the
@@ -89,6 +110,8 @@ Operations (JSON):
     active fact, e.g. it cites an old email/role).
 
 Rules:
+- The memory belongs to the person described under "owner" in the input:
+  "User", "the user" and their name are the same person.
 - Only use item ids present in the input.
 - NEVER retire a unique, current fact. Prefer keeping structured facts over
   free-form when they overlap.
@@ -200,7 +223,8 @@ class Consolidator:
 
     def run(self, *, dry_run: bool = False) -> tuple[list[ConsolidateOp], ConsolidateResult]:
         kg_summary = self.kg_summary_fn() if self.kg_summary_fn else ""
-        ctx = build_context(self.gov, kg_summary)
+        owner = owner_profile(getattr(self.memory_store, "workspace", None))
+        ctx = build_context(self.gov, kg_summary, owner)
         ops = self.propose_fn(ctx)
         if dry_run:
             return ops, ConsolidateResult(proposed=len(ops))

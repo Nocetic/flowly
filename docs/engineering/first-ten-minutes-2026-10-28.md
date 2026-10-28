@@ -200,3 +200,61 @@ Codex to `auto-review`, Auto to `on-request`); fixing it is an app change.
 **Tests.** `tests/test_exec_auto_mode.py`: a table of commands that run and
 commands that ask, links out of the folder, the home folder, and the executor
 end to end (the chained `touch` is asked about and does not run).
+
+## 12. Memory consolidation keeps duplicates
+
+**Finding** (the audit): the `consolidate` step does not merge copies of the
+same information.
+
+**What was measured** (active model `deepseek/deepseek-v4.1-flash`, the
+production prompt, a scratch memory store, five runs each):
+
+| Duplicates in the store | Before | After |
+|---|---|---|
+| Both notes say "User …" | 10 of 10 merged | 10 of 10 |
+| One says "User …", the other "Hakan …" | **2 of 10** | **10 of 10** |
+| Related but different ("lives in Istanbul" / "sister lives in Berlin", weekday/weekend wake-up) | never merged | never merged |
+
+Exact duplicates were already caught at write time. The pass itself worked
+on clean duplicates; it failed when the agent had written the owner's name in
+one note and "User" in the other, because the proposer was never told whose
+memory it was and, correctly told to be conservative, would not assume
+"Hakan" was "User". Rewording the prompt alone ("say the same thing, whatever
+the wording") changed nothing measurable.
+
+**Fix.**
+- `consolidate.owner_profile` reads the workspace `USER.md` (first 1200
+  characters) and `build_context` passes it as `owner`; the prompt says
+  "User", "the user" and the owner's name are one person. Both proposer paths
+  get it: `Consolidator.run` (app RPC, CLI) and the agent's
+  `memory_consolidate` tool (also the timed and every-50-turns runs).
+- Writing a note now ignores punctuation as well as case and spacing when
+  checking for an existing one ("User prefers Turkish." = "user prefers
+  turkish").
+
+**Tests.** `tests/test_memory_consolidate.py` (the owner reaches both paths),
+`tests/test_memory_coordinator.py` (punctuation), and the live
+`tests/test_memory_consolidate_real.py` (`FLOWLY_REAL_LLM_HOME=~/.flowly
+pytest -m real_llm …`): passes 3 of 3 with the fix, merges nothing without it.
+
+## The rest of the audit
+
+- **#9 No time limit on the agent loop**: not a defect. The loop has an
+  iteration cap (100), a soft "are you stuck?" warning, and a repetition guard
+  that forces an answer when results repeat; subagents have their own cap and
+  an optional timeout. A wall-clock cap would cut legitimate long research.
+  The audit's 49 turns were an agent searching for an MCP tool it could not
+  see, which #10 explains.
+- **#10 A live-added MCP server needs a manual retry**: same root cause as #5.
+  `mcp.upsert` relies on the gateway restart, which never happened on the
+  audit's machine (Linux without systemd). Fixed by the in-place restart. (A
+  live connect without restarting the gateway would be better still; not a
+  bug fix, not done.)
+- **#12 arxiv returns 400 on field queries**: fixed (commit `f3cb671c`).
+- **#12 Screen setup fails under the sandbox / `flowly agent` cannot use the
+  real screen**: CLI-only paths; not product surfaces under the 2026-10-28
+  decision (apps manage the agent). Not changed.
+- **#3 Gateway token visible in `ps`** and **#4 no token on loopback**: same
+  trust model as #1 on the owner's own machine. Not changed.
+- **#11 Screen RAM on 1 GB cloud machines**: a machine-size decision for the
+  cloud service, not Core code.

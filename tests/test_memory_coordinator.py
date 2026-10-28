@@ -179,6 +179,16 @@ def test_ingest_append_creates_active_and_coalesces_regen(gov, tmp_path):
     assert len(gov.list_items(status=STATUS_ACTIVE)) == 1
 
 
+def test_the_same_words_with_other_punctuation_are_one_memory(gov, tmp_path):
+    mg = MemoryGovernance(gov, memory_store=MemoryStore(tmp_path / "ws"))
+    assert mg.ingest_append("User prefers replies in Turkish.") is not None
+
+    assert mg.ingest_append("user prefers replies in turkish") is None
+    assert mg.ingest_append("User prefers: replies, in Turkish!") is None
+    assert mg.ingest_append("User prefers replies in English.") is not None
+    assert len(gov.list_items(status=STATUS_ACTIVE)) == 2
+
+
 def test_ingest_kg_fact_creates_and_supersedes(gov, tmp_path):
     ms = MemoryStore(tmp_path / "ws")
     mirror = FakeMirror()
