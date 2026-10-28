@@ -297,6 +297,23 @@ class FlowlyServerChannel(WebChannel):
                 self._prune_profile_bindings()
         await reply({"result": result})
 
+    async def report_profile_home_message(self, profile: str, message_id: str, text: str, files: int) -> None:
+        """A person's message in a named agent's one chat that did not come
+        through the server (Desktop, a direct gateway app), told to it on the
+        agent's delivery session as the person's own entry (server
+        chat-one-log.md §10.9). The server keeps it once; a message it
+        delivered itself is in its log already and stays as it is."""
+        from flowly.agent_home import HOME_SESSION
+
+        session_id = self._profile_sessions().get(profile)
+        if not session_id or not message_id:
+            return
+        await self._send_or_queue(json.dumps({
+            "type": "event", "sessionId": session_id, "event": "chat", "profile": profile,
+            "data": {"state": "user", "sessionKey": HOME_SESSION, "messageId": message_id,
+                     "message": {"role": "user", "text": text, "files": files}},
+        }))
+
     async def _forward_profile_event_to_server(
         self, profile: str, event_type: str, payload: dict[str, Any]
     ) -> None:

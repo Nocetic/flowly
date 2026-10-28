@@ -278,3 +278,87 @@ async def test_a_named_agents_runtime_refuses_malformed_notes_and_never_steers_a
     monkeypatch.setattr(feature_rpc, "steer_running_turn", never)
     _ws, seen, _users = await _gateway_send({"sessionKey": "web:n4", "idempotencyKey": "m7", "message": "Hi", "notes": ["n"]})
     assert seen[-1]["content"] == "Hi"
+
+
+# A person's message in a named agent's one chat that did not come through the
+# server (Desktop on the agent's own machine): the server, which keeps that
+# chat's log, saw only the agent's answer (2026-10-28). Core tells it the message.
+
+
+class _Host:
+    def __init__(self):
+        self.calls = []
+
+    def retain_default_events(self, owner):
+        pass
+
+    def release_default_events(self, owner):
+        pass
+
+    async def dispatch(self, method, params):
+        self.calls.append((method, params))
+        return {"runId": params["params"].get("idempotencyKey") or "run", "status": "accepted"}
+
+
+async def _desktop_send(report, inner, profile="tsuki"):
+    from unittest.mock import AsyncMock
+
+    from aiohttp import web
+    from flowly.gateway.server import GatewayServer
+
+    server = GatewayServer(advertise_control=False)
+    server._profile_host = _Host()
+    server._ws_rpc_reply = AsyncMock()
+    server._ws_rpc_error = AsyncMock()
+    server.on_profile_home_message = report
+    await server._handle_profile_host_rpc(web.WebSocketResponse(), "desktop", "1", "profiles.rpc",
+                                          {"name": profile, "method": "chat.send", "params": inner})
+    return server
+
+
+@pytest.mark.asyncio
+async def test_a_message_in_a_named_agents_home_sent_here_is_told_to_the_server():
+    from unittest.mock import AsyncMock
+
+    report = AsyncMock()
+    server = await _desktop_send(report, {"sessionKey": "desktop:profile-home", "message": "Hi again pal",
+                                          "idempotencyKey": "d1", "attachments": [{"x": 1}]})
+    report.assert_awaited_once_with("tsuki", "d1", "Hi again pal", 1)
+    server._ws_rpc_reply.assert_awaited_once()
+
+    for inner, profile in (({"sessionKey": "ios:earlier", "message": "x", "idempotencyKey": "d2"}, "tsuki"),
+                           ({"sessionKey": "desktop:profile-home", "message": "x", "idempotencyKey": "d3"}, "default"),
+                           ({"sessionKey": "desktop:profile-home", "message": "  ", "idempotencyKey": "d4"}, "tsuki")):
+        quiet = AsyncMock()
+        await _desktop_send(quiet, inner, profile)
+        quiet.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_report_never_fails_the_message():
+    from unittest.mock import AsyncMock
+
+    report = AsyncMock(side_effect=RuntimeError("socket gone"))
+    server = await _desktop_send(report, {"sessionKey": "desktop:profile-home", "message": "hi", "idempotencyKey": "d5"})
+    server._ws_rpc_reply.assert_awaited_once()
+    server._ws_rpc_error.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_server_channel_tells_it_on_the_agents_delivery_session():
+    from unittest.mock import AsyncMock
+
+    from flowly.channels.flowly_server import FlowlyServerChannel
+
+    channel = object.__new__(FlowlyServerChannel)
+    channel._profile_sessions = lambda: {"tsuki": "srv-p:tsuki:c1"}
+    channel._send_or_queue = AsyncMock()
+    await channel.report_profile_home_message("tsuki", "d1", "Hi again pal", 0)
+    sent = json.loads(channel._send_or_queue.await_args.args[0])
+    assert sent == {"type": "event", "sessionId": "srv-p:tsuki:c1", "event": "chat", "profile": "tsuki",
+                    "data": {"state": "user", "sessionKey": "desktop:profile-home", "messageId": "d1",
+                             "message": {"role": "user", "text": "Hi again pal", "files": 0}}}
+    # An agent the server never delivered to has no session yet: nothing to tell.
+    channel._send_or_queue.reset_mock()
+    await channel.report_profile_home_message("rocket", "d2", "x", 0)
+    channel._send_or_queue.assert_not_awaited()

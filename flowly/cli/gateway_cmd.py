@@ -2187,6 +2187,9 @@ Respond to the user now:"""
         web.set_local_event_callback(gateway_server.broadcast_event)
     if web and hasattr(web, "set_profile_host"):
         web.set_profile_host(gateway_server.profile_host)
+    if web and hasattr(web, "report_profile_home_message"):
+        # A named agent's chat written to here (Desktop) reaches the server's log too.
+        gateway_server.on_profile_home_message = web.report_profile_home_message
     if web and hasattr(web, "set_screen_gateway"):
         web.set_screen_gateway(gateway_server)
     if web and hasattr(web, "set_chat_commands"):

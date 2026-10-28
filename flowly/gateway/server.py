@@ -736,6 +736,11 @@ class GatewayServer:
         self._profile_run_subscriptions: OrderedDict[
             tuple[str, str], str
         ] = OrderedDict()
+        # The person's message in a named agent's one chat, sent here (Desktop,
+        # a direct gateway app): told to the Flowly server, which keeps that
+        # chat's log and otherwise saw only the agent's answer (2026-10-28).
+        # Set by the gateway command to the server channel's report.
+        self.on_profile_home_message: Callable[[str, str, str, int], Awaitable[None]] | None = None
         # Set when this gateway bounces itself (a settings change), so its
         # goodbye says it is coming back.
         self._restarting = False
@@ -2005,6 +2010,8 @@ class GatewayServer:
             versions = self._profile_subagent_event_versions.setdefault(ws, {})
             if profile in versions or len(versions) < _PROFILE_PROFILES_PER_CLIENT_LIMIT:
                 versions[profile] = event_version(inner_params) if "eventVersion" in inner_params else versions.get(profile, 1)
+        if inner_method == "chat.send" and isinstance(result, dict):
+            await self._report_profile_home_message(profile, inner_session_key, params.get("params"), result)
         if (
             inner_method in {"chat.send", "chat.inflight"}
             and inner_session_key
@@ -2022,6 +2029,33 @@ class GatewayServer:
                 ):
                     self._profile_run_subscriptions.popitem(last=False)
         await self._ws_rpc_reply(ws, rpc_id, result)
+
+    async def _report_profile_home_message(
+        self, profile: str, session_key: str, inner: Any, result: dict[str, Any],
+    ) -> None:
+        """A person's message the agent took in its one chat, to the Flowly server's log.
+
+        Only a named agent's home session (its one chat on the server), only
+        what the person wrote (its id, words and how many files), and never
+        a failure of the report itself: the message is the agent's already.
+        """
+        from flowly.agent_home import HOME_SESSION
+
+        report = self.on_profile_home_message
+        if report is None or not profile or profile == "default" or session_key != HOME_SESSION:
+            return
+        if not isinstance(inner, dict):
+            return
+        message_id = str(inner.get("idempotencyKey") or result.get("runId") or "")
+        text = inner.get("message") if isinstance(inner.get("message"), str) else ""
+        attachments = inner.get("attachments")
+        files = len(attachments) if isinstance(attachments, list) else 0
+        if not message_id or (not text.strip() and not files):
+            return
+        try:
+            await report(profile, message_id, text, files)
+        except Exception as exc:
+            logger.warning("[Gateway] {}'s message not told to the Flowly server ({})", profile, type(exc).__name__)
 
     async def _ws_rpc_media_read(
         self,
