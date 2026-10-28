@@ -10,6 +10,7 @@ Usage:
     python3 search_arxiv.py --id 2402.03300
     python3 search_arxiv.py --id 2402.03300,2401.12345
 """
+import re
 import sys
 import urllib.parse
 import urllib.request
@@ -27,6 +28,17 @@ SORT_KEYWORDS = {
 }
 
 
+# arXiv's own query syntax: a field prefix (``ti:transformer``) or a boolean
+# operator. Such a query is passed through as written.
+_FIELD_SYNTAX = re.compile(r'\b(?:ti|au|abs|co|jr|cat|rn|id|all):|\b(?:AND|OR|ANDNOT)\b')
+
+
+def _terms(text, field):
+    """Every word must match (``all:graph AND all:neural``), quoted phrases kept whole."""
+    parts = re.findall(r'"[^"]+"|\S+', text)
+    return " AND ".join(f"{field}:{part}" for part in parts)
+
+
 def _build_query(query, author, category, ids):
     """Assemble the query-string params for either an ID lookup or a search."""
     if ids:
@@ -34,9 +46,11 @@ def _build_query(query, author, category, ids):
 
     clauses = []
     if query:
-        clauses.append("all:" + urllib.parse.quote(query))
+        # A whole sentence under one all: matched its first word only; field
+        # syntax put under all: was a 400 from the API.
+        clauses.append(f"({query})" if _FIELD_SYNTAX.search(query) else _terms(query, "all"))
     if author:
-        clauses.append("au:" + urllib.parse.quote(author))
+        clauses.append(f'au:"{author}"' if " " in author.strip() else f"au:{author}")
     if category:
         clauses.append("cat:" + category)
 
@@ -44,12 +58,13 @@ def _build_query(query, author, category, ids):
         print("Error: provide a query, --author, --category, or --id")
         sys.exit(1)
 
-    return {"search_query": "+AND+".join(clauses)}
+    return {"search_query": " AND ".join(clauses)}
 
 
 def _fetch(params):
     """Hit the arXiv endpoint and hand back the raw Atom payload."""
-    encoded = "&".join(f"{key}={val}" for key, val in params.items())
+    # Spaces become '+', quotes and parentheses are escaped; field colons stay.
+    encoded = urllib.parse.urlencode(params, quote_via=urllib.parse.quote_plus, safe=":,")
     request = urllib.request.Request(
         f"{API}?{encoded}",
         headers={"User-Agent": "Flowly/1.0"},
