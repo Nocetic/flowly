@@ -122,6 +122,24 @@ def gateway_version() -> str | None:
     return version
 
 
+def home_id(home: str | os.PathLike[str] | None = None) -> str:
+    """An opaque, stable name for a Flowly home (the gateway's data directory).
+
+    A CLI command that changes what a running gateway holds in memory asks
+    that gateway — but only the one serving its own home. Any other gateway
+    on the port (the owner's real one, while a test or another profile runs
+    the CLI) is none of its business. A digest, not the path: ``/health``
+    needs no token.
+    """
+    import hashlib
+
+    if home is None:
+        from flowly.profile import get_flowly_home
+
+        home = get_flowly_home()
+    return hashlib.sha256(os.path.realpath(os.fspath(home)).encode("utf-8")).hexdigest()[:24]
+
+
 def health_identity(
     env: dict[str, str] | None = None,
     executable: str | None = None,
@@ -140,4 +158,8 @@ def health_identity(
     owner = runtime_owner(env=env, executable=executable)
     if owner:
         identity["runtime_owner"] = owner
+    try:
+        identity["home_id"] = home_id()
+    except Exception:  # noqa: BLE001 — absent rather than guessed
+        pass
     return identity

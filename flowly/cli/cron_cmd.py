@@ -23,6 +23,25 @@ console = Console()
 cron_app = typer.Typer(help="Manage scheduled tasks")
 
 
+def _ask_running_gateway(method: str, params: dict, *, missing_ok: bool = False) -> tuple[bool, dict | None]:
+    """Make a schedule change through the running gateway, if there is one.
+
+    A running gateway holds the schedule in memory and saves it on its own,
+    so a change written to jobs.json under it is lost at its next save: a
+    removed job kept firing. ``(False, None)`` means no gateway is running and
+    the file is the schedule. ``missing_ok`` turns a NOT_FOUND into ``None``.
+    """
+    from flowly.cli.live_gateway import GatewayRpcError, call_running_gateway
+
+    try:
+        return call_running_gateway(method, params)
+    except GatewayRpcError as exc:
+        if missing_ok and exc.code == "NOT_FOUND":
+            return True, None
+        console.print(f"[red]The running gateway refused this:[/red] {exc.message}")
+        raise typer.Exit(1) from exc
+
+
 @cron_app.command("list")
 def cron_list(
     all: bool = typer.Option(
@@ -111,6 +130,25 @@ def cron_add(
         console.print("[red]Error: Must specify --every, --cron, or --at[/red]")
         raise typer.Exit(1)
 
+    live, result = _ask_running_gateway("cron.add", {
+        "name": name,
+        "message": message,
+        "schedule": {
+            "kind": schedule.kind,
+            "atMs": schedule.at_ms,
+            "everyMs": schedule.every_ms,
+            "expr": schedule.expr,
+        },
+        "deliver": deliver,
+        "to": to,
+        "channel": channel,
+        "source": "cli",
+    })
+    if live:
+        job = result.get("job") or {}
+        console.print(f"[green]✓[/green] Added job '{job.get('name', name)}' ({job.get('id', '?')})")
+        return
+
     store_path = get_data_dir() / "cron" / "jobs.json"
     service = CronService(store_path)
 
@@ -140,10 +178,14 @@ def cron_remove(
     from flowly.config.loader import get_data_dir
     from flowly.cron.service import CronService
 
-    store_path = get_data_dir() / "cron" / "jobs.json"
-    service = CronService(store_path)
+    live, result = _ask_running_gateway("cron.remove", {"id": job_id, "purge": purge})
+    if live:
+        removed = bool(result.get("ok"))
+    else:
+        store_path = get_data_dir() / "cron" / "jobs.json"
+        removed = CronService(store_path).remove_job(job_id, purge=purge)
 
-    if service.remove_job(job_id, purge=purge):
+    if removed:
         action = "Permanently purged" if purge else "Archived"
         console.print(f"[green]✓[/green] {action} job {job_id}")
     else:
@@ -191,17 +233,20 @@ def cron_enable(
     from flowly.config.loader import get_data_dir
     from flowly.cron.service import CronService
 
-    store_path = get_data_dir() / "cron" / "jobs.json"
-    service = CronService(store_path)
-
-    try:
-        job = service.enable_job(job_id, enabled=not disable)
-    except ValueError as exc:
-        console.print(f"[red]Cannot update job:[/red] {exc}")
-        raise typer.Exit(1) from exc
-    if job:
+    live, result = _ask_running_gateway("cron.update", {"id": job_id, "enabled": not disable}, missing_ok=True)
+    if live:
+        name = (result or {}).get("job", {}).get("name")
+    else:
+        store_path = get_data_dir() / "cron" / "jobs.json"
+        try:
+            job = CronService(store_path).enable_job(job_id, enabled=not disable)
+        except ValueError as exc:
+            console.print(f"[red]Cannot update job:[/red] {exc}")
+            raise typer.Exit(1) from exc
+        name = job.name if job else None
+    if name:
         status = "disabled" if disable else "enabled"
-        console.print(f"[green]✓[/green] Job '{job.name}' {status}")
+        console.print(f"[green]✓[/green] Job '{name}' {status}")
     else:
         console.print(f"[red]Job {job_id} not found[/red]")
 

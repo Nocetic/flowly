@@ -110,6 +110,28 @@ def _parse_time(time_str: str) -> int | None:
         return None
 
 
+# Surfaces that keep no conversation a result could be sent back to later.
+_NO_RETURN_SURFACES = frozenset({"cli", "tui"})
+
+
+def _delivery_note(job_id: str, deliver: bool, channel: str | None) -> str:
+    """Where this job's results go, said plainly so the user can be told.
+
+    A job made from the terminal used to be accepted without a word while
+    nothing would ever show its results: the owner saw "scheduled" and then
+    silence.
+    """
+    kept = f"kept on the job (the Schedule screen, or `flowly cron output {job_id}`)"
+    if not deliver:
+        return f"not sent anywhere — results are {kept}. Tell the user where to find them."
+    if not channel or channel in _NO_RETURN_SURFACES:
+        return (
+            "this terminal conversation only, which nothing reads later — results are "
+            f"also {kept}. Tell the user, or connect an app or a channel to receive them."
+        )
+    return f"sent to {channel}"
+
+
 def _format_next_run(timestamp_ms: int | None) -> str:
     """Format a timestamp for display."""
     if not timestamp_ms:
@@ -630,7 +652,8 @@ class CronTool(Tool):
             f"Kind: {job.payload.kind}\n"
             f"Schedule: {schedule}\n"
             f"Next run: {next_run}\n"
-            f"Message: {message}"
+            f"Message: {message}\n"
+            f"Delivery: {_delivery_note(job.id, deliver, channel)}"
         )
 
     def _parse_schedule(self, schedule: str) -> CronSchedule | None:

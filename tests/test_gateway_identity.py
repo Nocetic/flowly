@@ -15,6 +15,7 @@ from flowly.gateway.identity import (
     VALID_OWNERS,
     gateway_version,
     health_identity,
+    home_id,
     runtime_owner,
 )
 
@@ -122,8 +123,9 @@ def test_the_payload_omits_what_it_does_not_know(monkeypatch):
 
     monkeypatch.setattr(flowly, "__version__", "0.0.0-dev", raising=False)
     identity = health_identity(env={}, executable="")
-    # The id is the one thing always true of this process.
-    assert identity == {"service_id": GATEWAY_SERVICE_ID}
+    # The ids are the things always true of this process: what it is and
+    # which Flowly home it serves.
+    assert identity == {"service_id": GATEWAY_SERVICE_ID, "home_id": home_id()}
 
 
 def test_the_payload_is_flat_strings_a_json_client_can_read(monkeypatch):
@@ -137,6 +139,7 @@ def test_the_payload_is_flat_strings_a_json_client_can_read(monkeypatch):
         "service_id": GATEWAY_SERVICE_ID,
         "version": "3.1.0",
         "runtime_owner": "desktop",
+        "home_id": home_id(),
     }
     assert all(isinstance(value, str) for value in identity.values())
 
