@@ -28,8 +28,10 @@ from flowly.profile import get_flowly_home
 class ExecApprovalsConfig:
     """Stored exec approvals configuration."""
     version: int = 1
-    security: ExecSecurity = "full"
-    ask: ExecAsk = "off"
+    # A new install starts in Auto: read-only commands run, anything else
+    # asks. Installs that already have this file keep what it says.
+    security: ExecSecurity = "allowlist"
+    ask: ExecAsk = "on-miss"
     ask_fallback: ExecSecurity = "deny"
     allowlist: list[AllowlistEntry] = field(default_factory=list)
 

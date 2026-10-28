@@ -28,9 +28,18 @@ def _cfg(workspace: Path):
     )
 
 
+def _full_access() -> None:
+    """These tests are about the live cwd, not approvals: run every command."""
+    store = ExecApprovalStore()
+    policy = store.load()
+    policy.security, policy.ask = "full", "off"
+    store.save()
+
+
 @pytest.fixture
 def tool(tmp_path, monkeypatch):
     monkeypatch.setenv("FLOWLY_HOME", str(tmp_path / "home"))
+    _full_access()
     ws = tmp_path / "ws"
     ws.mkdir()
     t = SecureExecTool(
@@ -115,6 +124,7 @@ async def test_deleted_cwd_recovers_to_workspace(tool, tmp_path):
 async def test_unsessioned_exec_is_not_tracked(tmp_path, monkeypatch):
     """A request with no session_key is never wrapped and pins nothing."""
     monkeypatch.setenv("FLOWLY_HOME", str(tmp_path / "home"))
+    _full_access()
     sub = tmp_path / "sub"
     sub.mkdir()
     store = ExecApprovalStore()

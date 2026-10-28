@@ -37,22 +37,23 @@ def test_seeds_from_legacy_config(home):
 
 
 def test_defaults_when_no_config(home):
+    # A new install starts in Auto.
     cfg = ExecApprovalStore().load()
-    assert cfg.security == "full"
-    assert cfg.ask == "off"
+    assert cfg.security == "allowlist"
+    assert cfg.ask == "on-miss"
 
 
 def test_defaults_when_config_has_no_exec_policy(home):
     _write_config(home, {"enabled": True})  # no security/ask
     cfg = ExecApprovalStore().load()
-    assert cfg.security == "full"
+    assert cfg.security == "allowlist"
 
 
 def test_invalid_legacy_security_falls_back(home):
     _write_config(home, {"security": "bogus", "ask": "always"})
     cfg = ExecApprovalStore().load()
-    assert cfg.security == "full"  # bogus ignored
-    assert cfg.ask == "off"
+    assert cfg.security == "allowlist"  # bogus ignored: the new-install default
+    assert cfg.ask == "on-miss"
 
 
 def test_invalid_ask_falls_back_but_security_kept(home):

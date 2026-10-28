@@ -41,6 +41,18 @@ teaches you something the code alone does not say.
   cross-repo change: ship it with Desktop.
 - **`${VAR}` in config is a reference, not a secret**: the value is in `.env`.
 
+## Exec approvals
+
+- **Judge every part of a shell command, never its first word.** `echo hi &&
+  rm -r x` starts with a harmless word. `flowly.exec.auto_rules` splits on
+  `|`, `&&`, `||`, `;` and asks on any other shell syntax.
+- **An allowlisted program covers one command, not a chain**
+  (`auto_rules.is_single_command`).
+- **The apps send `security`/`ask` pairs, not mode names.** Ask = `full/always`,
+  Auto = `allowlist/on-miss`, YOLO = `full/off`, anything else shows as Custom.
+  Changing what a mode does is a Core change; changing its values breaks
+  every app's preset table.
+
 ## Search
 
 - **`tools.web.search.ddgs.enabled` is tri-state**: unset = last resort when

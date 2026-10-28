@@ -40,8 +40,8 @@ def test_exec_policy_is_in_the_shared_surface():
 def test_policy_get_returns_defaults():
     result, restart = _dispatch("exec.policy.get")
     assert restart is False
-    assert result["security"] == "full"
-    assert result["ask"] == "off"
+    assert result["security"] == "allowlist"  # a new install starts in Auto
+    assert result["ask"] == "on-miss"
     assert result["allowlist"] == []
 
 

@@ -384,6 +384,11 @@ async def test_a_cut_command_really_dies(tmp_path, monkeypatch):
     from flowly.exec.types import ExecRequest
 
     monkeypatch.setenv("FLOWLY_HOME", str(tmp_path / "home"))
+    # About cancelling a running command, not approvals: run it unasked.
+    store = ExecApprovalStore()
+    policy = store.load()
+    policy.security, policy.ask = "full", "off"
+    store.save()
     aborts = RunAbortController()
 
     async def cut(how):

@@ -137,7 +137,11 @@ useful. They are not boundaries.
 - The **exec approval gate** (`flowly/exec/approvals.py`) detects
   destructive shell patterns and prompts the operator before
   execution, with fan-out to Telegram, paired iOS devices, and the
-  desktop UI. Shell is Turing-complete; a denylist over shell strings
+  desktop UI. In Auto, the default for new installs, a command runs
+  without a prompt only when every part of it is a known read-only
+  program reading inside its working folder
+  (`flowly/exec/auto_rules.py`); everything else prompts.
+  Shell is Turing-complete; a denylist over shell strings
   is structurally incomplete. The gate catches cooperative-mode
   mistakes, not adversarial output. Approval has **no effect on
   sandbox enforcement** — even an approved command runs inside the

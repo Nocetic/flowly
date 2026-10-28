@@ -39,7 +39,7 @@ def _write_policy_file(security: str, ask: str = "off") -> None:
 
 def test_refresh_picks_up_external_change():
     store = ExecApprovalStore()
-    assert store.load().security == "full"
+    assert store.load().security == "allowlist"
 
     _write_policy_file("deny")
     store.refresh_if_changed()
@@ -52,7 +52,7 @@ def test_refresh_is_noop_without_change():
     store.load()
     # No external write — refresh must not clobber the loaded config.
     store.refresh_if_changed()
-    assert store.config.security == "full"
+    assert store.config.security == "allowlist"
 
 
 def test_own_save_is_not_reloaded():
@@ -67,6 +67,9 @@ def test_own_save_is_not_reloaded():
 
 def test_exec_tool_reports_live_unattended_policy():
     tool = SecureExecTool(ExecConfig())
+    assert not tool.runs_unattended()  # a new install starts in Auto
+
+    _write_policy_file("full", "off")
     assert tool.runs_unattended()
 
     _write_policy_file("full", "always")
@@ -76,6 +79,7 @@ def test_exec_tool_reports_live_unattended_policy():
 @pytest.mark.asyncio
 @pytest.mark.skipif(sys.platform == "win32", reason="uses /bin/sh subprocess")
 async def test_execute_command_picks_up_external_policy_change(tmp_path):
+    _write_policy_file("full", "off")
     store = ExecApprovalStore()
     store.load()  # full / off → runs freely
 

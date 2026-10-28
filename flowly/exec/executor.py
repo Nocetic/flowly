@@ -19,7 +19,6 @@ from flowly.exec.bash_finder import find_bash
 from flowly.exec.safety import analyze_command
 from flowly.exec.approvals import (
     ExecApprovalStore,
-    check_allowlist,
     requires_approval,
 )
 from flowly.exec.env_scrub import sanitize_subprocess_env
@@ -267,7 +266,13 @@ async def execute_command(
     # Check if approval is required (works in any security mode)
     allowlist_ok = False
     if store_config.security == "allowlist":
-        allowlist_ok = check_allowlist(store, analysis.resolved_path, analysis.executable)
+        # Every part of a chain is judged, not its first word: Auto used to
+        # run `echo hi && rm -r ./build` unasked (see flowly.exec.auto_rules).
+        from flowly.exec.auto_rules import is_single_command, runs_without_asking
+
+        allowlist_ok = runs_without_asking(request.command, request.cwd) or (
+            is_single_command(request.command) and store.check_allowlist(analysis.resolved_path)
+        )
 
     # Risky commands force an approval prompt unless the security policy is
     # explicitly "full" with "ask=off" (the user signed off on full trust).
@@ -308,7 +313,7 @@ async def execute_command(
         # Allow-once or allow-always
         store.resolve_pending(pending.id, decision)
 
-    elif store_config.security == "allowlist" and not allowlist_ok and not analysis.is_safe_bin:
+    elif store_config.security == "allowlist" and not allowlist_ok:
         # Not in allowlist and not a safe bin
         return ExecResult(
             success=False,
