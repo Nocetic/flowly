@@ -226,6 +226,33 @@ async def run_login_flow(
     return account
 
 
+async def sign_in_with_handoff(custom_token: str) -> Account:
+    """Sign this machine's agent in with a token an app that is already signed
+    in handed over (Flowly Desktop's ``/api/auth/desktop-token``), so the
+    agent joins the same account without a browser. Same result as
+    :func:`run_login_flow` after its device-code step."""
+    custom_token = custom_token.strip()
+    if not custom_token:
+        raise FirebaseAuthError("empty handoff token")
+    tokens = await sign_in_with_custom_token(custom_token)
+    profile = await lookup_account(tokens.id_token)
+    account = Account(
+        user_id=tokens.user_id,
+        email=profile.get("email") or tokens.email,
+        id_token=tokens.id_token,
+        refresh_token=tokens.refresh_token,
+        expires_at=tokens.expires_at,
+        machine_id=machine_id(),
+        machine_name=machine_name(),
+        device_id="desktop-handoff",
+    )
+    save_account(account)
+    audit_log.info("login.handoff.success",
+                   user_id=tokens.user_id,
+                   storage=storage_status().detail)
+    return account
+
+
 async def _poll_for_token(
     client: httpx.AsyncClient, code: str, device_id: str
 ) -> str:

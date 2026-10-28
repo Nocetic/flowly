@@ -357,6 +357,35 @@ def _login_with_account_key(key: str) -> None:
         raise typer.Exit(code=4)
 
 
+def _login_with_handoff(token: str) -> None:
+    """Sign in with a token Flowly Desktop handed over on stdin, then issue the
+    account key — no browser, no relay. Desktop runs this for the agent it
+    carries; it retries on a non-zero exit.
+
+    Exit codes: 1 sign-in failed, 2 signed in but the key did not land,
+    4 the running gateway could not take the new key.
+    """
+    from flowly.account.auth import sign_in_with_handoff
+
+    try:
+        account = asyncio.run(sign_in_with_handoff(token))
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]✗ Sign-in with the handed-over token failed:[/] {exc}")
+        raise typer.Exit(code=1)
+    key_change = _provision_account_key(account)
+    console.print(f"[green]✓[/] Signed in as [b]{account.email or account.user_id}[/].")
+    runtime_ok = _apply_runtime_changes(
+        provider_reload_required=key_change.changed,
+        relay_restart_required=False,
+        security_sensitive=key_change.replaced_stale,
+    )
+    if not key_change.ready:
+        _print_provider_verdict()
+        raise typer.Exit(code=2)
+    if not runtime_ok:
+        raise typer.Exit(code=4)
+
+
 def _mint_and_save_account_key(account) -> bool:
     """Auto-provision the account-key provider after sign-in (shared with the TUI
     login modal). Idempotent + best-effort — see ``flowly.account.account_key``."""
@@ -436,6 +465,11 @@ def login(
         help="Skip the interactive prompt and force remote/phone reach (a server "
              "registration + relay) ON or OFF. Default: ask interactively.",
     ),
+    token_stdin: bool = typer.Option(
+        False, "--token-stdin",
+        help="Sign in with a token Flowly Desktop hands over on stdin (no browser).",
+        hidden=True,
+    ),
 ) -> None:
     """Sign in with Flowly account — zero API keys, OAuth-driven.
 
@@ -464,6 +498,12 @@ def login(
     # Programmatic / Desktop path: a key was provided, just store it.
     if key:
         _login_with_account_key(key)
+        return
+
+    # ── Path: --token-stdin (Desktop signs the agent it carries in) ──
+    # `is True`: called as a plain function the default is Typer's OptionInfo.
+    if token_stdin is True:
+        _login_with_handoff(sys.stdin.read())
         return
 
     if dry_run and not repair:
