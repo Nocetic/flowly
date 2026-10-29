@@ -3341,7 +3341,7 @@ class GatewayServer:
         # re-enters mid-stream must restore only the agent's words.
         from flowly.agent_home import AGENT_INTRODUCTION
 
-        from flowly.agent.report_turn import REPORT_TURN, report_turn_fields, run_started_event
+        from flowly.agent.report_turn import REPORT_TURN, report_turn_fields, turn_started_event
 
         # A subagent's report is the agent's own turn: its notice is hidden,
         # every event says whose run it is, and it opens with run_started.
@@ -3360,11 +3360,11 @@ class GatewayServer:
                            goal_run=bool((extra_metadata or {}).get('goal_run')),
                            turn_origin=turn_fields.get("turnOrigin"))
             turn_started = True
-            if report_turn:
-                await self._session_send(
-                    session_key, ws,
-                    {"type": "event", "event": "chat", "data": run_started_event(run_id, session_key)},
-                )
+            await self._session_send(
+                session_key, ws,
+                {"type": "event", "event": "chat", "data": turn_started_event(
+                    run_id, session_key, report_turn=report_turn, hidden_prompt=hidden_prompt)},
+            )
 
         if supports_turn_start:
             extra_metadata = {**(extra_metadata or {}), '_on_turn_started': on_turn_started}

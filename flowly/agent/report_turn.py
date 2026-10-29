@@ -56,6 +56,18 @@ def run_started_event(run_id: str, session_key: str) -> dict[str, Any]:
     }
 
 
+def turn_started_event(run_id: str, session_key: str, *, report_turn: bool,
+                       hidden_prompt: bool = False) -> dict[str, Any]:
+    """The ``chat`` event that tells the apps a turn has begun: sent once the
+    turn holds its conversation's lock, before the model is asked anything, so
+    the agent shows working at once rather than at its first word or tool.
+    A report turn's carries its own fields (:func:`run_started_event`)."""
+    if report_turn:
+        return run_started_event(run_id, session_key)
+    return {"state": "run_started", "runId": run_id, "sessionKey": session_key,
+            **({"hiddenPrompt": True} if hidden_prompt else {})}
+
+
 def report_notice(sender_id: str, chat_id: str) -> dict[str, str]:
     """The marker value: who sent the notice and where the reply goes."""
     return {"sender_id": sender_id, "chat_id": chat_id}

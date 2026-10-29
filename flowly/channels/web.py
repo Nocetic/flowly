@@ -24,7 +24,7 @@ from flowly.agent.report_turn import (
     REPORT_TURN_ORIGIN,
     report_notice,
     report_turn_fields,
-    run_started_event,
+    turn_started_event,
 )
 from flowly.bus.events import ConversationInboundMessage
 from flowly.bus.events import InboundMessage as _Base
@@ -3261,12 +3261,12 @@ class WebChannel(BaseChannel):
                 inflight.begin(session_key, run_id, "" if hidden_prompt else text,
                                goal_run=bool(metadata.get('goal_run')),
                                turn_origin=turn_fields.get("turnOrigin"))
-                if report_turn:
-                    data = run_started_event(run_id, session_key)
-                    await self._send_or_queue(json.dumps({
-                        "type": "event", "sessionId": session_id, "event": "chat", "data": data,
-                    }))
-                    asyncio.create_task(self._emit_local_event("chat", {**data, "source": "relay"}))
+                data = turn_started_event(run_id, session_key, report_turn=report_turn,
+                                          hidden_prompt=hidden_prompt)
+                await self._send_or_queue(json.dumps({
+                    "type": "event", "sessionId": session_id, "event": "chat", "data": data,
+                }))
+                asyncio.create_task(self._emit_local_event("chat", {**data, "source": "relay"}))
 
             metadata['_on_turn_started'] = on_turn_started
 
