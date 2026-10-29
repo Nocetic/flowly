@@ -2840,8 +2840,9 @@ class ProfileHost:
                     "PROFILE_COLLABORATION_FAILED",
                     "Target profile did not accept the collaboration turn.",
                 )
-            exchange = {"exchangeId": run_id, "source": source_profile, "target": target,
-                        "sourceSessionKey": source_session}
+            # correlationId: the source's turn, which groups its messages to one agent.
+            exchange = {"exchangeId": run_id, "correlationId": correlation_id, "source": source_profile,
+                        "target": target, "sourceSessionKey": source_session}
             await self._emit_exchange(target, {**exchange, "phase": "started", "message": message})
             try:
                 reply = await self._await_broker_reply(target, run_id)
