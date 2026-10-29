@@ -30,6 +30,11 @@ teaches you something the code alone does not say.
   The loop sends tool progress to `on_tool_progress`, or publishes it itself
   only when there is no `on_iteration`. The web channel set one without the
   other, so over the relay and the Flowly server no tool ever showed running.
+- **An agent-to-agent inbox turn stays private; its record does not.** The
+  target answers in `desktop:profile-inbox:…`, whose live events never leave
+  the host (`profile_host.py` `if not internal_turn`). What the apps see is
+  the one `agent.exchange` record `_run_broker_turn` emits (started / ended).
+  Add fields there, never by letting the inbox turn's events out.
 - **Every turn opens with `run_started`** once it holds the lock, before the
   model is asked: the apps show the agent working from it. Do not move it
   after compaction or the first model call.
