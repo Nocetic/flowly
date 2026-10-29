@@ -2841,8 +2841,10 @@ class ProfileHost:
                     "Target profile did not accept the collaboration turn.",
                 )
             # correlationId: the source's turn, which groups its messages to one agent.
+            # targetSessionKey: the private inbox session the target answers in.
             exchange = {"exchangeId": run_id, "correlationId": correlation_id, "source": source_profile,
-                        "target": target, "sourceSessionKey": source_session}
+                        "target": target, "sourceSessionKey": source_session,
+                        "targetSessionKey": target_session}
             await self._emit_exchange(target, {**exchange, "phase": "started", "message": message})
             try:
                 reply = await self._await_broker_reply(target, run_id)

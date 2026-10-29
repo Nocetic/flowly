@@ -1602,6 +1602,7 @@ async def test_an_exchange_between_agents_is_told_to_the_apps_but_its_turn_stays
     assert (started["source"], started["target"], started["message"]) == ("writer", "reviewer", "Please review this")
     assert started["sourceSessionKey"] == "web:writer-chat"
     assert started["correlationId"] == ended["correlationId"] == "c-1"
+    assert started["targetSessionKey"].startswith("desktop:profile-inbox:writer:")
     assert (ended["outcome"], ended["reply"]) == ("replied", "Reviewed")
     assert isinstance(started["at"], int) and isinstance(ended["at"], int)
     # The inbox turn's live events never leave the host.
