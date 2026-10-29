@@ -24,6 +24,16 @@ teaches you something the code alone does not say.
 - **One-shot CLI flags must not survive a restart.** `self_restart.install(...,
   drop_flags=(...))`; `--rotate-token` would unpair every app on every restart.
 
+## Turn events
+
+- **A host that passes `on_iteration` must pass `on_tool_progress` too.**
+  The loop sends tool progress to `on_tool_progress`, or publishes it itself
+  only when there is no `on_iteration`. The web channel set one without the
+  other, so over the relay and the Flowly server no tool ever showed running.
+- **Every turn opens with `run_started`** once it holds the lock, before the
+  model is asked: the apps show the agent working from it. Do not move it
+  after compaction or the first model call.
+
 ## State a running gateway owns
 
 - **A CLI command must not write a file a running gateway holds in memory**
