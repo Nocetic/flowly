@@ -2789,6 +2789,7 @@ class ProfileHost:
                 raise ProfileHostError("PROFILE_HOST_UNAVAILABLE", "The agent host is stopping.")
             return await self._run_broker_turn(
                 source_profile=source_profile,
+                source_session=source_session,
                 target=target,
                 target_session=target_session,
                 message=message,
@@ -2802,6 +2803,7 @@ class ProfileHost:
         self,
         *,
         source_profile: str,
+        source_session: str = "",
         target: str,
         target_session: str,
         message: str,
@@ -2838,34 +2840,25 @@ class ProfileHost:
                     "PROFILE_COLLABORATION_FAILED",
                     "Target profile did not accept the collaboration turn.",
                 )
-            key = (target, run_id)
-            terminal = self._terminal_events.pop(key, None)
-            if terminal is None:
-                waiter = asyncio.get_running_loop().create_future()
-                self._broker_waiters[key] = waiter
-                try:
-                    terminal = await asyncio.wait_for(waiter, timeout=600)
-                except asyncio.TimeoutError as exc:
-                    await self._abort_broker_turn(target, run_id)
-                    raise ProfileHostError(
-                        "PROFILE_RESPONSE_TIMEOUT",
-                        f"Profile '{target}' did not respond in time.",
-                    ) from exc
-                finally:
-                    self._broker_waiters.pop(key, None)
-                    self._terminal_events.pop(key, None)
-            _check_profile_terminal(terminal)
-            response = _profile_reply_text(terminal.get("message"))
-            if not response:
-                raise ProfileHostError(
-                    "PROFILE_EMPTY_RESPONSE",
-                    f"Profile '{target}' returned an empty response.",
-                )
+            exchange = {"exchangeId": run_id, "source": source_profile, "target": target,
+                        "sourceSessionKey": source_session}
+            await self._emit_exchange(target, {**exchange, "phase": "started", "message": message})
+            try:
+                reply = await self._await_broker_reply(target, run_id)
+            except asyncio.CancelledError:
+                await self._emit_exchange(target, {**exchange, "phase": "ended", "outcome": "aborted"})
+                raise
+            except ProfileHostError as exc:
+                await self._emit_exchange(target, {**exchange, "phase": "ended", "outcome": "error",
+                                                   "errorCode": exc.code})
+                raise
+            await self._emit_exchange(target, {**exchange, "phase": "ended", "outcome": "replied",
+                                               "reply": reply})
             return {
                 "ok": True,
                 "targetProfile": target,
                 "runId": run_id,
-                "response": response,
+                "response": reply,
                 "correlationId": correlation_id,
                 "hop": hop,
             }
@@ -2876,6 +2869,42 @@ class ProfileHost:
             raise
         finally:
             self._broker_sessions.pop((target, target_session), None)
+
+    async def _emit_exchange(self, target: str, data: dict[str, Any]) -> None:
+        """One message between two agents, for the apps (``agent.exchange``).
+
+        The inbox turn itself stays private (its live events never leave the
+        host); this is the exchange's record: who asked whom what, and what came
+        back. ``started`` once the target took it, ``ended`` with its outcome.
+        Sent under the target, the agent that is now working."""
+        await self._emit(target, "agent.exchange", {**data, "at": int(time.time() * 1000)})
+
+    async def _await_broker_reply(self, target: str, run_id: str) -> str:
+        """The target's reply text, or a ProfileHostError (timeout, error, empty)."""
+        key = (target, run_id)
+        terminal = self._terminal_events.pop(key, None)
+        if terminal is None:
+            waiter = asyncio.get_running_loop().create_future()
+            self._broker_waiters[key] = waiter
+            try:
+                terminal = await asyncio.wait_for(waiter, timeout=600)
+            except asyncio.TimeoutError as exc:
+                await self._abort_broker_turn(target, run_id)
+                raise ProfileHostError(
+                    "PROFILE_RESPONSE_TIMEOUT",
+                    f"Profile '{target}' did not respond in time.",
+                ) from exc
+            finally:
+                self._broker_waiters.pop(key, None)
+                self._terminal_events.pop(key, None)
+        _check_profile_terminal(terminal)
+        response = _profile_reply_text(terminal.get("message"))
+        if not response:
+            raise ProfileHostError(
+                "PROFILE_EMPTY_RESPONSE",
+                f"Profile '{target}' returned an empty response.",
+            )
+        return response
 
     async def _abort_broker_turn(self, target: str, run_id: str) -> None:
         try:

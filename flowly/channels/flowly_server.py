@@ -325,6 +325,12 @@ class FlowlyServerChannel(WebChannel):
         """
         from flowly.agent_home import HOME_SESSION
 
+        if event_type == "agent.exchange":
+            # A message between two agents (any two, the main agent too), once,
+            # for the server to record and show (agent-exchanges.md). The inbox
+            # turn behind it never leaves the host.
+            await self._send_or_queue(json.dumps({"type": "event", "event": "agent.exchange", "data": payload}))
+            return
         if profile in ("", "default") or event_type not in PROFILE_CHAT_EVENTS:
             return
         if payload.get("sessionKey") != HOME_SESSION:

@@ -1551,3 +1551,78 @@ async def test_a_read_if_running_never_starts_a_stopped_agent(profile_roots):
     with pytest.raises(ProfileHostError) as invalid:
         await host.dispatch('profiles.rpc', {**request, 'ifRunning': 'yes'})
     assert invalid.value.code == 'INVALID_PARAMS'
+
+
+def _broker_target(host: ProfileHost, terminal: dict) -> None:
+    async def target_rpc(profile: str, method: str, params: dict, _timeout: float):
+        run_id = "exchange-run"
+
+        async def finish() -> None:
+            await asyncio.sleep(0)
+            # The inbox turn's own events: one word, then its terminal.
+            await host._handle_profile_event(profile, "chat", {
+                "runId": run_id, "sessionKey": params["sessionKey"], "state": "streaming", "delta": "Re",
+            })
+            await host._handle_profile_event(profile, "chat", {
+                "runId": run_id, "sessionKey": params["sessionKey"], **terminal,
+            })
+
+        asyncio.create_task(finish())
+        return {"runId": run_id}
+
+    host._target_rpc = target_rpc  # type: ignore[method-assign]
+
+
+_EXCHANGE_PARAMS = {
+    "sourceProfile": "writer", "sourceSessionKey": "web:writer-chat", "targetProfile": "reviewer",
+    "message": "Please review this", "correlationId": "c-1", "hop": 1,
+}
+
+
+@pytest.mark.asyncio
+async def test_an_exchange_between_agents_is_told_to_the_apps_but_its_turn_stays_private(profile_roots) -> None:
+    profiles.create_profile("writer", local_runtime=True)
+    profiles.create_profile("reviewer", local_runtime=True)
+    events: list[dict] = []
+
+    async def on_event(event: dict) -> None:
+        events.append(event)
+
+    host = ProfileHost(on_event=on_event)
+    _broker_target(host, {"state": "final", "message": {"content": "Reviewed"}})
+
+    result = await host._broker("writer", dict(_EXCHANGE_PARAMS))
+
+    assert result["response"] == "Reviewed"
+    exchange = [e for e in events if e["type"] == "agent.exchange"]
+    assert [e["data"]["phase"] for e in exchange] == ["started", "ended"]
+    assert all(e["profile"] == "reviewer" for e in exchange)  # the agent now working
+    started, ended = (e["data"] for e in exchange)
+    assert started["exchangeId"] == ended["exchangeId"] == "exchange-run"
+    assert (started["source"], started["target"], started["message"]) == ("writer", "reviewer", "Please review this")
+    assert started["sourceSessionKey"] == "web:writer-chat"
+    assert (ended["outcome"], ended["reply"]) == ("replied", "Reviewed")
+    assert isinstance(started["at"], int) and isinstance(ended["at"], int)
+    # The inbox turn's live events never leave the host.
+    assert not [e for e in events if e["type"] == "chat"]
+
+
+@pytest.mark.asyncio
+async def test_an_exchange_that_fails_ends_with_its_error(profile_roots) -> None:
+    profiles.create_profile("writer", local_runtime=True)
+    profiles.create_profile("reviewer", local_runtime=True)
+    events: list[dict] = []
+
+    async def on_event(event: dict) -> None:
+        events.append(event)
+
+    host = ProfileHost(on_event=on_event)
+    _broker_target(host, {"state": "error", "errorMessage": "provider down"})
+
+    with pytest.raises(ProfileHostError):
+        await host._broker("writer", dict(_EXCHANGE_PARAMS))
+
+    exchange = [e["data"] for e in events if e["type"] == "agent.exchange"]
+    assert [e["phase"] for e in exchange] == ["started", "ended"]
+    assert exchange[1]["outcome"] == "error" and exchange[1]["errorCode"] == "PROFILE_COLLABORATION_FAILED"
+    assert "reply" not in exchange[1]

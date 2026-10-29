@@ -251,3 +251,16 @@ async def test_a_final_names_its_reply_apart_from_the_persons_message(home):
     await host._emit("writer", "chat", {"state": "final", "runId": "m-9", "streamRunId": "run-2", "sessionKey": HOME_SESSION,
                                         "message": {"role": "assistant", "content": []}})
     assert (forwarded[1]["data"]["runId"], forwarded[1]["data"]["streamRunId"]) == ("m-9", "run-2")
+
+
+@pytest.mark.asyncio
+async def test_a_message_between_agents_reaches_the_server_once_whoever_watches(home) -> None:
+    channel, host, forwarded = make_channel()
+    # A device that watches the writer's chat must not get its own copy.
+    channel._profile_conversation_sessions[("writer", HOME_SESSION)] = {"device-1": 0.0}
+    data = {"phase": "started", "exchangeId": "x1", "source": "default", "target": "writer",
+            "sourceSessionKey": "web:main-chat", "message": "Draft the post", "at": 1}
+
+    await host._emit("writer", "agent.exchange", data)
+
+    assert forwarded == [{"type": "event", "event": "agent.exchange", "data": data}]
