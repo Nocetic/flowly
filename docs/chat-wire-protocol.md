@@ -64,7 +64,7 @@ Discriminated by `data.state`.
 
 | `state` | Meaning | Key fields |
 | --- | --- | --- |
-| `run_started` | A run the server started opened (§4.7). Not a terminal, no text. | `turnOrigin`, `hiddenPrompt`, `steerable` |
+| `run_started` | A turn opened: sent once it holds its conversation's lock, before the model is asked anything (every turn since 2026-10-29; §4.7 for a report turn's fields). Not a terminal, no text. | `turnOrigin`, `hiddenPrompt`, `steerable` (report turns); `hiddenPrompt` when the app wrote the prompt |
 | `streaming` | One delta of assistant text. | `delta` |
 | `iteration_step` | One tool-protocol step inside the turn. | `iterationIdx`, `role`, `content`, `tool_calls?`, `tool_call_id?`, `name?` |
 | `tool_progress` | A call's state changed (queued, running, ended). Not a step. | `iterationIdx`, `revision`, `call` |
@@ -227,6 +227,12 @@ run_started ─▶ [streaming | agent delta | iteration_step | tool_progress]* �
 Older clients ignore `run_started` and `turnOrigin`; on the relay they see
 the deltas as before, on the direct gateway they show the reply on the next
 history read.
+
+Since 2026-10-29 every turn opens with `run_started`, a person's own too:
+`{state, runId, sessionKey}` (plus `hiddenPrompt: true` when the app wrote the
+prompt), so a client can show the agent working before its first word or
+tool. A report turn's keeps the fields above. Clients that do not know it
+skip it.
 
 **4.8 — A subagent's own turn streams to whoever watches it.** A subagent
 working for the owner is a thread with its own read-only conversation
