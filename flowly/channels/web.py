@@ -3281,6 +3281,18 @@ class WebChannel(BaseChannel):
                 ))
 
             metadata['on_iteration'] = on_iteration
+
+            # A tool's lifecycle (queued, running, done), live. Without this the
+            # loop leaves it to on_iteration's host, which forwards only the
+            # steps, so the apps never saw a tool running on this path.
+            async def on_tool_progress(event: dict) -> None:
+                await self.send(OutboundMessage(
+                    channel='web', chat_id=session_id, content='',
+                    metadata={'tool_progress_event': {**event, 'runId': run_id, **turn_fields},
+                              'session_key': session_key},
+                ))
+
+            metadata['on_tool_progress'] = on_tool_progress
         if voice_mode:
             metadata["voice_mode"] = True
         if render_capabilities:
