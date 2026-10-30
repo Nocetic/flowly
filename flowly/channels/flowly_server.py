@@ -307,6 +307,19 @@ class FlowlyServerChannel(WebChannel):
                 self._prune_profile_bindings()
         await reply({"result": result})
 
+    async def send_secret_event(self, session_key: str, event_name: str, data: dict) -> None:
+        """A secret request's card, even from a turn no device's session is bound to.
+
+        The relay needs a device's session to route an event; the server finds
+        the conversation by its ``sessionKey`` (PROTOCOL A9), so a request the
+        agent opened in a turn it started itself (a goal's step) still shows.
+        """
+        relay_id = self._relay_id_for(session_key)
+        frame: dict[str, Any] = {"type": "event", "event": event_name, "data": data}
+        if relay_id:
+            frame["sessionId"] = relay_id
+        await self._send_or_queue(json.dumps(frame))
+
     async def report_profile_home_message(self, profile: str, message_id: str, text: str, files: int) -> None:
         """A person's message in a named agent's one chat that did not come
         through the server (Desktop, a direct gateway app), told to it on the
