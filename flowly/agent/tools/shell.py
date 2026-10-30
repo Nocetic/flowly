@@ -229,11 +229,15 @@ class SecureExecTool(Tool):
             workspace=self.working_dir,
         )
 
-        # Create request
+        # Create request. The agent's saved secrets are in the command's
+        # environment (flowly.secrets); its output is redacted on the way out.
+        from flowly.secrets.service import forced_env
+
         request = ExecRequest(
             command=command.strip(),
             cwd=str(resolved_cwd),
             timeout=timeout,
+            env=forced_env() or None,
             session_key=session_key,
         )
 

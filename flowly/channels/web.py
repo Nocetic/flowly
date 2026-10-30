@@ -1741,6 +1741,22 @@ class WebChannel(BaseChannel):
         # Retiring a prompt matters as much as raising it — queue on a flap.
         await self._send_or_queue(json.dumps(event_msg))
 
+    async def send_secret_event(self, session_key: str, event_name: str, data: dict) -> None:
+        """A secret request's card (``secret.requested`` / ``secret.closed``) to the
+        conversation that asked, through the relay or the Flowly server.
+
+        Never a value: the request names what it asks for, its close says how
+        it ended (flowly.secrets.requests). Queued on a flap, as a question is.
+        """
+        if not self._ws:
+            return
+        relay_id = self._relay_id_for(session_key)
+        if not relay_id:
+            return
+        await self._send_or_queue(json.dumps({
+            "type": "event", "sessionId": relay_id, "event": event_name, "data": data,
+        }))
+
     async def send_plan_event(
         self,
         session_key: str,

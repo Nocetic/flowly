@@ -551,7 +551,9 @@ class ProcessRegistry:
     async def _emit_watch_match(self, session: ProcessSession, pattern: str, snippet: str) -> None:
         if self._bus is None or session.session_key is None:
             return
-        tail = _strip_ansi(snippet)[-COMPLETION_OUTPUT_TAIL_CHARS:]
+        from flowly.secrets.redact import redact
+
+        tail = redact(_strip_ansi(snippet))[-COMPLETION_OUTPUT_TAIL_CHARS:]
         content = (
             f"[Process {session.id} matched pattern {pattern!r}]\n"
             f"Last output:\n{tail}"
@@ -578,7 +580,9 @@ class ProcessRegistry:
     async def _emit_completion(self, session: ProcessSession) -> None:
         if self._bus is None or session.session_key is None:
             return
-        tail = _strip_ansi(session.output_buffer)[-COMPLETION_OUTPUT_TAIL_CHARS:]
+        from flowly.secrets.redact import redact
+
+        tail = redact(_strip_ansi(session.output_buffer))[-COMPLETION_OUTPUT_TAIL_CHARS:]
         verdict = "succeeded" if session.exit_code == 0 else "failed"
         content = (
             f"[Process {session.id} {verdict} (exit_code={session.exit_code}, "

@@ -2821,6 +2821,11 @@ class AgentLoop:
         # back an answer; see flowly.clarify.
         from flowly.agent.tools.clarify import ClarifyTool
         self.tools.register(ClarifyTool())
+        # Secrets — the agent asks for a key by name and never sees its value;
+        # the conversation continues when the person answers (flowly.secrets).
+        from flowly.agent.tools.secrets import ListSecretsTool, RequestSecretTool
+        self.tools.register(RequestSecretTool())
+        self.tools.register(ListSecretsTool())
         # React tool — one emoji on the user's latest message (chat-one-log.md
         # §13). Carried by whichever surfaces registered with the reaction hub.
         from flowly.agent.tools.react import ReactTool
@@ -9211,6 +9216,11 @@ class AgentLoop:
         if browser_tool and hasattr(browser_tool, "set_context"):
             browser_tool.set_context(tool_channel, tool_chat_id)
 
+        # A secret request continues this conversation once the person answers.
+        secret_tool = self.tools.get("request_secret")
+        if secret_tool and hasattr(secret_tool, "set_context"):
+            secret_tool.set_context(tool_channel, tool_chat_id)
+
         # Detect persona change and inject transition marker
         current_persona = self.context.persona
         session_persona = session.metadata.get("persona")
@@ -10062,6 +10072,10 @@ class AgentLoop:
         voice_tool = self.tools.get("voice_call")
         if voice_tool and hasattr(voice_tool, "set_context"):
             voice_tool.set_context(origin_channel, origin_chat_id)
+
+        secret_tool = self.tools.get("request_secret")
+        if secret_tool and hasattr(secret_tool, "set_context"):
+            secret_tool.set_context(origin_channel, origin_chat_id)
 
         # Build messages with the announce content. This path is the
         # subagent-completion-announce turn — the parent wakes back up

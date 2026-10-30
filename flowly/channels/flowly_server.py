@@ -39,6 +39,8 @@ PASSIVE_METHODS = frozenset({
     "objectives.list", "agenda.list",
     # A desktop says every 30 s that its owner is at the computer (flowly.push.presence).
     "presence.report",
+    # An app reading what secrets are saved or waiting (names only).
+    "secrets.requests", "secrets.list",
 })
 
 #: What Core asks the server for on connect (server PROTOCOL H1): the relay's
@@ -59,6 +61,11 @@ PROFILE_CHAT_METHODS = frozenset({
     # The server reads the agent's chat from Core only to move it over (B7 "Taşıma").
     "chat.history",
 })
+#: A named agent's secrets (flowly.secrets), called on the agent's own address
+#: the same way: the server sends them with ``params.profile``.
+PROFILE_SECRET_METHODS = frozenset({
+    "secrets.requests", "secrets.status", "secrets.list", "secrets.submit", "secrets.decline", "secrets.delete",
+})
 _PROFILE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 #: The server's delivery session for a named agent's chat: ``srv-p:<profile>:<conversationId>``.
 _PROFILE_DELIVERY_SESSION = re.compile(r"^srv-p:([A-Za-z0-9._-]{1,64}):([A-Za-z0-9_-]{1,128})$")
@@ -70,6 +77,8 @@ PROFILE_CHAT_EVENTS = frozenset({
     "chat.reaction",
     "exec.approval.requested", "exec.approval.closed",
     "agent.clarify.requested", "agent.clarify.closed",
+    # A secret request's card (flowly.secrets.requests); never a value.
+    "secret.requested", "secret.closed",
     "plan.updated", "plan.approval.requested",
 })
 
@@ -232,7 +241,8 @@ class FlowlyServerChannel(WebChannel):
     async def _dispatch_rpc(self, ws, msg: dict) -> None:
         params = msg.get("params")
         profile = params.get("profile") if isinstance(params, dict) else None
-        if msg.get("method") in PROFILE_CHAT_METHODS and profile not in (None, "", "default"):
+        method = msg.get("method")
+        if (method in PROFILE_CHAT_METHODS or method in PROFILE_SECRET_METHODS) and profile not in (None, "", "default"):
             await self._dispatch_profile_chat(ws, msg, profile)
             return
         await super()._dispatch_rpc(ws, msg)

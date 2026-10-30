@@ -24,6 +24,16 @@ from flowly.exec.safety import analyze_command, DEFAULT_SAFE_BINS
 from flowly.profile import get_flowly_home
 
 
+def _secret_reasons(command: str) -> list[str]:
+    """A "Uses saved secret NAME" reason per saved secret the command names (flowly.secrets)."""
+    try:
+        from flowly.secrets.service import approval_reasons
+
+        return approval_reasons(command)
+    except Exception:
+        return []
+
+
 @dataclass
 class ExecApprovalsConfig:
     """Stored exec approvals configuration."""
@@ -287,7 +297,7 @@ class ExecApprovalStore:
             expires_at=now + timeout_seconds,
             session_key=request.session_key,
             resolved_path=analysis.resolved_path,
-            risk_reasons=list(analysis.risk_reasons),
+            risk_reasons=[*analysis.risk_reasons, *_secret_reasons(request.command)],
             # "allow-always" only persists when we have a path to allowlist
             # (see resolve_pending). Pipelines / builtins resolve to no path,
             # so remembering them is impossible — don't offer it.

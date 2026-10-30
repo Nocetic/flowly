@@ -93,6 +93,8 @@ _ATTENTION_EVENTS = frozenset({
     "exec.approval.closed",
     "agent.clarify.requested",
     "agent.clarify.closed",
+    "secret.requested",
+    "secret.closed",
     "plan.approval.requested",
     "plan.updated",
 })

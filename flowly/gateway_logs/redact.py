@@ -4,6 +4,7 @@ The log file itself stays as written (it is the owner's, on their disk). What
 ``logs.events`` / ``logs.tail`` hand out — possibly over the relay to a phone —
 goes through ``redact`` first:
 
+- the agent's saved secrets, by their exact values (``flowly.secrets.redact``);
 - credentials: API keys, bearer and bot tokens, JWTs, ``password=…`` pairs;
 - the owner's home directory, which carries their account name, becomes ``~``;
 - long identifiers (UUIDs) are shortened to their first eight characters,
@@ -39,6 +40,9 @@ _UUID = re.compile(r"\b([0-9a-fA-F]{8})-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F
 def redact(text: str, home: str | None = None) -> str:
     if not text:
         return text
+    from flowly.secrets.redact import redact as hide_saved_secrets
+
+    text = hide_saved_secrets(text)
     for pattern in _SECRETS:
         text = pattern.sub(MASK, text)
     text = _BEARER.sub(lambda match: f"{match.group(1)} {MASK}", text)

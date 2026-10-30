@@ -10,6 +10,7 @@ something interesting happens.
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 from loguru import logger
@@ -156,10 +157,16 @@ buffer. Up to 64 concurrent processes; oldest finished are evicted first."""
         if not command or not isinstance(command, str) or not command.strip():
             return "Error: 'command' is required for action=start"
         try:
+            # The agent's saved secrets are in the process's environment
+            # (flowly.secrets); without any, it inherits as it always did.
+            from flowly.secrets.service import command_env
+
+            secret_env = command_env()
             session = await self._registry.spawn(
                 command=command,
                 session_key=session_key,
                 cwd=cwd,
+                env={**os.environ, **secret_env} if secret_env else None,
                 watch_patterns=watch_patterns,
                 notify_on_complete=bool(notify_on_complete),
             )

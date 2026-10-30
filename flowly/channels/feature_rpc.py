@@ -2222,6 +2222,37 @@ async def voice_call(method: str, params: dict) -> dict:
                                  stage='core_handler', finished=finished)
 
 
+async def secrets_call(method: str, params: dict) -> dict:
+    """``secrets.*``: this agent's saved secrets and its waiting requests (flowly.secrets).
+
+    Nothing here returns a value: values arrive sealed to the agent's key
+    (``secrets.submit``) and leave only as a command's environment.
+    """
+    from flowly.secrets import service
+    from flowly.secrets.vault import SecretsError
+
+    try:
+        if method == "secrets.requests":
+            return service.pending_requests()
+        if method == "secrets.status":
+            return service.status()
+        if method == "secrets.list":
+            return service.list_secrets()
+        if method == "secrets.submit":
+            return await service.submit(params)
+        if method == "secrets.decline":
+            return await service.decline(params)
+        if method == "secrets.delete":
+            return service.delete(params)
+    except SecretsError as exc:
+        raise FeatureRpcError(exc.code, str(exc)) from None
+    raise FeatureRpcError("UNKNOWN_METHOD", f"unknown feature method: {method}")
+
+
+SECRETS_METHODS = ("secrets.requests", "secrets.status", "secrets.list", "secrets.submit",
+                   "secrets.decline", "secrets.delete")
+
+
 def task_request_call(method: str, params: dict) -> dict:
     from flowly.live_voice.requests import pending_requests, respond
     from flowly.live_voice.sessions import VoiceError
@@ -5942,6 +5973,7 @@ _DISPATCH: dict[str, tuple] = {
 }
 
 _DISPATCH.update({method: (_partial(voice_call, method), True, False) for method in _VOICE_METHODS})
+_DISPATCH.update({method: (_partial(secrets_call, method), True, False) for method in SECRETS_METHODS})
 _DISPATCH.update({method: (_partial(task_request_call, method), True, False)
                   for method in ('chat.requests', 'chat.respond')})
 _DISPATCH.update({method: (_partial(work_output_call, method), True, False)

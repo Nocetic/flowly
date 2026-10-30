@@ -264,3 +264,18 @@ async def test_a_message_between_agents_reaches_the_server_once_whoever_watches(
     await host._emit("writer", "agent.exchange", data)
 
     assert forwarded == [{"type": "event", "event": "agent.exchange", "data": data}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["secrets.submit", "secrets.list", "secrets.decline"])
+async def test_a_named_agents_secret_calls_run_in_it(home, method):
+    """Secrets are the agent's own (flowly.secrets): the server names it with
+    ``params.profile`` as for its chat, never the main agent's vault."""
+    channel, host, _ = make_channel({"saved": ["FAL_KEY"]})
+    socket = Socket()
+    await channel._handle_rpc(socket, {"type": "rpc", "id": "s1", "method": method,
+                                       "params": {"profile": "writer", "names": ["FAL_KEY"]}})
+    called = host.dispatch.await_args.args
+    assert called[0] == "profiles.rpc"
+    assert called[1] == {"name": "writer", "method": method, "params": {"names": ["FAL_KEY"]}}
+    assert socket.sent[-1]["result"] == {"saved": ["FAL_KEY"]}

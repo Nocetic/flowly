@@ -2688,6 +2688,7 @@ Respond to the user now:"""
         _source_task: asyncio.Task | None = None
         _catalog_task: asyncio.Task | None = None
         _manager_task: asyncio.Task | None = None
+        _secret_expiry_task: asyncio.Task | None = None
         _board_orchestrator = getattr(agent, "_board_orchestrator", None)
 
         async def _shutdown_subagents() -> None:
@@ -2965,6 +2966,31 @@ Respond to the user now:"""
 
             _clarify_mgr.add_close_callback(_close_clarify)
 
+            # Secret requests (flowly.secrets): a card in the conversation that
+            # asked, on every surface showing it; their own events, never the
+            # clarify wire (an old surface would take the typed value as an
+            # answer). An answered request continues the conversation.
+            from flowly.secrets.requests import closed_to_wire, get_secret_requests
+            _secret_requests = get_secret_requests()
+
+            async def _carry_secret_event(session_key: str, event_name: str, data: dict) -> None:
+                web = channels.get_channel("web")
+                if session_key.startswith("web:") and web and hasattr(web, "send_secret_event"):
+                    await web.send_secret_event(session_key, event_name, data)
+                await gateway_server.broadcast_secret_event(event_name, data)
+
+            async def _secret_requested(request) -> None:
+                await _carry_secret_event(request.session_key, "secret.requested", request.to_wire())
+
+            async def _secret_closed(request, reason: str) -> None:
+                await _carry_secret_event(request.session_key, "secret.closed", closed_to_wire(request, reason))
+
+            _secret_requests.add_requested_callback(_secret_requested)
+            _secret_requests.add_closed_callback(_secret_closed)
+            _secret_requests.set_continuation(agent._continue_screen_task)
+            # Requests whose week is over end once, with the callbacks above in place.
+            _secret_expiry_task = asyncio.create_task(_secret_requests.run_expiry())
+
             # Questions and plan reviews pause the agent like approvals do:
             # pushed to the phone only if still unanswered after a minute.
             from flowly.plans.approval import get_plan_approval_manager
@@ -3037,6 +3063,8 @@ Respond to the user now:"""
                 _catalog_task.cancel()
             if _manager_task is not None:
                 _manager_task.cancel()
+            if _secret_expiry_task is not None:
+                _secret_expiry_task.cancel()
             if _board_orchestrator is not None:
                 await _board_orchestrator.stop_dispatcher()
             # Disarm cron wake-ups and give an in-flight run a bounded chance
