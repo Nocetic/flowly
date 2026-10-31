@@ -46,6 +46,8 @@ def _get_denied_paths() -> tuple[Path, ...]:
         home / "config.json",
         home / "credentials",
         home / "electron-api.json",
+        # Saved secrets: the vault and, without a keychain, its key file.
+        home / "secrets",
         home / "sessions",
         # Subagent conversations carry the owner's conversation they were
         # given, like the sessions above.

@@ -299,6 +299,21 @@ def test_every_agents_screen_directory_is_protected(tmp_path, monkeypatch):
     assert not is_protected_path(tmp_path / ".flowly" / "profiles" / "rhody" / "workspace" / "notes.md")
 
 
+def test_every_agents_saved_secrets_are_protected(tmp_path, monkeypatch):
+    """The vault and, where there is no keychain, its key file: a shell or a
+    file tool that reads both has every saved secret (flowly/secrets)."""
+    from flowly.protected_paths import find_protected_paths_in_command, is_protected_path
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for secrets in (tmp_path / ".flowly" / "secrets", tmp_path / ".flowly" / "profiles" / "rhody" / "secrets"):
+        secrets.mkdir(parents=True)
+        for name in ("vault.key", "vault.json", "requests.json"):
+            assert is_protected_path(secrets / name)
+        assert find_protected_paths_in_command(f"cat {secrets / 'vault.key'}")
+    assert find_protected_paths_in_command("base64 ~/.flowly/secrets/vault.key")
+    assert not is_protected_path(tmp_path / ".flowly" / "profiles" / "rhody" / "workspace" / "secrets.md")
+
+
 @pytest.mark.parametrize("command", [
     "XAUTHORITY=/run/flowly-screen/506920f551f47d2ec4efe27ac15ccc99/Xauthority DISPLAY=:1 ffmpeg -f x11grab -i :1 out.png",
     "export XAUTHORITY=/run/flowly-screen/5069/Xauthority DISPLAY=:1; xdotool key ctrl+1",
