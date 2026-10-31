@@ -50,6 +50,44 @@ async def test_handoff_signs_in_with_the_token_and_saves_the_account(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_the_uid_comes_from_the_profile_when_the_exchange_has_none(monkeypatch):
+    # The live /api/auth/exchange answers user_id "" (Google's
+    # signInWithCustomToken has no localId); without a uid the account key is
+    # never issued and the gateway has no provider (2026-11-01).
+    async def _sign_in(token):
+        return TokenBundle(id_token="id-1", refresh_token="refresh-1", expires_at=9e9, user_id="", email=None)
+
+    async def _lookup(id_token):
+        return {"email": "owner@example.com", "user_id": "uid-1"}
+
+    monkeypatch.setattr(auth, "sign_in_with_custom_token", _sign_in)
+    monkeypatch.setattr(auth, "lookup_account", _lookup)
+    monkeypatch.setattr(auth, "save_account", lambda account: None)
+
+    account = await auth.sign_in_with_handoff("custom-token")
+
+    assert account.user_id == "uid-1"
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_gives_an_account_saved_without_a_uid_its_uid(monkeypatch):
+    saved = auth.Account(user_id="", email="owner@example.com", id_token="old", refresh_token="refresh-1",
+                         expires_at=0, machine_id="m", machine_name="Mac")
+    stored: dict = {}
+
+    async def _refresh(refresh_token):
+        return TokenBundle(id_token="id-2", refresh_token="refresh-2", expires_at=9e9, user_id="uid-1", email=None)
+
+    monkeypatch.setattr(auth, "load_account_sync", lambda: saved)
+    monkeypatch.setattr(auth, "refresh_id_token", _refresh)
+    monkeypatch.setattr(auth, "save_account", lambda account: stored.setdefault("account", account))
+
+    account = await auth.load_account_refreshing()
+
+    assert account.user_id == "uid-1" and stored["account"].user_id == "uid-1"
+
+
+@pytest.mark.asyncio
 async def test_an_empty_handoff_token_is_refused_before_any_request(monkeypatch):
     async def _never(token):
         raise AssertionError("no request without a token")

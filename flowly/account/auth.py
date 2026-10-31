@@ -202,14 +202,26 @@ async def run_login_flow(
                    id_token=audit_log.safe_token_summary(tokens.id_token),
                    expires_in=int(tokens.expires_at - time.time()))
 
-    # 4. Fetch profile (email).
+    # 4. Fetch profile (email, uid).
     if on_status: on_status("fetching profile")
     profile = await lookup_account(tokens.id_token)
-    email = profile.get("email") or tokens.email
+    account = _account_from(tokens, profile, device_id)
+    save_account(account)
+    audit_log.info("login.flow.success",
+                   user_id=account.user_id,
+                   email=account.email,
+                   storage=storage_status().detail)
+    if on_status: on_status("done")
+    return account
 
-    account = Account(
-        user_id=tokens.user_id,
-        email=email,
+
+def _account_from(tokens: TokenBundle, profile: dict[str, Any], device_id: str) -> Account:
+    """The signed-in account. The uid comes from the profile: a custom-token
+    exchange answers without one (Google's ``signInWithCustomToken`` has no
+    ``localId``), and an account without a uid is never issued its key."""
+    return Account(
+        user_id=str(profile.get("user_id") or tokens.user_id or ""),
+        email=profile.get("email") or tokens.email,
         id_token=tokens.id_token,
         refresh_token=tokens.refresh_token,
         expires_at=tokens.expires_at,
@@ -217,13 +229,6 @@ async def run_login_flow(
         machine_name=machine_name(),
         device_id=device_id,
     )
-    save_account(account)
-    audit_log.info("login.flow.success",
-                   user_id=tokens.user_id,
-                   email=email,
-                   storage=storage_status().detail)
-    if on_status: on_status("done")
-    return account
 
 
 async def sign_in_with_handoff(custom_token: str) -> Account:
@@ -236,16 +241,7 @@ async def sign_in_with_handoff(custom_token: str) -> Account:
         raise FirebaseAuthError("empty handoff token")
     tokens = await sign_in_with_custom_token(custom_token)
     profile = await lookup_account(tokens.id_token)
-    account = Account(
-        user_id=tokens.user_id,
-        email=profile.get("email") or tokens.email,
-        id_token=tokens.id_token,
-        refresh_token=tokens.refresh_token,
-        expires_at=tokens.expires_at,
-        machine_id=machine_id(),
-        machine_name=machine_name(),
-        device_id="desktop-handoff",
-    )
+    account = _account_from(tokens, profile, "desktop-handoff")
     save_account(account)
     audit_log.info("login.handoff.success",
                    user_id=tokens.user_id,
@@ -301,6 +297,8 @@ async def load_account_refreshing() -> Account | None:
     acc.id_token = bundle.id_token
     acc.refresh_token = bundle.refresh_token
     acc.expires_at = bundle.expires_at
+    # An account saved by a sign-in that lost its uid gets it back here.
+    acc.user_id = acc.user_id or bundle.user_id
     save_account(acc)
     audit_log.info("token.refreshed",
                    user_id=acc.user_id,
@@ -336,5 +334,7 @@ async def background_refresh_loop(account_ref: list[Account | None]) -> None:
         acc.id_token = bundle.id_token
         acc.refresh_token = bundle.refresh_token
         acc.expires_at = bundle.expires_at
+        # An account saved by a sign-in that lost its uid gets it back here.
+        acc.user_id = acc.user_id or bundle.user_id
         save_account(acc)
         account_ref[0] = acc
