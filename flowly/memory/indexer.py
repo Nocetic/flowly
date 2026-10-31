@@ -104,16 +104,28 @@ class MemoryIndexer:
     # ── Sync ──────────────────────────────────────────────────────────────────
 
     def needs_reindex(self, path: Path, workspace: Path | None = None) -> bool:
-        """Return True if the file has changed since last index."""
+        """Return True if the file has changed since last index.
+
+        An unchanged mtime means an unchanged file, which is not opened:
+        opening is what costs in a cloud-synced folder (iCloud). A new mtime
+        over the same content is recorded, so the file is read once.
+        """
         rel = str(path.relative_to(workspace)) if workspace and path.is_relative_to(workspace) else str(path)
-        cur = self._conn.execute("SELECT hash FROM files WHERE path = ?", (rel,))
+        cur = self._conn.execute("SELECT hash, mtime FROM files WHERE path = ?", (rel,))
         row = cur.fetchone()
         if row is None:
             return True
         try:
-            return row["hash"] != _file_hash(path)
+            mtime = path.stat().st_mtime
+            if row["mtime"] == mtime:
+                return False
+            if row["hash"] != _file_hash(path):
+                return True
         except OSError:
             return True
+        with self._conn:
+            self._conn.execute("UPDATE files SET mtime = ? WHERE path = ?", (mtime, rel))
+        return False
 
     def index_file(
         self,
