@@ -12,6 +12,7 @@ The hook never raises — any failure degrades to "no injection".
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from pathlib import Path
@@ -90,17 +91,22 @@ def build_obsidian_injector(cfg: Any, state_dir: Path) -> Callable[[Any], Any]:
     """
     rt = ObsidianRuntime(cfg, state_dir)
 
+    def _search(user_msg: str) -> list[dict[str, Any]]:
+        # On a worker thread: the vault's files can be slow (iCloud), and the
+        # turn's hook timeout cannot interrupt a blocked event loop. An index
+        # still busy with an earlier sync yields nothing instead of a wait.
+        try:
+            rt.root()  # resolved lazily; quietly nothing if not configured
+        except Exception:
+            return []
+        return rt.index().search(user_msg, max_results=_MAX_SNIPPETS * 2, wait=False)
+
     async def _hook(ctx: Any) -> str | None:
         try:
             user_msg = getattr(ctx, "user_message", "") or ""
             if not looks_like_vault_query(user_msg):
                 return None
-            # Resolve vault lazily; bail quietly if not configured.
-            try:
-                rt.root()
-            except Exception:
-                return None
-            results = rt.index().search(user_msg, max_results=_MAX_SNIPPETS * 2)
+            results = await asyncio.to_thread(_search, user_msg)
             if not results:
                 return None
 
@@ -124,4 +130,5 @@ def build_obsidian_injector(cfg: Any, state_dir: Path) -> Callable[[Any], Any]:
             logger.debug("[obsidian] injection hook failed", exc_info=True)
             return None
 
+    _hook.runtime = rt  # type: ignore[attr-defined]
     return _hook

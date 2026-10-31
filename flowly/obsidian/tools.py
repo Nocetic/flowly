@@ -9,8 +9,10 @@ content guard (see ``_sanitize_tool_result``).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +43,7 @@ class ObsidianRuntime:
         self._state_dir = Path(state_dir)
         self._root: Path | None = None
         self._index: ObsidianIndex | None = None
+        self._index_lock = threading.Lock()
 
     @property
     def include_globs(self) -> list[str]:
@@ -61,15 +64,17 @@ class ObsidianRuntime:
         return self._root
 
     def index(self) -> ObsidianIndex:
-        if self._index is None:
-            self._index = ObsidianIndex(
-                self._state_dir / "obsidian_index.sqlite",
-                self.root(),
-                include_globs=self.include_globs,
-                exclude_globs=self.exclude_globs,
-                max_note_bytes=self.max_note_bytes,
-            )
-        return self._index
+        """The vault's index; blocking, so call it off the event loop."""
+        with self._index_lock:
+            if self._index is None:
+                self._index = ObsidianIndex(
+                    self._state_dir / "obsidian_index.sqlite",
+                    self.root(),
+                    include_globs=self.include_globs,
+                    exclude_globs=self.exclude_globs,
+                    max_note_bytes=self.max_note_bytes,
+                )
+            return self._index
 
 
 def _err(msg: str, *, code: str = "error") -> str:
@@ -141,7 +146,7 @@ class ObsidianSearchTool(_ObsidianTool):
         except (TypeError, ValueError):
             n = 6
         n = max(1, min(n, 20))
-        results = self._rt.index().search(query, max_results=n)
+        results = await asyncio.to_thread(lambda: self._rt.index().search(query, max_results=n))
         return json.dumps({"ok": True, "query": query, "results": results})
 
 

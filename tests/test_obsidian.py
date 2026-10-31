@@ -296,3 +296,107 @@ def test_obsidian_card_registered():
     card = next((c for c in REGISTRY if c.key == "obsidian"), None)
     assert card is not None and card.config_path == "integrations.obsidian"
     assert {f.key for f in card.fields} >= {"enabled", "vault_path", "auto_inject", "ingestion_policy"}
+
+
+# ── never on the event loop ──────────────────────────────────────────────────
+# A vault in iCloud can take a second or more per note to read. Search ran
+# that on the gateway's event loop, so a turn that mentioned the vault froze
+# the agent long enough for the Flowly server to call the Mac offline.
+
+def test_sync_skips_notes_that_did_not_change(vault, state):
+    from flowly.obsidian.index import ObsidianIndex
+
+    index = ObsidianIndex(state / "idx.sqlite", vault)
+    assert index.sync(force=True)["indexed"] == 2
+    assert index.sync(force=True)["indexed"] == 0
+    (vault / "note.md").write_text("Root level note about the kraken, edited.", encoding="utf-8")
+    assert index.sync(force=True)["indexed"] == 1
+
+
+def _slow_search(monkeypatch, seconds: float) -> None:
+    import time
+
+    from flowly.obsidian.index import ObsidianIndex
+
+    real = ObsidianIndex.sync
+
+    def slow(self, *, force: bool = False):
+        time.sleep(seconds)  # a vault that reads slowly (iCloud)
+        return real(self, force=force)
+
+    monkeypatch.setattr(ObsidianIndex, "sync", slow)
+
+
+async def _longest_stall(work) -> float:
+    """Run *work* while a ticker measures the longest gap the loop allowed."""
+    import time
+
+    longest = 0.0
+    done = asyncio.Event()
+
+    async def tick():
+        nonlocal longest
+        last = time.monotonic()
+        while not done.is_set():
+            await asyncio.sleep(0.01)
+            now = time.monotonic()
+            longest = max(longest, now - last)
+            last = now
+
+    ticker = asyncio.create_task(tick())
+    await asyncio.sleep(0.05)  # the ticker is running before the work starts
+    try:
+        result = await work
+    finally:
+        done.set()
+        await ticker
+    return longest, result
+
+
+def test_injection_hook_never_blocks_the_loop(vault, state, monkeypatch):
+    from flowly.obsidian.inject import build_obsidian_injector
+
+    _slow_search(monkeypatch, 0.6)
+    hook = build_obsidian_injector(ObsidianConfig(enabled=True, vault_path=str(vault)), state)
+    stall, block = _run(_longest_stall(hook(SimpleNamespace(user_message="notlarımda Ada kimdi, robotics?"))))
+    assert block and "Ada" in block
+    assert stall < 0.3
+
+
+def test_search_tool_never_blocks_the_loop(vault, state, monkeypatch):
+    from flowly.obsidian.tools import ObsidianRuntime, ObsidianSearchTool
+
+    _slow_search(monkeypatch, 0.6)
+    tool = ObsidianSearchTool(ObsidianRuntime(ObsidianConfig(enabled=True, vault_path=str(vault)), state))
+    stall, out = _run(_longest_stall(tool.execute(query="robotics")))
+    assert any("Ada" in r["path"] for r in json.loads(out)["results"])
+    assert stall < 0.3
+
+
+def test_rpc_search_never_blocks_the_loop(vault, state, monkeypatch):
+    from flowly.channels import feature_rpc
+
+    cfg = ObsidianConfig(enabled=True, vault_path=str(vault))
+    monkeypatch.setattr(feature_rpc, "_obsidian_cfg", lambda: cfg)
+    monkeypatch.setattr(feature_rpc, "state_db", lambda fn: state / fn)
+    _slow_search(monkeypatch, 0.6)
+    stall, (out, _restart) = _run(_longest_stall(feature_rpc.dispatch("obsidian.search", {"query": "robotics"})))
+    assert any("Ada" in r["path"] for r in out["results"])
+    assert stall < 0.3
+
+
+def test_injection_skips_the_vault_while_it_is_being_indexed(vault, state):
+    """A turn never waits behind an index that is still syncing (a timed-out
+    turn's sync keeps running on its thread): it goes without excerpts."""
+    import time
+
+    from flowly.obsidian.inject import build_obsidian_injector
+
+    hook = build_obsidian_injector(ObsidianConfig(enabled=True, vault_path=str(vault)), state)
+    message = SimpleNamespace(user_message="notlarımda Ada kimdi, robotics?")
+    assert _run(hook(message))  # the index exists and works
+    index = hook.runtime.index()
+    with index._lock:
+        started = time.monotonic()
+        assert _run(hook(message)) is None
+        assert time.monotonic() - started < 0.2

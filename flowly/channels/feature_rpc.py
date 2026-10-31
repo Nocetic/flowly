@@ -1581,6 +1581,12 @@ def obsidian_rpc(action: str, params: dict) -> dict:
     raise FeatureRpcError("INVALID", f"unknown obsidian action: {action}")
 
 
+async def obsidian_rpc_async(action: str, params: dict) -> dict:
+    """``obsidian_rpc`` on a worker thread: it reads the vault's files, which
+    can be slow (iCloud), and must never hold up the event loop."""
+    return await asyncio.to_thread(obsidian_rpc, action, params)
+
+
 def memory_gov(action: str, params: dict) -> dict:
     """Memory governance — review queue, stats, and the accept/reject/correct/
     feedback mutations. Reuses the same MemoryGovernance the local TUI/CLI use.
@@ -5872,8 +5878,8 @@ _DISPATCH: dict[str, tuple] = {
     "memory.dream": (memory_dream, True, False),
     "memory.import_prompt": (memory_import_prompt, True, False),
     "memory.import": (memory_import, True, False),
-    "obsidian.status": (_partial(obsidian_rpc, "status"), True, False),
-    "obsidian.search": (_partial(obsidian_rpc, "search"), True, False),
+    "obsidian.status": (_partial(obsidian_rpc_async, "status"), True, False),
+    "obsidian.search": (_partial(obsidian_rpc_async, "search"), True, False),
     "persona.list": (persona_list, False, False),
     "provider.active": (provider_active, False, False),
     "provider.list": (provider_list, False, False),
