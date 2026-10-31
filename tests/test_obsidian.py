@@ -313,6 +313,30 @@ def test_sync_skips_notes_that_did_not_change(vault, state):
     assert index.sync(force=True)["indexed"] == 1
 
 
+
+def test_sync_opens_no_note_whose_mtime_did_not_change(vault, state, monkeypatch):
+    """Opening a note is what costs in iCloud (~0.1 s each when cold): an
+    unchanged mtime skips it, and a touched but unchanged note is read once."""
+    import os
+
+    import flowly.memory.indexer as indexer
+    from flowly.obsidian.index import ObsidianIndex
+
+    index = ObsidianIndex(state / "idx.sqlite", vault)
+    index.sync(force=True)
+    opened: list[Path] = []
+    real = indexer._file_hash
+    monkeypatch.setattr(indexer, "_file_hash", lambda path: opened.append(path) or real(path))
+    assert index.sync(force=True)["indexed"] == 0
+    assert opened == []
+
+    note = vault / "note.md"
+    os.utime(note, (note.stat().st_atime, note.stat().st_mtime + 10))
+    assert index.sync(force=True)["indexed"] == 0
+    assert opened == [note.resolve()]
+    assert index.sync(force=True)["indexed"] == 0
+    assert opened == [note.resolve()]
+
 def _slow_search(monkeypatch, seconds: float) -> None:
     import time
 
