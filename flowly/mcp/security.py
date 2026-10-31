@@ -316,24 +316,54 @@ def build_safe_env(user_env: dict[str, str] | None) -> dict[str, str]:
     return env
 
 
-def interpolate_env_vars(value: Any) -> Any:
-    """Recursively substitute ``${VAR}`` placeholders from ``os.environ``.
+_SECRET_PREFIX = "secret:"
 
-    Unresolved placeholders are left as-is so misconfiguration is visible
-    in error messages (rather than silently becoming empty strings).
-    Supports nested dicts and lists; non-string scalars pass through
-    unchanged.
+
+def interpolate_env_vars(value: Any) -> Any:
+    """Recursively substitute ``${VAR}`` placeholders from ``os.environ``,
+    and ``${secret:NAME}`` from the agent's saved secrets (flowly.secrets).
+
+    A saved secret reaches the server it is written for and no further: the
+    vault is read once, for the names the configuration holds. Unresolved
+    placeholders are left as-is so misconfiguration is visible in error
+    messages (rather than silently becoming empty strings). Supports nested
+    dicts and lists; non-string scalars pass through unchanged.
     """
+    names: set[str] = set()
+    _secret_names(value, names)
+    saved: dict[str, str] = {}
+    if names:
+        from flowly.secrets.service import secret_values
+
+        saved = secret_values(names)
+
+    def lookup(match: re.Match[str]) -> str:
+        key = match.group(1)
+        if key.startswith(_SECRET_PREFIX):
+            return saved.get(key[len(_SECRET_PREFIX):], match.group(0))
+        return os.environ.get(key, match.group(0))
+
+    def walk(item: Any) -> Any:
+        if isinstance(item, str):
+            return _ENV_VAR_PATTERN.sub(lookup, item)
+        if isinstance(item, dict):
+            return {k: walk(v) for k, v in item.items()}
+        if isinstance(item, list):
+            return [walk(v) for v in item]
+        return item
+
+    return walk(value)
+
+
+def _secret_names(value: Any, out: set[str]) -> None:
     if isinstance(value, str):
-        return _ENV_VAR_PATTERN.sub(
-            lambda m: os.environ.get(m.group(1), m.group(0)),
-            value,
-        )
-    if isinstance(value, dict):
-        return {k: interpolate_env_vars(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [interpolate_env_vars(item) for item in value]
-    return value
+        out.update(key[len(_SECRET_PREFIX):] for key in _ENV_VAR_PATTERN.findall(value) if key.startswith(_SECRET_PREFIX))
+    elif isinstance(value, dict):
+        for item in value.values():
+            _secret_names(item, out)
+    elif isinstance(value, list):
+        for item in value:
+            _secret_names(item, out)
 
 
 def sanitize_error(text: str, *, secrets: Any = (), limit: int = MAX_DIAGNOSTIC_OUTPUT) -> str:

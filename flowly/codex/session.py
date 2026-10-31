@@ -333,11 +333,16 @@ class CodexSession:
                 "this CodexSession was retired; build a new one"
             )
 
+        # The agent's saved secrets are in Codex's environment, as in its
+        # own commands' (flowly.secrets); what Codex prints comes back
+        # through the projector with them hidden.
+        from flowly.secrets.service import forced_env
+
         self._client = await CodexAppServerClient.spawn(
             codex_bin=self._config.codex_bin,
             codex_home=self._config.codex_home,
             cwd=self._config.cwd,
-            env=self._config.extra_env or None,
+            env={**forced_env(), **self._config.extra_env} or None,
             client_name=self._config.client_name,
             client_version=self._config.client_version,
             config_overrides=self._config.config_overrides or None,

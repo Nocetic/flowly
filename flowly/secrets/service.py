@@ -10,7 +10,7 @@ never in a command's environment).
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Iterable
 
 from flowly.secrets import envelope
 from flowly.secrets.names import SecretNameError, check_name
@@ -152,6 +152,26 @@ def command_env() -> dict[str, str]:
         return {}
     vault.mark_used(list(data.secrets))
     return {name: secret.value for name, secret in data.secrets.items()}
+
+
+def secret_values(names: Iterable[str]) -> dict[str, str]:
+    """The saved values of these names, for configuration that names them
+    (``${secret:NAME}`` in an MCP server's env, headers or args).
+
+    A name not saved is left out; nothing when the vault is locked.
+    """
+    wanted = set(names)
+    if not wanted:
+        return {}
+    vault = get_vault()
+    try:
+        data = vault.load()
+    except Exception:
+        return {}
+    found = {name: secret.value for name, secret in (data.secrets.items() if data else ()) if name in wanted}
+    if found:
+        vault.mark_used(list(found))
+    return found
 
 
 def names_in_command(command: str) -> list[str]:

@@ -204,6 +204,19 @@ def _stable_tool_call_id(item_type: str, item_id: str | None) -> str:
     return f"codex_{item_type}_{uuid.uuid4().hex[:12]}"
 
 
+def _hide_saved_secrets(value: Any) -> Any:
+    """Every string in ``value`` with the agent's saved secrets hidden (flowly.secrets.redact)."""
+    from flowly.secrets.redact import redact
+
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, list):
+        return [_hide_saved_secrets(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _hide_saved_secrets(item) for key, item in value.items()}
+    return value
+
+
 def _truncate_for_message(text: str, max_chars: int = 8000) -> str:
     """Truncate long tool outputs so a giant ``cat huge_file`` doesn't
     blow up the session message store.
@@ -334,10 +347,12 @@ class CodexEventProjector:
         for item_id in list(self._open.keys()):
             self._on_item_completed({"itemId": item_id, "_forced": True})
 
+        # Codex's commands get the agent's saved secrets: what it printed
+        # leaves here with the values hidden, as Flowly's own tools' does.
         return TurnProjection(
-            messages=list(self._messages),
-            final_text=self._last_assistant_text,
-            reasoning_items=list(self._reasoning_items),
+            messages=_hide_saved_secrets(list(self._messages)),
+            final_text=_hide_saved_secrets(self._last_assistant_text),
+            reasoning_items=_hide_saved_secrets(list(self._reasoning_items)),
             tool_iterations=self._tool_iterations,
         )
 
@@ -444,7 +459,7 @@ class CodexEventProjector:
                     ):
                         payload = "\n\n" + text
                     try:
-                        await self._stream_callback(payload)
+                        await self._stream_callback(_hide_saved_secrets(payload))
                     except Exception:
                         # Stream callback errors are non-fatal —
                         # message still goes into the session, the

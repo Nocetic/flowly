@@ -91,6 +91,11 @@ class MCPChatSetupManager:
         elif draft is not None:
             if not isinstance(draft, dict) or set(draft) - {"command", "args", "url", "transport", "auth"}:
                 raise MCPSetupError("INVALID", "Enter credentials and advanced settings privately in the Flowly app")
+            # A placeholder resolves to the owner's environment or saved
+            # secrets (``${secret:NAME}``): from the agent it would route a
+            # key to an address of its choosing. Only the owner writes them.
+            if "${" in json.dumps(draft):
+                raise MCPSetupError("INVALID", "Name keys and secrets privately in the Flowly app, never in a connection request")
             try:
                 if len(json.dumps(draft, allow_nan=False).encode()) > 16_384:
                     raise ValueError
