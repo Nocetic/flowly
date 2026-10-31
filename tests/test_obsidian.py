@@ -155,8 +155,10 @@ def test_tool_search_read_list(vault, state):
     r = json.loads(_run(t["obsidian_search"].execute(query="robotics engineer")))
     assert r["ok"] and any("Ada" in hit["path"] for hit in r["results"])
 
-    rd = json.loads(_run(t["obsidian_read"].execute(path="People/Ada.md", from_line=1, lines=2)))
-    assert rd["ok"] and "Ada" in rd["content"] and rd["total_lines"] == 3
+    rd = _run(t["obsidian_read"].execute(path="People/Ada.md", from_line=1, lines=2))
+    assert rd.startswith("# People/Ada.md · lines 1-2 of 3\n")
+    assert "Ada works at Acme" in rd and "Likes dark mode" not in rd
+    assert rd.rstrip().endswith("[continues: obsidian_read path='People/Ada.md' from_line=3]")
 
     ls = json.loads(_run(t["obsidian_list"].execute(folder="People")))
     assert ls["notes"] == ["People/Ada.md"]
@@ -424,3 +426,41 @@ def test_injection_skips_the_vault_while_it_is_being_indexed(vault, state):
         started = time.monotonic()
         assert _run(hook(message)) is None
         assert time.monotonic() - started < 0.2
+
+
+# ── reading a long note ──────────────────────────────────────────────────────
+# A note came back as one JSON line with every Turkish letter escaped (\u015f):
+# twice its size, over the loop's 8 000-char cap, and spilled to a one-line
+# file that read_file(offset, limit) could not page. The agent re-read the same
+# notes for 46 steps and fell back to `cat` (an approval each time).
+
+def test_a_long_note_reads_page_by_page_within_the_cap(vault, state):
+    lines = [f"{i:03d} Strateji notu: şirketin yönü, müşteri, ölçüm ve öğrenilenler." for i in range(1, 401)]
+    (vault / "Uzun.md").write_text("\n".join(lines), encoding="utf-8")
+    t = _tools(vault, state)
+    seen: list[str] = []
+    start = 1
+    for _ in range(50):
+        page = _run(t["obsidian_read"].execute(path="Uzun.md", from_line=start, lines=1000))
+        assert len(page) < 8000  # under the loop's cap: never truncated, never spilled
+        assert "\\u" not in page and "ş" in page
+        body = page.split("\n", 1)[1]
+        more = "[continues: obsidian_read path='Uzun.md' from_line="
+        if more in body:
+            body, tail = body.rsplit("\n" + more, 1)
+            start = int(tail.split("]")[0])
+            seen.extend(body.split("\n"))
+        else:
+            seen.extend(body.rstrip("\n").split("\n"))
+            break
+    assert seen == lines
+
+
+def test_search_fits_the_cap_and_keeps_letters(vault, state):
+    for n in range(12):
+        (vault / f"Not {n}.md").write_text("Flowly stratejisi şöyle: " + "müşteri ölçümü " * 300, encoding="utf-8")
+    t = _tools(vault, state)
+    out = _run(t["obsidian_search"].execute(query="Flowly stratejisi", max_results=20))
+    assert len(out) < 8000
+    assert "\\u" not in out and "müşteri" in out
+    assert json.loads(out)["results"]

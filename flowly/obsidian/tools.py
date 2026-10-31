@@ -77,8 +77,21 @@ class ObsidianRuntime:
             return self._index
 
 
+# Tool results over 8 000 chars are cut and spilled by the agent loop
+# (``_TOOL_MAX_CHARS``), and a cut note is one the agent re-reads. Reads and
+# searches stay under it on their own.
+_PAGE_CHARS = 7000
+_SEARCH_CHARS = 6000
+_SEARCH_ROW_CHARS = 220  # a result's fields other than its snippet
+
+
+def _json(value: Any) -> str:
+    # Letters as they are: escaped (\u015f) they double Turkish text.
+    return json.dumps(value, ensure_ascii=False)
+
+
 def _err(msg: str, *, code: str = "error") -> str:
-    return json.dumps({"ok": False, "error": code, "detail": msg})
+    return _json({"ok": False, "error": code, "detail": msg})
 
 
 class _ObsidianTool(Tool):
@@ -147,7 +160,13 @@ class ObsidianSearchTool(_ObsidianTool):
             n = 6
         n = max(1, min(n, 20))
         results = await asyncio.to_thread(lambda: self._rt.index().search(query, max_results=n))
-        return json.dumps({"ok": True, "query": query, "results": results})
+        # A hit points at its lines; obsidian_read reads them in full.
+        room = max(120, min(1200, (_SEARCH_CHARS - _SEARCH_ROW_CHARS * len(results)) // max(1, len(results))))
+        for hit in results:
+            snippet = hit.get("snippet") or ""
+            if len(snippet) > room:
+                hit["snippet"] = snippet[:room].rstrip() + "…"
+        return _json({"ok": True, "query": query, "results": results})
 
 
 class ObsidianReadTool(_ObsidianTool):
@@ -159,7 +178,9 @@ class ObsidianReadTool(_ObsidianTool):
     def description(self) -> str:
         return (
             "Read a note from the Obsidian vault by its vault-relative path "
-            "(e.g. 'People/Ada.md'). Optionally read a line range."
+            "(e.g. 'People/Ada.md'). Returns the note's lines as written, about "
+            "7 000 characters at a time; when it ends with '[continues: … "
+            "from_line=N]', call it again with that from_line for the rest."
         )
 
     @property
@@ -189,15 +210,21 @@ class ObsidianReadTool(_ObsidianTool):
         except (TypeError, ValueError):
             frm, count = 1, 200
         all_lines = text.splitlines()
-        chunk = all_lines[frm - 1: frm - 1 + count]
-        return json.dumps({
-            "ok": True,
-            "path": rel,
-            "from_line": frm,
-            "to_line": min(len(all_lines), frm - 1 + count),
-            "total_lines": len(all_lines),
-            "content": "\n".join(chunk),
-        })
+        total = len(all_lines)
+        # The note's own lines, as many as fit a page: a page the agent loop
+        # never cuts, and a pointer that resumes exactly where it stopped.
+        chunk: list[str] = []
+        used = 0
+        for line in all_lines[frm - 1: frm - 1 + count]:
+            if chunk and used + len(line) + 1 > _PAGE_CHARS:
+                break
+            chunk.append(line)
+            used += len(line) + 1
+        to = frm - 1 + len(chunk)
+        page = f"# {rel} · lines {frm}-{to} of {total}\n" + "\n".join(chunk)
+        if to < total:
+            page += f"\n[continues: obsidian_read path={rel!r} from_line={to + 1}]"
+        return page
 
 
 class ObsidianListTool(_ObsidianTool):
@@ -247,7 +274,7 @@ class ObsidianListTool(_ObsidianTool):
             if len(out) >= cap:
                 break
         out.sort()
-        return json.dumps({"ok": True, "folder": folder, "count": len(out), "notes": out})
+        return _json({"ok": True, "folder": folder, "count": len(out), "notes": out})
 
 
 class ObsidianWriteTool(_ObsidianTool):
@@ -298,7 +325,7 @@ class ObsidianWriteTool(_ObsidianTool):
             return _err(f"note already exists: {rel} (pass if_exists='overwrite')", code="exists")
         abs_path.parent.mkdir(parents=True, exist_ok=True)
         abs_path.write_text(str(content), encoding="utf-8")
-        return json.dumps({"ok": True, "path": rel, "bytes": len(str(content).encode("utf-8"))})
+        return _json({"ok": True, "path": rel, "bytes": len(str(content).encode("utf-8"))})
 
 
 class ObsidianAppendTool(_ObsidianTool):
@@ -340,7 +367,7 @@ class ObsidianAppendTool(_ObsidianTool):
         sep = "" if (not existing or existing.endswith("\n")) else "\n"
         with abs_path.open("a", encoding="utf-8") as fh:
             fh.write(sep + str(content))
-        return json.dumps({"ok": True, "path": rel, "appended_bytes": len(str(content).encode("utf-8"))})
+        return _json({"ok": True, "path": rel, "appended_bytes": len(str(content).encode("utf-8"))})
 
 
 def build_obsidian_tools(cfg: Any, state_dir: Path, *, facade: Any = None) -> list[Tool]:
