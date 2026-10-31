@@ -2,18 +2,17 @@
 #
 # dev-install.sh — build an ISOLATED Flowly instance for development.
 #
-# This is NOT the normal way to work on Flowly. Day to day, clone the repo and
-# run `uv run flowly gateway`: your checkout serves the usual gateway port
-# against your real ~/.flowly (offering to stop and later restore the installed
-# service if it holds the port), so your providers, memory, channels and
-# Desktop keep working while you develop, with no second config to keep in sync.
+# This is NOT the normal way to work on Flowly. Day to day, follow the README
+# (clone, `uv run flowly login --no-relay`, `uv run flowly server connect`,
+# `uv run flowly gateway`): your checkout serves the usual gateway port against
+# your real ~/.flowly, so your account, memory and the apps keep working while
+# you develop, with no second config to keep in sync.
 #
 # Use this script when sharing that state would be wrong — a migration that
 # rewrites memory, a destructive experiment, a second agent running beside your
 # own. It creates an instance that cannot touch your real one: its own home,
-# its own gateway port, its own account registration ("<machine>-dev"), and
-# every copied channel disabled so two bots never fight over one Telegram token
-# or one relay identity.
+# its own gateway port, its own entry on the Flowly server, and every copied
+# channel disabled so two agents never fight over one Telegram token.
 #
 #   mkdir ~/flowly-isolated && cd ~/flowly-isolated
 #   bash /path/to/flowly/scripts/dev-install.sh
@@ -35,9 +34,11 @@
 #        • gateway.port → 18890, so it never collides with your real gateway;
 #        • agents.defaults.workspace → home/workspace, so the dev agent can't
 #          write into your real memory;
-#        • every channel disabled — two bots on one Telegram token or one
-#          relay identity poison each other's delivery. Re-enable per channel
-#          on the dev instance only if you know the real bot isn't using it.
+#        • every channel disabled — two agents on one Telegram token poison
+#          each other's delivery. Re-enable per channel on the dev instance
+#          only if you know the real one isn't using it;
+#        • the Flowly server entry dropped: it is your real Mac's, and
+#          `server connect` re-registers the entry the config names.
 #      No real config? You get the normal `flowly setup` wizard, same as any
 #      new user.
 #   5. Writes the ./flowly-dev launcher.
@@ -48,11 +49,10 @@
 #   ./flowly-dev doctor         health check
 #   cd flowly && uv run pytest  the test suite
 #
-# Flowly Desktop (engineers with the desktop repo): run it against this home —
-#   FLOWLY_HOME=<this dir>/home npm run dev
-# then sign in inside that Desktop; that writes fresh relay credentials into
-# the dev home, and the composer chats with THIS bot while your real install
-# keeps running untouched.
+# To see it in the apps, give it its own entry on the Flowly server:
+#   ./flowly-dev login --no-relay
+#   ./flowly-dev server connect --name "<machine> dev"
+# It shows up in Desktop, iOS and Android beside your real Mac.
 #
 # Re-running is safe and is how you refresh the setup. Options via env:
 #   FLOWLY_DEV_PORT=18795   pick a different dev gateway port
@@ -61,7 +61,7 @@
 
 set -euo pipefail
 
-FLOWLY_REPO_URL="${FLOWLY_REPO_URL:-https://github.com/Nocetic/flowly.git}"
+FLOWLY_REPO_URL="${FLOWLY_REPO_URL:-https://github.com/Nocetic/flowly-core.git}"
 FLOWLY_BRANCH="${FLOWLY_BRANCH:-main}"
 FLOWLY_DEV_PORT="${FLOWLY_DEV_PORT:-18890}"
 FLOWLY_PYTHON="${FLOWLY_PYTHON:-3.12}"
@@ -73,8 +73,8 @@ die()  { printf '\033[31m[flowly-dev]\033[0m %s\n' "$*" >&2; exit 1; }
 
 printf '\n\033[1m  Flowly — ISOLATED development instance\033[0m\n'
 printf '  Its own home, port, and account: it cannot touch your real Flowly.\n'
-printf '  Day-to-day development does not need this — clone the repo and run\n'
-printf '  `uv run flowly gateway` from your checkout — it serves ~/.flowly directly.\n\n'
+printf '  Day-to-day development does not need this — run your checkout with\n'
+printf '  `uv run flowly gateway` (see the README); it serves ~/.flowly directly.\n\n'
 
 # ── Layout ──────────────────────────────────────────────────────────────────
 # Run from an empty/new directory → everything under it (flowly/, home/).
@@ -92,6 +92,7 @@ else
   IN_REPO=0
 fi
 LAUNCHER="$DEV_ROOT/flowly-dev"
+CONFIG_EDITS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dev_install_config.py"
 VENV="$REPO/.venv"
 
 # ── Prerequisites ───────────────────────────────────────────────────────────
@@ -178,40 +179,22 @@ mkdir -p "$DEV_HOME"
 REAL_CONFIG="$HOME/.flowly/config.json"
 DEV_CONFIG="$DEV_HOME/config.json"
 
-# Applied on every run: port + workspace are the isolation invariants.
-# Channel state is NOT touched here — signing in from a dev Desktop enables
-# the dev instance's own relay channel, and a re-run must not sever it.
+# Applied on every run: port + workspace are the isolation invariants, and the
+# real Mac's server entry never survives here. Other channel state is NOT
+# touched — the dev instance's own server entry must survive a re-run.
 patch_invariants() {
-  "$VENV/bin/python" - "$DEV_CONFIG" "$DEV_HOME" "$FLOWLY_DEV_PORT" <<'EOF'
-import json, sys
-from pathlib import Path
-cfg_path, dev_home, port = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
-cfg = json.loads(cfg_path.read_text())
-cfg.setdefault("gateway", {})["port"] = port
-cfg.setdefault("agents", {}).setdefault("defaults", {})["workspace"] = str(Path(dev_home) / "workspace")
-cfg_path.write_text(json.dumps(cfg, indent=4, ensure_ascii=False) + "\n")
-EOF
+  "$VENV/bin/python" "$CONFIG_EDITS" invariants "$DEV_CONFIG" "$DEV_HOME" "$FLOWLY_DEV_PORT" "$REAL_CONFIG"
 }
 
 if [[ ! -f "$DEV_CONFIG" && -f "$REAL_CONFIG" ]]; then
   log "Copying your real config (providers and keys work immediately)…"
   cp "$REAL_CONFIG" "$DEV_CONFIG"
   # Once, at copy time: the copied channel credentials belong to the REAL
-  # bot. Two bots sharing one Telegram token or one relay identity steal
-  # each other's messages, so everything copied starts disabled. The dev
-  # instance earns its own relay identity (a separate "<machine>-dev"
-  # server) the moment you sign in — from ./flowly-dev login, or inside a
-  # FLOWLY_HOME-pointed Desktop — and that state is never touched again.
-  "$VENV/bin/python" - "$DEV_CONFIG" <<'EOF'
-import json, sys
-from pathlib import Path
-cfg_path = Path(sys.argv[1])
-cfg = json.loads(cfg_path.read_text())
-for channel in (cfg.get("channels") or {}).values():
-    if isinstance(channel, dict) and channel.get("enabled"):
-        channel["enabled"] = False
-cfg_path.write_text(json.dumps(cfg, indent=4, ensure_ascii=False) + "\n")
-EOF
+  # agent. Two agents sharing one Telegram token steal each other's messages,
+  # so everything copied starts disabled, and the Flowly server entry (the
+  # real Mac's) is dropped. The dev instance gets its own entry from
+  # ./flowly-dev server connect, and that state is never touched again.
+  "$VENV/bin/python" "$CONFIG_EDITS" copied "$DEV_CONFIG"
   patch_invariants
   ok "Dev config ready: port ${FLOWLY_DEV_PORT}, isolated workspace, copied channels disabled."
 elif [[ -f "$DEV_CONFIG" ]]; then
@@ -221,8 +204,8 @@ else
   log "No existing Flowly config found — running the normal setup wizard…"
   printf '\n'
   warn "You are configuring the DEVELOPMENT instance (its own home, port ${FLOWLY_DEV_PORT})."
-  warn "Signing in with a Flowly account here registers a separate \"<machine>-dev\""
-  warn "server — your real Flowly, if you install one later, is unaffected."
+  warn "Its Flowly server entry comes from ./flowly-dev server connect and is"
+  warn "separate from your real Mac's."
   printf '\n'
   if [[ -t 0 || -c /dev/tty ]] && FLOWLY_HOME="$DEV_HOME" "$VENV/bin/flowly" setup </dev/tty; then
     :
@@ -373,10 +356,7 @@ printf '\n'
 printf 'Your real Flowly install is untouched: this instance has its own home\n'
 printf '(%s),\nits own port (%s), and no channels enabled.\n' "$DEV_HOME" "$FLOWLY_DEV_PORT"
 printf '\n'
-printf 'To reach this instance from Flowly Desktop, run a SECOND Desktop beside\n'
-printf 'your real one — in the flowly-desktop repo, as one command:\n\n'
-printf '  FLOWLY_HOME=%s \\\n' "$DEV_HOME"
-printf '  FLOWLY_DESKTOP_USER_DATA_DIR=%s/desktop-data \\\n' "$DEV_ROOT"
-printf '  FLOWLY_DESKTOP_APP_NAME=FlowlyDev \\\n'
-printf '    npm run dev\n\n'
-printf 'Then sign in inside that Desktop — the composer then chats with this bot.\n'
+printf 'To see it in the apps beside your real Mac, give it its own entry\n'
+printf 'on the Flowly server:\n\n'
+printf '  ./flowly-dev login --no-relay\n'
+printf '  ./flowly-dev server connect --name "%s dev"\n\n' "$(hostname -s 2>/dev/null || echo this-mac)"

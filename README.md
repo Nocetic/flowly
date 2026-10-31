@@ -93,10 +93,10 @@ pushes to `main` and on pull requests (`.github/workflows/ci.yml`).
   pulls and restarts.
 - **Don't say yes to the relay** if `login` asks. It creates a second entry
   for the same Mac.
-- **`scripts/dev-install.sh` predates the server.** Its copy of your config
-  keeps your Mac's server entry, so `server connect` there would re-register
-  your real Mac. Don't connect an isolated instance to the server until the
-  script is updated.
+- **A second, isolated instance** (a migration that rewrites memory, a
+  destructive experiment): `scripts/dev-install.sh` builds one with its own
+  home and port. It drops your Mac's server entry from the copied config, so
+  its `./flowly-dev server connect` adds a separate computer to your account.
 
 ## Where Core ships
 
