@@ -264,3 +264,29 @@ async def test_a_message_between_agents_reaches_the_server_once_whoever_watches(
     await host._emit("writer", "agent.exchange", data)
 
     assert forwarded == [{"type": "event", "event": "agent.exchange", "data": data}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["secrets.submit", "secrets.list", "secrets.decline"])
+async def test_a_named_agents_secret_calls_run_in_it(home, method):
+    """Secrets are the agent's own (flowly.secrets): the server names it with
+    ``params.profile`` as for its chat, never the main agent's vault."""
+    channel, host, _ = make_channel({"saved": ["FAL_KEY"]})
+    socket = Socket()
+    await channel._handle_rpc(socket, {"type": "rpc", "id": "s1", "method": method,
+                                       "params": {"profile": "writer", "names": ["FAL_KEY"]}})
+    called = host.dispatch.await_args.args
+    assert called[0] == "profiles.rpc"
+    assert called[1] == {"name": "writer", "method": method, "params": {"names": ["FAL_KEY"]}}
+    assert socket.sent[-1]["result"] == {"saved": ["FAL_KEY"]}
+
+
+@pytest.mark.asyncio
+async def test_a_secret_card_reaches_the_server_without_a_bound_session(home):
+    """The server finds the conversation by its sessionKey (PROTOCOL A9): a
+    request from a turn the agent started itself is not lost for want of a
+    device's session."""
+    channel, _host, forwarded = make_channel()
+    await channel.send_secret_event("web:conv-9", "secret.requested", {"id": "sr_00112233445566aa", "sessionKey": "web:conv-9"})
+    assert forwarded == [{"type": "event", "event": "secret.requested",
+                          "data": {"id": "sr_00112233445566aa", "sessionKey": "web:conv-9"}}]

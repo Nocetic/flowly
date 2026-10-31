@@ -40,6 +40,14 @@ def _screen_directories(home: Path) -> tuple[Path, ...]:
     return (flowly / "desktop", *(Path(path) for path in sorted(glob(str(flowly / "profiles" / "*" / "desktop")))))
 
 
+def _secret_directories(home: Path) -> tuple[Path, ...]:
+    """Every agent's saved secrets: the vault and, without a keychain, its key file."""
+    from glob import glob
+
+    flowly = home / ".flowly"
+    return (flowly / "secrets", *(Path(path) for path in sorted(glob(str(flowly / "profiles" / "*" / "secrets")))))
+
+
 def _hardcoded_protected_roots() -> tuple[Path, ...]:
     """Return the static list of protected path roots.
 
@@ -74,6 +82,7 @@ def _hardcoded_protected_roots() -> tuple[Path, ...]:
         home / ".flowly" / "config.json",
         home / ".flowly" / "electron-api.json",
         home / ".flowly" / "desktop-client-id",
+        *_secret_directories(home),
         # An agent screen's private state: its display key and sockets, its
         # application account's home and browser profile (cookies, logins),
         # and the gateway's screen service sockets. The screen is reached

@@ -782,6 +782,12 @@ class ToolRegistry:
         except Exception as e:
             result = f"Error executing {name}: {str(e)}"
 
+        # Saved secrets never leave a tool's output: not to the model, the
+        # conversation, the server, a log or a plugin's hook (flowly.secrets).
+        from flowly.secrets.redact import redact as _redact_secrets
+
+        result = _redact_secrets(result)
+
         # Fire post-tool hooks then transform_tool_result; a plugin
         # may rewrite the result string entirely.
         if self._hooks and ctx is not None:

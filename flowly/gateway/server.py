@@ -2198,6 +2198,10 @@ class GatewayServer:
         }
         await self._broadcast_clients(event)
 
+    async def broadcast_secret_event(self, event_name: str, data: dict) -> None:
+        """A secret request's card to the local clients (and a named agent's host)."""
+        await self._broadcast_clients({"type": "event", "event": event_name, "data": data})
+
     async def broadcast_clarify_closed(
         self,
         clarify_id: str,

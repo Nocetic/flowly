@@ -101,6 +101,22 @@ def test_named_profile_cannot_read_sibling_profile(
     assert "private-content" not in denied
 
 
+
+def test_saved_secrets_are_never_read_wherever_the_home_is(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """A Flowly home outside ``~/.flowly`` (a cloud computer, a test) still keeps
+    its vault and key file from the file tools."""
+    home = tmp_path / "flowly-home"
+    workspace = home / "workspace"
+    workspace.mkdir(parents=True)
+    key = home / "secrets" / "vault.key"
+    key.parent.mkdir()
+    key.write_text("private-content", encoding="utf-8")
+    monkeypatch.setenv("FLOWLY_HOME", str(home))
+
+    denied = asyncio.run(ReadFileTool(workspace=workspace).execute(str(key)))
+    assert denied.startswith("Error: Access denied")
+    assert "private-content" not in denied
+
 # ── Denial messages carry next steps ──────────────────────────────────────
 
 def test_read_denied_error_protected_says_never():

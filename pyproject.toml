@@ -56,7 +56,8 @@ dependencies = [
     "referencing>=0.35.0",
     "textual>=0.80.0",
     "keyring>=24.0.0",
-    "cryptography>=45.0.0",
+    # 48 added hazmat.primitives.hpke, which opens saved secrets (flowly/secrets).
+    "cryptography>=48.0.0",
     # Core, API-key-free multilingual tool routing. Model weights are pinned
     # separately and prepared in the background; conversation memory does not
     # use this runtime. Excluded on Intel macOS: onnxruntime stopped shipping

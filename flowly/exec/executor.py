@@ -378,6 +378,12 @@ async def execute_command(
         stdout_str = stdout.decode('utf-8', errors='replace')
         stderr_str = stderr.decode('utf-8', errors='replace')
 
+        # Saved secrets are hidden before the output is cut, so a cut never
+        # leaves part of one behind (flowly.secrets.redact).
+        from flowly.secrets.redact import redact
+
+        stdout_str, stderr_str = redact(stdout_str), redact(stderr_str)
+
         # Truncate if too long
         max_output = config.max_output_chars
         if len(stdout_str) > max_output:
