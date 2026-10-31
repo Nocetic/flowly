@@ -179,19 +179,11 @@ def consolidate_cmd(
             "{context}", json.dumps(ctx, ensure_ascii=False, indent=2)
         )
 
-        async def _stream() -> str:
-            # Stream (not chat()): the Flowly proxy 504s on long non-streamed
-            # completions — streaming keeps the connection alive like the agent.
-            parts: list[str] = []
-            async for delta in provider.chat_stream(
-                [{"role": "user", "content": prompt}],
-                model=model, max_tokens=2048, temperature=0.1,
-            ):
-                if delta.content:
-                    parts.append(delta.content)
-            return "".join(parts)
+        from flowly.providers.background import background_answer
 
-        text = asyncio.run(_stream())
+        text = asyncio.run(background_answer(
+            provider, prompt, model=model, max_tokens=2048, temperature=0.1, label="consolidate",
+        ))
         _last_raw["text"] = text
         return parse_operations(text)
 

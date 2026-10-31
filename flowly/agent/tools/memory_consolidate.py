@@ -67,30 +67,16 @@ class MemoryConsolidateTool(Tool):
 
         prompt = PROMPT.replace("{context}", json.dumps(ctx, ensure_ascii=False, indent=2))
 
-        # The Flowly proxy intermittently returns an empty stream for these
-        # long (~40s) reasoning-model completions. The model produces correct
-        # output when it does respond, so retry a couple of times on empty.
-        raw = ""
-        last_exc: Exception | None = None
-        for attempt in range(3):
-            parts: list[str] = []
-            try:
-                async for delta in self._provider.chat_stream(
-                    [{"role": "user", "content": prompt}],
-                    model=self._model, max_tokens=2048, temperature=0.1,
-                ):
-                    if delta.content:
-                        parts.append(delta.content)
-            except Exception as exc:
-                last_exc = exc
-                logger.warning(f"[consolidate] attempt {attempt + 1} failed: {exc}")
-                continue
-            raw = "".join(parts)
-            if raw.strip():
-                break
-            logger.warning(f"[consolidate] attempt {attempt + 1} returned empty; retrying")
-        if not raw.strip() and last_exc is not None:
-            return f"Consolidation LLM call failed: {last_exc}"
+        # What looked like a flaky empty stream was a thinking model spending
+        # the whole cap on thinking (flowly/providers/background.py).
+        from flowly.providers.background import BackgroundAnswerError, background_answer
+
+        try:
+            raw = await background_answer(
+                self._provider, prompt, model=self._model, max_tokens=2048, temperature=0.1, label="consolidate",
+            )
+        except BackgroundAnswerError as exc:
+            return f"Consolidation LLM call failed: {exc}"
 
         ops = parse_operations(raw)
         if not ops:

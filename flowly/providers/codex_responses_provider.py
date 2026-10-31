@@ -1049,6 +1049,7 @@ class CodexResponsesProvider(LLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         tool_choice: str = "auto",
+        reasoning: bool | None = None,
     ) -> AsyncIterator[LLMResponse]:
         """Token-by-token streaming over the ChatGPT Codex SSE API.
 
@@ -1057,7 +1058,8 @@ class CodexResponsesProvider(LLMProvider):
         ``usage`` and ``content=None``. Any failure degrades to a single
         blocking :meth:`chat` so a turn is never left empty.
         """
-        del max_tokens, temperature
+        # No cap reaches this API, so thinking cannot crowd out the answer (see chat()).
+        del max_tokens, temperature, reasoning
         resolved_model = _normalize_codex_model(model or self.default_model)
         request_timeout = self.request_timeout_seconds
         auth_refreshed = False

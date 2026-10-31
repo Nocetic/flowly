@@ -571,7 +571,9 @@ class AnthropicProvider(LLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         tool_choice: str = "auto",
+        reasoning: bool | None = None,
     ) -> AsyncIterator[LLMResponse]:
+        del reasoning  # extended thinking is off unless asked for
         payload = self._build_payload(
             messages=messages,
             tools=tools,

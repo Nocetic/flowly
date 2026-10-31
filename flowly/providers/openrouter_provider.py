@@ -469,6 +469,7 @@ class OpenRouterProvider(LLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         tool_choice: str = "auto",
+        reasoning: bool | None = None,
     ) -> AsyncIterator[LLMResponse]:
         """Stream a chat completion.
 
@@ -493,6 +494,12 @@ class OpenRouterProvider(LLMProvider):
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice
+        # The same switch as chat(), with the same retry for a model that
+        # always thinks.
+        switched = (reasoning is False and self.provider_name in _REASONING_SWITCH_PROVIDERS
+                    and resolved_model not in _REASONING_MANDATORY_MODELS)
+        if switched:
+            kwargs["extra_body"] = {"reasoning": {"enabled": False}}
 
         current_key = self._rotator.current_key() if self._rotator else self.api_key
         client = self._client_for_key(current_key).with_options(
@@ -500,7 +507,15 @@ class OpenRouterProvider(LLMProvider):
         )
 
         try:
-            stream = await client.chat.completions.create(**kwargs)
+            try:
+                stream = await client.chat.completions.create(**kwargs)
+            except Exception as exc:
+                if not switched or not _reasoning_is_mandatory(exc):
+                    raise
+                _REASONING_MANDATORY_MODELS.add(resolved_model)
+                kwargs.pop("extra_body", None)
+                logger.info(f"[LLM] {resolved_model} always reasons; asking again without reasoning.enabled=false")
+                stream = await client.chat.completions.create(**kwargs)
         except Exception as exc:
             yield self._error_response(exc)
             return

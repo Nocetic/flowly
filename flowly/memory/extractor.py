@@ -145,27 +145,12 @@ class SubagentExtractor:
     async def _extract_async(
         self, delta: Sequence[MessageRow], known: Sequence[Any] = (), profile: str = ""
     ) -> str:
-        prompt = self._build_prompt(delta, known, profile)
-        raw = ""
-        for attempt in range(3):
-            parts: list[str] = []
-            try:
-                async for d in self._provider.chat_stream(
-                    [{"role": "user", "content": prompt}],
-                    model=self._model,
-                    max_tokens=2048,
-                    temperature=0.2,
-                ):
-                    if getattr(d, "content", None):
-                        parts.append(d.content)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"[dreamer-extract] attempt {attempt + 1} failed: {exc}")
-                continue
-            raw = "".join(parts)
-            if raw.strip():
-                break
-            logger.warning(f"[dreamer-extract] attempt {attempt + 1} empty; retrying")
-        return raw
+        from flowly.providers.background import background_answer
+
+        return await background_answer(
+            self._provider, self._build_prompt(delta, known, profile),
+            model=self._model, max_tokens=2048, temperature=0.2, label="dreamer-extract",
+        )
 
     # -- pure, testable helpers --------------------------------------------
 
