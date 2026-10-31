@@ -1,11 +1,14 @@
 """`PendingApproval.supports_always` tells surfaces whether offering "Always
-allow" is meaningful. Exec commands we can allowlist (resolved_path known) and
-codex (acceptForSession) support it; tool actions that can never be remembered
-(send email, create Linear issue, ...) must not — otherwise "Always allow" is a
-silent no-op that re-asks every time.
+allow" is meaningful. An exec command supports it when remembering its
+programs makes it run unasked next time, and codex (acceptForSession) does;
+tool actions that can never be remembered (send email, create Linear issue,
+...) must not — otherwise "Always allow" is a silent no-op that re-asks every
+time.
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import pytest
 
@@ -18,34 +21,52 @@ def _isolate(monkeypatch, tmp_path):
     monkeypatch.setenv("FLOWLY_HOME", str(tmp_path / "home"))
 
 
-@pytest.mark.parametrize(
-    "command",
-    ["git status", "ls -la", "echo hi | cat", "definitely-not-a-real-binary-xyz"],
-)
-def test_create_pending_tracks_resolved_path(command):
+def _pending(command: str, cwd: str | None = None) -> PendingApproval:
     store = ExecApprovalStore()
     store.load()
-    pending = store.create_pending(ExecRequest(command=command))
-    # Invariant: we offer "always" exactly when we have a path to allowlist.
-    assert pending.supports_always is (pending.resolved_path is not None)
+    store.config.security, store.config.ask = "allowlist", "on-miss"
+    return store.create_pending(ExecRequest(command=command, cwd=cwd))
 
 
-def test_resolvable_command_supports_always():
-    store = ExecApprovalStore()
-    store.load()
-    pending = store.create_pending(ExecRequest(command="git status"))
-    assert pending.resolved_path is not None
+def test_a_program_that_does_not_read_supports_always():
+    pending = _pending("git commit -m x")
     assert pending.supports_always is True
+    assert len(pending.remembers) == 1 and pending.remembers[0].endswith("/git")
 
 
-def test_unresolvable_command_does_not_support_always():
+@pytest.mark.parametrize("command", [
+    # Remembering cat or git did nothing here: the variable, the chain, the
+    # write redirection or the interpreter asked again the next time.
+    'cat "$USER/notes.md"',
+    "git commit -m x > log.txt",
+    "python3 -c 'print(1)'",
+    "definitely-not-a-real-binary-xyz --flag",
+    # A dangerous pattern asks every time.
+    "git push --force",
+])
+def test_always_is_not_offered_where_it_would_do_nothing(command):
+    pending = _pending(command)
+    assert pending.supports_always is False
+    assert pending.remembers == ()
+
+
+def test_always_is_not_offered_in_ask_mode():
     store = ExecApprovalStore()
     store.load()
-    pending = store.create_pending(
-        ExecRequest(command="definitely-not-a-real-binary-xyz --flag")
-    )
-    assert pending.resolved_path is None
-    assert pending.supports_always is False
+    store.config.security, store.config.ask = "full", "always"
+    assert store.create_pending(ExecRequest(command="git commit -m x")).supports_always is False
+
+
+def test_always_remembers_every_program_of_a_chain():
+    store = ExecApprovalStore()
+    store.load()
+    store.config.security, store.config.ask = "allowlist", "on-miss"
+    pending = store.create_pending(ExecRequest(command="git add -A && git commit -m x; make 2>&1 | tail -3"))
+    assert [Path(p).name for p in pending.remembers] == ["git", "make"]
+
+    store.resolve_pending(pending.id, "allow-always")
+
+    assert {entry.pattern for entry in store.config.allowlist} == set(pending.remembers)
 
 
 def test_default_pending_supports_always():

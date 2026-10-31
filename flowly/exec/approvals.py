@@ -20,7 +20,7 @@ from flowly.exec.types import (
     PendingApproval,
     ExecApprovalDecision,
 )
-from flowly.exec.safety import analyze_command, DEFAULT_SAFE_BINS
+from flowly.exec.safety import analyze_command, has_dangerous_pattern, DEFAULT_SAFE_BINS
 from flowly.profile import get_flowly_home
 
 
@@ -290,6 +290,19 @@ class ExecApprovalStore:
         # a generic approve/deny with no context.
         analysis = analyze_command(request.command)
 
+        # "allow-always" is offered only when it makes the command run
+        # unasked next time: in Auto (Ask asks every time anyway), with no
+        # dangerous pattern (that asks every time too), and when allowing the
+        # programs of the parts that do not read is enough. It used to be
+        # offered whenever the first word resolved, and did nothing on a
+        # chain or a command with a variable.
+        remembers: tuple[str, ...] = ()
+        config = self.config
+        if config.security == "allowlist" and config.ask == "on-miss" and not has_dangerous_pattern(request.command):
+            from flowly.exec.auto_rules import programs_to_remember
+
+            remembers = tuple(programs_to_remember(request.command, request.cwd))
+
         pending = PendingApproval(
             id=approval_id,
             request=request,
@@ -298,10 +311,8 @@ class ExecApprovalStore:
             session_key=request.session_key,
             resolved_path=analysis.resolved_path,
             risk_reasons=[*analysis.risk_reasons, *_secret_reasons(request.command)],
-            # "allow-always" only persists when we have a path to allowlist
-            # (see resolve_pending). Pipelines / builtins resolve to no path,
-            # so remembering them is impossible — don't offer it.
-            supports_always=analysis.resolved_path is not None,
+            supports_always=bool(remembers),
+            remembers=remembers,
             kind="exec",
         )
 
@@ -322,13 +333,9 @@ class ExecApprovalStore:
         if not pending:
             return False
 
-        if decision == "allow-always" and pending.resolved_path:
-            # Add to allowlist
-            self.add_to_allowlist(
-                pattern=pending.resolved_path,
-                command=pending.request.command,
-                resolved_path=pending.resolved_path,
-            )
+        if decision == "allow-always":
+            for path in pending.remembers:
+                self.add_to_allowlist(pattern=path, command=pending.request.command, resolved_path=path)
 
         return True
 
