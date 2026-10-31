@@ -104,4 +104,7 @@ class PendingApproval:
     # — e.g. sending an email — so surfaces must NOT offer "Always allow"
     # there (it would be a silent no-op that re-asks every time).
     supports_always: bool = True
+    # The programs an exec "allow-always" adds to the allowlist: every part
+    # of the command that does not only read (see flowly.exec.auto_rules).
+    remembers: tuple[str, ...] = ()
     run_id: str | None = None
