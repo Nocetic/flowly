@@ -146,3 +146,43 @@ async def test_what_codex_prints_comes_back_with_the_value_hidden(saved):
     assert VALUE not in repr(turn.messages) and VALUE not in turn.final_text
     assert VALUE not in "".join(streamed)
     assert "[secret:LINEAR_API_KEY]" in turn.final_text
+
+
+async def test_a_changed_secret_reconnects_the_servers_that_name_it(tmp_path, monkeypatch):
+    """A server reads ``${secret:NAME}`` when it connects: a replaced or deleted
+    key used to reach it only at its next restart."""
+    import json
+
+    monkeypatch.setenv("FLOWLY_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(vault_mod, "_keyring", lambda: None)
+    for module in (vault_mod, secret_requests, redact):
+        module._reset_for_tests()
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"mcpServers": {
+        "linear": {"command": "linear-mcp", "env": {"LINEAR_API_KEY": "${secret:LINEAR_API_KEY}"}},
+        "notes": {"command": "notes-mcp"},
+        "paused": {"command": "linear-mcp", "enabled": False, "env": {"K": "${secret:LINEAR_API_KEY}"}},
+    }}))
+    applied: list[str] = []
+
+    async def apply(name):
+        applied.append(name)
+        return {"ok": True, "connected": True}
+
+    instance = MCPConnectionService(path, lambda: object(), probe=AsyncMock(return_value=(True, [], "")), apply=apply)
+    monkeypatch.setattr(feature_rpc, "_mcp_connection_service", instance)
+    try:
+        key = service.status()["key"]
+        sealed = envelope.seal({"LINEAR_API_KEY": VALUE}, envelope.unb64url(key["publicKey"]), kid=key["kid"], request_id=None)
+        await service.submit({"names": ["LINEAR_API_KEY"], "kid": key["kid"], "sealed": sealed})
+        await asyncio.sleep(0.05)
+        assert applied == ["linear"]
+
+        applied.clear()
+        service.delete({"name": "LINEAR_API_KEY"})
+        await asyncio.sleep(0.05)
+        assert applied == ["linear"]
+    finally:
+        await instance.close()
+        for module in (vault_mod, secret_requests, redact):
+            module._reset_for_tests()

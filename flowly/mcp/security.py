@@ -355,6 +355,13 @@ def interpolate_env_vars(value: Any) -> Any:
     return walk(value)
 
 
+def secret_names(value: Any) -> set[str]:
+    """The saved secrets a configuration names (``${secret:NAME}``)."""
+    out: set[str] = set()
+    _secret_names(value, out)
+    return out
+
+
 def _secret_names(value: Any, out: set[str]) -> None:
     if isinstance(value, str):
         out.update(key[len(_SECRET_PREFIX):] for key in _ENV_VAR_PATTERN.findall(value) if key.startswith(_SECRET_PREFIX))

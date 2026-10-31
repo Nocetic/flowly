@@ -10,7 +10,10 @@ never in a command's environment).
 from __future__ import annotations
 
 import re
+import secrets
 from typing import Any, Iterable
+
+from loguru import logger
 
 from flowly.secrets import envelope
 from flowly.secrets.names import SecretNameError, check_name
@@ -102,6 +105,7 @@ async def submit(params: dict[str, Any]) -> dict[str, Any]:
     description = request.description if request is not None else opened.description
     saved = vault.put(opened.values, description)
     _audit("secret.saved", saved, request_id)
+    reconnect_mcp_servers(saved)
     if request is not None:
         await requests.close(request.id, "saved")
     else:
@@ -127,7 +131,39 @@ def delete(params: dict[str, Any]) -> dict[str, Any]:
     deleted = get_vault().delete(name)
     if deleted:
         _audit("secret.deleted", [name], None)
+        reconnect_mcp_servers([name])
     return {"deleted": deleted}
+
+
+def reconnect_mcp_servers(names: Iterable[str]) -> list[str]:
+    """Reconnect the MCP servers whose settings name one of these secrets.
+
+    A server reads ``${secret:NAME}`` when it connects; without this, a key
+    replaced or deleted reached it only at its next restart. Each goes
+    through the owner's own "retry", one at a time per server; a server busy
+    with another change is left to pick it up then. Never fails a save.
+    """
+    try:
+        from flowly.channels.feature_rpc import _mcp_connection_service as connections
+        from flowly.mcp.security import secret_names
+
+        if connections is None or connections.manager._closed:
+            return []
+        changed = set(names)
+        servers = connections.manager.store.read().get("mcpServers", {})
+        named = [name for name, config in servers.items()
+                 if isinstance(config, dict) and config.get("enabled", True) and secret_names(config) & changed]
+    except Exception as exc:
+        logger.warning("[Secrets] MCP servers to reconnect unknown ({})", type(exc).__name__)
+        return []
+    started = []
+    for name in named:
+        try:
+            connections.manager.manage({"name": name, "action": "retry", "requestId": f"secret-{secrets.token_hex(12)}"})
+            started.append(name)
+        except Exception as exc:
+            logger.info("[Secrets] MCP server {} not reconnected now ({})", name, getattr(exc, "code", type(exc).__name__))
+    return started
 
 
 def pending_requests() -> dict[str, Any]:
