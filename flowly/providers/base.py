@@ -248,9 +248,13 @@ class LLMProvider(ABC):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         tool_choice: str = "auto",
+        reasoning: bool | None = None,
     ) -> AsyncIterator[LLMResponse]:
         """
         Stream a chat completion request, yielding partial LLMResponse objects.
+
+        ``reasoning`` is ``chat()``'s: ``False`` asks a thinking model to
+        answer without thinking first, where the backend can say so.
 
         Each yielded item has either:
           - content set (text delta, tool_calls empty) — a text token
@@ -265,6 +269,7 @@ class LLMProvider(ABC):
             model=model,
             max_tokens=max_tokens,
             temperature=temperature,
+            reasoning=reasoning,
         )
         yield response
 

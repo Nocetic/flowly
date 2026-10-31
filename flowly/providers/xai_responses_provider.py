@@ -409,6 +409,7 @@ class XAIResponsesProvider(LLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         tool_choice: str = "auto",
+        reasoning: bool | None = None,
     ) -> AsyncIterator[LLMResponse]:
         """Real token-by-token streaming over the xAI Responses SSE API.
 
@@ -423,6 +424,7 @@ class XAIResponsesProvider(LLMProvider):
         and any streaming failure degrades to a single blocking ``chat()`` call
         so a turn is NEVER left without a reply.
         """
+        del reasoning  # as chat(): this backend's thinking is not switched
         resolved_model = _normalize_xai_model(model or self.default_model)
         instructions, input_items = _messages_to_responses_input(messages)
         payload: dict[str, Any] = {

@@ -310,26 +310,11 @@ class MemoryDumpExtractor:
             .replace("{known}", _render_known(known))
             .replace("{dump}", dump)
         )
-        raw = ""
-        for attempt in range(3):
-            parts: list[str] = []
-            try:
-                async for delta in self._provider.chat_stream(
-                    [{"role": "user", "content": prompt}],
-                    model=self._model,
-                    max_tokens=3072,
-                    temperature=0.1,
-                ):
-                    if getattr(delta, "content", None):
-                        parts.append(delta.content)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"[memory-import] attempt {attempt + 1} failed: {exc}")
-                continue
-            raw = "".join(parts)
-            if raw.strip():
-                break
-            logger.warning(f"[memory-import] attempt {attempt + 1} empty; retrying")
-        return raw
+        from flowly.providers.background import background_answer
+
+        return await background_answer(
+            self._provider, prompt, model=self._model, max_tokens=3072, temperature=0.1, label="memory-import",
+        )
 
     def _parse(
         self,

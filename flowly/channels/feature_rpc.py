@@ -1686,19 +1686,11 @@ def _consolidate_run(dry_run: bool) -> dict:
         provider = build_provider(ap, default_model=model, config=config)
         prompt = PROMPT.replace("{context}", json.dumps(ctx, ensure_ascii=False, indent=2))
 
-        async def _stream() -> str:
-            parts: list[str] = []
-            async for delta in provider.chat_stream(
-                [{"role": "user", "content": prompt}],
-                model=model,
-                max_tokens=2048,
-                temperature=0.1,
-            ):
-                if delta.content:
-                    parts.append(delta.content)
-            return "".join(parts)
+        from flowly.providers.background import background_answer
 
-        return parse_operations(asyncio.run(_stream()))
+        return parse_operations(asyncio.run(background_answer(
+            provider, prompt, model=model, max_tokens=2048, temperature=0.1, label="consolidate",
+        )))
 
     gov = GovernanceStore(state_db("memory_governance.sqlite3"))
     mirror = SqliteKGMirror(str(kg_path)) if kg_path.exists() else None

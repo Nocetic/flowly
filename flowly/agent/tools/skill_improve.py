@@ -57,23 +57,14 @@ class SkillImproveTool(Tool):
         }
 
     async def _stream(self, prompt: str) -> str:
-        raw = ""
-        for attempt in range(3):
-            parts: list[str] = []
-            try:
-                async for d in self._provider.chat_stream(
-                    [{"role": "user", "content": prompt}],
-                    model=self._model, max_tokens=4096, temperature=0.1,
-                ):
-                    if d.content:
-                        parts.append(d.content)
-            except Exception as exc:
-                logger.warning(f"[skill-improve] attempt {attempt+1} failed: {exc}")
-                continue
-            raw = "".join(parts)
-            if raw.strip():
-                break
-        return raw
+        from flowly.providers.background import BackgroundAnswerError, background_answer
+
+        try:
+            return await background_answer(
+                self._provider, prompt, model=self._model, max_tokens=4096, temperature=0.1, label="skill-improve",
+            )
+        except BackgroundAnswerError:
+            return ""
 
     def _skill_rows(self) -> list[dict]:
         from flowly.agent.skill_usage import PROV_AGENT
