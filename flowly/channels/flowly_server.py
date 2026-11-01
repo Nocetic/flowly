@@ -80,6 +80,8 @@ PROFILE_CHAT_EVENTS = frozenset({
     "agent.clarify.requested", "agent.clarify.closed",
     # A secret request's card (flowly.secrets.requests); never a value.
     "secret.requested", "secret.closed",
+    # A template the agent drafted of itself (flowly.templates); the server keeps it.
+    "template.drafted",
     "plan.updated", "plan.approval.requested",
 })
 
@@ -317,6 +319,18 @@ class FlowlyServerChannel(WebChannel):
         """
         relay_id = self._relay_id_for(session_key)
         frame: dict[str, Any] = {"type": "event", "event": event_name, "data": data}
+        if relay_id:
+            frame["sessionId"] = relay_id
+        await self._send_or_queue(json.dumps(frame))
+
+    async def send_template_event(self, session_key: str, data: dict) -> None:
+        """A template the main agent drafted (``template.drafted``, PROTOCOL B6d).
+
+        The server finds the conversation by the draft's ``sessionKey``, as for
+        a secret request's card.
+        """
+        relay_id = self._relay_id_for(session_key)
+        frame: dict[str, Any] = {"type": "event", "event": "template.drafted", "data": data}
         if relay_id:
             frame["sessionId"] = relay_id
         await self._send_or_queue(json.dumps(frame))

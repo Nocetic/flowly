@@ -1,0 +1,3 @@
+{"v": 1, "profile": {"displayName": "Researcher"},
+ "skills": [{"slug": "brief", "name": "Brief", "description": "Brief.", "content": "One."},
+            {"slug": "brief", "name": "Brief again", "description": "Brief.", "content": "Two."}]}

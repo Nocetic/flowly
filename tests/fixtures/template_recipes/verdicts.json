@@ -1,0 +1,12 @@
+{
+  "valid-minimal.json": null,
+  "valid-full.json": null,
+  "bad-unknown-key.json": {"code": "BAD_RECIPE", "field": "plugins"},
+  "bad-version.json": {"code": "BAD_RECIPE", "field": "v"},
+  "bad-slug.json": {"code": "BAD_RECIPE", "field": "skills[0].slug"},
+  "bad-duplicate-slug.json": {"code": "BAD_RECIPE", "field": "skills[1].slug"},
+  "bad-profile-shape.json": {"code": "BAD_RECIPE", "field": "profile.markShape"},
+  "bad-schedule.json": {"code": "BAD_RECIPE", "field": "routines[0].schedule.seconds"},
+  "bad-app-id.json": {"code": "BAD_RECIPE", "field": "apps[0].id"},
+  "bad-empty-name.json": {"code": "BAD_RECIPE", "field": "profile.displayName"}
+}

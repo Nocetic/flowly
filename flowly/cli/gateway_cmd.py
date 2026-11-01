@@ -2965,6 +2965,19 @@ Respond to the user now:"""
             # Requests whose week is over end once, with the callbacks above in place.
             _secret_expiry_task = asyncio.create_task(_secret_requests.run_expiry())
 
+            # A template the agent drafted of itself (flowly.templates): to the
+            # Flowly server for the main agent, to the agent host for a named
+            # one, which passes it on under the agent's profile.
+            from flowly.templates.drafts import add_drafted_callback
+
+            async def _carry_template_draft(session_key: str, data: dict) -> None:
+                web = channels.get_channel("web")
+                if session_key.startswith("web:") and web and hasattr(web, "send_template_event"):
+                    await web.send_template_event(session_key, data)
+                await gateway_server.broadcast_event("template.drafted", data)
+
+            add_drafted_callback(_carry_template_draft)
+
             # Questions and plan reviews pause the agent like approvals do:
             # pushed to the phone only if still unanswered after a minute.
             from flowly.plans.approval import get_plan_approval_manager

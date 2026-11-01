@@ -28,6 +28,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -842,6 +843,7 @@ def create_profile(
     mark_tone: str = "",
     mark_seed: int | None = None,
     mark_shape: str = "",
+    populate: Callable[[Path], None] | None = None,
 ) -> Path:
     """Create a new profile directory.
 
@@ -849,6 +851,8 @@ def create_profile(
         name: Profile identifier.
         clone_from: Source profile to clone from (default: active profile).
         clone_all: If True, full copy including sessions/memory.
+        populate: Writes more into the staged directory before it is published
+            (a template's skills and suggestions); if it raises, no profile exists.
     """
     validate_profile_name(name)
     if name == "default":
@@ -970,6 +974,9 @@ def create_profile(
             "credentialPolicy": _NAMED_PROFILE_CREDENTIAL_POLICY,
             "agentHomeVersion": 1,
         })
+
+        if populate is not None:
+            populate(temp_dir)
 
         # Publishing the completed directory is the commit point. A crash
         # before this line leaves only a hidden temp dir, never a half-profile.

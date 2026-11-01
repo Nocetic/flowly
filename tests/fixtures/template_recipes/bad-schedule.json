@@ -1,0 +1,2 @@
+{"v": 1, "profile": {"displayName": "Researcher"},
+ "routines": [{"name": "Too often", "prompt": "Ping.", "schedule": {"kind": "every", "seconds": 5}}]}
