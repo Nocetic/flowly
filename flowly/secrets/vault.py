@@ -43,6 +43,11 @@ _AAD = b"flowly-vault/v1"
 MAX_VALUE_BYTES = 16 * 1024
 MAX_DESCRIPTION_CHARS = 500
 MAX_SECRETS = 100
+#: A value this long or longer shows its last :data:`HINT_CHARS` characters in
+#: Settings ("…a1f"): enough to tell which key is saved, never enough to use it.
+#: A shorter one shows nothing.
+HINT_MIN_CHARS = 12
+HINT_CHARS = 3
 #: ``lastUsedAt`` is written at most this often per secret: not a write per command.
 LAST_USED_RESOLUTION_SECONDS = 3600
 
@@ -75,9 +80,14 @@ class Secret:
     last_used_at: float | None = None
 
     def summary(self, name: str) -> dict[str, Any]:
-        """What may leave the vault: everything but the value."""
+        """What may leave the vault: everything but the value, and the value's last characters as a hint."""
         return {"name": name, "description": self.description, "createdAt": self.created_at,
-                "updatedAt": self.updated_at, "lastUsedAt": self.last_used_at}
+                "updatedAt": self.updated_at, "lastUsedAt": self.last_used_at, "hint": value_hint(self.value)}
+
+
+def value_hint(value: str) -> str | None:
+    """The last :data:`HINT_CHARS` characters of a long enough value; None for a short one."""
+    return value[-HINT_CHARS:] if len(value) >= HINT_MIN_CHARS else None
 
 
 @dataclass
@@ -280,6 +290,25 @@ class Vault:
                 )
             self.save(VaultData(private_key=data.private_key, secrets=secrets))
             return sorted(values)
+
+    def update(self, name: str, *, description: str | None = None, new_name: str | None = None) -> str:
+        """Change a secret's description or name, never its value; returns its name now."""
+        with self._lock:
+            data = self.load()
+            if data is None or name not in data.secrets:
+                raise SecretsError("No secret has this name.", "NOT_FOUND")
+            target = new_name or name
+            if target != name and target in data.secrets:
+                raise SecretsError(f"A secret named {target} is already saved.", "NAME_TAKEN")
+            old = data.secrets[name]
+            secrets = {key: value for key, value in data.secrets.items() if key != name}
+            secrets[target] = Secret(
+                value=old.value,
+                description=(description if description is not None else old.description)[:MAX_DESCRIPTION_CHARS],
+                created_at=old.created_at, updated_at=time.time(), last_used_at=old.last_used_at,
+            )
+            self.save(VaultData(private_key=data.private_key, secrets=secrets))
+            return target
 
     def delete(self, name: str) -> bool:
         with self._lock:

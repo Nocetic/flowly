@@ -2242,13 +2242,15 @@ async def secrets_call(method: str, params: dict) -> dict:
             return await service.decline(params)
         if method == "secrets.delete":
             return service.delete(params)
+        if method == "secrets.update":
+            return service.update(params)
     except SecretsError as exc:
         raise FeatureRpcError(exc.code, str(exc)) from None
     raise FeatureRpcError("UNKNOWN_METHOD", f"unknown feature method: {method}")
 
 
 SECRETS_METHODS = ("secrets.requests", "secrets.status", "secrets.list", "secrets.submit",
-                   "secrets.decline", "secrets.delete")
+                   "secrets.decline", "secrets.delete", "secrets.update")
 
 
 def task_request_call(method: str, params: dict) -> dict:

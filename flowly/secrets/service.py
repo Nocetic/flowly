@@ -135,6 +135,27 @@ def delete(params: dict[str, Any]) -> dict[str, Any]:
     return {"deleted": deleted}
 
 
+def update(params: dict[str, Any]) -> dict[str, Any]:
+    """Change a saved secret's description or name (Settings → Secrets → Edit); never its value.
+
+    A new value is a ``secrets.submit`` under the name, sealed as any. A
+    renamed secret reaches commands and MCP settings under its new name only.
+    """
+    try:
+        name = check_name(params.get("name"))
+        new_name = check_name(params["newName"]) if params.get("newName") not in (None, "") else None
+    except SecretNameError as exc:
+        raise SecretsError(str(exc), "BAD_NAME") from None
+    description = params.get("description")
+    if description is not None and not isinstance(description, str):
+        raise SecretsError("The description is not text.", "BAD_PARAMS")
+    now_named = get_vault().update(name, description=description, new_name=new_name)
+    _audit("secret.updated", sorted({name, now_named}), None)
+    if now_named != name:
+        reconnect_mcp_servers([name, now_named])
+    return {"name": now_named}
+
+
 def reconnect_mcp_servers(names: Iterable[str]) -> list[str]:
     """Reconnect the MCP servers whose settings name one of these secrets.
 

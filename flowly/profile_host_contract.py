@@ -127,6 +127,7 @@ PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     "secrets.submit": 30_000,
     "secrets.decline": 30_000,
     "secrets.delete": 30_000,
+    "secrets.update": 30_000,
     "agent.clarify.resolve": 30_000,
     "plan.get": 30_000,
     "plan.resolve": 30_000,

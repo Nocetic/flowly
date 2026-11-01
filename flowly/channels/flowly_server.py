@@ -65,6 +65,7 @@ PROFILE_CHAT_METHODS = frozenset({
 #: the same way: the server sends them with ``params.profile``.
 PROFILE_SECRET_METHODS = frozenset({
     "secrets.requests", "secrets.status", "secrets.list", "secrets.submit", "secrets.decline", "secrets.delete",
+    "secrets.update",
 })
 _PROFILE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 #: The server's delivery session for a named agent's chat: ``srv-p:<profile>:<conversationId>``.
