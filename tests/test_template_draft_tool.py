@@ -6,6 +6,7 @@ puts the card in the chat); a refused draft leaves nothing.
 from __future__ import annotations
 
 import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -54,6 +55,9 @@ async def test_draft_emits_one_event_with_a_valid_recipe(agent):
     session_key, data = sent[0]
     assert session_key == HOME_SESSION == data["sessionKey"]
     assert data["draftId"] == result["draftId"]
+    # The server's contract (PROTOCOL B6d): exactly these fields, a 32-hex draft id.
+    assert set(data) == {"draftId", "sessionKey", "recipe", "createdAt"}
+    assert re.fullmatch(r"[0-9a-f]{32}", data["draftId"])
     assert validate_recipe(data["recipe"])["profile"]["displayName"] == "Researcher"
     assert isinstance(data["createdAt"], int)
 
