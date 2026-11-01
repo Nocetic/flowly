@@ -1256,6 +1256,28 @@ async def agent_home_get(params: dict) -> dict:
         raise FeatureRpcError(exc.code, str(exc)) from exc
 
 
+async def agent_template_contents() -> dict:
+    """What a template of this agent could carry (the share button's choices; flowly.templates.share)."""
+    from flowly.templates.share import share_contents
+
+    cron = _cron()
+    jobs = cron.list_jobs(include_disabled=True) if cron is not None else []
+    return await asyncio.to_thread(share_contents, jobs)
+
+
+async def agent_template_export(params: dict) -> dict:
+    """The recipe of what the owner chose to share, for the server to keep: ``{recipe, skipped}``."""
+    from flowly.templates.recipe import RecipeError
+    from flowly.templates.share import share_export
+
+    cron = _cron()
+    jobs = cron.list_jobs(include_disabled=True) if cron is not None else []
+    try:
+        return await asyncio.to_thread(share_export, params, jobs)
+    except RecipeError as exc:
+        raise FeatureRpcError(exc.code, str(exc)) from exc
+
+
 async def agent_home_setup(params: dict) -> dict:
     from flowly.agent_home import AgentHomeError, finish_setup
     try:
@@ -5985,6 +6007,8 @@ _DISPATCH: dict[str, tuple] = {
     "goal.stop": (goal_stop, True, False),
     "chat.compact": (chat_compact, True, False),
     "agent.home.get": (agent_home_get, True, False),
+    "agent.template.contents": (agent_template_contents, False, False),
+    "agent.template.export": (agent_template_export, True, False),
     "agent.home.setup": (agent_home_setup, True, False),
     "agent.home.introduce": (agent_home_introduce, True, False),
     "plan.get": (plan_get, True, False),

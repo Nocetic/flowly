@@ -115,7 +115,7 @@ async def test_populate_failure_leaves_no_agent(roots, monkeypatch):
 
 
 def test_capabilities_announce_templates(roots):
-    assert ProfileHost().capabilities()["templates"] == {"version": 1}
+    assert ProfileHost().capabilities()["templates"] == {"version": 2}
 
 
 async def test_introduction_offers_the_template_routines(roots, monkeypatch):

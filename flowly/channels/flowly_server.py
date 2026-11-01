@@ -69,6 +69,9 @@ PROFILE_SECRET_METHODS = frozenset({
     "secrets.requests", "secrets.status", "secrets.list", "secrets.submit", "secrets.decline", "secrets.delete",
     "secrets.update",
 })
+#: A named agent's share button (flowly.templates.share): the server asks the
+#: agent itself for what it can share and for the recipe, with ``params.profile``.
+PROFILE_TEMPLATE_METHODS = frozenset({"agent.template.contents", "agent.template.export"})
 _PROFILE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 #: The server's delivery session for a named agent's chat: ``srv-p:<profile>:<conversationId>``.
 _PROFILE_DELIVERY_SESSION = re.compile(r"^srv-p:([A-Za-z0-9._-]{1,64}):([A-Za-z0-9_-]{1,128})$")
@@ -260,7 +263,8 @@ class FlowlyServerChannel(WebChannel):
                                       "error": {"code": "KEY_NOT_SEALED", "retryable": False,
                                                 "message": "Seal the key to this agent before sending it."}}))
             return
-        if (method in PROFILE_CHAT_METHODS or method in PROFILE_SECRET_METHODS) and profile not in (None, "", "default"):
+        if (method in PROFILE_CHAT_METHODS or method in PROFILE_SECRET_METHODS or method in PROFILE_TEMPLATE_METHODS) \
+                and profile not in (None, "", "default"):
             await self._dispatch_profile_chat(ws, msg, profile)
             return
         await super()._dispatch_rpc(ws, msg)

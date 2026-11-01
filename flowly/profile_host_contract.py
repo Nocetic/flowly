@@ -78,6 +78,9 @@ PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     "mcp.access.revoke": 30_000,
     "mcp.chat.pending": 30_000,
     "mcp.chat.cancel": 30_000,
+    # The share button (flowly.templates.share): read the agent's own files, no model turn.
+    "agent.template.contents": 30_000,
+    "agent.template.export": 30_000,
     "gmail.capabilities": 30_000,
     "gmail.status": 30_000,
     "gmail.setup.begin": 60_000,
