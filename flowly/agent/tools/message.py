@@ -1,6 +1,5 @@
 """Message tool for sending messages and media to users."""
 
-import mimetypes
 from pathlib import Path
 from typing import Any, Callable, Awaitable
 
@@ -9,11 +8,12 @@ from loguru import logger
 from flowly.agent.tools._arg_coercion import coerce_str_list
 from flowly.agent.tools.base import Tool
 from flowly.bus.events import OutboundMessage
+from flowly.media.assets import DOCUMENT_TYPES, guess_mime
 
 
 # Supported media MIME types
 SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
-SUPPORTED_DOCUMENT_TYPES = {"application/pdf", "text/plain", "application/zip"}
+SUPPORTED_DOCUMENT_TYPES = set(DOCUMENT_TYPES.values())
 SUPPORTED_MEDIA_TYPES = SUPPORTED_IMAGE_TYPES | SUPPORTED_DOCUMENT_TYPES
 
 # Maximum media file size (10MB)
@@ -101,7 +101,8 @@ class MessageTool(Tool):
                     "items": {"type": "string"},
                     "description": (
                         "Optional list of file paths to send as media attachments. "
-                        "Supports images (jpg, png, gif) and documents (pdf, txt). "
+                        "Supports images (jpg, png, gif, webp) and documents (PDF, Office, text, "
+                        "Markdown, CSV, JSON, RTF, zip). "
                         "Example: [\"/path/to/screenshot.png\"]"
                     )
                 },
@@ -268,8 +269,8 @@ class MessageTool(Tool):
                 return f"File too large ({size_mb:.1f}MB > 10MB): {path_str}"
 
             # Check MIME type
-            mime_type, _ = mimetypes.guess_type(str(path))
-            if mime_type is None:
+            mime_type = guess_mime(path)
+            if mime_type == "application/octet-stream":
                 # Allow files with common image extensions even without MIME detection
                 ext = path.suffix.lower()
                 if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
@@ -287,11 +288,9 @@ class MessageTool(Tool):
     @staticmethod
     def is_image(path: str) -> bool:
         """Check if a file path points to an image."""
-        mime_type, _ = mimetypes.guess_type(path)
-        return mime_type in SUPPORTED_IMAGE_TYPES if mime_type else False
+        return guess_mime(path) in SUPPORTED_IMAGE_TYPES
 
     @staticmethod
     def is_document(path: str) -> bool:
         """Check if a file path points to a document."""
-        mime_type, _ = mimetypes.guess_type(path)
-        return mime_type in SUPPORTED_DOCUMENT_TYPES if mime_type else False
+        return guess_mime(path) in SUPPORTED_DOCUMENT_TYPES

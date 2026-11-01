@@ -18,7 +18,6 @@ drift apart.
 from __future__ import annotations
 
 import json
-import mimetypes
 import os
 import re
 import tempfile
@@ -124,14 +123,14 @@ _MEDIA_TOKEN = re.compile(r"`?MEDIA:(/[^\s`\"'<>]+)`?")
 # were pointed at (checked only when the path as written does not exist).
 _TRAILING = ".,;:!?)]}"
 
-# What a token may attach, and how large: what the message tool sends, plus
-# the audio and video the clients play inline. Anything else (HTML, archives
-# of other kinds, files with no type) is refused.
-_DOCUMENT_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp",
-                   "application/pdf", "text/plain", "application/zip"}
+# What a token may attach, and how large: pictures, the documents every app
+# opens (``assets.DOCUMENT_TYPES``: PDF, Office, text, CSV, JSON, zip), and
+# the audio and video the clients play inline. Anything else (HTML, scripts,
+# files with no type) is refused.
+_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp", "image/heic"}
 _PLAYABLE_TYPES = {"audio/mpeg", "audio/ogg", "audio/wav", "audio/x-wav", "audio/mp4",
                    "video/mp4", "video/quicktime", "video/webm"}
-_DOCUMENT_MAX_BYTES = 10 * 1024 * 1024
+_DOCUMENT_MAX_BYTES = 50 * 1024 * 1024
 _PLAYABLE_MAX_BYTES = 50 * 1024 * 1024
 
 
@@ -169,13 +168,15 @@ def deliverable_media_path(raw: str, roots: list[Path]) -> tuple[Path | None, st
         return None, "outside the agent's files"
     if not path.is_file():
         return None, "not a file"
-    mime, _ = mimetypes.guess_type(path.name)
-    if mime in _DOCUMENT_TYPES:
+    from flowly.media.assets import DOCUMENT_TYPES, guess_mime
+
+    mime = guess_mime(path.name)
+    if mime in _IMAGE_TYPES or mime in DOCUMENT_TYPES.values():
         limit = _DOCUMENT_MAX_BYTES
     elif mime in _PLAYABLE_TYPES:
         limit = _PLAYABLE_MAX_BYTES
     else:
-        return None, f"unsupported type {mime or 'unknown'}"
+        return None, f"unsupported type {'unknown' if mime == 'application/octet-stream' else mime}"
     size = path.stat().st_size
     if not 0 < size <= limit:
         return None, "empty" if size == 0 else "too large"

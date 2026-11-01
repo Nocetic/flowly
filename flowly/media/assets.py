@@ -60,7 +60,31 @@ def kind_for_mime(mime_type: str) -> str:
     return KIND_FILE
 
 
+#: Documents the agent can show in a chat, by extension. The type is ours, not
+#: the platform's mime table: a minimal Linux image has no Office types, and a
+#: file must be the same type on every machine it is shown from. HTML and
+#: anything else a browser would run are not here.
+DOCUMENT_TYPES: dict[str, str] = {
+    ".pdf": "application/pdf",
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+    ".csv": "text/csv",
+    ".json": "application/json",
+    ".rtf": "application/rtf",
+    ".zip": "application/zip",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".doc": "application/msword",
+    ".xls": "application/vnd.ms-excel",
+    ".ppt": "application/vnd.ms-powerpoint",
+}
+
+
 def guess_mime(path: Path | str) -> str:
+    document = DOCUMENT_TYPES.get(Path(str(path)).suffix.lower())
+    if document:
+        return document
     mime, _ = mimetypes.guess_type(str(path))
     return mime or "application/octet-stream"
 

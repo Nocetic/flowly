@@ -111,13 +111,28 @@ async def test_ticket_rejects_traversal_ids(aiohttp_client, media_home):
         assert resp.status in (400, 404), bad
 
 
-async def test_ticket_refuses_non_media_files(aiohttp_client, media_home):
-    (media_home / "notes.txt").write_text("hello")
+async def test_ticket_refuses_what_a_browser_would_run(aiohttp_client, media_home):
+    (media_home / "page.html").write_text("<script>alert(1)</script>")
     _server, client = await _client(aiohttp_client)
     resp = await client.post(
-        "/api/media/tickets", json={"id": "notes.txt"}, headers={TOKEN_HEADER: TOKEN}
+        "/api/media/tickets", json={"id": "page.html"}, headers={TOKEN_HEADER: TOKEN}
     )
     assert resp.status == 415
+
+
+async def test_a_document_the_agent_shows_streams_with_its_type_and_runs_nothing(aiohttp_client, media_home):
+    """2026-11-01: the agent gives the owner any file; Desktop and a phone
+    on the direct gateway open it from here (415 before)."""
+    data = b"PK\x03\x04 a word document"
+    (media_home / "brief.docx").write_bytes(data)
+    _server, client = await _client(aiohttp_client)
+    ticket = await _mint(client, "brief.docx")
+    resp = await client.get(f"/api/media/stream?id=brief.docx&ticket={ticket}")
+    assert resp.status == 200
+    assert resp.headers["Content-Type"] == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    assert resp.headers["X-Content-Type-Options"] == "nosniff"
+    assert "sandbox" in resp.headers["Content-Security-Policy"]
+    assert await resp.read() == data
 
 
 # ── streaming ────────────────────────────────────────────────────────────────

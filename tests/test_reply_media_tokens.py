@@ -53,7 +53,6 @@ def test_backticks_trailing_punctuation_and_repeats(tmp_path):
 
 @pytest.mark.parametrize("name, data, reason", [
     ("missing.jpg", None, "not found"),
-    ("config.json", b"{}", "unsupported type application/json"),
     ("page.html", b"<script>", "unsupported type text/html"),
     ("id_rsa", b"-----BEGIN", "unsupported type unknown"),
     ("empty.png", b"", "empty"),
@@ -80,12 +79,28 @@ def test_the_owners_other_files_are_refused_even_through_a_link(tmp_path):
 
 
 def test_size_limits_follow_the_kind_of_file(tmp_path):
-    big = tmp_path / "big.png"
-    big.write_bytes(b"0" * (10 * 1024 * 1024 + 1))
-    clip = tmp_path / "clip.mp4"
-    clip.write_bytes(b"0" * (10 * 1024 * 1024 + 1))
-    assert deliverable_media_path(str(big), [tmp_path.resolve()]) == (None, "too large")
+    def sized(name: str, size: int):
+        path = tmp_path / name
+        with path.open("wb") as handle:
+            handle.truncate(size)
+        return path
+
+    limit = 50 * 1024 * 1024
+    assert deliverable_media_path(str(sized("big.png", limit + 1)), [tmp_path.resolve()]) == (None, "too large")
+    report = sized("report.pdf", limit)
+    assert deliverable_media_path(str(report), [tmp_path.resolve()])[0] == report.resolve()
+    clip = sized("clip.mp4", limit)
     assert deliverable_media_path(str(clip), [tmp_path.resolve()])[0] == clip.resolve()
+
+
+@pytest.mark.parametrize("name", ["notes.md", "data.csv", "config.json", "brief.docx", "budget.xlsx",
+                                  "deck.pptx", "old.doc", "letter.rtf", "bundle.zip", "photo.heic"])
+def test_the_documents_every_app_opens_are_attached(tmp_path, name):
+    """2026-11-01: the owner asked for any file on the agent's machine; a
+    Word file, a spreadsheet or notes in Markdown were refused by type."""
+    path = _file(tmp_path / name, b"content")
+    _text, accepted, refused = take_media_tokens(f"Here MEDIA:{path}", [tmp_path])
+    assert (accepted, refused) == ([str(path.resolve())], [])
 
 
 def test_roots_are_the_agents_home_workspace_and_temp(tmp_path, monkeypatch):

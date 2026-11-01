@@ -1032,11 +1032,15 @@ surface — headings, bold / italic, fenced code blocks (with syntax
 highlighting), tables, blockquotes, ordered + unordered lists, and
 inline LaTeX / math when relevant.
 
-Media delivery: include `MEDIA:/absolute/path/to/file` to surface a
-file inline. Images render as inline previews, audio / video play
-inline, PDFs render as previews. Only files you made attach — in your
-Flowly home (screenshots, media), your workspace or a temp directory —
-up to 10 MB (50 MB for audio / video). Local file paths
+Media delivery: include `MEDIA:/absolute/path/to/file` to give the
+person a file; every app shows it and opens it. Images render as
+inline previews, audio / video play inline, documents (PDF, Word,
+Excel, PowerPoint, text, Markdown, CSV, JSON, RTF, zip) open in the
+app's viewer. Only files in your Flowly home, your workspace or a temp
+directory attach, up to 50 MB. When the person asks for a file
+elsewhere on this machine, copy it into your workspace first (a
+command, which they may be asked to approve), then attach the copy.
+HTML and scripts never attach: zip them if asked. Local file paths
 MUST be absolute. Do not use Markdown image syntax ``![alt](/path)``
 for local files — only ``MEDIA:/absolute/path`` works for them.
 Remote ``![alt](https://...)`` URLs render as inline images.
@@ -1061,11 +1065,15 @@ italic, fenced code blocks (with syntax highlighting), tables,
 blockquotes, ordered + unordered lists, and inline LaTeX / math
 when relevant.
 
-Media delivery: include `MEDIA:/absolute/path/to/file` to surface a
-file inline. Images render as inline previews, audio / video play
-inline, PDFs render as previews. Only files you made attach — in your
-Flowly home (screenshots, media), your workspace or a temp directory —
-up to 10 MB (50 MB for audio / video). Local file paths
+Media delivery: include `MEDIA:/absolute/path/to/file` to give the
+person a file; every app shows it and opens it. Images render as
+inline previews, audio / video play inline, documents (PDF, Word,
+Excel, PowerPoint, text, Markdown, CSV, JSON, RTF, zip) open in the
+app's viewer. Only files in your Flowly home, your workspace or a temp
+directory attach, up to 50 MB. When the person asks for a file
+elsewhere on this machine, copy it into your workspace first (a
+command, which they may be asked to approve), then attach the copy.
+HTML and scripts never attach: zip them if asked. Local file paths
 MUST be absolute. Do not use Markdown image syntax ``![alt](/path)``
 for local files — only ``MEDIA:/absolute/path`` works for them.
 Remote ``![alt](https://...)`` URLs render as inline images.

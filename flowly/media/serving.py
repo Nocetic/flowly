@@ -16,9 +16,10 @@ window until the previous one has been written to the client.
 
 from __future__ import annotations
 
-import mimetypes
 from dataclasses import dataclass
 from pathlib import Path
+
+from flowly.media.assets import DOCUMENT_TYPES, guess_mime
 
 # Mirror of the gateway's streaming ceiling: bounds what one file may be, not
 # what one request may read.
@@ -27,11 +28,9 @@ MAX_SERVE_BYTES = 2 * 1024 * 1024 * 1024
 # What may be served at all. Generated media only — this is not a file server.
 SERVABLE_MIME_PREFIXES = ("image/", "video/", "audio/")
 
-# Files the agent shows in a chat besides media (``share_in_media_dir``):
+# Files the agent shows in a chat besides media (``assets.DOCUMENT_TYPES``):
 # served too, never indexed in the media library.
-SHARED_DOCUMENT_TYPES = frozenset({
-    "application/pdf", "text/plain", "text/markdown", "text/csv", "application/json", "application/zip",
-})
+SHARED_DOCUMENT_TYPES = frozenset(DOCUMENT_TYPES.values())
 
 # A file outside the media dir is copied in to be shown, up to this size.
 MAX_SHARE_BYTES = 512 * 1024 * 1024
@@ -98,7 +97,7 @@ def share_in_media_dir(path: Path, media_dir: Path | None = None) -> str | None:
         source = path.resolve()
         if not source.is_file() or source.stat().st_size > MAX_SHARE_BYTES:
             return None
-        mime = mimetypes.guess_type(source.name)[0] or ""
+        mime = guess_mime(source.name)
         if not (mime.startswith(SERVABLE_MIME_PREFIXES) or mime in SHARED_DOCUMENT_TYPES):
             return None
         published = Path(publish_reply_file(str(source), media_dir))
@@ -136,8 +135,7 @@ def read_media_window(
             "forbidden" if error == "forbidden" else "not_found"
         ))
 
-    mime, _ = mimetypes.guess_type(str(target))
-    mime = mime or ""
+    mime = guess_mime(target.name)
     if not (mime.startswith(SERVABLE_MIME_PREFIXES) or mime in SHARED_DOCUMENT_TYPES):
         return MediaWindow(ok=False, error="unsupported_type")
 

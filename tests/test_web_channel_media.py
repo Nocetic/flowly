@@ -447,3 +447,32 @@ async def test_the_relay_bridges_an_audio_window_off_this_machine(channel, flowl
     assert reply["size"] == 2048
     assert reply["mimeType"] == "audio/mpeg"
     assert reply["eof"] is False
+
+
+@pytest.mark.parametrize("name, mime", [
+    ("brief.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+    ("budget.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+    ("notes.md", "text/markdown"),
+])
+async def test_a_document_goes_by_media_id_with_its_own_type_and_is_served_as_that(channel, media, name, mime, monkeypatch):
+    """The type is Flowly's, not the platform's: a minimal Linux image has no
+    Office types, and the apps open a file by the type it came with."""
+    import mimetypes
+
+    from flowly.media.serving import read_media_window
+
+    monkeypatch.setattr(mimetypes, "guess_type", lambda *_a, **_k: (None, None))
+    path = media / name
+    path.write_bytes(b"PK\x03\x04 document")
+    await channel.send(OutboundMessage(channel="web", chat_id="conv-1", content="here",
+                                       media=[str(path)], metadata={"run_id": "r"}))
+    att = channel._capture[-1]["data"]["attachments"][0]
+    assert (att["kind"], att["mimeType"], att["mediaId"]) == ("file", mime, name)
+    window = read_media_window(name, 0, 100, media_dir=media)
+    assert (window.ok, window.mime_type) == (True, mime)
+
+
+async def test_a_page_a_browser_would_run_is_never_served(channel, flowly_home):
+    (flowly_home / "media" / "page.html").write_text("<script>alert(1)</script>")
+    reply = await _fetch(channel, FakeWs(), requestId="r", mediaId="page.html", offset=0, length=100)
+    assert (reply["ok"], reply["error"]) == (False, "unsupported_type")

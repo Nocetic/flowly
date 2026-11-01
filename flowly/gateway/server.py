@@ -199,6 +199,16 @@ _MAX_STREAM_BYTES = 2 * 1024 * 1024 * 1024
 # documents) has no business being fetched by a chat client.
 _STREAMABLE_MIME_PREFIXES = ("image/", "video/", "audio/")
 
+
+def _streamable_mime(target: Path) -> str | None:
+    """The type a media file streams as, or None when it is not served:
+    media, and the documents the agent shows (the bridge's rules)."""
+    from flowly.media.assets import guess_mime
+    from flowly.media.serving import SHARED_DOCUMENT_TYPES
+
+    mime = guess_mime(target.name)
+    return mime if mime.startswith(_STREAMABLE_MIME_PREFIXES) or mime in SHARED_DOCUMENT_TYPES else None
+
 # Browser providers share the same local WebSocket transport as desktop/chat
 # clients. Provider IDs are intentionally stricter than arbitrary display
 # names: they are persisted by clients and may later be used for per-session
@@ -1138,9 +1148,8 @@ class GatewayServer:
         if target is None:
             return web.json_response({"error": error}, status=status)
 
-        mime, _ = mimetypes.guess_type(str(target))
-        mime = mime or ""
-        if not mime.startswith(_STREAMABLE_MIME_PREFIXES):
+        mime = _streamable_mime(target)
+        if mime is None:
             return web.json_response({"error": "unsupported media type"}, status=415)
 
         ticket = self._media_ticket_store.mint(name)
@@ -1180,9 +1189,8 @@ class GatewayServer:
         if target is None:
             return web.json_response({"error": error}, status=status)
 
-        mime, _ = mimetypes.guess_type(str(target))
-        mime = mime or ""
-        if not mime.startswith(_STREAMABLE_MIME_PREFIXES):
+        mime = _streamable_mime(target)
+        if mime is None:
             return web.json_response({"error": "unsupported media type"}, status=415)
         if target.stat().st_size > _MAX_STREAM_BYTES:
             return web.json_response({"error": "file too large"}, status=413)
@@ -1191,6 +1199,11 @@ class GatewayServer:
             target,
             headers={
                 "Content-Type": mime,
+                # The same rules as the server's bridge: no guessing another
+                # type, and nothing opened here runs (a PDF keeps its viewer).
+                "X-Content-Type-Options": "nosniff",
+                **({} if mime == "application/pdf"
+                   else {"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox"}),
                 # Generated media is immutable: the filename is unique per
                 # generation, so a player may cache it for the session.
                 "Cache-Control": "private, max-age=3600",
