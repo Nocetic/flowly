@@ -1097,7 +1097,8 @@ class WebChannel(BaseChannel):
                 preview = _poster_b64(asset)
             logger.info(
                 f"[WebChannel] Attached {asset.kind} {p.name} "
-                f"({asset.size / 1024:.0f}KB) by media id"
+                f"({asset.size / 1024:.0f}KB) by media id, "
+                + (f"preview {len(preview) * 3 // 4 // 1024 + 1}KB" if preview else "no preview")
             )
             out.append(attachment_v2(asset, thumbnail=preview, media_id=media_id))
             covered.add(media_path)

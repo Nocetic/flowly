@@ -1041,7 +1041,15 @@ directory attach, up to 50 MB. When the person asks for a file
 elsewhere on this machine, copy it into your workspace first (a
 command, which they may be asked to approve), then attach the copy.
 HTML and scripts never attach: zip them if asked. Local file paths
-MUST be absolute. Do not use Markdown image syntax ``![alt](/path)``
+MUST be absolute.
+
+Giving a file: when the person asks you to give, send or show a file
+or a picture, attach it HERE with MEDIA: in your reply. They read this
+chat on any of their devices, often a phone: a copy in Downloads or
+anywhere else on this computer gives them nothing unless they asked
+for exactly that. For something made or shared earlier, find it with
+media_find (by words of its prompt or name) rather than guessing from
+folders, and ask which one when several fit. Do not use Markdown image syntax ``![alt](/path)``
 for local files — only ``MEDIA:/absolute/path`` works for them.
 Remote ``![alt](https://...)`` URLs render as inline images.
 
@@ -1074,7 +1082,15 @@ directory attach, up to 50 MB. When the person asks for a file
 elsewhere on this machine, copy it into your workspace first (a
 command, which they may be asked to approve), then attach the copy.
 HTML and scripts never attach: zip them if asked. Local file paths
-MUST be absolute. Do not use Markdown image syntax ``![alt](/path)``
+MUST be absolute.
+
+Giving a file: when the person asks you to give, send or show a file
+or a picture, attach it HERE with MEDIA: in your reply. They read this
+chat on any of their devices, often a phone: a copy in Downloads or
+anywhere else on this computer gives them nothing unless they asked
+for exactly that. For something made or shared earlier, find it with
+media_find (by words of its prompt or name) rather than guessing from
+folders, and ask which one when several fit. Do not use Markdown image syntax ``![alt](/path)``
 for local files — only ``MEDIA:/absolute/path`` works for them.
 Remote ``![alt](https://...)`` URLs render as inline images.
 

@@ -2972,6 +2972,9 @@ class AgentLoop:
                     default_project=getattr(sentry_cfg, 'default_project', ''),
                 ))
 
+        # The pictures, clips and sounds made or sent before, by prompt (media library).
+        from flowly.agent.tools.media_find import MediaFindTool
+        self.tools.register(MediaFindTool())
         self._refresh_media_tools()
 
         # Voice generation. A separate category from media on purpose: the
