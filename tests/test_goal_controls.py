@@ -248,7 +248,7 @@ async def test_web_channel_delivers_a_terminal_notice_as_a_visible_row():
     channel._send_or_queue = _send  # type: ignore[method-assign]
     channel._emit_local_event = AsyncMock()  # type: ignore[method-assign]
     channel._session_key_for_relay_id = lambda sid: f"web:{sid}"  # type: ignore[method-assign]
-    channel._media_attachments = AsyncMock(return_value=[])  # type: ignore[method-assign]
+    channel._media_attachments = AsyncMock(return_value=([], set()))  # type: ignore[method-assign]
 
     from flowly.bus.events import OutboundMessage
 

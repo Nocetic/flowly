@@ -11,8 +11,20 @@ URLs pass through as ``cdnUrl``. This is what makes generated media
 
 from __future__ import annotations
 
+import pytest
+
 from flowly.gateway.server import _reply_media_attachments
 
+
+
+@pytest.fixture
+def media():
+    """Where generated media lands: what a media id names."""
+    from flowly.profile import get_flowly_home
+
+    directory = get_flowly_home() / "media"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
 
 def test_missing_file_is_skipped(tmp_path):
     from PIL import Image
@@ -33,13 +45,16 @@ def test_reply_media_local_carries_inline_thumbnail(tmp_path):
     Image.new("RGB", (64, 48), (200, 30, 30)).save(p)
     att = _reply_media_attachments([str(p)])[0]
     assert att["fileName"] == "img-xyz.png"
-    assert att["mediaId"] == "img-xyz.png"
+    # Outside the media dir: a copy there, which the id fetches.
+    from flowly.media.serving import resolve_media_id
+    target, _error, _status = resolve_media_id(att["mediaId"])
+    assert target is not None and target.read_bytes() == p.read_bytes()
     assert att["mimeType"].startswith("image/")
     # inline base64 preview — what a remote (iOS / desktop) renders with no fetch
     assert base64.b64decode(att["thumbnail"])  # decodes to non-empty bytes
 
 
-def test_reply_media_thumbnail_is_small_for_large_image(tmp_path):
+def test_reply_media_thumbnail_is_small_for_large_image(media):
     """The inline thumbnail must stay a lightweight preview — a large original is
     downscaled (≤512 px) and re-encoded so history doesn't ship megabytes of
     base64; the full-res original is served separately via mediaId."""
@@ -49,7 +64,7 @@ def test_reply_media_thumbnail_is_small_for_large_image(tmp_path):
     from PIL import Image
 
     # A big, noisy original (noise resists JPEG compression → forces a resize).
-    p = tmp_path / "big.png"
+    p = media / "big.png"
     import os
     Image.frombytes("RGB", (2000, 1500), os.urandom(2000 * 1500 * 3)).save(p)
     assert p.stat().st_size > 48 * 1024  # original is well over the thumbnail budget
@@ -139,14 +154,14 @@ def test_image_attachment_keeps_its_real_mime_type(tmp_path):
     assert (att["width"], att["height"]) == (64, 48)
 
 
-def test_video_attachment_carries_playback_metadata_and_poster(tmp_path):
+def test_video_attachment_carries_playback_metadata_and_poster(media):
     from PIL import Image
 
     from flowly.media.assets import MediaAsset
 
-    clip = tmp_path / "clip.mp4"
+    clip = media / "clip.mp4"
     clip.write_bytes(b"\x00" * 2048)
-    poster = tmp_path / "clip.jpg"
+    poster = media / "clip.jpg"
     Image.new("RGB", (320, 180), (30, 30, 30)).save(poster)
 
     asset = MediaAsset(
@@ -171,7 +186,7 @@ def test_video_attachment_carries_playback_metadata_and_poster(tmp_path):
     assert att["thumbnail"]  # the poster frame, not the mp4 bytes
 
 
-def test_video_without_a_poster_still_ships_as_a_video(tmp_path):
+def test_video_without_a_poster_still_ships_as_a_video(media):
     """No ffmpeg means no poster. It must NOT mean no video.
 
     Dropping the attachment (or mislabelling it) is how a clip silently
@@ -180,7 +195,7 @@ def test_video_without_a_poster_still_ships_as_a_video(tmp_path):
     """
     from flowly.media.assets import MediaAsset
 
-    clip = tmp_path / "silent.mp4"
+    clip = media / "silent.mp4"
     clip.write_bytes(b"\x00" * 512)
     asset = MediaAsset(
         path=str(clip), kind="video", file_name="silent.mp4", mime_type="video/mp4", id="media_x"
@@ -193,9 +208,9 @@ def test_video_without_a_poster_still_ships_as_a_video(tmp_path):
     assert "thumbnail" not in att
 
 
-def test_video_without_an_asset_entry_is_still_described(tmp_path):
+def test_video_without_an_asset_entry_is_still_described(media):
     """History written before assets existed must still render as video."""
-    clip = tmp_path / "legacy.mp4"
+    clip = media / "legacy.mp4"
     clip.write_bytes(b"\x00" * 64)
     att = _reply_media_attachments([str(clip)])[0]
 

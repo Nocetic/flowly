@@ -480,6 +480,7 @@ def _reply_media_attachments(media_paths: list, assets: dict | None = None) -> l
     a client as a broken bubble.
     """
     from flowly.media.assets import attachment_v2, describe, guess_mime, kind_for_mime
+    from flowly.media.serving import share_in_media_dir
 
     by_path = assets or {}
     out: list[dict] = []
@@ -517,7 +518,9 @@ def _reply_media_attachments(media_paths: list, assets: dict | None = None) -> l
                 attachment_v2(
                     asset,
                     thumbnail=_inline_preview_b64(asset, p),
-                    media_id=p.name,
+                    # A file outside the media dir (a screenshot, a file the
+                    # agent found) is copied in, or its id would fetch nothing.
+                    media_id=share_in_media_dir(p) or p.name,
                 )
             )
         except Exception:

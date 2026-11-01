@@ -2708,6 +2708,43 @@ class AgentLoop:
             self.tools.unregister("linear", expected=existing)
         return isinstance(self.tools.get("linear"), LinearTool)
 
+    def _refresh_media_tools(self) -> None:
+        """Register the media tools as the settings are now, if they changed.
+
+        Settings are read through the resolver so an install still carrying
+        the older image-only config keeps its key and its chosen model. Asked
+        again at each turn: a ``FAL_KEY`` the owner saves mid-conversation
+        is what generates from the next turn on, with no restart.
+        """
+        if not (self._main_config and hasattr(self._main_config, 'tools')):
+            return
+        from flowly.media.settings import resolve_media_settings
+        media_cfg = resolve_media_settings(self._main_config.tools)
+        if media_cfg == getattr(self, "_media_settings", None):
+            return
+        self._media_settings = media_cfg
+        for name in ("image_generate", "video_generate"):
+            if self.tools.get(name) is not None:
+                self.tools.unregister(name)
+        if media_cfg.image_ready:
+            from flowly.agent.tools.image_generate import ImageGenerateTool
+            self.tools.register(ImageGenerateTool(
+                api_key=media_cfg.api_key,
+                model=media_cfg.text_to_image,
+                edit_model=media_cfg.image_to_image,
+            ))
+        # Video is gated on a chosen model as well as a key: there is no
+        # safe default, and picking one would spend the user's money on a
+        # model they never selected.
+        if media_cfg.video_ready:
+            from flowly.agent.tools.video_generate import VideoGenerateTool
+            self.tools.register(VideoGenerateTool(
+                api_key=media_cfg.api_key,
+                text_to_video_model=media_cfg.text_to_video,
+                image_to_video_model=media_cfg.image_to_video,
+                timeout_seconds=media_cfg.video_timeout_seconds,
+            ))
+
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
         from flowly.profile import current_profile_name
@@ -2935,29 +2972,7 @@ class AgentLoop:
                     default_project=getattr(sentry_cfg, 'default_project', ''),
                 ))
 
-        # Media generation (provider-backed, opt-in). Settings are read through
-        # the resolver so an install still carrying the older image-only config
-        # keeps its key and its chosen model.
-        if self._main_config and hasattr(self._main_config, 'tools'):
-            from flowly.media.settings import resolve_media_settings
-            media_cfg = resolve_media_settings(self._main_config.tools)
-            if media_cfg.image_ready:
-                from flowly.agent.tools.image_generate import ImageGenerateTool
-                self.tools.register(ImageGenerateTool(
-                    api_key=media_cfg.api_key,
-                    model=media_cfg.text_to_image,
-                ))
-            # Video is gated on a chosen model as well as a key: there is no
-            # safe default, and picking one would spend the user's money on a
-            # model they never selected.
-            if media_cfg.video_ready:
-                from flowly.agent.tools.video_generate import VideoGenerateTool
-                self.tools.register(VideoGenerateTool(
-                    api_key=media_cfg.api_key,
-                    text_to_video_model=media_cfg.text_to_video,
-                    image_to_video_model=media_cfg.image_to_video,
-                    timeout_seconds=media_cfg.video_timeout_seconds,
-                ))
+        self._refresh_media_tools()
 
         # Voice generation. A separate category from media on purpose: the
         # provider is talked to directly, and the voice and model come from the
@@ -9220,6 +9235,9 @@ class AgentLoop:
         secret_tool = self.tools.get("request_secret")
         if secret_tool and hasattr(secret_tool, "set_context"):
             secret_tool.set_context(tool_channel, tool_chat_id)
+
+        # A FAL_KEY saved since the last turn turns media generation on now.
+        self._refresh_media_tools()
 
         # Detect persona change and inject transition marker
         current_persona = self.context.persona

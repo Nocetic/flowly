@@ -46,8 +46,13 @@ async def generate_image(
     image_size: str = "landscape_4_3",
     num_images: int = 1,
     output_format: str = "png",
+    image_urls: list[str] | None = None,
 ) -> dict[str, Any]:
     """Generate image(s) and download them to the media dir.
+
+    ``image_urls`` (https or ``data:`` URIs) are the images an edit model works
+    from; one alone is also sent as ``image_url``, the name single-image
+    models use.
 
     Returns ``{"paths": [...], "urls": [...], "model": str, "seed": Any}``.
     """
@@ -64,6 +69,10 @@ async def generate_image(
     }
     if image_size:
         payload["image_size"] = image_size
+    if image_urls:
+        payload["image_urls"] = list(image_urls)
+        if len(image_urls) == 1:
+            payload["image_url"] = image_urls[0]
 
     headers = {"Authorization": f"Key {api_key}", "Content-Type": "application/json", "User-Agent": _UA}
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:

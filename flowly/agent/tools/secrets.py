@@ -78,7 +78,9 @@ class RequestSecretTool(Tool):
             "you never see the value. Do not wait for it: say in one short sentence what you asked for and why, "
             "then end your reply. The conversation continues on its own once they save it, decline, or the "
             "request expires (a week). Check list_secrets first; a name already saved needs no request unless "
-            "it must change (replace=true). " + _RULES
+            "it must change (replace=true). Image and video generation use your image_generate / video_generate "
+            "tools: when you have them, their key is set and needs no request; without them, ask for FAL_KEY "
+            "(by that name) and they are yours from the next turn. " + _RULES
         )
 
     @property

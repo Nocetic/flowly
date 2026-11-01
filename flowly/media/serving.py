@@ -27,6 +27,15 @@ MAX_SERVE_BYTES = 2 * 1024 * 1024 * 1024
 # What may be served at all. Generated media only — this is not a file server.
 SERVABLE_MIME_PREFIXES = ("image/", "video/", "audio/")
 
+# Files the agent shows in a chat besides media (``share_in_media_dir``):
+# served too, never indexed in the media library.
+SHARED_DOCUMENT_TYPES = frozenset({
+    "application/pdf", "text/plain", "text/markdown", "text/csv", "application/json", "application/zip",
+})
+
+# A file outside the media dir is copied in to be shown, up to this size.
+MAX_SHARE_BYTES = 512 * 1024 * 1024
+
 # One window must fit in one relay frame after base64 (+33%) and JSON overhead.
 # The relay caps agent frames at 10 MB; 4 MB raw → ~5.5 MB encoded. One frame
 # per window is what keeps the protocol stateless.
@@ -70,6 +79,35 @@ def resolve_media_id(
     return target, "", 0
 
 
+def share_in_media_dir(path: Path, media_dir: Path | None = None) -> str | None:
+    """The media id a client fetches this file by, or None when it cannot be shown.
+
+    A file in the media dir is its own name. One elsewhere (a screenshot, a
+    file the message tool sends) is published there first, as a reply's
+    ``MEDIA:`` file is (``publish_reply_file``): clients only ever fetch from
+    the media dir (:func:`resolve_media_id`), so the copy is what makes the
+    file reachable, and nothing beside it is.
+    """
+    from flowly.agent.reply_media import publish_reply_file
+
+    if media_dir is None:
+        from flowly.profile import get_flowly_home
+
+        media_dir = get_flowly_home() / "media"
+    try:
+        source = path.resolve()
+        if not source.is_file() or source.stat().st_size > MAX_SHARE_BYTES:
+            return None
+        mime = mimetypes.guess_type(source.name)[0] or ""
+        if not (mime.startswith(SERVABLE_MIME_PREFIXES) or mime in SHARED_DOCUMENT_TYPES):
+            return None
+        published = Path(publish_reply_file(str(source), media_dir))
+        target, _error, _status = resolve_media_id(published.name, media_dir)
+        return published.name if target is not None and target == published.resolve() else None
+    except OSError:
+        return None
+
+
 @dataclass(frozen=True, slots=True)
 class MediaWindow:
     """One answered window request."""
@@ -100,7 +138,7 @@ def read_media_window(
 
     mime, _ = mimetypes.guess_type(str(target))
     mime = mime or ""
-    if not mime.startswith(SERVABLE_MIME_PREFIXES):
+    if not (mime.startswith(SERVABLE_MIME_PREFIXES) or mime in SHARED_DOCUMENT_TYPES):
         return MediaWindow(ok=False, error="unsupported_type")
 
     try:

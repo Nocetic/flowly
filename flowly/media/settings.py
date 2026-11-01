@@ -17,6 +17,10 @@ from typing import Any
 # worked without the user choosing a model, and that should stay true.
 DEFAULT_IMAGE_MODEL = "fal-ai/flux/dev"
 
+#: The saved secret (flowly.secrets) media uses when its settings hold no key:
+#: the agent asks for it by this name, and once saved it is what generates.
+SECRET_KEY_NAME = "FAL_KEY"
+
 
 @dataclass(frozen=True, slots=True)
 class MediaSettings:
@@ -62,13 +66,17 @@ def resolve_media_settings(tools_config: Any) -> MediaSettings:
     legacy_enabled = bool(getattr(legacy, "enabled", False))
     legacy_key = str(getattr(legacy, "api_key", "") or "")
     legacy_model = str(getattr(legacy, "model", "") or "")
+    config_key = str(_media("api_key", legacy_key))
+    # No key in settings: the one the owner saved for the agent, which then
+    # turns media on by itself (saving it is how the owner said so).
+    secret_key = "" if config_key else saved_key()
 
     return MediaSettings(
         # Either block turning it on is enough: an upgrade must not silently
         # disable the image generation someone already had working.
-        enabled=bool(getattr(media, "enabled", False)) or legacy_enabled,
+        enabled=bool(getattr(media, "enabled", False)) or legacy_enabled or bool(secret_key),
         provider=str(_media("provider", getattr(legacy, "provider", "fal") or "fal")),
-        api_key=str(_media("api_key", legacy_key)),
+        api_key=config_key or secret_key,
         # Explicit new choice, else the model the older config already had,
         # else a known-good image model so image generation works out of the box.
         text_to_image=_default("text_to_image", legacy_model or DEFAULT_IMAGE_MODEL),
@@ -77,3 +85,15 @@ def resolve_media_settings(tools_config: Any) -> MediaSettings:
         image_to_video=_default("image_to_video"),
         video_timeout_seconds=int(_media("video_timeout_seconds", 900) or 900),
     )
+
+
+def saved_key() -> str:
+    """The saved ``FAL_KEY`` secret, or "" (none, or the vault cannot be read)."""
+    try:
+        from flowly.secrets.vault import get_vault
+
+        data = get_vault().load()
+        secret = data.secrets.get(SECRET_KEY_NAME) if data else None
+        return secret.value.strip() if secret else ""
+    except Exception:
+        return ""

@@ -1009,6 +1009,12 @@ must continue through `computer`, follow this minimum workflow:
 """
 
 
+def _image_note(name: str, ref: str) -> str:
+    """What the model is told besides seeing an attached image: where it is,
+    so a tool can work on it (an edit, a command) without asking for it again."""
+    return f"[Image attached: {name} — its file for tools: {ref}]"
+
+
 def _resize_image_b64(path: Path, mime: str, max_px: int = 768) -> tuple[str, str]:
     """Return (base64_str, mime_type) with the image resized to *max_px*.
 
@@ -2396,6 +2402,7 @@ When in doubt, ASK FIRST. A wrong action can't be undone.""")
                 fname = file_path.rsplit("/", 1)[-1] or file_path
                 if url_mime.startswith("image/"):
                     images.append({"type": "image_url", "image_url": {"url": file_path}})
+                    text_parts.append(_image_note(fname, file_path))
                 elif url_mime.startswith("video/"):
                     text_parts.append(
                         f"[Video attached: {fname} ({url_mime}). To inspect this "
@@ -2425,6 +2432,7 @@ When in doubt, ASK FIRST. A wrong action can't be undone.""")
                 b64, actual_mime = _resize_image_b64(p, mime)
                 if b64:  # empty when oversized and Pillow unavailable
                     images.append({"type": "image_url", "image_url": {"url": f"data:{actual_mime};base64,{b64}"}})
+                text_parts.append(_image_note(p.name, str(p)))
 
             elif mime == "application/pdf":
                 text_parts.append(_extract_pdf_text(p))

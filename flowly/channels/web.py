@@ -242,6 +242,16 @@ def _compress_image_for_transport(
         return None
 
 
+def _image_preview_b64(path: Path) -> str | None:
+    """Base64 JPEG an image is drawn from in the bubble before anyone opens it."""
+    compressed = _compress_image_for_transport(
+        path, max_dimension=512, target_bytes=48 * 1024, initial_quality=70
+    )
+    if compressed is None:
+        return None
+    return base64.b64encode(compressed[0]).decode("ascii")
+
+
 def _poster_b64(asset: Any) -> str | None:
     """Base64 JPEG preview for a hosted attachment, from the asset's poster.
 
@@ -1035,20 +1045,20 @@ class WebChannel(BaseChannel):
             await self._ws.close()
             self._ws = None
 
-    async def _media_attachments(self, msg: OutboundMessage) -> list[dict[str, Any]]:
-        """Describe this turn's non-image media as Attachment V2, by media id.
+    async def _media_attachments(self, msg: OutboundMessage) -> tuple[list[dict[str, Any]], set[str]]:
+        """Describe this turn's media and files as Attachment V2, by media id,
+        with the paths they cover.
 
-        Images are deliberately left alone: they already reach the relay as
-        compressed base64 content blocks, that path works, and rerouting it
-        would risk a regression for the media people actually send today.
-
-        Everything else — video above all — stays on this machine and travels
-        as a ``mediaId`` plus its poster. No cloud copy: clients that reach
-        this bot's gateway stream it directly, and clients that only reach the
-        relay stream it THROUGH the relay, which bridges the request to this
-        socket (``media.fetch``) without storing a byte. Delivery therefore
-        depends on nothing but the bot being online — no account, no hosted
-        storage, and nothing at rest anywhere else.
+        Everything stays on this machine and travels as a ``mediaId`` plus a
+        small preview (an image's own, downscaled; a video's poster). No cloud
+        copy: clients that reach this bot's gateway fetch it directly, and
+        clients that only reach the server fetch it THROUGH the server, which
+        bridges the request to this socket (``media.fetch``) without storing a
+        byte. A file outside the media dir is copied in to be reachable
+        (``share_in_media_dir``). Delivery therefore depends on nothing but
+        the bot being online — no account, no hosted storage, nothing at rest
+        anywhere else. A file that cannot be shared this way is left to the
+        caller (an image then goes inline, as before).
         """
         from flowly.media.assets import (
             ASSETS_META_KEY,
@@ -1059,29 +1069,32 @@ class WebChannel(BaseChannel):
             index_by_path,
             kind_for_mime,
         )
+        from flowly.media.serving import share_in_media_dir
 
         by_path = index_by_path(assets_from_meta(msg.metadata.get(ASSETS_META_KEY)))
         out: list[dict[str, Any]] = []
+        covered: set[str] = set()
         for media_path in msg.media:
             if not isinstance(media_path, str) or media_path.startswith(("http://", "https://")):
                 continue
             p = Path(media_path)
             if not p.is_file():
                 continue
+            media_id = await asyncio.to_thread(share_in_media_dir, p)
+            if media_id is None:
+                continue
             asset = by_path.get(media_path)
             if asset is None:
                 mime = mimetypes.guess_type(str(p))[0] or ""
-                if kind_for_mime(mime) == KIND_IMAGE:
-                    continue
-                asset = describe(p, probe_media=False)
-            if asset.kind == KIND_IMAGE:
-                continue
+                asset = describe(p, probe_media=kind_for_mime(mime) == KIND_IMAGE)
+            preview = _image_preview_b64(p) if asset.kind == KIND_IMAGE else _poster_b64(asset)
             logger.info(
                 f"[WebChannel] Attached {asset.kind} {p.name} "
                 f"({asset.size / 1024:.0f}KB) by media id"
             )
-            out.append(attachment_v2(asset, thumbnail=_poster_b64(asset), media_id=p.name))
-        return out
+            out.append(attachment_v2(asset, thumbnail=preview, media_id=media_id))
+            covered.add(media_path)
+        return out, covered
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send agent response back to the browser via the relay proxy.
@@ -1217,10 +1230,13 @@ class WebChannel(BaseChannel):
         # goes to hosted storage instead and travels as a URL. Done BEFORE the
         # image loop so a delivery failure is known while the payload is still
         # being assembled.
-        attachments_meta = await self._media_attachments(msg)
+        attachments_meta, shown = await self._media_attachments(msg)
 
-        # Encode media files as base64 image blocks (relay uploads to S3)
+        # An image that could not be shared by media id goes inline, as base64
+        # (the server stores it for the apps).
         for media_path in msg.media:
+            if media_path in shown:
+                continue
             try:
                 p = Path(media_path)
                 if not p.is_file():

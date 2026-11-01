@@ -43,6 +43,12 @@ def flowly_home(tmp_path, monkeypatch):
 
 
 @pytest.fixture
+def media(flowly_home):
+    """Where generated media lands: what a media id names."""
+    return flowly_home / "media"
+
+
+@pytest.fixture
 def channel():
     ch = WebChannel(config=WebChannelConfig(enabled=True), bus=MessageBus())
     capture: list[dict] = []
@@ -98,9 +104,9 @@ async def _send(channel, asset, path, **meta):
 # ── attachment shape on the wire ────────────────────────────────────────────
 
 
-async def test_video_is_delivered_by_media_id_with_no_account_involved(channel, tmp_path):
+async def test_video_is_delivered_by_media_id_with_no_account_involved(channel, media):
     """The whole point: delivery must not depend on a signed-in account."""
-    path, asset = _video(tmp_path)
+    path, asset = _video(media)
 
     data = await _send(channel, asset, path)
 
@@ -144,12 +150,14 @@ async def test_local_paths_never_leak_onto_the_wire(channel, tmp_path):
     assert str(tmp_path) not in json.dumps(data)
 
 
-async def test_images_keep_the_existing_base64_content_block(channel, tmp_path):
-    """Regression guard: the image path clients use today must not move."""
+async def test_images_go_by_media_id_with_their_own_preview(channel, media):
+    """2026-11-01: an image inline as base64 reached the server, which stored
+    it where no app read it. It travels as every other file does: an id and
+    a small preview, its bytes fetched from this machine when opened."""
     from PIL import Image
 
-    img = tmp_path / "pic.png"
-    Image.new("RGB", (64, 48), (7, 7, 7)).save(img)
+    img = media / "pic.png"
+    Image.new("RGB", (1600, 1200), (7, 7, 7)).save(img)
 
     await channel.send(
         OutboundMessage(
@@ -162,9 +170,27 @@ async def test_images_keep_the_existing_base64_content_block(channel, tmp_path):
     )
     data = channel._capture[-1]["data"]
 
-    assert "attachments" not in data  # old wire shape, unchanged
-    kinds = [b["type"] for b in data["message"]["content"]]
-    assert "image" in kinds
+    att = data["attachments"][0]
+    assert (att["kind"], att["mediaId"], att["mimeType"]) == ("image", "pic.png", "image/png")
+    assert len(base64.b64decode(att["thumbnail"])) <= 64 * 1024
+    assert [b["type"] for b in data["message"]["content"]] == ["text"], "nothing inline"
+
+
+async def test_a_file_outside_the_media_dir_is_shared_by_a_copy_there(channel, media, tmp_path):
+    """A screenshot or a file the agent found: shown by an id that fetches it."""
+    from flowly.media.serving import read_media_window
+
+    report = tmp_path / "Q3 report.pdf"
+    report.write_bytes(b"%PDF-1.4 hello")
+    for _ in range(2):
+        await channel.send(OutboundMessage(channel="web", chat_id="conv-1", content="here",
+                                           media=[str(report)], metadata={"run_id": "r"}))
+    first, second = (c["data"]["attachments"][0] for c in channel._capture[-2:])
+    assert first["mediaId"] == second["mediaId"], "shown twice, copied once"
+    assert first["mediaId"].endswith(".pdf")
+    window = read_media_window(first["mediaId"], 0, 100, media_dir=media)
+    assert (window.ok, window.mime_type, window.data) == (True, "application/pdf", b"%PDF-1.4 hello")
+    assert str(tmp_path) not in json.dumps(channel._capture[-1])
 
 
 async def test_text_only_turn_omits_the_attachments_field(channel):
@@ -176,9 +202,9 @@ async def test_text_only_turn_omits_the_attachments_field(channel):
     assert "attachments" not in channel._capture[-1]["data"]
 
 
-async def test_video_without_an_asset_entry_is_still_delivered(channel, tmp_path):
+async def test_video_without_an_asset_entry_is_still_delivered(channel, media):
     """A tool that produced no descriptors must not lose its video."""
-    path = tmp_path / "bare.mp4"
+    path = media / "bare.mp4"
     path.write_bytes(b"\x00" * 128)
 
     await channel.send(
@@ -274,9 +300,9 @@ async def test_a_missing_file_is_an_error_the_relay_can_forward(channel, flowly_
 
 
 async def test_non_media_files_are_refused(channel, flowly_home):
-    (flowly_home / "media" / "notes.txt").write_text("hello")
+    (flowly_home / "media" / "notes.py").write_text("hello")
     ws = FakeWs()
-    reply = await _fetch(channel, ws, requestId="r", mediaId="notes.txt", offset=0, length=100)
+    reply = await _fetch(channel, ws, requestId="r", mediaId="notes.py", offset=0, length=100)
     assert reply["ok"] is False
     assert reply["error"] == "unsupported_type"
 
@@ -339,14 +365,14 @@ def _speech(tmp_path, name="speech.mp3", *, duration_ms=4200):
     )
 
 
-async def test_generated_speech_is_playable_with_no_account_and_no_upload(channel, tmp_path):
+async def test_generated_speech_is_playable_with_no_account_and_no_upload(channel, media):
     """The whole promise of local-first delivery, for audio.
 
     A generated file travels as an id and its duration. Nothing is uploaded,
     nothing needs a signed-in account, and the client can draw a real player —
     with the right length on it — before it fetches a single byte.
     """
-    path, asset = _speech(tmp_path)
+    path, asset = _speech(media)
     data = await _send(channel, asset, path)
 
     att = data["attachments"][0]
@@ -382,10 +408,10 @@ async def test_audio_carries_no_thumbnail_because_there_is_nothing_to_see(
     assert not data["attachments"][0].get("thumbnail")
 
 
-async def test_audio_without_an_asset_entry_is_still_delivered(channel, tmp_path):
+async def test_audio_without_an_asset_entry_is_still_delivered(channel, media):
     """A tool that produced no descriptors must not lose its audio — the mime
     type alone is enough to classify it."""
-    path = tmp_path / "bare.mp3"
+    path = media / "bare.mp3"
     path.write_bytes(b"\x00" * 128)
 
     await channel.send(

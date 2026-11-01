@@ -124,7 +124,9 @@ def test_gateway_history_rebuilds_a_playable_video_attachment(tmp_path, flowly_h
     """End of the chain: what a reopened chat actually sends to a client."""
     from flowly.gateway.server import _assets_index, _reply_media_attachments
 
-    path, asset = _clip(tmp_path)
+    # Generated media lands in the media dir: its name is the id that fetches it.
+    (flowly_home / "media").mkdir(exist_ok=True)
+    path, asset = _clip(flowly_home / "media")
     sessions = _manager(tmp_path)
     session = sessions.get_or_create("web:conv-5")
     session.extend_with_turn_messages(
