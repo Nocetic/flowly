@@ -1062,6 +1062,7 @@ class WebChannel(BaseChannel):
         """
         from flowly.media.assets import (
             ASSETS_META_KEY,
+            KIND_FILE,
             KIND_IMAGE,
             assets_from_meta,
             attachment_v2,
@@ -1069,6 +1070,7 @@ class WebChannel(BaseChannel):
             index_by_path,
             kind_for_mime,
         )
+        from flowly.media.previews import document_preview_b64
         from flowly.media.serving import share_in_media_dir
 
         by_path = index_by_path(assets_from_meta(msg.metadata.get(ASSETS_META_KEY)))
@@ -1087,7 +1089,12 @@ class WebChannel(BaseChannel):
             if asset is None:
                 mime = mimetypes.guess_type(str(p))[0] or ""
                 asset = describe(p, probe_media=kind_for_mime(mime) == KIND_IMAGE)
-            preview = _image_preview_b64(p) if asset.kind == KIND_IMAGE else _poster_b64(asset)
+            if asset.kind == KIND_IMAGE:
+                preview = _image_preview_b64(p)
+            elif asset.kind == KIND_FILE:
+                preview = await asyncio.to_thread(document_preview_b64, p)
+            else:
+                preview = _poster_b64(asset)
             logger.info(
                 f"[WebChannel] Attached {asset.kind} {p.name} "
                 f"({asset.size / 1024:.0f}KB) by media id"

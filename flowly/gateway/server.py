@@ -449,6 +449,11 @@ def _inline_preview_b64(asset: Any, path: Path) -> str | None:
             return None
         thumb = _thumbnail_b64(poster)
         return thumb[0] if thumb else None
+    if asset.kind == "file":
+        # A document's first page (a PDF; an Office file through Quick Look on a Mac).
+        from flowly.media.previews import document_preview_b64
+
+        return document_preview_b64(path)
     thumb = _thumbnail_b64(path)
     return thumb[0] if thumb else None
 
