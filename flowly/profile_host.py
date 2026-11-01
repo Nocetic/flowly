@@ -2057,6 +2057,13 @@ class ProfileHost:
 
     async def _start_runtime(self, name: str) -> _Runtime:
         await self._emit(name, "connection", {"state": "starting"})
+        try:
+            # A key entered once on the main agent reaches every agent (profile_connections).
+            from flowly.profile_connections import sync_provider_keys
+
+            await asyncio.to_thread(sync_provider_keys, name)
+        except Exception as exc:
+            logger.warning("[Profiles] {} starts without the computer's keys ({})", name, type(exc).__name__)
         env = _profile_runtime_environment()
         env.update({
             "FLOWLY_DESKTOP_MANAGER_PID": str(os.getpid()),
