@@ -126,7 +126,7 @@ class DraftTemplateTool(Tool):
             return _refused(exc.code, str(exc), exc.field)
         try:
             draft_id = await drafts.announce(session_key, recipe)
-        except drafts.TemplatesUnavailable as exc:
+        except drafts.TemplatesUnavailableError as exc:
             return _refused("TEMPLATES_UNAVAILABLE", str(exc))
         return _result(
             status="drafted", draftId=draft_id, counts=recipe_counts(recipe), skipped=skipped,

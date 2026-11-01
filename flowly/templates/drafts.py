@@ -17,7 +17,7 @@ DraftedCallback = Callable[[str, dict], Awaitable[None]]
 _callbacks: list[DraftedCallback] = []
 
 
-class TemplatesUnavailable(RuntimeError):
+class TemplatesUnavailableError(RuntimeError):
     """Nothing carries a draft from this process (no gateway, or a CLI turn)."""
 
 
@@ -32,7 +32,7 @@ def reset_for_tests() -> None:
 async def announce(session_key: str, recipe: dict) -> str:
     """Send the draft once; its ``draftId``."""
     if not _callbacks:
-        raise TemplatesUnavailable("Templates need this agent's connection to Flowly.")
+        raise TemplatesUnavailableError("Templates need this agent's connection to Flowly.")
     draft_id = uuid.uuid4().hex
     data = {"draftId": draft_id, "sessionKey": session_key, "recipe": recipe, "createdAt": int(time.time())}
     for callback in tuple(_callbacks):
