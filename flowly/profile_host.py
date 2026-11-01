@@ -172,6 +172,27 @@ def _public_settings(name: str) -> dict[str, Any]:
     return settings
 
 
+def _create_template(params: dict[str, Any]) -> dict | None:
+    """``profiles.create``'s ``template``, as the Flowly server put it there (PROTOCOL A10)."""
+    if params.get("template") is None:
+        return None
+    from flowly.templates.apply import TemplateError, check_template
+
+    try:
+        return check_template(params["template"])
+    except TemplateError as exc:
+        raise ProfileHostError(exc.code, str(exc)) from exc
+
+
+def _template_populate(template: dict | None):
+    if template is None:
+        return None
+    from flowly.templates import apply
+
+    # Looked up at call time, so a test can stand in for it.
+    return lambda staging: apply.populate_from_template(staging, template)
+
+
 def _validate_profile_selector(name: str) -> None:
     if name != "default":
         validate_profile_name(name)
@@ -517,6 +538,8 @@ class ProfileHost:
             "maxConcurrentRuntimes": MAX_NAMED_PROFILES,
             "maxNamedProfiles": MAX_NAMED_PROFILES,
             "profileReadiness": True,
+            # profiles.create takes a ``template`` (flowly.templates).
+            "templates": {"version": 1},
             "profileMessaging": {"authority": "gateway", "version": 1},
             "credentialPolicies": {
                 "namedProfile": "isolated",
@@ -767,21 +790,26 @@ class ProfileHost:
                 raise ProfileHostError("INVALID_PARAMS", "cloneFrom must be a bot name or null.")
             clone_from = clone_from.strip()
             _validate_profile_selector(clone_from)
+        template = _create_template(params)
+        # What the owner typed in the form wins; the template fills the rest.
+        made = template["recipe"]["profile"] if template else {}
+        soul = _required_string(params, "soul") if "soul" in params else (made.get("soul") or None)
         try:
             create_profile(
                 name,
                 clone_from=clone_from,
                 clone_all=False,
-                display_name=_optional_string(params, "displayName").strip(),
-                description=_optional_string(params, "description").strip(),
+                display_name=_optional_string(params, "displayName").strip() or made.get("displayName", ""),
+                description=_optional_string(params, "description").strip() or made.get("description", ""),
                 local_runtime=True,
                 provider=_required_string(params, "provider").strip() if "provider" in params else None,
                 model=_required_string(params, "model").strip() if "model" in params else None,
-                soul=_required_string(params, "soul") if "soul" in params else None,
+                soul=soul,
                 mark_text=_optional_string(params, "markText"),
-                mark_tone=_optional_string(params, "markTone"),
+                mark_tone=_optional_string(params, "markTone") or made.get("markTone", ""),
                 mark_seed=params.get("markSeed"),
-                mark_shape=_optional_string(params, "markShape"),
+                mark_shape=_optional_string(params, "markShape") or made.get("markShape", ""),
+                populate=_template_populate(template),
             )
         except ProfileLimitError as exc:
             raise ProfileHostError("PROFILE_LIMIT", str(exc)) from exc
