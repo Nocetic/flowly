@@ -340,6 +340,7 @@ def test_profile_model_and_soul_are_isolated_and_editable(profile_roots) -> None
         "name": "analyst",
         "provider": "openrouter",
         "model": "profile/model",
+        "reasoningEffort": "",
         "soul": "# Analyst\n\nVerify every claim.\n",
         "workspace": str(created / "workspace"),
         "credentialPolicy": "isolated",

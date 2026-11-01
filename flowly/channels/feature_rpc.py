@@ -2425,6 +2425,7 @@ def provider_active() -> dict:
     for the Settings display and the model picker's current selection."""
     from flowly.config.loader import load_config
     from flowly.integrations.active_provider import resolve_active_provider
+    from flowly.providers.effort import normalize_effort
 
     cfg = load_config()
     active = resolve_active_provider(cfg)
@@ -2438,6 +2439,8 @@ def provider_active() -> dict:
             # api_key deliberately omitted — never send the secret.
         },
         "model": cfg.agents.defaults.model or "",
+        # The agent's reasoning effort; "" = the model's default.
+        "effort": normalize_effort(cfg.agents.defaults.reasoning_effort),
     }
 
 
@@ -2460,6 +2463,8 @@ async def model_list(params: dict) -> dict:
         if requested == "active" or requested not in ProvidersConfig.model_fields:
             raise FeatureRpcError("INVALID", f"unknown provider: {requested}")
     models = await fetch_models(provider_key, force_refresh=bool(params.get("forceRefresh")))
+    from flowly.integrations.model_catalog import flowly_effort_cap
+
     return {
         "provider": provider_key,
         "models": [
@@ -2469,31 +2474,80 @@ async def model_list(params: dict) -> dict:
                 "description": m.description,
                 "contextWindow": m.context_window,
                 "tags": list(m.tags or []),
+                # Reasoning efforts, lowest first; empty = no effort picker.
+                "efforts": list(m.efforts),
+                "defaultEffort": m.default_effort,
             }
             for m in models
         ],
+        # The highest effort the plan's credit runs at (free Flowly plan).
+        "effortCap": flowly_effort_cap() if provider_key == "flowly" else None,
     }
 
 
+def _effort_param(params: dict) -> str | None:
+    """``effort`` from an RPC: a known level, ``""`` for the model's default,
+    ``None`` when absent."""
+    from flowly.providers.effort import normalize_effort
+
+    if "effort" not in params:
+        return None
+    raw = params["effort"]
+    if not isinstance(raw, str):
+        raise FeatureRpcError("INVALID", "effort must be a string")
+    effort = normalize_effort(raw)
+    if raw.strip() and not effort:
+        raise FeatureRpcError("INVALID", f"unknown effort: {raw.strip()}")
+    return effort
+
+
 async def model_set(params: dict) -> dict:
-    """Set the bot's default model (``agents.defaults.model``) and apply it.
+    """Set the bot's default model (``agents.defaults.model``) and/or its
+    reasoning effort (``agents.defaults.reasoningEffort``), and apply them.
+
+    ``effort`` is checked against the model's catalogue and the plan's cap;
+    ``""`` goes back to the model's default. A new model that lacks the saved
+    effort drops it (``effortReset``).
 
     Live-reloads the running provider when the host wired
     :func:`set_provider_reload_callback` (gateway); otherwise returns
     ``willRestart`` so the transport restarts the bot to pick up the change.
     """
-    model = params.get("model")
-    if not isinstance(model, str) or not model.strip():
-        raise FeatureRpcError("INVALID", "model must be a non-empty string")
-    model = model.strip()
+    model: str | None = None
+    if "model" in params:
+        model = params.get("model")
+        if not isinstance(model, str) or not model.strip():
+            raise FeatureRpcError("INVALID", "model must be a non-empty string")
+        model = model.strip()
+    effort = _effort_param(params)
+    if model is None and effort is None:
+        raise FeatureRpcError("INVALID", "model or effort is required")
     from flowly.config.loader import load_config, save_config
+    from flowly.integrations.active_provider import resolve_active_provider
+    from flowly.integrations.model_catalog import effort_choice, effort_refusal
+    from flowly.providers.effort import normalize_effort
 
     cfg = load_config()
-    cfg.agents.defaults.model = model
+    target = model or cfg.agents.defaults.model
+    active = resolve_active_provider(cfg)
+    choice = await effort_choice(active.key if active is not None else "", target)
+    saved = normalize_effort(cfg.agents.defaults.reasoning_effort)
+    effort_reset = False
+    if effort:
+        refusal = effort_refusal(effort, choice)
+        if refusal is not None:
+            raise FeatureRpcError(*refusal)
+    elif effort is None:
+        effort = saved
+        if saved and choice.levels is not None and saved not in choice.levels:
+            effort, effort_reset = "", True
+    cfg.agents.defaults.model = target
+    cfg.agents.defaults.reasoning_effort = effort
     save_config(cfg)
+    result = {"ok": True, "model": target, "effort": effort, "effortReset": effort_reset}
     if await _live_provider_reload_succeeded():
-        return {"ok": True, "model": model, "willRestart": False}
-    return {"ok": True, "model": model, "willRestart": True}
+        return {**result, "willRestart": False}
+    return {**result, "willRestart": True}
 
 
 # ── Exec approval policy ─────────────────────────────────────────────────────

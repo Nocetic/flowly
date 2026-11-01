@@ -344,6 +344,10 @@ class AgentDefaults(BaseModel):
     # Every new agent's model: in every Flowly plan's list (Free included) and
     # Flowly's default for paid plans (flowly-app PAID_DEFAULT_MODEL).
     model: str = "anthropic/claude-haiku-5.5"
+    # How hard the model thinks on this agent's turns (flowly/providers/effort.py).
+    # Empty → the model's own default. Background calls that switch thinking
+    # off (``chat(reasoning=False)``) never use it.
+    reasoning_effort: str = ""
     max_tokens: int = 8192
     # Per-request LLM call timeout (seconds). A hung or slow provider call is
     # aborted after this instead of hanging and accumulating token charges.

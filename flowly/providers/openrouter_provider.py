@@ -44,6 +44,7 @@ from flowly.providers.base import (
     ToolCallRequest,
     error_info_from_exception,
 )
+from flowly.providers.effort import capped
 from flowly.providers.key_rotator import KeyRotator, classify_error
 from flowly.providers.prompt_caching import apply_cache_control, is_cacheable_model
 from flowly.providers.tool_preview import ToolPreviewSnapshots
@@ -57,8 +58,19 @@ _REASONING_SWITCH_PROVIDERS = frozenset({"openrouter", "flowly"})
 _REASONING_MANDATORY_MODELS: set[str] = set()
 
 
+#: Models that refused a reasoning effort (a 400 naming it): asked without one from then on.
+_EFFORT_REFUSED_MODELS: set[str] = set()
+
+
 def _reasoning_is_mandatory(exc: Exception) -> bool:
     return "reasoning is mandatory" in str(exc).lower()
+
+
+def _effort_refused(exc: Exception) -> bool:
+    if not isinstance(exc, BadRequestError):
+        return False
+    text = str(exc).lower()
+    return "effort" in text or "reasoning" in text
 
 
 def _strip_known_prefixes(model: str) -> str:
@@ -310,6 +322,41 @@ class OpenRouterProvider(LLMProvider):
             error_info=error_info_from_exception(exc),
         )
 
+    # -------------------------------------------------------------- reasoning
+
+    def _reasoning_field(self, model: str, reasoning: bool | None) -> dict[str, Any] | None:
+        """The ``reasoning`` body field a request carries, if any: OpenRouter's
+        unified switch (``chat(reasoning=False)``) or the agent's effort. The
+        Flowly backend forwards it to OpenRouter (capping the free plan's
+        effort); other OpenAI-compatible APIs may refuse an unknown field."""
+        if self.provider_name not in _REASONING_SWITCH_PROVIDERS:
+            return None
+        if reasoning is False:
+            return None if model in _REASONING_MANDATORY_MODELS else {"enabled": False}
+        effort = self.turn_effort(reasoning)
+        if effort and self.provider_name == "flowly":
+            from flowly.integrations.model_catalog import flowly_effort_cap
+
+            effort = capped(effort, flowly_effort_cap())
+        if not effort or model in _EFFORT_REFUSED_MODELS:
+            return None
+        return {"effort": effort}
+
+    def _retry_without_reasoning(self, model: str, field: object, exc: Exception) -> bool:
+        """True when ``exc`` is the backend refusing ``field``; the model is
+        asked without it from then on."""
+        if not isinstance(field, dict):
+            return False
+        if field.get("enabled") is False and _reasoning_is_mandatory(exc):
+            _REASONING_MANDATORY_MODELS.add(model)
+            logger.info(f"[LLM] {model} always reasons; asking again without reasoning.enabled=false")
+            return True
+        if "effort" in field and _effort_refused(exc):
+            _EFFORT_REFUSED_MODELS.add(model)
+            logger.warning(f"[LLM] {model} refused reasoning effort {field['effort']!r}; asking again without it")
+            return True
+        return False
+
     # ------------------------------------------------------------------- chat
 
     async def chat(
@@ -345,11 +392,9 @@ class OpenRouterProvider(LLMProvider):
         extra_body: dict[str, Any] = {}
         if purpose:
             extra_body["purpose"] = purpose
-        # OpenRouter's unified switch; the Flowly backend forwards it to
-        # OpenRouter. Other OpenAI-compatible APIs may refuse an unknown field.
-        if (reasoning is False and self.provider_name in _REASONING_SWITCH_PROVIDERS
-                and resolved_model not in _REASONING_MANDATORY_MODELS):
-            extra_body["reasoning"] = {"enabled": False}
+        reasoning_field = self._reasoning_field(resolved_model, reasoning)
+        if reasoning_field is not None:
+            extra_body["reasoning"] = reasoning_field
         if extra_body:
             kwargs["extra_body"] = extra_body
 
@@ -359,16 +404,15 @@ class OpenRouterProvider(LLMProvider):
             try:
                 return await client.with_options(timeout=request_timeout).chat.completions.create(**kwargs)
             except Exception as exc:
-                # A model that always thinks refuses the switch: ask it again as it is.
-                if "reasoning" not in extra_body or not _reasoning_is_mandatory(exc):
+                # A model that refuses the field (always thinks, or takes no
+                # effort): ask it again as it is.
+                if not self._retry_without_reasoning(resolved_model, extra_body.get("reasoning"), exc):
                     raise
-                _REASONING_MANDATORY_MODELS.add(resolved_model)
                 del extra_body["reasoning"]
                 if extra_body:
                     kwargs["extra_body"] = extra_body
                 else:
                     kwargs.pop("extra_body", None)
-                logger.info(f"[LLM] {resolved_model} always reasons; asking again without reasoning.enabled=false")
                 return await client.with_options(timeout=request_timeout).chat.completions.create(**kwargs)
 
         max_attempts = self._rotator.key_count() if self._rotator else 1
@@ -494,12 +538,11 @@ class OpenRouterProvider(LLMProvider):
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice
-        # The same switch as chat(), with the same retry for a model that
-        # always thinks.
-        switched = (reasoning is False and self.provider_name in _REASONING_SWITCH_PROVIDERS
-                    and resolved_model not in _REASONING_MANDATORY_MODELS)
-        if switched:
-            kwargs["extra_body"] = {"reasoning": {"enabled": False}}
+        # The same field as chat(), with the same retry for a model that
+        # refuses it.
+        reasoning_field = self._reasoning_field(resolved_model, reasoning)
+        if reasoning_field is not None:
+            kwargs["extra_body"] = {"reasoning": reasoning_field}
 
         current_key = self._rotator.current_key() if self._rotator else self.api_key
         client = self._client_for_key(current_key).with_options(
@@ -510,11 +553,9 @@ class OpenRouterProvider(LLMProvider):
             try:
                 stream = await client.chat.completions.create(**kwargs)
             except Exception as exc:
-                if not switched or not _reasoning_is_mandatory(exc):
+                if not self._retry_without_reasoning(resolved_model, reasoning_field, exc):
                     raise
-                _REASONING_MANDATORY_MODELS.add(resolved_model)
                 kwargs.pop("extra_body", None)
-                logger.info(f"[LLM] {resolved_model} always reasons; asking again without reasoning.enabled=false")
                 stream = await client.chat.completions.create(**kwargs)
         except Exception as exc:
             yield self._error_response(exc)
