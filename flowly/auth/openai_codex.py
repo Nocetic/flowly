@@ -793,12 +793,14 @@ def login_with_device_code(
     client_id: str,
     on_user_code: Any | None = None,
     timeout_seconds: int = 900,
+    cancelled: Any | None = None,
 ) -> CodexTokenPayload:
     """Poll the device-code endpoints; return tokens once the user approves.
 
     ``on_user_code(user_code, verification_url)`` is invoked with the code
     the user must enter. Suited to the gateway / headless installs where no
-    browser + loopback is available.
+    browser + loopback is available. ``cancelled()`` returning true stops the
+    wait (:class:`CodexAuthError`), checked between polls.
     """
     headers = {"Content-Type": "application/json", "User-Agent": "flowly/codex-device"}
     try:
@@ -824,6 +826,8 @@ def login_with_device_code(
     deadline = time.monotonic() + max(60, int(timeout_seconds))
     while time.monotonic() < deadline:
         time.sleep(interval)
+        if cancelled is not None and cancelled():
+            raise CodexAuthError("Device login cancelled")
         try:
             with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
                 token_resp = client.post(

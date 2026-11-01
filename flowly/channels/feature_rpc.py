@@ -2679,6 +2679,20 @@ _PROVIDER_SLOTS = (
 )
 
 
+#: What each provider is, for the app's list: ``account`` (Flowly credit),
+#: ``subscription`` (signed in to a plan), ``key`` (an API key), ``url`` (a
+#: self-hosted address). ``login``: how a subscription signs in from the app —
+#: ``device`` (a code approved on any device; flowly/auth/provider_login.py) or
+#: ``loopback`` (a browser on the agent's own machine only).
+_PROVIDER_KINDS: dict[str, tuple[str, str | None]] = {
+    "flowly": ("account", None),
+    "openai_codex": ("subscription", "device"),
+    "xai_oauth": ("subscription", "loopback"),
+    "zai_coding": ("subscription", None),
+    "vllm": ("url", None),
+}
+
+
 def provider_list() -> dict:
     """Every configurable LLM provider with status — **no secrets**. The desktop
     BYOK panel reads this instead of ``config.get`` so raw API keys never cross
@@ -2727,11 +2741,14 @@ def provider_list() -> dict:
                 has_key = False
         else:
             has_key = bool(getattr(slot, "api_key", "")) if keyable else True
+        kind, login = _PROVIDER_KINDS.get(key, ("key", None))
         providers.append(
             {
                 "key": key,
                 "name": name,
                 "keyable": keyable,
+                "kind": kind,
+                "login": login,
                 "hasKey": has_key,
                 "apiBase": getattr(slot, "api_base", None),
                 "isActive": resolved is not None and resolved.key == key,
@@ -2773,13 +2790,10 @@ async def provider_set_key(params: dict) -> dict:
     echoes the key back — returns presence only. Flushes the model catalogue
     cache (so the picker refetches with the new credential) and live-reloads."""
     key = params.get("key")
-    value = params.get("value", "")
     if not isinstance(key, str) or not key.strip():
         raise FeatureRpcError("INVALID", "key must be a non-empty string")
-    if not isinstance(value, str):
-        raise FeatureRpcError("INVALID", "value must be a string")
     key = key.strip()
-    value = value.strip()
+    value = _provider_key_value(key, params)
     if key == "zai_coding":
         from flowly.auth import zai_coding
         from flowly.config.loader import load_config, save_config
@@ -2813,6 +2827,87 @@ async def provider_set_key(params: dict) -> dict:
     if await _live_provider_reload_succeeded():
         return {"ok": True, "key": key, "hasKey": bool(value), "willRestart": False}
     return {"ok": True, "key": key, "hasKey": bool(value), "willRestart": True}
+
+
+#: The one name a sealed provider key travels under (flowly/secrets/envelope.py).
+PROVIDER_KEY_NAME = "PROVIDER_KEY"
+
+
+def provider_key_request(key: str) -> str:
+    """The ``requestId`` a provider key is sealed for: binds it to that provider."""
+    return f"provider:{key}"
+
+
+def _provider_key_value(key: str, params: dict) -> str:
+    """The key ``provider.set_key`` saves: opened from ``sealed`` (sealed in the
+    app to this agent's secrets key, so the Flowly server between them cannot
+    read it), else the plain ``value`` local callers send (CLI, the old desktop
+    over IPC); the server channel refuses a plain one (KEY_NOT_SEALED)."""
+    if params.get("sealed") is None:
+        value = params.get("value", "")
+        if not isinstance(value, str):
+            raise FeatureRpcError("INVALID", "value must be a string")
+        return value.strip()
+    from flowly.secrets import envelope
+    from flowly.secrets.vault import get_vault
+
+    data = get_vault().load_or_create()
+    if params.get("kid") != data.kid:
+        raise FeatureRpcError("KEY_CHANGED", "This agent's key changed; seal the key again.")
+    try:
+        opened = envelope.open_sealed(params.get("sealed"), data.private_key, kid=data.kid,
+                                      request_id=provider_key_request(key), names=[PROVIDER_KEY_NAME])
+    except envelope.EnvelopeError:
+        raise FeatureRpcError("DECRYPT_FAILED", "The key could not be opened.") from None
+    return opened.values[PROVIDER_KEY_NAME].strip()
+
+
+async def _provider_signed_in() -> None:
+    """After a subscription signs in: the catalogue may list more models, and
+    the running provider picks up the new credential."""
+    from flowly.integrations import model_catalog
+
+    model_catalog.flush_cache()
+    await _live_provider_reload_succeeded()
+
+
+async def provider_login_start(params: dict) -> dict:
+    """Begin signing in to a subscription (``{key}``): ``{loginId, userCode,
+    verificationUrl, expiresIn, state}`` (flowly/auth/provider_login.py)."""
+    from flowly.auth import provider_login
+
+    key = params.get("key")
+    if not isinstance(key, str) or not key.strip():
+        raise FeatureRpcError("INVALID", "key must be a non-empty string")
+    try:
+        return await provider_login.start(key.strip(), on_signed_in=_provider_signed_in)
+    except provider_login.ProviderLoginError as exc:
+        raise FeatureRpcError(exc.code, exc.message) from None
+
+
+def _login_id(params: dict) -> str:
+    login_id = params.get("loginId")
+    if not isinstance(login_id, str) or not login_id:
+        raise FeatureRpcError("INVALID", "loginId must be a non-empty string")
+    return login_id
+
+
+def provider_login_status(params: dict) -> dict:
+    from flowly.auth import provider_login
+
+    try:
+        return provider_login.status(_login_id(params))
+    except provider_login.ProviderLoginError as exc:
+        raise FeatureRpcError(exc.code, exc.message) from None
+
+
+def provider_login_cancel(params: dict) -> dict:
+    from flowly.auth import provider_login
+
+    try:
+        return provider_login.cancel(_login_id(params))
+    except provider_login.ProviderLoginError as exc:
+        raise FeatureRpcError(exc.code, exc.message) from None
 
 
 async def provider_set_flowly_account(params: dict) -> dict:
@@ -5910,6 +6005,9 @@ _DISPATCH: dict[str, tuple] = {
     "provider.list": (provider_list, False, False),
     "provider.set": (provider_set, True, True),
     "provider.set_key": (provider_set_key, True, True),
+    "provider.login.start": (provider_login_start, True, False),
+    "provider.login.status": (provider_login_status, True, False),
+    "provider.login.cancel": (provider_login_cancel, True, False),
     "provider.set_flowly_account": (provider_set_flowly_account, True, True),
     "provider.bind_flowly_account": (provider_bind_flowly_account, True, True),
     "logs.tail": (logs_tail, True, False),

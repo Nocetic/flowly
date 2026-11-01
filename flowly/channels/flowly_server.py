@@ -41,6 +41,8 @@ PASSIVE_METHODS = frozenset({
     "presence.report",
     # An app reading what secrets are saved or waiting (names only).
     "secrets.requests", "secrets.list",
+    # An app waiting for a subscription sign-in to finish (provider.login.*).
+    "provider.login.status",
 })
 
 #: What Core asks the server for on connect (server PROTOCOL H1): the relay's
@@ -176,6 +178,12 @@ def _with_exact_times(history: dict[str, Any]) -> dict[str, Any]:
     return {**history, "messages": exact}
 
 
+def _plain_provider_key(params: dict) -> bool:
+    """A ``provider.set_key`` carrying a key in the clear (clearing one, ``""``, is fine)."""
+    value = params.get("value")
+    return params.get("sealed") is None and isinstance(value, str) and bool(value.strip())
+
+
 class FlowlyServerChannel(WebChannel):
     """``WebChannel`` connected to the Flowly server instead of the relay."""
 
@@ -245,6 +253,13 @@ class FlowlyServerChannel(WebChannel):
         params = msg.get("params")
         profile = params.get("profile") if isinstance(params, dict) else None
         method = msg.get("method")
+        if method == "provider.set_key" and isinstance(params, dict) and _plain_provider_key(params):
+            # The server between the app and this agent would read it: an app seals
+            # a provider key to the agent's secrets key (feature_rpc._provider_key_value).
+            await ws.send(json.dumps({"type": "rpc", "id": msg.get("id", ""), "sessionId": msg.get("sessionId", ""),
+                                      "error": {"code": "KEY_NOT_SEALED", "retryable": False,
+                                                "message": "Seal the key to this agent before sending it."}}))
+            return
         if (method in PROFILE_CHAT_METHODS or method in PROFILE_SECRET_METHODS) and profile not in (None, "", "default"):
             await self._dispatch_profile_chat(ws, msg, profile)
             return
