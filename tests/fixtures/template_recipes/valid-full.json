@@ -1,0 +1,22 @@
+{
+  "v": 1,
+  "profile": {
+    "displayName": "Researcher",
+    "description": "Finds sources and writes short briefs.",
+    "soul": "You read primary sources before summarising and you cite every claim.",
+    "markShape": "cloud",
+    "markTone": "sky"
+  },
+  "skills": [
+    {"slug": "source-brief", "name": "Source brief", "description": "A one-page brief with citations.",
+     "content": "# Source brief\n\nRead the sources, then write five bullet points with a link each.\n\n```bash\ncurl -s https://example.com\n```\n"}
+  ],
+  "routines": [
+    {"name": "Morning reading", "description": "New papers on the owner's topics.",
+     "prompt": "Find three new papers on my topics and send me a brief.",
+     "schedule": {"kind": "cron", "expr": "0 8 * * 1-5", "tz": "Europe/Istanbul"}},
+    {"name": "Hourly check", "prompt": "Check the feeds I follow.", "schedule": {"kind": "every", "seconds": 3600}}
+  ],
+  "apps": [{"id": "notion", "name": "Notion"}],
+  "memories": [{"content": "The owner prefers sources from the last two years."}]
+}
