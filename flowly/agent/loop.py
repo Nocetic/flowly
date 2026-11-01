@@ -2826,6 +2826,10 @@ class AgentLoop:
         from flowly.agent.tools.secrets import ListSecretsTool, RequestSecretTool
         self.tools.register(RequestSecretTool())
         self.tools.register(ListSecretsTool())
+        # Templates — the agent drafts a shareable template of itself; the
+        # owner publishes it from the card in the chat (flowly.templates).
+        from flowly.agent.tools.templates import DraftTemplateTool
+        self.tools.register(DraftTemplateTool(agent=self))
         # React tool — one emoji on the user's latest message (chat-one-log.md
         # §13). Carried by whichever surfaces registered with the reaction hub.
         from flowly.agent.tools.react import ReactTool
