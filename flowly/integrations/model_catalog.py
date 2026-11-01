@@ -30,6 +30,16 @@ from typing import Any
 
 import httpx
 
+from flowly.providers.effort import (
+    FREE_PLAN_EFFORT_CAP,
+    OPENROUTER_DEFAULT_EFFORT,
+    OPENROUTER_EFFORTS,
+    above_cap,
+    anthropic_efforts,
+    normalize_effort,
+    ordered_efforts,
+)
+
 
 @dataclass
 class Model:
@@ -52,6 +62,10 @@ class Model:
     # Tri-state capability: True/False only when the upstream catalog states
     # it explicitly; None means unknown and must never be used to block a call.
     supports_vision: bool | None = None
+    # Reasoning efforts the model takes, lowest first (flowly/providers/effort.py),
+    # and the one it runs at when none is set. Empty: no effort picker.
+    efforts: list[str] = dc_field(default_factory=list)
+    default_effort: str | None = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +104,8 @@ async def fetch_models(provider_key: str, *, force_refresh: bool = False) -> lis
             models = await models_dev.fetch_provider_models(provider_key)
         except Exception:
             models = []
+        if provider_key == "anthropic":
+            _with_anthropic_efforts(models)
         _CACHE[provider_key] = models
         return models
     try:
@@ -110,6 +126,79 @@ def flush_cache() -> None:
 def get_flowly_model_policy() -> FlowlyModelPolicy | None:
     """Return metadata from the latest authenticated Flowly catalog fetch."""
     return _FLOWLY_POLICY
+
+
+def cached_efforts(provider_key: str, model_id: str) -> list[str] | None:
+    """The efforts the cached catalogue lists for ``model_id``; ``None`` when
+    that catalogue is not cached or does not list the model (nothing known,
+    so nothing to hold a request against)."""
+    for model in _CACHE.get(provider_key) or ():
+        if model.id == model_id:
+            return list(model.efforts)
+    return None
+
+
+def flowly_effort_cap() -> str | None:
+    """The highest effort the account's Flowly credit runs at: ``medium`` on
+    the free plan, none on the others or before the plan is known (the proxy
+    caps the free plan either way)."""
+    policy = _FLOWLY_POLICY
+    if policy is not None and policy.plan.strip().lower() == "free":
+        return FREE_PLAN_EFFORT_CAP
+    return None
+
+
+@dataclass(frozen=True)
+class EffortChoice:
+    """What an agent may set as its reasoning effort for one model."""
+
+    #: The levels the model takes; ``None`` when the catalogue does not know
+    #: the model (offline, or a model typed by hand): nothing to check against.
+    levels: list[str] | None
+    default: str | None
+    #: The highest level the account's plan runs at (free Flowly plan only).
+    cap: str | None
+
+
+async def effort_choice(provider_key: str, model_id: str) -> EffortChoice:
+    """The efforts ``model_id`` takes on ``provider_key``, from its catalogue."""
+    models = await fetch_models(provider_key) if provider_key else []
+    # After the fetch: Flowly's catalogue is where the plan is learned.
+    cap = flowly_effort_cap() if provider_key == "flowly" else None
+    candidates = {model_id, _dash_to_dot_version(model_id), _dot_to_dash_version(model_id)}
+    for model in models:
+        if model.id in candidates:
+            return EffortChoice(list(model.efforts), model.default_effort, cap)
+    return EffortChoice(None, None, cap)
+
+
+def effort_refusal(effort: str, choice: EffortChoice) -> tuple[str, str] | None:
+    """Why ``effort`` (a known level) cannot be set, as ``(code, message)``;
+    ``None`` when it can."""
+    if choice.levels is not None and effort not in choice.levels:
+        if not choice.levels:
+            return "EFFORT_UNSUPPORTED", "This model takes no reasoning effort."
+        return "EFFORT_UNSUPPORTED", f"This model takes {', '.join(choice.levels)}, not {effort}."
+    if above_cap(effort, choice.cap):
+        return "EFFORT_NOT_IN_PLAN", f"Your plan's credit goes up to {choice.cap} effort."
+    return None
+
+
+def _with_anthropic_efforts(models: list[Model]) -> None:
+    """Anthropic's catalogue (models.dev) says nothing of effort: the levels
+    follow the model family (``anthropic_efforts``)."""
+    for model in models:
+        if not model.efforts:
+            model.efforts, model.default_effort = anthropic_efforts(model.id)
+
+
+def _openrouter_efforts(item: dict[str, Any]) -> tuple[list[str], str | None]:
+    """OpenRouter (and the Flowly proxy, which passes its rows through) lists
+    ``reasoning`` among ``supported_parameters`` for a model that thinks."""
+    params = item.get("supported_parameters")
+    if isinstance(params, list) and "reasoning" in params:
+        return list(OPENROUTER_EFFORTS), OPENROUTER_DEFAULT_EFFORT
+    return [], None
 
 
 # Rough context window by model family, for when no catalogue can place an id.
@@ -373,6 +462,7 @@ async def _fetch_openrouter() -> list[Model]:
             or (item.get("top_provider") or {}).get("context_length")
         )
         vision = _vision_capability(item)
+        efforts, default_effort = _openrouter_efforts(item)
         out.append(Model(
             id=mid,
             name=item.get("name") or mid,
@@ -383,6 +473,8 @@ async def _fetch_openrouter() -> list[Model]:
             pricing_cache_read=_per_million(pricing.get("input_cache_read")),
             tags=_openrouter_tags(item, pricing),
             supports_vision=vision,
+            efforts=efforts,
+            default_effort=default_effort,
         ))
     # Sort: free first, then alphabetical
     out.sort(key=lambda m: (0 if "free" in m.tags else 1, m.id.lower()))
@@ -420,6 +512,7 @@ def _flowly_catalog_row(item: object) -> Model | None:
         if "free" not in tags:
             tags.append("free")
     vision = _vision_capability(item)
+    efforts, default_effort = _openrouter_efforts(item)
     return Model(
         id=mid,
         name=item.get("name") or mid,
@@ -430,6 +523,8 @@ def _flowly_catalog_row(item: object) -> Model | None:
         pricing_cache_read=_per_million(pricing.get("input_cache_read")),
         tags=tags,
         supports_vision=vision,
+        efforts=efforts,
+        default_effort=default_effort,
     )
 
 
@@ -711,6 +806,10 @@ def _codex_models_from_payload(payload: Any) -> list[Model]:
 
         levels = item.get("supported_reasoning_levels")
         tags: list[str] = ["reasoning"] if isinstance(levels, list) and levels else []
+        efforts = ordered_efforts(levels)
+        default_effort = normalize_effort(item.get("default_reasoning_level"))
+        if default_effort not in efforts:
+            default_effort = "medium" if "medium" in efforts else (efforts[0] if efforts else "")
         description = str(item.get("description") or "")[:140]
         low_id = mid.lower()
         if "fast" in description.lower() or "mini" in low_id or low_id.endswith("-luna"):
@@ -747,6 +846,8 @@ def _codex_models_from_payload(payload: Any) -> list[Model]:
             context_window=context_window,
             tags=tags,
             supports_vision=supports_vision,
+            efforts=efforts,
+            default_effort=default_effort or None,
         )
         ranked.append((priority, low_id, model))
 

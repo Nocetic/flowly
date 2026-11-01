@@ -172,6 +172,43 @@ def _public_settings(name: str) -> dict[str, Any]:
     return settings
 
 
+async def _profile_effort(name: str, params: dict[str, Any]) -> str | None:
+    """The reasoning effort ``profiles.configure`` saves for a named agent:
+    ``reasoningEffort`` checked against the agent's model (the one being set,
+    its own, or the one it follows) and the plan's cap; for a model change
+    alone, ``""`` when the saved effort is not one the new model takes, else
+    ``None`` (unchanged)."""
+    from flowly.config.loader import load_config
+    from flowly.integrations.active_provider import resolve_active_provider
+    from flowly.integrations.model_catalog import effort_choice, effort_refusal
+    from flowly.providers.effort import normalize_effort
+
+    effort: str | None = None
+    if "reasoningEffort" in params:
+        raw = params["reasoningEffort"]
+        effort = normalize_effort(raw)
+        if raw.strip() and not effort:
+            raise ProfileHostError("INVALID_PARAMS", f"Unknown reasoning effort: {raw.strip()}")
+    current = read_profile_settings(name)
+    host = load_config()
+    model = (params["model"].strip() if "model" in params else "") or current["model"] or host.agents.defaults.model
+    provider = (params["provider"].strip() if "provider" in params else "") or current["provider"]
+    if not provider:
+        active = resolve_active_provider(host)
+        provider = active.key if active is not None else ""
+    choice = await effort_choice(provider, model)
+    if effort:
+        refusal = effort_refusal(effort, choice)
+        if refusal is not None:
+            raise ProfileHostError(*refusal)
+        return effort
+    if effort is None:
+        saved = normalize_effort(current.get("reasoningEffort"))
+        if saved and choice.levels is not None and saved not in choice.levels:
+            return ""
+    return effort
+
+
 def _create_template(params: dict[str, Any]) -> dict | None:
     """``profiles.create``'s ``template``, as the Flowly server put it there (PROTOCOL A10)."""
     if params.get("template") is None:
@@ -848,19 +885,23 @@ class ProfileHost:
         name = _required_string(params, "name").strip()
         _validate_profile_selector(name)
         mutable_fields = {
-            "provider", "model", "soul", "displayName", "description", "markText", "markTone",
-            "markShape",
+            "provider", "model", "soul", "reasoningEffort", "displayName", "description",
+            "markText", "markTone", "markShape",
         }
+        runtime_fields = ("provider", "model", "soul", "reasoningEffort")
         if not mutable_fields.intersection(params):
             raise ProfileHostError("INVALID_PARAMS", "No bot settings were provided.")
         for field_name in mutable_fields.intersection(params):
             _required_string(params, field_name)
-        if name == "default" and any(field in params for field in ("provider", "model", "soul")):
+        if name == "default" and any(field in params for field in runtime_fields):
             raise ProfileHostError(
                 "DEFAULT_PROFILE_DIRECT",
                 "Change the default profile through the host gateway settings.",
             )
-        if any(field in params for field in ("provider", "model", "soul")):
+        effort = await _profile_effort(name, params) if (
+            "model" in params or "reasoningEffort" in params
+        ) else None
+        if any(field in params for field in runtime_fields):
             runtime = self._runtimes.get(name)
             has_internal_turn = any(profile == name for profile, _session in self._broker_sessions)
             if (runtime and runtime.active_runs) or has_internal_turn:
@@ -875,6 +916,7 @@ class ProfileHost:
                 provider=params["provider"].strip() if "provider" in params else None,
                 model=params["model"].strip() if "model" in params else None,
                 soul=params["soul"] if "soul" in params else None,
+                reasoning_effort=effort,
             )
         if any(
             field in params

@@ -24,6 +24,7 @@ from flowly.providers.base import (
     ToolCallRequest,
     error_info_from_exception,
 )
+from flowly.providers.effort import anthropic_efforts
 from flowly.providers.key_rotator import KeyRotator, classify_error
 from flowly.providers.prompt_caching import apply_cache_control, is_cacheable_model
 from flowly.providers.tool_preview import ToolPreviewSnapshots
@@ -435,6 +436,7 @@ class AnthropicProvider(LLMProvider):
         temperature: float,
         tool_choice: str | None,
         stream: bool = False,
+        effort: str = "",
     ) -> dict[str, Any]:
         resolved_model = self._prepare_model(model)
         prepared = _strip_internal_keys(messages)
@@ -458,6 +460,14 @@ class AnthropicProvider(LLMProvider):
                 payload["tool_choice"] = choice
         if stream:
             payload["stream"] = True
+        # The agent's effort, on a model that takes that level (any other
+        # level answers 400). Thinking itself is left as the model has it.
+        if effort:
+            levels, _default = anthropic_efforts(resolved_model)
+            if effort in levels:
+                payload["output_config"] = {"effort": effort}
+            else:
+                logger.warning(f"[LLM] {resolved_model} does not take reasoning effort {effort!r}; using its default")
         return payload
 
     async def _raise_for_error(self, response: httpx.Response) -> None:
@@ -495,7 +505,7 @@ class AnthropicProvider(LLMProvider):
         purpose: str | None = None,
         reasoning: bool | None = None,
     ) -> LLMResponse:
-        del purpose, reasoning  # extended thinking is off unless asked for
+        del purpose  # extended thinking is off unless asked for
         payload = self._build_payload(
             messages=messages,
             tools=tools,
@@ -503,6 +513,7 @@ class AnthropicProvider(LLMProvider):
             max_tokens=max_tokens,
             temperature=temperature,
             tool_choice=tool_choice,
+            effort=self.turn_effort(reasoning),
         )
         request_timeout = timeout or self.request_timeout_seconds
         url = f"{self._base_url}/messages"
@@ -573,7 +584,7 @@ class AnthropicProvider(LLMProvider):
         tool_choice: str = "auto",
         reasoning: bool | None = None,
     ) -> AsyncIterator[LLMResponse]:
-        del reasoning  # extended thinking is off unless asked for
+        # extended thinking is off unless asked for
         payload = self._build_payload(
             messages=messages,
             tools=tools,
@@ -582,6 +593,7 @@ class AnthropicProvider(LLMProvider):
             temperature=temperature,
             tool_choice=tool_choice,
             stream=True,
+            effort=self.turn_effort(reasoning),
         )
         current_key = self._rotator.current_key() if self._rotator else self.api_key
         url = f"{self._base_url}/messages"

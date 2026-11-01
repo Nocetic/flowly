@@ -624,7 +624,8 @@ def _load_config_object(path: Path) -> dict:
     return value
 
 
-def _set_profile_model(config: dict, model: str) -> None:
+def _profile_defaults(config: dict) -> dict:
+    """``config["agents"]["defaults"]``, made a dict where it is not one."""
     agents = config.setdefault("agents", {})
     if not isinstance(agents, dict):
         agents = {}
@@ -633,7 +634,22 @@ def _set_profile_model(config: dict, model: str) -> None:
     if not isinstance(defaults, dict):
         defaults = {}
         agents["defaults"] = defaults
-    defaults["model"] = _validate_model(model)
+    return defaults
+
+
+def _set_profile_model(config: dict, model: str) -> None:
+    _profile_defaults(config)["model"] = _validate_model(model)
+
+
+def _validate_effort(effort: str) -> str:
+    from flowly.providers.effort import normalize_effort
+
+    if not isinstance(effort, str):
+        raise ValueError("Reasoning effort must be a string.")
+    validated = normalize_effort(effort)
+    if effort.strip() and not validated:
+        raise ValueError(f"Unknown reasoning effort: {effort.strip()}")
+    return validated
 
 
 def _set_profile_provider(config: dict, provider: str) -> None:
@@ -1492,6 +1508,8 @@ def read_profile_settings(name: str) -> dict:
         "name": profile.name,
         "provider": str(providers.get("active") or "").strip(),
         "model": str(defaults.get("model") or "").strip(),
+        # "" = the model's default (flowly/providers/effort.py).
+        "reasoningEffort": str(defaults.get("reasoningEffort") or "").strip(),
         "soul": soul,
         "workspace": str(profile.path / "workspace"),
         "credentialPolicy": (
@@ -1506,12 +1524,15 @@ def update_profile_settings(
     provider: str | None = None,
     model: str | None = None,
     soul: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> dict:
-    """Safely update profile-local model and persona files."""
-    if provider is None and model is None and soul is None:
+    """Safely update profile-local model and persona files. ``reasoning_effort``
+    ``""`` goes back to the model's default."""
+    if provider is None and model is None and soul is None and reasoning_effort is None:
         raise ValueError("At least one profile setting is required.")
     validated_provider = _validate_provider(provider) if provider is not None else None
     validated_model = _validate_model(model) if model is not None else None
+    validated_effort = _validate_effort(reasoning_effort) if reasoning_effort is not None else None
     validated_soul = _validate_soul(soul) if soul is not None else None
     profile = describe_profile(name)
     lease = reconcile_runtime_lease(profile.path, profile_name=name)
@@ -1520,7 +1541,7 @@ def update_profile_settings(
             f"Profile runtime is active (pid {lease.get('pid')}). Stop it before changing settings."
         )
 
-    if validated_provider is not None or validated_model is not None:
+    if validated_provider is not None or validated_model is not None or validated_effort is not None:
         config_path = profile.path / "config.json"
         config = _load_config_object(config_path)
         if bool(_profile_metadata(profile.path).get("localRuntime")):
@@ -1529,6 +1550,8 @@ def update_profile_settings(
             _set_profile_provider(config, validated_provider)
         if validated_model is not None:
             _set_profile_model(config, validated_model)
+        if validated_effort is not None:
+            _profile_defaults(config)["reasoningEffort"] = validated_effort
         _atomic_write_json(config_path, config)
     if validated_soul is not None:
         _atomic_write_text(profile.path / "workspace" / "SOUL.md", validated_soul)

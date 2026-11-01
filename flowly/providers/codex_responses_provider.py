@@ -61,7 +61,7 @@ DEFAULT_CODEX_MODEL = os.getenv("FLOWLY_CODEX_MODEL", "gpt-5.6-sol")
 
 # Reasoning efforts the ChatGPT Codex backend accepts. "minimal" is NOT
 # accepted here (unlike the metered API) — it is folded down to "low".
-_VALID_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
+_VALID_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max", "ultra")
 _DEFAULT_EFFORT = "medium"
 
 _NATIVE_MODEL_MARKER = "gpt-5.6"
@@ -668,6 +668,7 @@ class CodexResponsesProvider(LLMProvider):
         tool_choice: str,
         *,
         stream: bool,
+        effort: str = "",
     ) -> tuple[dict[str, Any], str]:
         resolved_model = _normalize_codex_model(model or self.default_model)
         scope = _REQUEST_SCOPE.get()
@@ -689,7 +690,10 @@ class CodexResponsesProvider(LLMProvider):
             "store": False,
             "stream": stream,
             "prompt_cache_key": session_id,
-            "reasoning": {"effort": _resolve_effort(model or self.default_model), "summary": "auto"},
+            "reasoning": {
+                "effort": _resolve_effort(model or self.default_model, self._supported_effort(resolved_model, effort)),
+                "summary": "auto",
+            },
             "include": ["reasoning.encrypted_content"],
         }
         context_management = self._native_context_management(resolved_model)
@@ -827,9 +831,10 @@ class CodexResponsesProvider(LLMProvider):
     ) -> LLMResponse:
         # This backend rejects max_output_tokens / temperature — accepted for
         # interface parity, deliberately not forwarded. Without a token cap a
-        # model's thinking cannot crowd out its answer, so ``reasoning`` stays
-        # at the model's own effort.
-        del max_tokens, temperature, purpose, reasoning
+        # model's thinking cannot crowd out its answer, so ``reasoning=False``
+        # only keeps the agent's effort off the call (the model's own runs).
+        del max_tokens, temperature, purpose
+        effort = self.turn_effort(reasoning)
         resolved_model = _normalize_codex_model(model or self.default_model)
         request_timeout = timeout or self.request_timeout_seconds
         auth_refreshed = False
@@ -837,7 +842,7 @@ class CodexResponsesProvider(LLMProvider):
         try:
             for _attempt in range(4):
                 payload, session_id = self._build_payload(
-                    messages, tools, model, tool_choice, stream=True
+                    messages, tools, model, tool_choice, stream=True, effort=effort
                 )
                 async with httpx.AsyncClient(timeout=request_timeout) as client:
                     async with client.stream(
@@ -1059,7 +1064,8 @@ class CodexResponsesProvider(LLMProvider):
         blocking :meth:`chat` so a turn is never left empty.
         """
         # No cap reaches this API, so thinking cannot crowd out the answer (see chat()).
-        del max_tokens, temperature, reasoning
+        del max_tokens, temperature
+        effort = self.turn_effort(reasoning)
         resolved_model = _normalize_codex_model(model or self.default_model)
         request_timeout = self.request_timeout_seconds
         auth_refreshed = False
@@ -1068,7 +1074,7 @@ class CodexResponsesProvider(LLMProvider):
         try:
             for _attempt in range(4):
                 payload, session_id = self._build_payload(
-                    messages, tools, model, tool_choice, stream=True
+                    messages, tools, model, tool_choice, stream=True, effort=effort
                 )
                 streamed_text = False
                 async with httpx.AsyncClient(timeout=request_timeout) as client:
@@ -1187,10 +1193,25 @@ class CodexResponsesProvider(LLMProvider):
                 tools=tools,
                 model=model,
                 tool_choice=tool_choice,
+                reasoning=reasoning,
             )
 
     def get_default_model(self) -> str:
         return self.default_model
+
+    def _supported_effort(self, model: str, effort: str) -> str:
+        """``effort`` when the model takes it. A level the live catalogue
+        says this model lacks (set for another model) falls back to the
+        model's own default rather than failing every turn."""
+        if not effort:
+            return ""
+        from flowly.integrations.model_catalog import cached_efforts
+
+        levels = cached_efforts(self.provider_name, model)
+        if levels is not None and effort not in levels:
+            logger.warning(f"[LLM] {model} does not take reasoning effort {effort!r}; using its default")
+            return ""
+        return effort
 
 
 async def _to_thread(fn, /, *args, **kwargs):

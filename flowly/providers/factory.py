@@ -6,6 +6,7 @@ from flowly.integrations.active_provider import ActiveProvider
 from flowly.providers.anthropic_provider import AnthropicProvider
 from flowly.providers.base import LLMProvider
 from flowly.providers.codex_responses_provider import CodexResponsesProvider
+from flowly.providers.effort import normalize_effort
 from flowly.providers.openrouter_provider import OpenRouterProvider
 from flowly.providers.xai_responses_provider import XAIResponsesProvider
 
@@ -16,6 +17,29 @@ def build_provider(
     default_model: str,
     fallback_keys: list[str] | None = None,
     config: object | None = None,
+) -> LLMProvider:
+    provider = _construct_provider(
+        active, default_model=default_model, fallback_keys=fallback_keys, config=config,
+    )
+    provider.reasoning_effort = configured_effort(config)
+    return provider
+
+
+def configured_effort(config: object | None) -> str:
+    """The agent's reasoning effort (``agents.defaults.reasoningEffort``);
+    empty when unset or not a known level."""
+    try:
+        return normalize_effort(config.agents.defaults.reasoning_effort)  # type: ignore[union-attr]
+    except AttributeError:
+        return ""
+
+
+def _construct_provider(
+    active: ActiveProvider,
+    *,
+    default_model: str,
+    fallback_keys: list[str] | None,
+    config: object | None,
 ) -> LLMProvider:
     # Per-request LLM timeout from config (agents.defaults.llmTimeoutSeconds),
     # set via the desktop Settings UI. None → provider falls back to the

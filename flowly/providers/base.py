@@ -172,9 +172,19 @@ class LLMProvider(ABC):
     while maintaining a consistent interface.
     """
 
+    #: The agent's reasoning effort (``agents.defaults.reasoningEffort``, set by
+    #: ``build_provider``); empty = the model's default. Providers that can take
+    #: a level send it on every request but a ``reasoning=False`` one.
+    reasoning_effort: str = ""
+
     def __init__(self, api_key: str | None = None, api_base: str | None = None):
         self.api_key = api_key
         self.api_base = api_base
+
+    def turn_effort(self, reasoning: bool | None) -> str:
+        """The effort a request carries: none for a call that switches
+        thinking off (background work keeps the model's default behaviour)."""
+        return "" if reasoning is False else self.reasoning_effort
 
     @contextmanager
     def request_scope(
