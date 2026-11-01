@@ -640,6 +640,11 @@ class MediaLibrary:
                 (media_id, row["prompt"], row["title"], row["file_name"]),
             )
 
+    def starred_files(self) -> list[Path]:
+        """The files the owner starred, with their posters: what retention keeps."""
+        rows = self._conn.execute("SELECT media_id, poster_id FROM media WHERE starred = 1").fetchall()
+        return [self._media_dir / name for row in rows for name in (row["media_id"], row["poster_id"]) if name]
+
     def star(self, media_id: str, starred: bool = True) -> dict | None:
         with self._lock, self._conn:
             self._conn.execute(

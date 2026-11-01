@@ -760,42 +760,11 @@ def gateway(
     # nothing else reclaims it. Best-effort; never blocks startup. Settings live
     # in config (media.retention); the FLOWLY_MEDIA_* env vars still override
     # them for a one-off run.
-    if config.media.retention.enabled:
-        try:
-            from flowly.media.retention import prune_media
-            from flowly.profile import get_flowly_home
-            from flowly.profile_rooms import GROUP_MEDIA_PREFIX
+    # Same settings and the same keepers as every other prune
+    # (flowly/media/retention.py prune_configured).
+    from flowly.media.retention import prune_configured
 
-            def _media_env_int(name: str, default: int) -> int:
-                try:
-                    return int(os.environ[name])
-                except (KeyError, ValueError):
-                    return default
-
-            retention = config.media.retention
-            prune_media(
-                get_flowly_home() / "media",
-                retention_days=_media_env_int(
-                    "FLOWLY_MEDIA_RETENTION_DAYS", retention.retention_days
-                ),
-                image_max_size_mb=_media_env_int(
-                    "FLOWLY_MEDIA_MAX_SIZE_MB", retention.image_max_size_mb
-                ),
-                video_max_size_mb=_media_env_int(
-                    "FLOWLY_MEDIA_VIDEO_MAX_SIZE_MB", retention.video_max_size_mb
-                ),
-                audio_max_size_mb=_media_env_int(
-                    "FLOWLY_MEDIA_AUDIO_MAX_SIZE_MB", retention.audio_max_size_mb
-                ),
-                # Group attachments share this folder so they are servable and
-                # browsable, but they are not generated media and no age cap
-                # applies to them: the room decides when a message dies, and
-                # the file dies with it. Pruning them here deleted attachments
-                # that transcripts still pointed at.
-                owned_elsewhere=(GROUP_MEDIA_PREFIX,),
-            )
-        except Exception as e:
-            logger.debug(f"[Gateway] Media retention skipped: {e}")
+    prune_configured()
 
     # Bring the media library index in step with the directory we just pruned,
     # and — once, on the first run that has this feature — recover provenance
@@ -2767,6 +2736,11 @@ Respond to the user now:"""
 
                     _manager_task = asyncio.create_task(_watch_desktop_manager())
             await cron.start()
+            # An agent that stays up prunes its media daily, not only at start
+            # and after a generation (sharing files alone never pruned).
+            from flowly.media.retention import prune_daily
+
+            _media_prune_task = asyncio.create_task(prune_daily())
 
             # A change to the goals is announced, not polled for
             # (flowly/objectives/events.py): to this runtime's own clients

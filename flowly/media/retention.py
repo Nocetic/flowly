@@ -288,3 +288,77 @@ def prune_media(
     summary["remaining_units"] = len(kept)
     summary["remaining_bytes"] = sum(u.size for u in kept)
     return summary
+
+
+#: How often an always-on agent prunes when nothing is generated (it also
+#: prunes at start and after each generation).
+DAILY_PRUNE_SECONDS = 24 * 60 * 60
+
+
+def _env_int(name: str, default: int) -> int:
+    import os
+
+    try:
+        return int(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+def prune_configured(protect: Iterable[str | Path] = (), media_dir: Path | None = None) -> dict:
+    """One prune with this agent's settings, the same for every caller.
+
+    The settings are ``media.retention`` (the ``FLOWLY_MEDIA_*`` env vars
+    override them for a one-off run). Kept: what the caller just made, what
+    the owner starred in the library (with its poster), and group attachments,
+    whose room decides when they die. The start-up prune and the one after a
+    generation had drifted apart: only the first spared group attachments, and
+    neither spared a starred file (2026-11-01). Never raises.
+    """
+    try:
+        from flowly.config.loader import load_config
+        from flowly.profile import get_flowly_home
+        from flowly.profile_rooms import GROUP_MEDIA_PREFIX
+
+        retention = load_config().media.retention
+        if not retention.enabled:
+            return {"skipped": True}
+        try:
+            from flowly.media.library import get_library
+
+            starred = get_library().starred_files()
+        except Exception:
+            starred = []
+        return prune_media(
+            media_dir or get_flowly_home() / "media",
+            retention_days=_env_int("FLOWLY_MEDIA_RETENTION_DAYS", retention.retention_days),
+            image_max_size_mb=_env_int("FLOWLY_MEDIA_MAX_SIZE_MB", retention.image_max_size_mb),
+            video_max_size_mb=_env_int("FLOWLY_MEDIA_VIDEO_MAX_SIZE_MB", retention.video_max_size_mb),
+            audio_max_size_mb=_env_int("FLOWLY_MEDIA_AUDIO_MAX_SIZE_MB", retention.audio_max_size_mb),
+            protect=[*protect, *starred],
+            owned_elsewhere=(GROUP_MEDIA_PREFIX,),
+        )
+    except Exception as exc:  # noqa: BLE001 - pruning never blocks start-up or a reply
+        _logger.debug("[Media] retention skipped: {}", exc)
+        return {"skipped": True}
+
+
+async def prune_and_expire(protect: Iterable[str | Path] = (), media_dir: Path | None = None) -> dict:
+    """:func:`prune_configured` off the event loop, then the library told what went."""
+    import asyncio
+
+    summary = await asyncio.to_thread(prune_configured, list(protect), media_dir)
+    deleted = summary.get("deleted_paths") or []
+    if deleted:
+        from flowly.media.library import expire_paths_async
+
+        await expire_paths_async(deleted)
+    return summary
+
+
+async def prune_daily() -> None:
+    """Prune once a day for an agent that stays up: sharing files alone never triggered it."""
+    import asyncio
+
+    while True:
+        await asyncio.sleep(DAILY_PRUNE_SECONDS)
+        await prune_and_expire()

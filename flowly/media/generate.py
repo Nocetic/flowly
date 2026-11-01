@@ -162,37 +162,10 @@ async def prune_after_generation(new_paths: list[str]) -> None:
     one.
     """
     try:
-        import asyncio
+        from flowly.media.retention import prune_and_expire
 
-        from flowly.config.loader import load_config
-        from flowly.media.retention import prune_media
-
-        retention = load_config().media.retention
-        if not retention.enabled:
-            return
-
-        directory = media_dir()
-        posters = [
-            str(Path(p).with_suffix(".jpg")) for p in new_paths
-        ]
-        summary = await asyncio.to_thread(
-            prune_media,
-            directory,
-            retention_days=retention.retention_days,
-            image_max_size_mb=retention.image_max_size_mb,
-            video_max_size_mb=retention.video_max_size_mb,
-            audio_max_size_mb=retention.audio_max_size_mb,
-            protect=[*new_paths, *posters],
-        )
-        # Expire exactly what this pass removed. Without it the library would
-        # keep offering tiles for bytes that no longer exist until the next
-        # gateway start reconciled them — a full rescan to learn what we were
-        # just told.
-        deleted = summary.get("deleted_paths") or []
-        if deleted:
-            from flowly.media.library import expire_paths_async
-
-            await expire_paths_async(deleted)
+        posters = [str(Path(p).with_suffix(".jpg")) for p in new_paths]
+        await prune_and_expire(protect=[*new_paths, *posters], media_dir=media_dir())
     except Exception as exc:  # noqa: BLE001 - never break a reply over cleanup
         logger.debug("[media] post-generation prune skipped: {}", exc)
 
