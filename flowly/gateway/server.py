@@ -7,6 +7,7 @@ import ipaddress
 import json
 import mimetypes
 import os
+import re
 import secrets
 import time
 import uuid
@@ -198,6 +199,14 @@ _MAX_STREAM_BYTES = 2 * 1024 * 1024 * 1024
 # general file server, and anything outside these families (archives, scripts,
 # documents) has no business being fetched by a chat client.
 _STREAMABLE_MIME_PREFIXES = ("image/", "video/", "audio/")
+
+
+def _content_disposition(name: str) -> str:
+    """Shown where it can be, saved under its own name where it cannot (RFC 6266)."""
+    from urllib.parse import quote
+
+    ascii_name = re.sub(r"[^A-Za-z0-9._-]", "_", name) or "file"
+    return f"inline; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(name, safe='')}"
 
 
 def _streamable_mime(target: Path) -> str | None:
@@ -1204,6 +1213,8 @@ class GatewayServer:
                 "X-Content-Type-Options": "nosniff",
                 **({} if mime == "application/pdf"
                    else {"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox"}),
+                # The URL ends in /stream: a file the browser saves keeps its own name.
+                "Content-Disposition": _content_disposition(target.name),
                 # Generated media is immutable: the filename is unique per
                 # generation, so a player may cache it for the session.
                 "Cache-Control": "private, max-age=3600",

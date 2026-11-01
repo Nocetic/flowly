@@ -132,6 +132,7 @@ async def test_a_document_the_agent_shows_streams_with_its_type_and_runs_nothing
     assert resp.headers["Content-Type"] == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     assert resp.headers["X-Content-Type-Options"] == "nosniff"
     assert "sandbox" in resp.headers["Content-Security-Policy"]
+    assert resp.headers["Content-Disposition"] == """inline; filename="brief.docx"; filename*=UTF-8''brief.docx"""
     assert await resp.read() == data
 
 
