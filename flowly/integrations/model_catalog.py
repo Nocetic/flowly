@@ -39,6 +39,7 @@ from flowly.providers.effort import (
     normalize_effort,
     ordered_efforts,
 )
+from flowly.providers.service_tier import ServiceTier, parse_service_tiers
 
 
 @dataclass
@@ -66,6 +67,9 @@ class Model:
     # and the one it runs at when none is set. Empty: no effort picker.
     efforts: list[str] = dc_field(default_factory=list)
     default_effort: str | None = None
+    # Faster tiers the model offers (flowly/providers/service_tier.py); empty:
+    # standard speed only, no Fast switch.
+    service_tiers: list[ServiceTier] = dc_field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -138,6 +142,21 @@ def cached_efforts(provider_key: str, model_id: str) -> list[str] | None:
     return None
 
 
+def cached_service_tiers(provider_key: str, model_id: str) -> list[str] | None:
+    """The tier ids the cached catalogue lists for ``model_id``; ``None``
+    when nothing is known (as ``cached_efforts``)."""
+    for model in _CACHE.get(provider_key) or ():
+        if model.id == model_id:
+            return [tier.id for tier in model.service_tiers]
+    return None
+
+
+def _catalogue_row(models: list[Model], model_id: str) -> Model | None:
+    """``model_id``'s row, matching a dotted or dashed version either way."""
+    candidates = {model_id, _dash_to_dot_version(model_id), _dot_to_dash_version(model_id)}
+    return next((model for model in models if model.id in candidates), None)
+
+
 def flowly_effort_cap() -> str | None:
     """The highest effort the account's Flowly credit runs at: ``medium`` on
     the free plan, none on the others or before the plan is known (the proxy
@@ -165,11 +184,10 @@ async def effort_choice(provider_key: str, model_id: str) -> EffortChoice:
     models = await fetch_models(provider_key) if provider_key else []
     # After the fetch: Flowly's catalogue is where the plan is learned.
     cap = flowly_effort_cap() if provider_key == "flowly" else None
-    candidates = {model_id, _dash_to_dot_version(model_id), _dot_to_dash_version(model_id)}
-    for model in models:
-        if model.id in candidates:
-            return EffortChoice(list(model.efforts), model.default_effort, cap)
-    return EffortChoice(None, None, cap)
+    row = _catalogue_row(models, model_id)
+    if row is None:
+        return EffortChoice(None, None, cap)
+    return EffortChoice(list(row.efforts), row.default_effort, cap)
 
 
 def effort_refusal(effort: str, choice: EffortChoice) -> tuple[str, str] | None:
@@ -182,6 +200,25 @@ def effort_refusal(effort: str, choice: EffortChoice) -> tuple[str, str] | None:
     if above_cap(effort, choice.cap):
         return "EFFORT_NOT_IN_PLAN", f"Your plan's credit goes up to {choice.cap} effort."
     return None
+
+
+async def service_tier_choice(provider_key: str, model_id: str) -> list[str] | None:
+    """The tier ids ``model_id`` offers on ``provider_key``, from its
+    catalogue; ``None`` when the catalogue does not know the model."""
+    models = await fetch_models(provider_key) if provider_key else []
+    row = _catalogue_row(models, model_id)
+    return None if row is None else [tier.id for tier in row.service_tiers]
+
+
+def service_tier_refusal(tier: str, tiers: list[str] | None) -> tuple[str, str] | None:
+    """Why ``tier`` (a valid id) cannot be set, as ``(code, message)``;
+    ``None`` when it can. A model the catalogue does not know is refused too:
+    no catalogue has ever offered it a tier."""
+    if tiers is not None and tier in tiers:
+        return None
+    if not tiers:
+        return "SERVICE_TIER_UNSUPPORTED", "This model has no faster tier."
+    return "SERVICE_TIER_UNSUPPORTED", f"This model offers {', '.join(tiers)}, not {tier}."
 
 
 def _with_anthropic_efforts(models: list[Model]) -> None:
@@ -848,6 +885,7 @@ def _codex_models_from_payload(payload: Any) -> list[Model]:
             supports_vision=supports_vision,
             efforts=efforts,
             default_effort=default_effort or None,
+            service_tiers=parse_service_tiers(item.get("service_tiers")),
         )
         ranked.append((priority, low_id, model))
 

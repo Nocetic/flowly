@@ -331,9 +331,10 @@ class OpenRouterProvider(LLMProvider):
         effort); other OpenAI-compatible APIs may refuse an unknown field."""
         if self.provider_name not in _REASONING_SWITCH_PROVIDERS:
             return None
-        if reasoning is False:
-            return None if model in _REASONING_MANDATORY_MODELS else {"enabled": False}
         effort = self.turn_effort(reasoning)
+        if reasoning is False or effort == "none":
+            # Thinking off: a background call, or the agent's own choice.
+            return None if model in _REASONING_MANDATORY_MODELS else {"enabled": False}
         if effort and self.provider_name == "flowly":
             from flowly.integrations.model_catalog import flowly_effort_cap
 

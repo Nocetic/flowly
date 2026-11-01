@@ -5,7 +5,8 @@ default) reaches every provider that can take it:
 
 * ChatGPT subscription (``openai_codex``): ``reasoning.effort``; the levels
   each model takes come from the live catalogue.
-* Flowly credit and OpenRouter: ``reasoning: {"effort": …}``.
+* Flowly credit and OpenRouter: ``reasoning: {"effort": …}``; ``none`` is
+  ``reasoning: {"enabled": false}``.
 * Anthropic: ``output_config: {"effort": …}``; the levels follow the model
   family (``anthropic_efforts``).
 
@@ -27,9 +28,11 @@ FREE_PLAN_EFFORT_CAP = "medium"
 #: Levels the apps warn about: they spend credit or a subscription's limits fastest.
 COSTLY_EFFORTS: frozenset[str] = frozenset({"xhigh", "max", "ultra"})
 
-#: OpenRouter normalises effort across its models; it takes these three on any
-#: model whose catalogue row lists the ``reasoning`` parameter.
-OPENROUTER_EFFORTS: tuple[str, ...] = ("low", "medium", "high")
+#: OpenRouter normalises effort across its models; it takes these on any model
+#: whose catalogue row lists the ``reasoning`` parameter. ``none`` switches
+#: thinking off (``reasoning: {"enabled": false}``); a model that always thinks
+#: refuses that and is asked again without it.
+OPENROUTER_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high")
 OPENROUTER_DEFAULT_EFFORT = "medium"
 
 

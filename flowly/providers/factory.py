@@ -8,6 +8,7 @@ from flowly.providers.base import LLMProvider
 from flowly.providers.codex_responses_provider import CodexResponsesProvider
 from flowly.providers.effort import normalize_effort
 from flowly.providers.openrouter_provider import OpenRouterProvider
+from flowly.providers.service_tier import normalize_service_tier
 from flowly.providers.xai_responses_provider import XAIResponsesProvider
 
 
@@ -22,6 +23,7 @@ def build_provider(
         active, default_model=default_model, fallback_keys=fallback_keys, config=config,
     )
     provider.reasoning_effort = configured_effort(config)
+    provider.service_tier = configured_service_tier(config)
     return provider
 
 
@@ -30,6 +32,15 @@ def configured_effort(config: object | None) -> str:
     empty when unset or not a known level."""
     try:
         return normalize_effort(config.agents.defaults.reasoning_effort)  # type: ignore[union-attr]
+    except AttributeError:
+        return ""
+
+
+def configured_service_tier(config: object | None) -> str:
+    """The agent's service tier (``agents.defaults.serviceTier``); empty when
+    unset or not a valid tier id."""
+    try:
+        return normalize_service_tier(config.agents.defaults.service_tier)  # type: ignore[union-attr]
     except AttributeError:
         return ""
 

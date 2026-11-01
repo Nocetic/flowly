@@ -652,6 +652,17 @@ def _validate_effort(effort: str) -> str:
     return validated
 
 
+def _validate_service_tier(tier: str) -> str:
+    from flowly.providers.service_tier import normalize_service_tier
+
+    if not isinstance(tier, str):
+        raise ValueError("Service tier must be a string.")
+    validated = normalize_service_tier(tier)
+    if tier.strip() and not validated:
+        raise ValueError(f"Invalid service tier: {tier.strip()[:40]}")
+    return validated
+
+
 def _set_profile_provider(config: dict, provider: str) -> None:
     providers = config.setdefault("providers", {})
     if not isinstance(providers, dict):
@@ -1510,6 +1521,8 @@ def read_profile_settings(name: str) -> dict:
         "model": str(defaults.get("model") or "").strip(),
         # "" = the model's default (flowly/providers/effort.py).
         "reasoningEffort": str(defaults.get("reasoningEffort") or "").strip(),
+        # "" = standard speed (flowly/providers/service_tier.py).
+        "serviceTier": str(defaults.get("serviceTier") or "").strip(),
         "soul": soul,
         "workspace": str(profile.path / "workspace"),
         "credentialPolicy": (
@@ -1525,14 +1538,17 @@ def update_profile_settings(
     model: str | None = None,
     soul: str | None = None,
     reasoning_effort: str | None = None,
+    service_tier: str | None = None,
 ) -> dict:
     """Safely update profile-local model and persona files. ``reasoning_effort``
-    ``""`` goes back to the model's default."""
-    if provider is None and model is None and soul is None and reasoning_effort is None:
+    ``""`` goes back to the model's default; ``service_tier`` ``""`` to
+    standard speed."""
+    if provider is None and model is None and soul is None and reasoning_effort is None and service_tier is None:
         raise ValueError("At least one profile setting is required.")
     validated_provider = _validate_provider(provider) if provider is not None else None
     validated_model = _validate_model(model) if model is not None else None
     validated_effort = _validate_effort(reasoning_effort) if reasoning_effort is not None else None
+    validated_tier = _validate_service_tier(service_tier) if service_tier is not None else None
     validated_soul = _validate_soul(soul) if soul is not None else None
     profile = describe_profile(name)
     lease = reconcile_runtime_lease(profile.path, profile_name=name)
@@ -1541,7 +1557,10 @@ def update_profile_settings(
             f"Profile runtime is active (pid {lease.get('pid')}). Stop it before changing settings."
         )
 
-    if validated_provider is not None or validated_model is not None or validated_effort is not None:
+    if (
+        validated_provider is not None or validated_model is not None
+        or validated_effort is not None or validated_tier is not None
+    ):
         config_path = profile.path / "config.json"
         config = _load_config_object(config_path)
         if bool(_profile_metadata(profile.path).get("localRuntime")):
@@ -1552,6 +1571,8 @@ def update_profile_settings(
             _set_profile_model(config, validated_model)
         if validated_effort is not None:
             _profile_defaults(config)["reasoningEffort"] = validated_effort
+        if validated_tier is not None:
+            _profile_defaults(config)["serviceTier"] = validated_tier
         _atomic_write_json(config_path, config)
     if validated_soul is not None:
         _atomic_write_text(profile.path / "workspace" / "SOUL.md", validated_soul)

@@ -102,7 +102,7 @@ def test_flowly_rows_take_effort_when_the_model_reasons():
     thinking = catalog._flowly_catalog_row({"id": "deepseek/r", "supported_parameters": ["tools", "reasoning"]})
     plain = catalog._flowly_catalog_row({"id": "meta/plain", "supported_parameters": ["tools"]})
     old_proxy = catalog._flowly_catalog_row({"id": "x/y"})
-    assert thinking.efforts == ["low", "medium", "high"] and thinking.default_effort == "medium"
+    assert thinking.efforts == ["none", "low", "medium", "high"] and thinking.default_effort == "medium"
     assert plain.efforts == [] and old_proxy.efforts == []
 
 
@@ -122,7 +122,7 @@ async def test_openrouter_rows_take_effort_when_the_model_reasons(monkeypatch):
 
     monkeypatch.setattr(catalog.httpx, "AsyncClient", _Client)
     by_id = {m.id: m for m in await catalog._fetch_openrouter()}
-    assert by_id["a/thinks"].efforts == ["low", "medium", "high"]
+    assert by_id["a/thinks"].efforts == ["none", "low", "medium", "high"]
     assert by_id["b/plain"].efforts == []
 
 
@@ -328,7 +328,7 @@ async def test_model_set_saves_an_effort_the_model_takes(main_agent):
     cfg, saved = main_agent
     result = await feature_rpc.model_set({"effort": "xhigh"})
     assert result == {"ok": True, "model": "gpt-5.6-terra", "effort": "xhigh", "effortReset": False,
-                      "willRestart": False}
+                      "serviceTier": "", "serviceTierReset": False, "willRestart": False}
     assert cfg.agents.defaults.reasoning_effort == "xhigh" and saved == [cfg]
     assert feature_rpc.provider_active()["effort"] == "xhigh"
 

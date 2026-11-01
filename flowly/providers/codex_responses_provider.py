@@ -524,6 +524,8 @@ class CodexResponsesProvider(LLMProvider):
         # model round trip per call. If this backend ever rejects the flag, the
         # provider falls back to one call per response for its lifetime.
         self._parallel_tool_calls = True
+        # Models whose backend refused ``service_tier``: asked at standard speed from then on.
+        self._service_tier_refused: set[str] = set()
 
     def _issuer_key(self) -> str:
         account = hashlib.sha256(
@@ -669,6 +671,7 @@ class CodexResponsesProvider(LLMProvider):
         *,
         stream: bool,
         effort: str = "",
+        service_tier: str = "",
     ) -> tuple[dict[str, Any], str]:
         resolved_model = _normalize_codex_model(model or self.default_model)
         scope = _REQUEST_SCOPE.get()
@@ -696,6 +699,9 @@ class CodexResponsesProvider(LLMProvider):
             },
             "include": ["reasoning.encrypted_content"],
         }
+        tier = self._supported_service_tier(resolved_model, service_tier)
+        if tier:
+            payload["service_tier"] = tier
         context_management = self._native_context_management(resolved_model)
         if context_management:
             payload["context_management"] = context_management
@@ -771,6 +777,14 @@ class CodexResponsesProvider(LLMProvider):
             self._parallel_tool_calls = False
             logger.warning("Codex backend rejected parallel tool calls; using one call per response")
             return True
+        if payload.get("service_tier") and "service_tier" in str(detail) and model:
+            self._service_tier_refused.add(model)
+            logger.warning(
+                "Codex backend rejected service tier {!r} for {}; using standard speed",
+                payload["service_tier"],
+                model,
+            )
+            return True
         scope = _REQUEST_SCOPE.get()
         if scope is None:
             return False
@@ -835,6 +849,7 @@ class CodexResponsesProvider(LLMProvider):
         # only keeps the agent's effort off the call (the model's own runs).
         del max_tokens, temperature, purpose
         effort = self.turn_effort(reasoning)
+        tier = self.turn_service_tier(reasoning)
         resolved_model = _normalize_codex_model(model or self.default_model)
         request_timeout = timeout or self.request_timeout_seconds
         auth_refreshed = False
@@ -842,7 +857,7 @@ class CodexResponsesProvider(LLMProvider):
         try:
             for _attempt in range(4):
                 payload, session_id = self._build_payload(
-                    messages, tools, model, tool_choice, stream=True, effort=effort
+                    messages, tools, model, tool_choice, stream=True, effort=effort, service_tier=tier
                 )
                 async with httpx.AsyncClient(timeout=request_timeout) as client:
                     async with client.stream(
@@ -1066,6 +1081,7 @@ class CodexResponsesProvider(LLMProvider):
         # No cap reaches this API, so thinking cannot crowd out the answer (see chat()).
         del max_tokens, temperature
         effort = self.turn_effort(reasoning)
+        tier = self.turn_service_tier(reasoning)
         resolved_model = _normalize_codex_model(model or self.default_model)
         request_timeout = self.request_timeout_seconds
         auth_refreshed = False
@@ -1074,7 +1090,7 @@ class CodexResponsesProvider(LLMProvider):
         try:
             for _attempt in range(4):
                 payload, session_id = self._build_payload(
-                    messages, tools, model, tool_choice, stream=True, effort=effort
+                    messages, tools, model, tool_choice, stream=True, effort=effort, service_tier=tier
                 )
                 streamed_text = False
                 async with httpx.AsyncClient(timeout=request_timeout) as client:
@@ -1198,6 +1214,21 @@ class CodexResponsesProvider(LLMProvider):
 
     def get_default_model(self) -> str:
         return self.default_model
+
+    def _supported_service_tier(self, model: str, tier: str) -> str:
+        """``tier`` when the model offers it. A tier the live catalogue says
+        this model lacks (set for another model), or one its backend refused,
+        falls back to standard speed rather than failing every turn. Nothing
+        known (no catalogue yet): sent, and dropped if refused."""
+        if not tier or model in self._service_tier_refused:
+            return ""
+        from flowly.integrations.model_catalog import cached_service_tiers
+
+        tiers = cached_service_tiers(self.provider_name, model)
+        if tiers is not None and tier not in tiers:
+            logger.warning(f"[LLM] {model} does not offer service tier {tier!r}; using standard speed")
+            return ""
+        return tier
 
     def _supported_effort(self, model: str, effort: str) -> str:
         """``effort`` when the model takes it. A level the live catalogue

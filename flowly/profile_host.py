@@ -209,6 +209,42 @@ async def _profile_effort(name: str, params: dict[str, Any]) -> str | None:
     return effort
 
 
+async def _profile_service_tier(name: str, params: dict[str, Any]) -> str | None:
+    """The service tier ``profiles.configure`` saves for a named agent, as
+    ``_profile_effort`` does the effort: ``serviceTier`` checked against the
+    agent's model; for a model change alone, ``""`` when the saved tier is not
+    one the new model offers, else ``None`` (unchanged)."""
+    from flowly.config.loader import load_config
+    from flowly.integrations.active_provider import resolve_active_provider
+    from flowly.integrations.model_catalog import service_tier_choice, service_tier_refusal
+    from flowly.providers.service_tier import normalize_service_tier
+
+    tier: str | None = None
+    if "serviceTier" in params:
+        raw = params["serviceTier"]
+        tier = normalize_service_tier(raw)
+        if raw.strip() and not tier:
+            raise ProfileHostError("INVALID_PARAMS", f"Invalid service tier: {raw.strip()[:40]}")
+    current = read_profile_settings(name)
+    host = load_config()
+    model = (params["model"].strip() if "model" in params else "") or current["model"] or host.agents.defaults.model
+    provider = (params["provider"].strip() if "provider" in params else "") or current["provider"]
+    if not provider:
+        active = resolve_active_provider(host)
+        provider = active.key if active is not None else ""
+    tiers = await service_tier_choice(provider, model)
+    if tier:
+        refusal = service_tier_refusal(tier, tiers)
+        if refusal is not None:
+            raise ProfileHostError(*refusal)
+        return tier
+    if tier is None:
+        saved = normalize_service_tier(current.get("serviceTier"))
+        if saved and tiers is not None and saved not in tiers:
+            return ""
+    return tier
+
+
 def _create_template(params: dict[str, Any]) -> dict | None:
     """``profiles.create``'s ``template``, as the Flowly server put it there (PROTOCOL A10)."""
     if params.get("template") is None:
@@ -885,10 +921,10 @@ class ProfileHost:
         name = _required_string(params, "name").strip()
         _validate_profile_selector(name)
         mutable_fields = {
-            "provider", "model", "soul", "reasoningEffort", "displayName", "description",
+            "provider", "model", "soul", "reasoningEffort", "serviceTier", "displayName", "description",
             "markText", "markTone", "markShape",
         }
-        runtime_fields = ("provider", "model", "soul", "reasoningEffort")
+        runtime_fields = ("provider", "model", "soul", "reasoningEffort", "serviceTier")
         if not mutable_fields.intersection(params):
             raise ProfileHostError("INVALID_PARAMS", "No bot settings were provided.")
         for field_name in mutable_fields.intersection(params):
@@ -900,6 +936,9 @@ class ProfileHost:
             )
         effort = await _profile_effort(name, params) if (
             "model" in params or "reasoningEffort" in params
+        ) else None
+        tier = await _profile_service_tier(name, params) if (
+            "model" in params or "serviceTier" in params
         ) else None
         if any(field in params for field in runtime_fields):
             runtime = self._runtimes.get(name)
@@ -917,6 +956,7 @@ class ProfileHost:
                 model=params["model"].strip() if "model" in params else None,
                 soul=params["soul"] if "soul" in params else None,
                 reasoning_effort=effort,
+                service_tier=tier,
             )
         if any(
             field in params

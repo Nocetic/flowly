@@ -2426,6 +2426,7 @@ def provider_active() -> dict:
     from flowly.config.loader import load_config
     from flowly.integrations.active_provider import resolve_active_provider
     from flowly.providers.effort import normalize_effort
+    from flowly.providers.service_tier import normalize_service_tier
 
     cfg = load_config()
     active = resolve_active_provider(cfg)
@@ -2441,6 +2442,8 @@ def provider_active() -> dict:
         "model": cfg.agents.defaults.model or "",
         # The agent's reasoning effort; "" = the model's default.
         "effort": normalize_effort(cfg.agents.defaults.reasoning_effort),
+        # The agent's service tier; "" = standard speed.
+        "serviceTier": normalize_service_tier(cfg.agents.defaults.service_tier),
     }
 
 
@@ -2477,6 +2480,11 @@ async def model_list(params: dict) -> dict:
                 # Reasoning efforts, lowest first; empty = no effort picker.
                 "efforts": list(m.efforts),
                 "defaultEffort": m.default_effort,
+                # Faster tiers; empty = standard speed only, no Fast switch.
+                "serviceTiers": [
+                    {"id": tier.id, "name": tier.name, "description": tier.description}
+                    for tier in m.service_tiers
+                ],
             }
             for m in models
         ],
@@ -2501,13 +2509,32 @@ def _effort_param(params: dict) -> str | None:
     return effort
 
 
+def _service_tier_param(params: dict) -> str | None:
+    """``serviceTier`` from an RPC: a tier id, ``""`` for standard speed,
+    ``None`` when absent."""
+    from flowly.providers.service_tier import normalize_service_tier
+
+    if "serviceTier" not in params:
+        return None
+    raw = params["serviceTier"]
+    if not isinstance(raw, str):
+        raise FeatureRpcError("INVALID", "serviceTier must be a string")
+    tier = normalize_service_tier(raw)
+    if raw.strip() and not tier:
+        raise FeatureRpcError("INVALID", f"invalid serviceTier: {raw.strip()[:40]}")
+    return tier
+
+
 async def model_set(params: dict) -> dict:
-    """Set the bot's default model (``agents.defaults.model``) and/or its
-    reasoning effort (``agents.defaults.reasoningEffort``), and apply them.
+    """Set the bot's default model (``agents.defaults.model``), its
+    reasoning effort (``agents.defaults.reasoningEffort``) and/or its service
+    tier (``agents.defaults.serviceTier``), and apply them.
 
     ``effort`` is checked against the model's catalogue and the plan's cap;
     ``""`` goes back to the model's default. A new model that lacks the saved
-    effort drops it (``effortReset``).
+    effort drops it (``effortReset``). ``serviceTier`` must be one the model's
+    catalogue offers; ``""`` is standard speed. A new model that lacks the
+    saved tier drops it (``serviceTierReset``).
 
     Live-reloads the running provider when the host wired
     :func:`set_provider_reload_callback` (gateway); otherwise returns
@@ -2520,17 +2547,25 @@ async def model_set(params: dict) -> dict:
             raise FeatureRpcError("INVALID", "model must be a non-empty string")
         model = model.strip()
     effort = _effort_param(params)
-    if model is None and effort is None:
-        raise FeatureRpcError("INVALID", "model or effort is required")
+    tier = _service_tier_param(params)
+    if model is None and effort is None and tier is None:
+        raise FeatureRpcError("INVALID", "model, effort or serviceTier is required")
     from flowly.config.loader import load_config, save_config
     from flowly.integrations.active_provider import resolve_active_provider
-    from flowly.integrations.model_catalog import effort_choice, effort_refusal
+    from flowly.integrations.model_catalog import (
+        effort_choice,
+        effort_refusal,
+        service_tier_choice,
+        service_tier_refusal,
+    )
     from flowly.providers.effort import normalize_effort
+    from flowly.providers.service_tier import normalize_service_tier
 
     cfg = load_config()
     target = model or cfg.agents.defaults.model
     active = resolve_active_provider(cfg)
-    choice = await effort_choice(active.key if active is not None else "", target)
+    provider_key = active.key if active is not None else ""
+    choice = await effort_choice(provider_key, target)
     saved = normalize_effort(cfg.agents.defaults.reasoning_effort)
     effort_reset = False
     if effort:
@@ -2541,10 +2576,25 @@ async def model_set(params: dict) -> dict:
         effort = saved
         if saved and choice.levels is not None and saved not in choice.levels:
             effort, effort_reset = "", True
+    tiers = await service_tier_choice(provider_key, target)
+    saved_tier = normalize_service_tier(cfg.agents.defaults.service_tier)
+    tier_reset = False
+    if tier:
+        refusal = service_tier_refusal(tier, tiers)
+        if refusal is not None:
+            raise FeatureRpcError(*refusal)
+    elif tier is None:
+        tier = saved_tier
+        if saved_tier and tiers is not None and saved_tier not in tiers:
+            tier, tier_reset = "", True
     cfg.agents.defaults.model = target
     cfg.agents.defaults.reasoning_effort = effort
+    cfg.agents.defaults.service_tier = tier
     save_config(cfg)
-    result = {"ok": True, "model": target, "effort": effort, "effortReset": effort_reset}
+    result = {
+        "ok": True, "model": target, "effort": effort, "effortReset": effort_reset,
+        "serviceTier": tier, "serviceTierReset": tier_reset,
+    }
     if await _live_provider_reload_succeeded():
         return {**result, "willRestart": False}
     return {**result, "willRestart": True}

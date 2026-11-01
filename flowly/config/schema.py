@@ -348,6 +348,10 @@ class AgentDefaults(BaseModel):
     # Empty → the model's own default. Background calls that switch thinking
     # off (``chat(reasoning=False)``) never use it.
     reasoning_effort: str = ""
+    # How fast the model answers this agent (flowly/providers/service_tier.py):
+    # a tier its catalogue offers, e.g. ChatGPT's "priority" (Fast). Empty →
+    # standard speed. Background calls never use it.
+    service_tier: str = ""
     max_tokens: int = 8192
     # Per-request LLM call timeout (seconds). A hung or slow provider call is
     # aborted after this instead of hanging and accumulating token charges.

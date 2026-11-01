@@ -176,6 +176,10 @@ class LLMProvider(ABC):
     #: ``build_provider``); empty = the model's default. Providers that can take
     #: a level send it on every request but a ``reasoning=False`` one.
     reasoning_effort: str = ""
+    #: The agent's service tier (``agents.defaults.serviceTier``, set by
+    #: ``build_provider``); empty = standard speed. Only a provider whose
+    #: catalogue offers tiers sends it, and never on a ``reasoning=False`` call.
+    service_tier: str = ""
 
     def __init__(self, api_key: str | None = None, api_base: str | None = None):
         self.api_key = api_key
@@ -185,6 +189,11 @@ class LLMProvider(ABC):
         """The effort a request carries: none for a call that switches
         thinking off (background work keeps the model's default behaviour)."""
         return "" if reasoning is False else self.reasoning_effort
+
+    def turn_service_tier(self, reasoning: bool | None) -> str:
+        """The tier a request carries: none for background work, which has no
+        one waiting on it."""
+        return "" if reasoning is False else self.service_tier
 
     @contextmanager
     def request_scope(
