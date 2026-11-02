@@ -40,7 +40,7 @@ from typing import Any
 import httpx
 from loguru import logger
 
-from flowly.profile import credential_scope_suffix, get_flowly_home
+from flowly.auth.shared_signin import refresh_lock, signin_home, signin_scope_suffix
 
 CODEX_OAUTH_ISSUER = "https://auth.openai.com"
 CODEX_OAUTH_AUTHORIZE_URL = f"{CODEX_OAUTH_ISSUER}/oauth/authorize"
@@ -74,14 +74,15 @@ _KEYRING_ACCOUNT = "openai-codex"
 
 
 def _keyring_service() -> str:
-    """Keychain service name, scoped to the active FLOWLY_HOME.
+    """Keychain service name, scoped to the sign-in home
+    (:func:`flowly.auth.shared_signin.signin_home`): the main agent's for every
+    agent on the computer.
 
     Unsuffixed (``"flowly-tui"``) at the default home for backward
-    compatibility; suffixed everywhere else so two homes (e.g. a second
-    product built on this codebase) never share one keychain entry. See
-    :func:`flowly.profile.credential_scope_suffix`.
+    compatibility; suffixed for any other home so two homes (e.g. a second
+    product built on this codebase) never share one keychain entry.
     """
-    suffix = credential_scope_suffix()
+    suffix = signin_scope_suffix()
     return f"flowly-tui:{suffix}" if suffix else "flowly-tui"
 
 
@@ -201,7 +202,8 @@ class CodexRuntimeCredentials:
 
 
 def credentials_path() -> Path:
-    return get_flowly_home() / "credentials" / "openai_codex.json"
+    # The computer's sign-in, shared by its named agents (shared_signin).
+    return signin_home() / "credentials" / "openai_codex.json"
 
 
 def codex_home_dir() -> Path:
@@ -585,6 +587,10 @@ def refresh_tokens(
     except httpx.HTTPError as exc:
         raise CodexAuthError(f"Codex token refresh failed: {type(exc).__name__}") from exc
     if response.status_code in (400, 401):
+        # Another agent may have refreshed in between: its sign-in stays.
+        stored = load_token_payload()
+        if stored is not None and stored.refresh_token and stored.refresh_token != current.refresh_token:
+            return stored
         clear_token_payload()
         raise CodexAuthError("Codex OAuth refresh token was rejected; run `flowly codex login` again.")
     if response.status_code >= 400:
@@ -610,12 +616,19 @@ def resolve_runtime_credentials(
     if payload is None:
         return None
     if force_refresh or token_is_expiring(payload):
-        try:
-            payload = refresh_tokens(client_id=require_client_id(config), payload=payload)
-        except CodexAuthError:
-            if force_refresh:
-                raise
-            # A soft-expiring token may still work; let the request try.
+        # One refresh at a time across the computer's agents; whoever comes
+        # second uses what the first saved.
+        with refresh_lock("openai_codex"):
+            latest = load_token_payload() or payload
+            if latest.refresh_token != payload.refresh_token or not (force_refresh or token_is_expiring(latest)):
+                payload = latest
+            else:
+                try:
+                    payload = refresh_tokens(client_id=require_client_id(config), payload=latest)
+                except CodexAuthError:
+                    if force_refresh:
+                        raise
+                    # A soft-expiring token may still work; let the request try.
     if not payload.account_id:
         raise CodexEntitlementError(
             "Codex OAuth token is missing a ChatGPT account id. Sign in again "

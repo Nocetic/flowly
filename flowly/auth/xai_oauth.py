@@ -26,7 +26,7 @@ from typing import Any
 import httpx
 from loguru import logger
 
-from flowly.profile import credential_scope_suffix, get_flowly_home
+from flowly.auth.shared_signin import refresh_lock, signin_home, signin_scope_suffix
 
 DEFAULT_XAI_OAUTH_BASE_URL = "https://api.x.ai/v1"
 XAI_OAUTH_DISCOVERY_URL = "https://auth.x.ai/.well-known/openid-configuration"
@@ -55,14 +55,15 @@ _KEYRING_ACCOUNT = "xai-oauth"
 
 
 def _keyring_service() -> str:
-    """Keychain service name, scoped to the active FLOWLY_HOME.
+    """Keychain service name, scoped to the sign-in home
+    (:func:`flowly.auth.shared_signin.signin_home`): the main agent's for every
+    agent on the computer.
 
     Unsuffixed (``"flowly-tui"``) at the default home for backward
-    compatibility; suffixed everywhere else so two homes (e.g. a second
-    product built on this codebase) never share one keychain entry. See
-    :func:`flowly.profile.credential_scope_suffix`.
+    compatibility; suffixed for any other home so two homes (e.g. a second
+    product built on this codebase) never share one keychain entry.
     """
-    suffix = credential_scope_suffix()
+    suffix = signin_scope_suffix()
     return f"flowly-tui:{suffix}" if suffix else "flowly-tui"
 
 
@@ -148,7 +149,8 @@ class XAIRuntimeCredentials:
 
 
 def credentials_path() -> Path:
-    return get_flowly_home() / "credentials" / "xai_oauth.json"
+    # The computer's sign-in, shared by its named agents (shared_signin).
+    return signin_home() / "credentials" / "xai_oauth.json"
 
 
 def resolve_client_id(config: Any | None = None) -> str:
@@ -525,6 +527,10 @@ def refresh_tokens(*, client_id: str | None = None, payload: XAITokenPayload | N
             + (f" xAI says: {detail}" if detail else "")
         )
     if response.status_code in (400, 401):
+        # Another agent may have refreshed in between: its sign-in stays.
+        stored = load_token_payload()
+        if stored is not None and stored.refresh_token and stored.refresh_token != current.refresh_token:
+            return stored
         clear_token_payload()
         raise XAIAuthError("xAI OAuth refresh token was rejected; run `flowly xai login` again.")
     if response.status_code >= 400:
@@ -560,7 +566,14 @@ def resolve_runtime_credentials(
     if payload is None:
         return None
     if force_refresh or token_is_expiring(payload):
-        payload = refresh_tokens(client_id=require_client_id(config), payload=payload)
+        # One refresh at a time across the computer's agents; whoever comes
+        # second uses what the first saved.
+        with refresh_lock("xai_oauth"):
+            latest = load_token_payload() or payload
+            if latest.refresh_token != payload.refresh_token or not (force_refresh or token_is_expiring(latest)):
+                payload = latest
+            else:
+                payload = refresh_tokens(client_id=require_client_id(config), payload=latest)
     return XAIRuntimeCredentials(
         provider="xai_oauth",
         api_key=payload.access_token,

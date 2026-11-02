@@ -14,7 +14,8 @@ API keys (``providers.<key>.apiKey``) into that agent's own ``config.json``.
 What was copied is remembered as a SHA-256 per provider in the agent's
 ``provider-keys.json``, never the key. Subscription sign-ins (ChatGPT, Grok)
 are not copied: their refresh tokens rotate, and two agents holding one would
-log each other out.
+log each other out. Every agent reads them from the main agent's store
+instead (flowly/auth/shared_signin.py).
 """
 
 from __future__ import annotations

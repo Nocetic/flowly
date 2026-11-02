@@ -2855,6 +2855,9 @@ def provider_list() -> dict:
                 "keyable": keyable,
                 "kind": kind,
                 "login": login,
+                # A sign-in is the computer's: every agent on it runs on it
+                # (flowly/auth/shared_signin.py). Older Core kept it with the main agent.
+                "shared": login is not None,
                 "hasKey": has_key,
                 "apiBase": getattr(slot, "api_base", None),
                 "isActive": resolved is not None and resolved.key == key,
