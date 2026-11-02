@@ -282,6 +282,24 @@ async def test_a_named_agents_secret_calls_run_in_it(home, method):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("method, params", [
+    ("agent.template.contents", {}),
+    ("agent.template.export", {"skills": ["brief"], "apps": False}),
+])
+async def test_a_named_agents_share_calls_run_in_it(home, method, params):
+    """The share button asks the agent itself (flowly.templates.share): the
+    server names it with ``params.profile``, never the main agent's files."""
+    channel, host, _ = make_channel({"recipe": {"v": 1}})
+    socket = Socket()
+    await channel._handle_rpc(socket, {"type": "rpc", "id": "t1", "method": method,
+                                       "params": {"profile": "writer", **params}})
+    called = host.dispatch.await_args.args
+    assert called[0] == "profiles.rpc"
+    assert called[1] == {"name": "writer", "method": method, "params": params}
+    assert socket.sent[-1]["result"] == {"recipe": {"v": 1}}
+
+
+@pytest.mark.asyncio
 async def test_a_secret_card_reaches_the_server_without_a_bound_session(home):
     """The server finds the conversation by its sessionKey (PROTOCOL A9): a
     request from a turn the agent started itself is not lost for want of a

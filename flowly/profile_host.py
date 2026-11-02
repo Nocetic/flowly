@@ -607,8 +607,9 @@ class ProfileHost:
             "maxConcurrentRuntimes": MAX_NAMED_PROFILES,
             "maxNamedProfiles": MAX_NAMED_PROFILES,
             "profileReadiness": True,
-            # profiles.create takes a ``template`` (flowly.templates).
-            "templates": {"version": 1},
+            # profiles.create takes a ``template`` (1); every agent answers
+            # ``agent.template.contents`` / ``.export`` for the share button (2).
+            "templates": {"version": 2},
             "profileMessaging": {"authority": "gateway", "version": 1},
             "credentialPolicies": {
                 "namedProfile": "isolated",
