@@ -50,7 +50,8 @@ def test_every_provider_says_what_it_is_and_how_it_signs_in(keychain):  # noqa: 
     rows = {row["key"]: row for row in feature_rpc.provider_list()["providers"]}
     assert (rows["flowly"]["kind"], rows["flowly"]["login"]) == ("account", None)
     assert (rows["openai_codex"]["kind"], rows["openai_codex"]["login"]) == ("subscription", "device")
-    assert (rows["xai_oauth"]["kind"], rows["xai_oauth"]["login"]) == ("subscription", "loopback")
+    # Grok signs in with a device code too: from a phone, away from the agent's machine.
+    assert (rows["xai_oauth"]["kind"], rows["xai_oauth"]["login"]) == ("subscription", "device")
     assert rows["anthropic"]["kind"] == "key" and rows["anthropic"]["login"] is None
     assert rows["vllm"]["kind"] == "url"
     assert all("apiKey" not in row and "value" not in row for row in rows.values())
@@ -171,6 +172,34 @@ async def test_chatgpt_signs_in_with_a_code_and_the_provider_reloads(monkeypatch
     await _until(lambda: reloads)
     done = feature_rpc.provider_login_status({"loginId": started["loginId"]})
     assert done["state"] == "done" and "userCode" not in done and device.saved
+
+
+@pytest.mark.asyncio
+async def test_grok_signs_in_with_a_code_from_any_device(monkeypatch):
+    from flowly.auth import xai_oauth
+
+    device = _DeviceLogin()
+
+    def grok(**kwargs):
+        on_user_code = kwargs["on_user_code"]
+        kwargs["on_user_code"] = lambda code, _url: on_user_code(code, "https://accounts.x.ai/oauth2/device?user_code=ABCD-1234")
+        return device(**kwargs)
+
+    monkeypatch.setattr(xai_oauth, "login_with_device_code", grok)
+    monkeypatch.setattr(openai_codex, "login_with_device_code", lambda **_: pytest.fail("ChatGPT's sign-in ran for Grok"))
+    reloads: list[bool] = []
+
+    async def reloaded():
+        reloads.append(True)
+        return True
+
+    monkeypatch.setattr(feature_rpc, "_live_provider_reload_succeeded", reloaded)
+    started = await feature_rpc.provider_login_start({"key": "xai_oauth"})
+    assert (started["key"], started["state"], started["userCode"]) == ("xai_oauth", "pending", "ABCD-1234")
+    assert started["verificationUrl"].startswith("https://accounts.x.ai/")
+    device.approve.set()
+    await _until(lambda: reloads)
+    assert feature_rpc.provider_login_status({"loginId": started["loginId"]})["state"] == "done" and device.saved
 
 
 @pytest.mark.asyncio

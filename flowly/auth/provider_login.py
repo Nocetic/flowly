@@ -1,9 +1,9 @@
 """Signing in to a subscription provider from an app (``provider.login.*``).
 
-The ChatGPT subscription (``openai_codex``) signs in with a device code: Core
-asks OpenAI for a code, the app shows it and opens the verification page, the
-person approves on any device, and Core waits for the tokens in the
-background. Nothing has to reach the machine the agent runs on, so it works
+The ChatGPT subscription (``openai_codex``) and xAI's Grok sign-in
+(``xai_oauth``) sign in with a device code: Core asks the provider for a code,
+the app shows it and opens the verification page, the person approves on any
+device, and Core waits for the tokens in the background. Nothing has to reach the machine the agent runs on, so it works
 the same on a Mac and on a cloud computer. Design: flowly-server
 ``docs/cloud/design/provider-switching.md``.
 
@@ -22,7 +22,7 @@ from typing import Any, Awaitable, Callable
 from loguru import logger
 
 #: Providers that sign in with a device code.
-DEVICE_LOGIN_PROVIDERS = frozenset({"openai_codex"})
+DEVICE_LOGIN_PROVIDERS = frozenset({"openai_codex", "xai_oauth"})
 #: How long a code is good for; OpenAI's own limit is about fifteen minutes.
 LOGIN_TIMEOUT_SECONDS = 900
 #: A finished sign-in is still answered for this long, then forgotten.
@@ -88,8 +88,6 @@ async def start(key: str, *, on_signed_in: Callable[[], Awaitable[Any]] | None =
             other.cancel.set()
             _finish(other, "cancelled")
 
-    from flowly.auth import openai_codex
-
     login = _Login(id=secrets.token_urlsafe(12), key=key)
     loop = asyncio.get_running_loop()
     code_ready: asyncio.Future[None] = loop.create_future()
@@ -101,10 +99,7 @@ async def start(key: str, *, on_signed_in: Callable[[], Awaitable[Any]] | None =
 
     def run() -> None:
         try:
-            openai_codex.login_with_device_code(
-                client_id=openai_codex.require_client_id(), on_user_code=on_user_code,
-                timeout_seconds=LOGIN_TIMEOUT_SECONDS, cancelled=login.cancel.is_set,
-            )
+            _sign_in(key, on_user_code=on_user_code, cancelled=login.cancel.is_set)
         except Exception as exc:
             reason = str(exc)
             if login.cancel.is_set():
@@ -131,6 +126,24 @@ async def start(key: str, *, on_signed_in: Callable[[], Awaitable[Any]] | None =
         _finish(login, "failed", "Timeout")
         raise ProviderLoginError("LOGIN_FAILED", "The sign-in could not start.") from None
     return login.wire()
+
+
+def _sign_in(key: str, *, on_user_code: Callable[[str, str], None], cancelled: Callable[[], bool]) -> None:
+    """Run ``key``'s device sign-in to the end (blocking): its tokens are saved where every agent reads them."""
+    if key == "xai_oauth":
+        from flowly.auth import xai_oauth
+
+        xai_oauth.login_with_device_code(
+            client_id=xai_oauth.require_client_id(), on_user_code=on_user_code,
+            timeout_seconds=LOGIN_TIMEOUT_SECONDS, cancelled=cancelled,
+        )
+        return
+    from flowly.auth import openai_codex
+
+    openai_codex.login_with_device_code(
+        client_id=openai_codex.require_client_id(), on_user_code=on_user_code,
+        timeout_seconds=LOGIN_TIMEOUT_SECONDS, cancelled=cancelled,
+    )
 
 
 def status(login_id: str) -> dict[str, Any]:

@@ -377,10 +377,12 @@ def discover_oauth_metadata() -> dict[str, str]:
     data = response.json()
     authorization_endpoint = str(data.get("authorization_endpoint") or "")
     token_endpoint = str(data.get("token_endpoint") or "")
+    device_endpoint = str(data.get("device_authorization_endpoint") or "")
     issuer = str(data.get("issuer") or "")
     for endpoint_name, endpoint in {
         "authorization_endpoint": authorization_endpoint,
         "token_endpoint": token_endpoint,
+        "device_authorization_endpoint": device_endpoint,
         "issuer": issuer,
     }.items():
         if endpoint and not _provider_host_is_xai(endpoint):
@@ -390,6 +392,7 @@ def discover_oauth_metadata() -> dict[str, str]:
     return {
         "authorization_endpoint": authorization_endpoint,
         "token_endpoint": token_endpoint,
+        "device_authorization_endpoint": device_endpoint,
         "issuer": issuer,
     }
 
@@ -475,7 +478,10 @@ def exchange_code_for_tokens(
             f"xAI token exchange failed: HTTP {response.status_code} "
             f"{redact_secret(response.text[:300], code, code_verifier)}"
         )
-    body = response.json()
+    return _payload_from_token_body(response.json())
+
+
+def _payload_from_token_body(body: dict[str, Any]) -> XAITokenPayload:
     access = str(body.get("access_token") or "").strip()
     if not access:
         raise XAIAuthError("xAI token exchange did not return an access token")
@@ -493,6 +499,110 @@ def exchange_code_for_tokens(
         email=profile["email"],
         subject=profile["sub"],
     )
+
+
+def _device_verification_url(body: dict[str, Any]) -> str:
+    """The page the person approves the code on: xAI's own, over HTTPS, and
+    nothing else (never a page another answer could point the apps at)."""
+    for field in ("verification_uri_complete", "verification_uri"):
+        value = str(body.get(field) or "").strip()
+        if not value:
+            continue
+        parsed = urllib.parse.urlparse(value)
+        if (parsed.scheme == "https" and (parsed.hostname or "").lower() == "accounts.x.ai"
+                and parsed.port in (None, 443) and not parsed.username and not parsed.password
+                and not parsed.fragment):
+            return value
+    raise XAIAuthError("xAI returned an unsupported sign-in page")
+
+
+def login_with_device_code(
+    *,
+    client_id: str,
+    on_user_code: Any | None = None,
+    timeout_seconds: int = 900,
+    cancelled: Any | None = None,
+) -> XAITokenPayload:
+    """Sign in with a device code (RFC 8628): xAI gives a code, the person
+    approves it on xAI's page on any device, and the tokens come back here.
+
+    Nothing has to reach this machine, so an app on a phone, or one away from
+    a cloud computer, signs it in (the loopback login needs a browser on this
+    machine). ``on_user_code(user_code, verification_url)`` is called once
+    the code is known; ``cancelled()`` returning true stops the wait.
+    """
+    metadata = discover_oauth_metadata()
+    device_endpoint = metadata.get("device_authorization_endpoint") or ""
+    if not device_endpoint:
+        raise XAIAuthError("xAI does not offer device sign-in")
+    headers = {"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded",
+               "User-Agent": "flowly/xai-oauth"}
+    try:
+        with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
+            response = client.post(device_endpoint, headers=headers,
+                                   data={"client_id": client_id, "scope": XAI_OAUTH_SCOPE, "referrer": "flowly"})
+    except httpx.HTTPError as exc:
+        raise XAIAuthError(f"Device login could not start: {type(exc).__name__}") from exc
+    if response.status_code >= 400:
+        raise XAIAuthError(f"Device login could not start: HTTP {response.status_code}")
+    data = response.json()
+    device_code = data.get("device_code")
+    user_code = data.get("user_code")
+    if not isinstance(device_code, str) or not device_code or not isinstance(user_code, str) or not user_code:
+        raise XAIAuthError("Device login response missing expected fields")
+    verification_url = _device_verification_url(data)
+    try:
+        interval = max(int(data.get("interval") or 5), 1)
+    except (TypeError, ValueError):
+        interval = 5
+    try:
+        expires_in = int(data.get("expires_in") or timeout_seconds)
+    except (TypeError, ValueError):
+        expires_in = timeout_seconds
+
+    if on_user_code is not None:
+        on_user_code(user_code, verification_url)
+
+    deadline = time.monotonic() + max(60, min(int(timeout_seconds), expires_in))
+    while time.monotonic() < deadline:
+        time.sleep(interval)
+        if cancelled is not None and cancelled():
+            raise XAIAuthError("Device login cancelled")
+        try:
+            with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
+                token = client.post(metadata["token_endpoint"], headers=headers, data={
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                    "client_id": client_id,
+                    "device_code": device_code,
+                })
+        except httpx.HTTPError:
+            continue
+        if token.status_code < 400:
+            payload = _payload_from_token_body(token.json())
+            save_token_payload(payload)
+            return payload
+        try:
+            error = str(token.json().get("error") or "")
+        except ValueError:
+            error = ""
+        if error == "authorization_pending":
+            continue
+        if error == "slow_down":
+            interval += 5
+            continue
+        if error == "expired_token":
+            break
+        if token.status_code == 403 and error != "access_denied":
+            detail = entitlement_detail(token.text)
+            raise XAIEntitlementError(
+                "xAI accepted the sign-in but this account is not entitled to API access."
+                + (f" xAI says: {detail}" if detail else "")
+            )
+        if error == "access_denied":
+            raise XAIAuthError("Device login was not approved")
+        raise XAIAuthError(f"Device login failed: HTTP {token.status_code}")
+
+    raise XAIAuthError("Device login timed out")
 
 
 def refresh_tokens(*, client_id: str | None = None, payload: XAITokenPayload | None = None) -> XAITokenPayload:

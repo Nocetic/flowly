@@ -239,3 +239,113 @@ def test_exchange_code_403_includes_body_detail(monkeypatch: pytest.MonkeyPatch)
             token_endpoint="https://auth.x.ai/oauth2/token",
         )
     assert "run out of credits" in str(excinfo.value)
+
+
+# ── Device sign-in (any device: a phone signs the agent in) ─────────────────
+
+
+class _FakeXAI:
+    """xAI's device endpoints as RFC 8628 has them: a code, then the token
+    endpoint's answers in order (`pending`, `slow_down`, …, then tokens)."""
+
+    def __init__(self, answers, device=None):
+        self.answers = list(answers)
+        self.device = device or {
+            "device_code": "dev-1", "user_code": "WDJB-MJHT", "interval": 1, "expires_in": 600,
+            "verification_uri": "https://accounts.x.ai/oauth2/device",
+            "verification_uri_complete": "https://accounts.x.ai/oauth2/device?user_code=WDJB-MJHT",
+        }
+        self.posts: list[tuple[str, dict]] = []
+
+    def client(self, *_, **__):
+        fake = self
+
+        class _Client:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def post(self, url, data=None, **_):
+                import httpx
+
+                fake.posts.append((url, dict(data or {})))
+                request = httpx.Request("POST", url)
+                if url.endswith("/device/code"):
+                    return httpx.Response(200, json=fake.device, request=request)
+                status, body = fake.answers.pop(0)
+                return httpx.Response(status, json=body, request=request)
+
+        return _Client()
+
+
+@pytest.fixture
+def xai_device(monkeypatch: pytest.MonkeyPatch):
+    def install(answers, device=None):
+        fake = _FakeXAI(answers, device)
+        monkeypatch.setattr(xai_oauth, "discover_oauth_metadata", lambda: {
+            "authorization_endpoint": "https://auth.x.ai/oauth2/authorize",
+            "token_endpoint": "https://auth.x.ai/oauth2/token",
+            "device_authorization_endpoint": "https://auth.x.ai/oauth2/device/code",
+            "issuer": "https://auth.x.ai",
+        })
+        monkeypatch.setattr(xai_oauth.httpx, "Client", fake.client)
+        monkeypatch.setattr(xai_oauth.time, "sleep", lambda _s: None)
+        return fake
+    return install
+
+
+_TOKENS = {"access_token": "grok-access", "refresh_token": "grok-refresh", "expires_in": 3600, "token_type": "Bearer"}
+
+
+def test_device_sign_in_waits_for_approval_and_keeps_the_tokens(xai_device):
+    fake = xai_device([
+        (400, {"error": "authorization_pending"}),
+        (400, {"error": "slow_down"}),
+        (200, _TOKENS),
+    ])
+    shown: list[tuple[str, str]] = []
+    payload = xai_oauth.login_with_device_code(client_id=xai_oauth.XAI_OAUTH_CLIENT_ID,
+                                               on_user_code=lambda code, url: shown.append((code, url)))
+    assert shown == [("WDJB-MJHT", "https://accounts.x.ai/oauth2/device?user_code=WDJB-MJHT")]
+    assert payload.access_token == "grok-access" and payload.refresh_token == "grok-refresh"
+    assert xai_oauth.load_token_payload().access_token == "grok-access"
+    url, asked = fake.posts[0]
+    assert url == "https://auth.x.ai/oauth2/device/code"
+    assert asked["client_id"] == xai_oauth.XAI_OAUTH_CLIENT_ID and asked["scope"] == xai_oauth.XAI_OAUTH_SCOPE
+    polls = [data for url, data in fake.posts if url.endswith("/token")]
+    assert len(polls) == 3
+    assert all(p == {"grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                     "client_id": xai_oauth.XAI_OAUTH_CLIENT_ID, "device_code": "dev-1"} for p in polls)
+
+
+@pytest.mark.parametrize("page", [
+    "http://accounts.x.ai/oauth2/device",
+    "https://accounts.x.ai.evil.example/oauth2/device",
+    "https://evil.example/oauth2/device",
+    "https://user@accounts.x.ai/oauth2/device",
+    "https://accounts.x.ai:444/oauth2/device",
+    "https://accounts.x.ai/oauth2/device#token",
+])
+def test_device_sign_in_never_sends_the_apps_to_another_page(xai_device, page):
+    xai_device([], device={"device_code": "d", "user_code": "C", "verification_uri": page})
+    with pytest.raises(xai_oauth.XAIAuthError, match="unsupported sign-in page"):
+        xai_oauth.login_with_device_code(client_id="c", on_user_code=lambda *_: pytest.fail("a code was shown"))
+
+
+def test_device_sign_in_says_how_it_ended(xai_device):
+    xai_device([(400, {"error": "access_denied"})])
+    with pytest.raises(xai_oauth.XAIAuthError, match="not approved"):
+        xai_oauth.login_with_device_code(client_id="c")
+    xai_device([(400, {"error": "expired_token"})])
+    with pytest.raises(xai_oauth.XAIAuthError, match="timed out"):
+        xai_oauth.login_with_device_code(client_id="c")
+    xai_device([(403, {"error": "forbidden", "error_description": "no API access"})])
+    with pytest.raises(xai_oauth.XAIEntitlementError):
+        xai_oauth.login_with_device_code(client_id="c")
+    xai_device([(400, {"error": "authorization_pending"})] * 3)
+    calls = iter([False, False, True])
+    with pytest.raises(xai_oauth.XAIAuthError, match="cancelled"):
+        xai_oauth.login_with_device_code(client_id="c", cancelled=lambda: next(calls))
+    assert xai_oauth.load_token_payload() is None

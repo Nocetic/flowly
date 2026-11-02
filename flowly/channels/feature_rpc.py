@@ -2811,11 +2811,12 @@ _PROVIDER_SLOTS = (
 #: ``subscription`` (signed in to a plan), ``key`` (an API key), ``url`` (a
 #: self-hosted address). ``login``: how a subscription signs in from the app —
 #: ``device`` (a code approved on any device; flowly/auth/provider_login.py) or
-#: ``loopback`` (a browser on the agent's own machine only).
+#: ``loopback`` (a browser on the agent's own machine only; none today: xAI's
+#: Grok sign-in moved to a device code so a phone signs in the agent too).
 _PROVIDER_KINDS: dict[str, tuple[str, str | None]] = {
     "flowly": ("account", None),
     "openai_codex": ("subscription", "device"),
-    "xai_oauth": ("subscription", "loopback"),
+    "xai_oauth": ("subscription", "device"),
     "zai_coding": ("subscription", None),
     "vllm": ("url", None),
 }
