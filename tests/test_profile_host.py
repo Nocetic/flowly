@@ -1628,3 +1628,36 @@ async def test_an_exchange_that_fails_ends_with_its_error(profile_roots) -> None
     assert [e["phase"] for e in exchange] == ["started", "ended"]
     assert exchange[1]["outcome"] == "error" and exchange[1]["errorCode"] == "PROFILE_COLLABORATION_FAILED"
     assert "reply" not in exchange[1]
+
+
+@pytest.mark.asyncio
+async def test_a_named_agent_switched_to_another_provider_takes_a_model_it_serves(
+    profile_roots, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """As the main agent's provider.set: a model the new provider cannot serve
+    moves to its default; one it serves, or a provider not set up yet, leaves it."""
+    from flowly.integrations import active_provider
+
+    profiles.create_profile("writer", local_runtime=True)
+    profiles.update_profile_settings("writer", provider="openai_codex", model="gpt-5.5")
+    host = ProfileHost()
+    monkeypatch.setattr(host, "stop", AsyncMock())
+    served = {"xai_oauth": {"grok-4.6"}, "openai_codex": {"gpt-5.5"}}
+    usable = {"xai_oauth", "openai_codex"}
+    monkeypatch.setattr(active_provider, "model_fits_provider", lambda model, key: model in served.get(key, set()))
+    monkeypatch.setattr(active_provider, "_build_for", lambda _cfg, key: object() if key in usable else None)
+
+    switched = await host.configure({"name": "writer", "provider": "xai_oauth"})
+    assert switched["settings"]["provider"] == "xai_oauth"
+    assert switched["settings"]["model"] == active_provider.DEFAULT_MODELS["xai_oauth"]
+
+    served["openai_codex"].add(active_provider.DEFAULT_MODELS["xai_oauth"])
+    kept = await host.configure({"name": "writer", "provider": "openai_codex"})
+    assert kept["settings"]["model"] == active_provider.DEFAULT_MODELS["xai_oauth"]
+
+    usable.discard("anthropic")
+    unset = await host.configure({"name": "writer", "provider": "anthropic"})
+    assert unset["settings"]["model"] == active_provider.DEFAULT_MODELS["xai_oauth"]
+
+    chosen = await host.configure({"name": "writer", "provider": "xai_oauth", "model": "grok-4.6"})
+    assert chosen["settings"]["model"] == "grok-4.6"

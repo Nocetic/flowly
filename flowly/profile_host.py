@@ -172,6 +172,32 @@ def _public_settings(name: str) -> dict[str, Any]:
     return settings
 
 
+def _model_for_provider(name: str, provider: str) -> str | None:
+    """The model a named agent moves to with ``provider`` (``profiles.configure``
+    with a provider and no model), as the main agent's ``provider.set`` does
+    (``set_active_provider``): its own model, or the one it follows, when the
+    provider serves it; else the provider's curated default. ``None`` leaves
+    it. Without it a named agent kept the old provider's model, which the new
+    one refused on the next message, and the apps showed a model their new
+    list did not have (no levels, nothing to pick)."""
+    from flowly.config.loader import load_config
+    from flowly.integrations.active_provider import DEFAULT_MODELS, _build_for, model_fits_provider
+
+    if not provider:
+        return None
+    host = load_config()
+    model = read_profile_settings(name)["model"] or host.agents.defaults.model or ""
+    fallback = DEFAULT_MODELS.get(provider)
+    if not fallback or model.strip().lower() == fallback.lower() or model_fits_provider(model, provider):
+        return None
+    try:
+        usable = _build_for(host, provider) is not None
+    except Exception:
+        usable = False
+    # A provider not set up yet would fall through to another one, which the default would not fit.
+    return fallback if usable else None
+
+
 async def _profile_effort(name: str, params: dict[str, Any]) -> str | None:
     """The reasoning effort ``profiles.configure`` saves for a named agent:
     ``reasoningEffort`` checked against the agent's model (the one being set,
@@ -947,10 +973,13 @@ class ProfileHost:
                     retryable=True,
                 )
             await self.stop(name)
+            model = params["model"].strip() if "model" in params else None
+            if model is None and "provider" in params:
+                model = _model_for_provider(name, params["provider"].strip())
             update_profile_settings(
                 name,
                 provider=params["provider"].strip() if "provider" in params else None,
-                model=params["model"].strip() if "model" in params else None,
+                model=model,
                 soul=params["soul"] if "soul" in params else None,
                 reasoning_effort=effort,
                 service_tier=tier,
