@@ -2480,6 +2480,8 @@ async def model_list(params: dict) -> dict:
                 # Reasoning efforts, lowest first; empty = no effort picker.
                 "efforts": list(m.efforts),
                 "defaultEffort": m.default_effort,
+                # False: the model does not think until a level is picked.
+                "defaultThinking": m.default_thinking,
                 # Faster tiers; empty = standard speed only, no Fast switch.
                 "serviceTiers": [
                     {"id": tier.id, "name": tier.name, "description": tier.description}
@@ -2531,8 +2533,10 @@ async def model_set(params: dict) -> dict:
     tier (``agents.defaults.serviceTier``), and apply them.
 
     ``effort`` is checked against the model's catalogue and the plan's cap;
-    ``""`` goes back to the model's default. A new model that lacks the saved
-    effort drops it (``effortReset``). ``serviceTier`` must be one the model's
+    ``""`` goes back to the model's default. A new model keeps the saved
+    effort: a level it lacks runs lowered to the nearest one it takes
+    (``clamp_effort``), and comes back on a model that has it
+    (``effortReset`` stays false, for older apps). ``serviceTier`` must be one the model's
     catalogue offers; ``""`` is standard speed. A new model that lacks the
     saved tier drops it (``serviceTierReset``).
 
@@ -2574,8 +2578,6 @@ async def model_set(params: dict) -> dict:
             raise FeatureRpcError(*refusal)
     elif effort is None:
         effort = saved
-        if saved and choice.levels is not None and saved not in choice.levels:
-            effort, effort_reset = "", True
     tiers = await service_tier_choice(provider_key, target)
     saved_tier = normalize_service_tier(cfg.agents.defaults.service_tier)
     tier_reset = False

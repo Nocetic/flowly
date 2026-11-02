@@ -460,14 +460,15 @@ class AnthropicProvider(LLMProvider):
                 payload["tool_choice"] = choice
         if stream:
             payload["stream"] = True
-        # The agent's effort, on a model that takes that level (any other
-        # level answers 400). Thinking itself is left as the model has it.
+        # The agent's effort, lowered to the nearest level the model takes (any
+        # other level answers 400). Thinking itself is left as the model has it.
         if effort:
+            from flowly.providers.effort import clamp_effort
+
             levels, _default = anthropic_efforts(resolved_model)
-            if effort in levels:
-                payload["output_config"] = {"effort": effort}
-            else:
-                logger.warning(f"[LLM] {resolved_model} does not take reasoning effort {effort!r}; using its default")
+            level = clamp_effort(effort, levels) if levels else ""
+            if level and level in levels:
+                payload["output_config"] = {"effort": level}
         return payload
 
     async def _raise_for_error(self, response: httpx.Response) -> None:

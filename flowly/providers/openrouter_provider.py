@@ -324,16 +324,56 @@ class OpenRouterProvider(LLMProvider):
 
     # -------------------------------------------------------------- reasoning
 
+    def _model_efforts(self, model: str) -> list[str] | None:
+        """The levels the catalogue says ``model`` takes on this provider;
+        ``None`` when nothing is known."""
+        from flowly.integrations.model_catalog import cached_efforts
+
+        levels = cached_efforts(self.provider_name, model)
+        if levels is None and self.provider_name == "xai":
+            from flowly.providers.effort import xai_efforts
+
+            levels = xai_efforts(model)[0]
+        return levels
+
+    def _reasoning_body(self, model: str, reasoning: bool | None) -> dict[str, Any]:
+        """The body fields a request carries for thinking: OpenRouter's and
+        Flowly's ``reasoning`` object, xAI's ``reasoning_effort``, nothing for
+        other OpenAI-compatible APIs (they may refuse an unknown field)."""
+        if self.provider_name == "xai":
+            effort = self.turn_effort(reasoning)
+            levels = self._model_efforts(model)
+            if levels is not None:
+                from flowly.providers.effort import clamp_effort
+
+                effort = clamp_effort(effort, levels) if levels else ""
+            # Grok cannot switch thinking off: none was lowered to its weakest level.
+            if not effort or effort == "none" or model in _EFFORT_REFUSED_MODELS:
+                return {}
+            return {"reasoning_effort": effort}
+        field = self._reasoning_field(model, reasoning)
+        return {} if field is None else {"reasoning": field}
+
     def _reasoning_field(self, model: str, reasoning: bool | None) -> dict[str, Any] | None:
         """The ``reasoning`` body field a request carries, if any: OpenRouter's
-        unified switch (``chat(reasoning=False)``) or the agent's effort. The
+        unified switch (``chat(reasoning=False)``) or the agent's effort,
+        lowered to the nearest level the catalogue says the model takes. The
         Flowly backend forwards it to OpenRouter (capping the free plan's
-        effort); other OpenAI-compatible APIs may refuse an unknown field."""
+        effort)."""
         if self.provider_name not in _REASONING_SWITCH_PROVIDERS:
             return None
+        if reasoning is False:
+            # Background work: thinking off.
+            return None if model in _REASONING_MANDATORY_MODELS else {"enabled": False}
         effort = self.turn_effort(reasoning)
-        if reasoning is False or effort == "none":
-            # Thinking off: a background call, or the agent's own choice.
+        levels = self._model_efforts(model)
+        if effort and levels is not None:
+            from flowly.providers.effort import clamp_effort
+
+            # A model that exposes no effort gets none; none on one that always
+            # thinks becomes its weakest level.
+            effort = clamp_effort(effort, levels) if levels else ""
+        if effort == "none":
             return None if model in _REASONING_MANDATORY_MODELS else {"enabled": False}
         if effort and self.provider_name == "flowly":
             from flowly.integrations.model_catalog import flowly_effort_cap
@@ -344,8 +384,15 @@ class OpenRouterProvider(LLMProvider):
         return {"effort": effort}
 
     def _retry_without_reasoning(self, model: str, field: object, exc: Exception) -> bool:
-        """True when ``exc`` is the backend refusing ``field``; the model is
-        asked without it from then on."""
+        """True when ``exc`` is the backend refusing ``field`` (the
+        ``reasoning`` object, or xAI's ``reasoning_effort`` as a string); the
+        model is asked without it from then on."""
+        if isinstance(field, str):
+            if _effort_refused(exc):
+                _EFFORT_REFUSED_MODELS.add(model)
+                logger.warning(f"[LLM] {model} refused reasoning_effort {field!r}; asking again without it")
+                return True
+            return False
         if not isinstance(field, dict):
             return False
         if field.get("enabled") is False and _reasoning_is_mandatory(exc):
@@ -393,9 +440,8 @@ class OpenRouterProvider(LLMProvider):
         extra_body: dict[str, Any] = {}
         if purpose:
             extra_body["purpose"] = purpose
-        reasoning_field = self._reasoning_field(resolved_model, reasoning)
-        if reasoning_field is not None:
-            extra_body["reasoning"] = reasoning_field
+        thinking = self._reasoning_body(resolved_model, reasoning)
+        extra_body.update(thinking)
         if extra_body:
             kwargs["extra_body"] = extra_body
 
@@ -407,9 +453,11 @@ class OpenRouterProvider(LLMProvider):
             except Exception as exc:
                 # A model that refuses the field (always thinks, or takes no
                 # effort): ask it again as it is.
-                if not self._retry_without_reasoning(resolved_model, extra_body.get("reasoning"), exc):
+                key = next(iter(thinking), None)
+                if key is None or not self._retry_without_reasoning(resolved_model, extra_body.get(key), exc):
                     raise
-                del extra_body["reasoning"]
+                del extra_body[key]
+                thinking.clear()
                 if extra_body:
                     kwargs["extra_body"] = extra_body
                 else:
@@ -541,9 +589,9 @@ class OpenRouterProvider(LLMProvider):
             kwargs["tool_choice"] = tool_choice
         # The same field as chat(), with the same retry for a model that
         # refuses it.
-        reasoning_field = self._reasoning_field(resolved_model, reasoning)
-        if reasoning_field is not None:
-            kwargs["extra_body"] = {"reasoning": reasoning_field}
+        thinking = self._reasoning_body(resolved_model, reasoning)
+        if thinking:
+            kwargs["extra_body"] = dict(thinking)
 
         current_key = self._rotator.current_key() if self._rotator else self.api_key
         client = self._client_for_key(current_key).with_options(
@@ -554,7 +602,8 @@ class OpenRouterProvider(LLMProvider):
             try:
                 stream = await client.chat.completions.create(**kwargs)
             except Exception as exc:
-                if not self._retry_without_reasoning(resolved_model, reasoning_field, exc):
+                key = next(iter(thinking), None)
+                if key is None or not self._retry_without_reasoning(resolved_model, thinking[key], exc):
                     raise
                 kwargs.pop("extra_body", None)
                 stream = await client.chat.completions.create(**kwargs)

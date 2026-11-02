@@ -32,12 +32,12 @@ import httpx
 
 from flowly.providers.effort import (
     FREE_PLAN_EFFORT_CAP,
-    OPENROUTER_DEFAULT_EFFORT,
-    OPENROUTER_EFFORTS,
     above_cap,
     anthropic_efforts,
     normalize_effort,
+    openrouter_efforts,
     ordered_efforts,
+    xai_efforts,
 )
 from flowly.providers.service_tier import ServiceTier, parse_service_tiers
 
@@ -67,6 +67,9 @@ class Model:
     # and the one it runs at when none is set. Empty: no effort picker.
     efforts: list[str] = dc_field(default_factory=list)
     default_effort: str | None = None
+    # Whether the model thinks when no level is sent; False (an OpenRouter row's
+    # ``default_enabled: false``) shows thinking off until the agent picks a level.
+    default_thinking: bool = True
     # Faster tiers the model offers (flowly/providers/service_tier.py); empty:
     # standard speed only, no Fast switch.
     service_tiers: list[ServiceTier] = dc_field(default_factory=list)
@@ -229,13 +232,10 @@ def _with_anthropic_efforts(models: list[Model]) -> None:
             model.efforts, model.default_effort = anthropic_efforts(model.id)
 
 
-def _openrouter_efforts(item: dict[str, Any]) -> tuple[list[str], str | None]:
-    """OpenRouter (and the Flowly proxy, which passes its rows through) lists
-    ``reasoning`` among ``supported_parameters`` for a model that thinks."""
-    params = item.get("supported_parameters")
-    if isinstance(params, list) and "reasoning" in params:
-        return list(OPENROUTER_EFFORTS), OPENROUTER_DEFAULT_EFFORT
-    return [], None
+def _openrouter_efforts(item: dict[str, Any]) -> tuple[list[str], str | None, bool]:
+    """An OpenRouter row's levels, default and default thinking
+    (``openrouter_efforts``); the Flowly proxy passes its rows through."""
+    return openrouter_efforts(item)
 
 
 # Rough context window by model family, for when no catalogue can place an id.
@@ -499,7 +499,7 @@ async def _fetch_openrouter() -> list[Model]:
             or (item.get("top_provider") or {}).get("context_length")
         )
         vision = _vision_capability(item)
-        efforts, default_effort = _openrouter_efforts(item)
+        efforts, default_effort, default_thinking = _openrouter_efforts(item)
         out.append(Model(
             id=mid,
             name=item.get("name") or mid,
@@ -512,6 +512,7 @@ async def _fetch_openrouter() -> list[Model]:
             supports_vision=vision,
             efforts=efforts,
             default_effort=default_effort,
+            default_thinking=default_thinking,
         ))
     # Sort: free first, then alphabetical
     out.sort(key=lambda m: (0 if "free" in m.tags else 1, m.id.lower()))
@@ -549,7 +550,7 @@ def _flowly_catalog_row(item: object) -> Model | None:
         if "free" not in tags:
             tags.append("free")
     vision = _vision_capability(item)
-    efforts, default_effort = _openrouter_efforts(item)
+    efforts, default_effort, default_thinking = _openrouter_efforts(item)
     return Model(
         id=mid,
         name=item.get("name") or mid,
@@ -562,6 +563,7 @@ def _flowly_catalog_row(item: object) -> Model | None:
         supports_vision=vision,
         efforts=efforts,
         default_effort=default_effort,
+        default_thinking=default_thinking,
     )
 
 
@@ -724,11 +726,14 @@ def _xai_models_from_payload(data: Any) -> list[Model]:
             tags.append("reasoning")
         if "multi-agent" in low:
             tags.append("multi-agent")
+        efforts, default_effort = xai_efforts(mid)
         out.append(Model(
             id=mid,
             name=mid,
             description=f"xAI · {item.get('owned_by') or 'xai'}",
             tags=tags,
+            efforts=efforts,
+            default_effort=default_effort,
         ))
     # grok-4.3 first, then alphabetical.
     out.sort(key=lambda m: (0 if m.id == _XAI_TOP_MODEL else 1, m.id.lower()))
@@ -893,11 +898,49 @@ def _codex_models_from_payload(payload: Any) -> list[Model]:
     return [model for _, _, model in ranked]
 
 
+def _codex_cache_path():
+    from flowly.profile import get_flowly_home
+    return get_flowly_home() / "codex_models_cache.json"
+
+
+def _codex_account_tag(account_id: str) -> str:
+    """The account a cached catalogue belongs to, as a digest (never the id)."""
+    import hashlib
+    return hashlib.sha256(account_id.encode("utf-8")).hexdigest()
+
+
+def _write_codex_cache(account_id: str, payload: Any) -> None:
+    """Keep the last live catalogue this account got, for when the backend
+    cannot be reached: its models' levels and tiers then still show."""
+    import json
+    try:
+        path = _codex_cache_path()
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"account": _codex_account_tag(account_id), "payload": payload}), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        pass
+
+
+def _cached_codex_models(account_id: str) -> list[Model]:
+    """The last live catalogue of this account (none for another account)."""
+    import json
+    try:
+        kept = json.loads(_codex_cache_path().read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(kept, dict) or kept.get("account") != _codex_account_tag(account_id):
+        return []
+    return _codex_models_from_payload(kept.get("payload"))
+
+
 async def _fetch_openai_codex() -> list[Model]:
     """Fetch the signed-in account's live ChatGPT Codex model catalogue.
 
     ``client_version`` is required by this endpoint. A 401 refreshes OAuth
-    once; all other network/schema failures use the curated fallback.
+    once. A live answer is kept on disk for this account; a network or
+    schema failure serves that, then the curated fallback (which knows no
+    levels).
     """
     from flowly import __version__
     from flowly.auth.openai_codex import resolve_runtime_credentials
@@ -929,10 +972,15 @@ async def _fetch_openai_codex() -> list[Model]:
                     return _static_codex_models()
                 continue
             response.raise_for_status()
-            return _codex_models_from_payload(response.json()) or _static_codex_models()
+            payload = response.json()
+            models = _codex_models_from_payload(payload)
+            if models:
+                _write_codex_cache(creds.account_id, payload)
+                return models
+            return _cached_codex_models(creds.account_id) or _static_codex_models()
         except Exception:
-            return _static_codex_models()
-    return _static_codex_models()
+            return _cached_codex_models(creds.account_id) or _static_codex_models()
+    return _cached_codex_models(creds.account_id) or _static_codex_models()
 
 
 _ZAI_CODING_MODELS: list[tuple[str, str, int, list[str]]] = [

@@ -175,9 +175,9 @@ def _public_settings(name: str) -> dict[str, Any]:
 async def _profile_effort(name: str, params: dict[str, Any]) -> str | None:
     """The reasoning effort ``profiles.configure`` saves for a named agent:
     ``reasoningEffort`` checked against the agent's model (the one being set,
-    its own, or the one it follows) and the plan's cap; for a model change
-    alone, ``""`` when the saved effort is not one the new model takes, else
-    ``None`` (unchanged)."""
+    its own, or the one it follows) and the plan's cap; ``None`` (unchanged)
+    for a model change alone: a level the new model lacks runs lowered to the
+    nearest one it takes, and comes back on a model that has it."""
     from flowly.config.loader import load_config
     from flowly.integrations.active_provider import resolve_active_provider
     from flowly.integrations.model_catalog import effort_choice, effort_refusal
@@ -202,10 +202,6 @@ async def _profile_effort(name: str, params: dict[str, Any]) -> str | None:
         if refusal is not None:
             raise ProfileHostError(*refusal)
         return effort
-    if effort is None:
-        saved = normalize_effort(current.get("reasoningEffort"))
-        if saved and choice.levels is not None and saved not in choice.levels:
-            return ""
     return effort
 
 

@@ -1231,18 +1231,19 @@ class CodexResponsesProvider(LLMProvider):
         return tier
 
     def _supported_effort(self, model: str, effort: str) -> str:
-        """``effort`` when the model takes it. A level the live catalogue
-        says this model lacks (set for another model) falls back to the
-        model's own default rather than failing every turn."""
+        """``effort`` on this model: lowered to the nearest level the live
+        catalogue says it takes (set for another model, ``ultra`` on one that
+        stops at ``max``), its default when it takes none, as sent when
+        nothing is known."""
         if not effort:
             return ""
         from flowly.integrations.model_catalog import cached_efforts
+        from flowly.providers.effort import clamp_effort
 
         levels = cached_efforts(self.provider_name, model)
-        if levels is not None and effort not in levels:
-            logger.warning(f"[LLM] {model} does not take reasoning effort {effort!r}; using its default")
-            return ""
-        return effort
+        if levels is None:
+            return effort
+        return clamp_effort(effort, levels) if levels else ""
 
 
 async def _to_thread(fn, /, *args, **kwargs):

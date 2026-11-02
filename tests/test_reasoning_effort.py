@@ -238,13 +238,15 @@ def test_codex_turns_carry_the_agents_effort_over_the_old_default():
     assert _codex_effort(provider, "gpt-5.6-terra:high", "low") == "low"  # the setting wins
 
 
-def test_codex_falls_back_to_the_default_for_a_level_the_model_lacks(monkeypatch):
+def test_codex_lowers_a_level_the_model_lacks_to_the_nearest_it_takes(monkeypatch):
     provider = CodexResponsesProvider(api_key="tok", account_id="acct-1", provider_name="openai_codex")
     monkeypatch.setitem(catalog._CACHE, "openai_codex", [
         catalog.Model(id="gpt-5.6-luna", name="Luna", efforts=["low", "medium", "high"]),
+        catalog.Model(id="gpt-plain", name="Plain"),
     ])
-    assert _codex_effort(provider, "gpt-5.6-luna", "ultra") == "medium"
+    assert _codex_effort(provider, "gpt-5.6-luna", "ultra") == "high"  # not its default, medium
     assert _codex_effort(provider, "gpt-5.6-luna", "high") == "high"
+    assert _codex_effort(provider, "gpt-plain", "high") == "medium"  # takes none: its own default
 
 
 @pytest.mark.asyncio
@@ -272,7 +274,9 @@ def _anthropic_payload(model: str, effort: str) -> dict:
 
 def test_anthropic_turns_carry_effort_only_on_models_that_take_it():
     assert _anthropic_payload("claude-opus-4-7", "xhigh")["output_config"] == {"effort": "xhigh"}
-    assert "output_config" not in _anthropic_payload("claude-opus-4-6", "xhigh")  # 4.6 has no xhigh
+    # 4.6 has no xhigh: the nearest level below it, never one above.
+    assert _anthropic_payload("claude-opus-4-6", "xhigh")["output_config"] == {"effort": "high"}
+    assert _anthropic_payload("claude-opus-4-5", "ultra")["output_config"] == {"effort": "high"}
     assert "output_config" not in _anthropic_payload("claude-haiku-4-5", "low")
     assert "output_config" not in _anthropic_payload("claude-opus-4-7", "")
     assert "thinking" not in _anthropic_payload("claude-opus-4-7", "high")
@@ -350,14 +354,14 @@ async def test_model_set_refuses_an_effort_it_cannot_run(main_agent, params, cod
 
 
 @pytest.mark.asyncio
-async def test_a_new_model_without_the_saved_effort_drops_it(main_agent):
+async def test_a_new_model_keeps_the_saved_effort_for_when_it_comes_back(main_agent):
     cfg, _saved = main_agent
     cfg.agents.defaults.reasoning_effort = "max"
-    result = await feature_rpc.model_set({"model": "gpt-5.6-luna"})
-    assert (result["model"], result["effort"], result["effortReset"]) == ("gpt-5.6-luna", "", True)
-    cfg.agents.defaults.reasoning_effort = "low"
-    kept = await feature_rpc.model_set({"model": "gpt-5.6-terra"})
-    assert (kept["effort"], kept["effortReset"]) == ("low", False)
+    result = await feature_rpc.model_set({"model": "gpt-5.6-luna"})  # takes low and medium
+    assert (result["model"], result["effort"], result["effortReset"]) == ("gpt-5.6-luna", "max", False)
+    assert cfg.agents.defaults.reasoning_effort == "max"
+    back = await feature_rpc.model_set({"model": "gpt-5.6-terra"})
+    assert (back["effort"], back["effortReset"]) == ("max", False)
 
 
 @pytest.mark.asyncio
@@ -448,7 +452,7 @@ async def test_profiles_configure_checks_the_effort_against_the_agents_model(pro
     assert refused.value.code == "EFFORT_UNSUPPORTED"
 
     moved = await host.configure({"name": "writer", "model": "gpt-5.6-luna"})
-    assert (moved["settings"]["model"], moved["settings"]["reasoningEffort"]) == ("gpt-5.6-luna", "")
+    assert (moved["settings"]["model"], moved["settings"]["reasoningEffort"]) == ("gpt-5.6-luna", "max")
 
     with pytest.raises(ProfileHostError) as unknown:
         await host.configure({"name": "writer", "reasoningEffort": "warp"})

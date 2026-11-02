@@ -27,6 +27,12 @@ class _FakeResponse:
             raise httpx.HTTPStatusError("catalogue failed", request=request, response=response)
 
 
+@pytest.fixture(autouse=True)
+def _own_flowly_home(tmp_path, monkeypatch):
+    # The last live catalogue is kept on disk; each test starts with none.
+    monkeypatch.setattr("flowly.profile.get_flowly_home", lambda: tmp_path)
+
+
 def _credentials(token: str = "token") -> SimpleNamespace:
     return SimpleNamespace(
         api_key=token,

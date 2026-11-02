@@ -233,6 +233,10 @@ def _usage_from_response(data: dict[str, Any]) -> dict[str, int]:
     }
 
 
+#: Models whose backend refused ``reasoning.effort``: asked without it from then on.
+_EFFORT_REFUSED_MODELS: set[str] = set()
+
+
 class XAIResponsesProvider(LLMProvider):
     """LLM provider for xAI's ``/v1/responses`` endpoint."""
 
@@ -271,6 +275,23 @@ class XAIResponsesProvider(LLMProvider):
             error_info=error_info_from_exception(exc),
         )
 
+    def _effort(self, model: str, reasoning: bool | None) -> str:
+        """The ``reasoning.effort`` a request carries: the agent's level,
+        lowered to the nearest one the model takes (Grok cannot switch thinking
+        off, so ``none`` becomes its weakest); none for background work, a model
+        that does not reason, or one that refused the field."""
+        from flowly.integrations.model_catalog import cached_efforts
+        from flowly.providers.effort import clamp_effort, xai_efforts
+
+        effort = self.turn_effort(reasoning)
+        if not effort or model in _EFFORT_REFUSED_MODELS:
+            return ""
+        levels = cached_efforts(self.provider_name, model)
+        if levels is None:
+            levels = xai_efforts(model)[0]
+        level = clamp_effort(effort, levels) if levels else ""
+        return "" if level == "none" else level
+
     async def _refresh_api_key(self) -> None:
         payload = await _to_thread(refresh_tokens, client_id=self._client_id or None)
         creds = await _to_thread(resolve_runtime_credentials, force_refresh=False)
@@ -291,7 +312,7 @@ class XAIResponsesProvider(LLMProvider):
         purpose: str | None = None,
         reasoning: bool | None = None,
     ) -> LLMResponse:
-        del purpose, reasoning
+        del purpose
         resolved_model = _normalize_xai_model(model or self.default_model)
         instructions, input_items = _messages_to_responses_input(messages)
         payload: dict[str, Any] = {
@@ -301,6 +322,9 @@ class XAIResponsesProvider(LLMProvider):
             "max_output_tokens": max_tokens,
             "temperature": temperature,
         }
+        effort = self._effort(resolved_model, reasoning)
+        if effort:
+            payload["reasoning"] = {"effort": effort}
         if instructions:
             payload["instructions"] = instructions
         response_tools = _responses_tools(tools)
@@ -309,7 +333,7 @@ class XAIResponsesProvider(LLMProvider):
             payload["tool_choice"] = tool_choice if tool_choice in {"auto", "required", "none"} else "auto"
 
         request_timeout = timeout or self.request_timeout_seconds
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 async with httpx.AsyncClient(timeout=request_timeout) as client:
                     response = await client.post(
@@ -330,6 +354,12 @@ class XAIResponsesProvider(LLMProvider):
                 # surfaces below on the second attempt.
                 if response.status_code in (401, 403) and attempt == 0:
                     await self._refresh_api_key()
+                    continue
+                if response.status_code == 400 and "reasoning" in payload and "reasoning" in response.text.lower():
+                    # A model that takes no effort: ask it again as it is, and remember it.
+                    _EFFORT_REFUSED_MODELS.add(resolved_model)
+                    logger.warning("xAI refused reasoning effort {!r} for {}; asking again without it",
+                                   payload.pop("reasoning")["effort"], resolved_model)
                     continue
                 if response.status_code == 403:
                     detail = entitlement_detail(response.text)
@@ -424,7 +454,6 @@ class XAIResponsesProvider(LLMProvider):
         and any streaming failure degrades to a single blocking ``chat()`` call
         so a turn is NEVER left without a reply.
         """
-        del reasoning  # as chat(): this backend's thinking is not switched
         resolved_model = _normalize_xai_model(model or self.default_model)
         instructions, input_items = _messages_to_responses_input(messages)
         payload: dict[str, Any] = {
@@ -435,6 +464,10 @@ class XAIResponsesProvider(LLMProvider):
             "temperature": temperature,
             "stream": True,
         }
+        # A refusal fails the stream; the blocking fallback asks again without it and remembers.
+        effort = self._effort(resolved_model, reasoning)
+        if effort:
+            payload["reasoning"] = {"effort": effort}
         if instructions:
             payload["instructions"] = instructions
         response_tools = _responses_tools(tools)
@@ -556,6 +589,7 @@ class XAIResponsesProvider(LLMProvider):
                 max_tokens=max_tokens,
                 temperature=temperature,
                 tool_choice=tool_choice,
+                reasoning=reasoning,
             )
 
     def get_default_model(self) -> str:
