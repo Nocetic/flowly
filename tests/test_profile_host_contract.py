@@ -43,12 +43,49 @@ def test_mobile_profile_rpc_surface_is_bot_scoped() -> None:
         "config.set",
         "connections.secret.get",
         "mcp.install",
-        "skills.install",
+        "skills.update",
         "cli.exec",
     ):
         with pytest.raises(ProfileHostError) as raised:
             validate_profile_rpc(forbidden, {})
         assert raised.value.code == "METHOD_NOT_ALLOWED"
+
+
+def test_named_agent_skills_take_marketplace_slugs_only() -> None:
+    assert validate_profile_rpc("skills.list", {"anything": 1}) == ("skills.list", {})
+    assert validate_profile_rpc("skills.install", {"source": "research", "force": True}) == (
+        "skills.install",
+        {"source": "research", "restart": False},
+    )
+    assert validate_profile_rpc("skills.install", {"source": "pdf-tools@1.2.0"})[1] == {
+        "source": "pdf-tools@1.2.0",
+        "restart": False,
+    }
+    assert validate_profile_rpc("skills.remove", {"slug": "research", "restart": True})[1] == {
+        "slug": "research",
+        "restart": False,
+    }
+    for source in (
+        "github:owner/repo/skill",
+        "https://example.com/SKILL.md",
+        "./skill",
+        "/etc",
+        "~/skills/x",
+        "../escape",
+        "Research",
+        "skill@",
+        "skill@1.0 && rm",
+        "",
+        None,
+        42,
+    ):
+        with pytest.raises(ProfileHostError) as raised:
+            validate_profile_rpc("skills.install", {"source": source})
+        assert raised.value.code == "INVALID_PARAMS"
+    for slug in ("../x", ".hidden", "a/b", "", None):
+        with pytest.raises(ProfileHostError) as raised:
+            validate_profile_rpc("skills.remove", {"slug": slug})
+        assert raised.value.code == "INVALID_PARAMS"
 
 
 def test_remote_profile_access_policy_is_strictly_bounded() -> None:

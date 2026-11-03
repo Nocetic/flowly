@@ -62,3 +62,17 @@ async def test_skills_remove_only_reports_a_real_managed_removal():
 
     with pytest.raises(feature_rpc.FeatureRpcError, match="managed skill not found"):
         await feature_rpc.skills_remove({"slug": "bundled-skill", "restart": False})
+
+
+async def test_a_blocked_skill_is_reported_with_its_reason(monkeypatch):
+    from flowly.hub import guard
+
+    def _blocked(self, source, force=False):
+        raise guard.SkillBlocked(guard.ScanResult(source, guard.TRUST_REGISTRY, guard.DANGEROUS, []),
+                                 "Blocked: trusted source, dangerous (0 findings).")
+
+    monkeypatch.setattr(_Manager, "install", _blocked)
+    with pytest.raises(feature_rpc.FeatureRpcError) as raised:
+        await feature_rpc.skills_install({"source": "evil", "restart": False})
+    assert raised.value.code == "SKILL_BLOCKED"
+    assert "dangerous" in raised.value.message

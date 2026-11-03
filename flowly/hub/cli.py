@@ -73,6 +73,9 @@ def search(
 def install(
     source: str = typer.Argument(..., help="Skill source (name, github:..., URL, or path)"),
     force: bool = typer.Option(False, "--force", "-f", help="Force reinstall"),
+    accept_caution: bool = typer.Option(
+        False, "--accept-caution", help="Accept a community skill the safety scan flagged as caution"
+    ),
     workspace: bool = typer.Option(False, "--workspace", "-w", help="Install to workspace"),
 ):
     """
@@ -85,10 +88,18 @@ def install(
         flowly-hub install https://example.com/skill.md
         flowly-hub install ./my-skill
     """
+    from flowly.hub.guard import SkillBlocked
+
     with _get_manager() as manager:
         console.print(f"[cyan]Installing {source}...[/cyan]")
 
-        skill = manager.install(source, force=force, to_workspace=workspace)
+        try:
+            skill = manager.install(source, force=force, to_workspace=workspace, accept_caution=accept_caution)
+        except SkillBlocked as blocked:
+            console.print(f"[red]✗[/red] {blocked.reason}")
+            for finding in blocked.result.findings:
+                console.print(f"  {finding.severity:<8} {finding.file}:{finding.line}  {finding.meaning}")
+            raise typer.Exit(1)
 
         if skill:
             console.print(f"[green]✓[/green] Installed [cyan]{skill.name}[/cyan] v{skill.version}")

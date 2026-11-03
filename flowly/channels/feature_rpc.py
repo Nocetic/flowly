@@ -4144,9 +4144,13 @@ async def skills_install(params: dict) -> dict:
     """Install one managed skill into the active profile.
 
     ``source`` accepts the same registry slug, GitHub reference, URL or local
-    path as ``flowly skills install``. The explicit managed directory keeps
+    path as ``flowly skills install`` (a named agent's call through the profile
+    host carries a registry slug only). The explicit managed directory keeps
     profile runtimes isolated even when ``SkillManager`` was imported before
-    ``FLOWLY_HOME`` was rebound for the profile.
+    ``FLOWLY_HOME`` was rebound for the profile. Every install passes the
+    safety scan (``flowly.hub.guard``): a refused skill is SKILL_BLOCKED, with
+    the reason, and nothing is written. A caution verdict is never accepted
+    over the wire; only the owner's CLI can accept one.
     """
     source = str(params.get("source") or "").strip()
     if not source:
@@ -4165,7 +4169,12 @@ async def skills_install(params: dict) -> dict:
             clear_skills_snapshot()
         return result
 
-    result = await asyncio.to_thread(_install)
+    from flowly.hub.guard import SkillBlocked
+
+    try:
+        result = await asyncio.to_thread(_install)
+    except SkillBlocked as blocked:
+        raise FeatureRpcError(blocked.code, blocked.reason) from None
     if result is None:
         raise FeatureRpcError("INSTALL_FAILED", f"could not install skill: {source}")
     return {

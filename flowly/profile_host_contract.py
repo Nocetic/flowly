@@ -38,8 +38,10 @@ _NON_PUBLIC_ATTACHMENT_HOST_SUFFIXES = (
 )
 
 # Deliberately excludes raw global config/secrets, arbitrary CLI execution, and
-# legacy MCP/skill installation. Modern MCP setup stays in the selected runtime's
+# legacy MCP installation. Modern MCP setup stays in the selected runtime's
 # staged owner-confirmation service; it never falls back to direct config writes.
+# Skills install into the named agent's own home from the marketplace registry
+# only (a slug, never a GitHub path, URL or folder), through the safety scan.
 # The small access-policy projection below is safe to
 # expose because it accepts only closed enums and a deny-only toolset list.
 PROFILE_RPC_TIMEOUTS: dict[str, int] = {
@@ -93,6 +95,10 @@ PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     "voice.context": 10_000,
     "voice.memory.append": 10_000,
     "voice.memory.snapshot": 10_000,
+    # The agent's own skills: list, add from the marketplace, remove.
+    "skills.list": 30_000,
+    "skills.install": 180_000,
+    "skills.remove": 60_000,
     "provider.list": 30_000,
     "provider.active": 30_000,
     "model.list": 60_000,
@@ -410,6 +416,43 @@ def _subagent_watch_key(params: dict[str, Any]) -> str:
     return thread_session_key(thread_id) if is_thread_id(thread_id) else ""
 
 
+_SKILL_SLUG_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-_.")
+_SKILL_VERSION_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-+_")
+
+
+def _skill_slug(value: Any) -> str | None:
+    if not isinstance(value, str) or not 1 <= len(value) <= 128:
+        return None
+    if value[0] in "._-" or ".." in value or set(value) - _SKILL_SLUG_CHARS:
+        return None
+    return value
+
+
+def _validate_skills_request(method: str, value: dict[str, Any]) -> dict[str, Any]:
+    """A named agent's skills: marketplace slugs only, never a restart.
+
+    The agent's runtime clears its skills cache itself, so a remote call never
+    asks it to restart; and the reinstall/accept flags stay with the owner's CLI.
+    """
+    if method == "skills.list":
+        return {}
+    if method == "skills.remove":
+        slug = _skill_slug(value.get("slug"))
+        if slug is None:
+            raise ProfileHostError("INVALID_PARAMS", "A skill's name is required.")
+        return {"slug": slug, "restart": False}
+    source = value.get("source")
+    slug, _, version = source.partition("@") if isinstance(source, str) else ("", "", "")
+    if _skill_slug(slug) is None or (
+        version and (len(version) > 32 or set(version) - _SKILL_VERSION_CHARS)
+    ) or (isinstance(source, str) and source.endswith("@")):
+        raise ProfileHostError(
+            "INVALID_PARAMS",
+            "A named agent installs skills from the marketplace by name only.",
+        )
+    return {"source": source, "restart": False}
+
+
 def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]:
     if not isinstance(method, str) or method not in PROFILE_RPC_TIMEOUTS:
         raise ProfileHostError(
@@ -429,6 +472,8 @@ def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]
     if size > MAX_REQUEST_BYTES:
         raise ProfileHostError("REQUEST_TOO_LARGE", "Profile request is too large.")
     value = _validate_access_policy(method, value)
+    if method.startswith("skills."):
+        value = _validate_skills_request(method, value)
     if method.startswith("agent.home."):
         from flowly.agent_home import AgentHomeError, validate_request
         try:

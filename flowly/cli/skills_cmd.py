@@ -56,15 +56,25 @@ def skills_list(
 def skills_install(
     source: str = typer.Argument(..., help="Skill source"),
     force: bool = typer.Option(False, "--force", "-f", help="Force reinstall"),
+    accept_caution: bool = typer.Option(
+        False, "--accept-caution", help="Accept a community skill the safety scan flagged as caution"
+    ),
 ):
     """Install a skill."""
+    from flowly.hub.guard import SkillBlocked
     from flowly.hub.manager import SkillManager
     from flowly.utils.helpers import get_workspace_path
 
     workspace = get_workspace_path()
     with SkillManager(workspace_dir=workspace) as manager:
         console.print(f"[cyan]Installing {source}...[/cyan]")
-        skill = manager.install(source, force=force)
+        try:
+            skill = manager.install(source, force=force, accept_caution=accept_caution)
+        except SkillBlocked as blocked:
+            console.print(f"[red]✗[/red] {blocked.reason}")
+            for finding in blocked.result.findings:
+                console.print(f"  {finding.severity:<8} {finding.file}:{finding.line}  {finding.meaning}")
+            raise typer.Exit(1)
 
         if skill:
             console.print(f"[green]✓[/green] Installed [cyan]{skill.name}[/cyan] v{skill.version}")

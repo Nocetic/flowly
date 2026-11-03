@@ -139,6 +139,11 @@ class HubClient:
         Returns:
             Path to downloaded skill directory, or None on failure.
         """
+        from flowly.hub.guard import valid_skill_dir_name
+
+        if not valid_skill_dir_name(skill.slug):
+            logger.error(f"Refusing a skill with an unsafe name: {skill.slug!r}")
+            return None
         skill_dir = target_dir / skill.slug
         skill_dir.mkdir(parents=True, exist_ok=True)
 
@@ -190,6 +195,10 @@ class HubClient:
                     import zipfile
                     import io
                     with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                        for member in zf.namelist():
+                            member_path = (skill_dir / member).resolve()
+                            if not member_path.is_relative_to(skill_dir.resolve()):
+                                raise ValueError(f"ZIP member {member} escapes target dir")
                         zf.extractall(skill_dir)
                 except zipfile.BadZipFile:
                     (skill_dir / "SKILL.md").write_bytes(resp.content)

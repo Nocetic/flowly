@@ -170,6 +170,34 @@ class AuditLogger:
             "messages_dropped": messages_dropped,
         })
 
+    def log_skill_event(
+        self,
+        *,
+        action: str,
+        slug: str,
+        source: str,
+        scan: dict[str, Any] | None,
+        reason: str,
+    ) -> None:
+        """Record a skill installed, blocked by the safety scan, or removed."""
+        record: dict[str, Any] = {
+            "type": "skill",
+            "ts": datetime.now(tz=timezone.utc).isoformat(),
+            "action": action,
+            "slug": slug,
+            "source": source,
+            "status": "error" if action == "blocked" else "success",
+            "reason": reason,
+        }
+        if scan is not None:
+            record["trust"] = scan.get("trust")
+            record["verdict"] = scan.get("verdict")
+            record["findings"] = [
+                {key: finding.get(key) for key in ("rule", "severity", "file", "line")}
+                for finding in scan.get("findings", [])
+            ]
+        self._write(record)
+
     def log_key_rotation(
         self,
         *,
