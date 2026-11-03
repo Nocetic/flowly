@@ -95,10 +95,14 @@ PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     "voice.context": 10_000,
     "voice.memory.append": 10_000,
     "voice.memory.snapshot": 10_000,
-    # The agent's own skills: list, add from the marketplace, remove.
+    # The agent's own skills: list, preview and add from the marketplace,
+    # turn on or off, remove, and bring a removed built-in back.
     "skills.list": 30_000,
+    "skills.preview": 120_000,
     "skills.install": 180_000,
+    "skills.toggle": 30_000,
     "skills.remove": 60_000,
+    "skills.restore": 30_000,
     "provider.list": 30_000,
     "provider.active": 30_000,
     "model.list": 60_000,
@@ -436,10 +440,17 @@ def _validate_skills_request(method: str, value: dict[str, Any]) -> dict[str, An
     """
     if method == "skills.list":
         return {}
-    if method == "skills.remove":
+    if method in {"skills.remove", "skills.restore", "skills.toggle"}:
         slug = _skill_slug(value.get("slug"))
         if slug is None:
             raise ProfileHostError("INVALID_PARAMS", "A skill's name is required.")
+        if method == "skills.toggle":
+            enabled = value.get("enabled")
+            if not isinstance(enabled, bool):
+                raise ProfileHostError("INVALID_PARAMS", "A skill is turned on or off.")
+            return {"slug": slug, "enabled": enabled}
+        if method == "skills.restore":
+            return {"slug": slug}
         return {"slug": slug, "restart": False}
     source = value.get("source")
     slug, _, version = source.partition("@") if isinstance(source, str) else ("", "", "")
@@ -450,6 +461,8 @@ def _validate_skills_request(method: str, value: dict[str, Any]) -> dict[str, An
             "INVALID_PARAMS",
             "A named agent installs skills from the marketplace by name only.",
         )
+    if method == "skills.preview":
+        return {"source": source}
     return {"source": source, "restart": False}
 
 

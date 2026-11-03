@@ -135,7 +135,12 @@ def sync_skills(quiet: bool = True) -> dict[str, list[str] | int]:
                 continue
 
             if not dest.exists():
-                # User deleted it — respect
+                # User deleted it — respect. The entry stays: it is the only
+                # record that this built-in was removed on purpose, and the
+                # loader reads it to keep the package's copy out too
+                # (flowly.skills.state). Dropping it re-added the skill on the
+                # next sync.
+                new_manifest[name] = origin_hash
                 result["skipped"] += 1  # type: ignore
                 continue
 

@@ -82,10 +82,20 @@ def test_named_agent_skills_take_marketplace_slugs_only() -> None:
         with pytest.raises(ProfileHostError) as raised:
             validate_profile_rpc("skills.install", {"source": source})
         assert raised.value.code == "INVALID_PARAMS"
-    for slug in ("../x", ".hidden", "a/b", "", None):
-        with pytest.raises(ProfileHostError) as raised:
-            validate_profile_rpc("skills.remove", {"slug": slug})
-        assert raised.value.code == "INVALID_PARAMS"
+    for method in ("skills.remove", "skills.restore", "skills.toggle"):
+        for slug in ("../x", ".hidden", "a/b", "", None):
+            with pytest.raises(ProfileHostError) as raised:
+                validate_profile_rpc(method, {"slug": slug, "enabled": True})
+            assert raised.value.code == "INVALID_PARAMS"
+    assert validate_profile_rpc("skills.toggle", {"slug": "notion", "enabled": False, "x": 1})[1] == {
+        "slug": "notion", "enabled": False,
+    }
+    with pytest.raises(ProfileHostError):
+        validate_profile_rpc("skills.toggle", {"slug": "notion", "enabled": "false"})
+    assert validate_profile_rpc("skills.restore", {"slug": "notion", "all": True})[1] == {"slug": "notion"}
+    assert validate_profile_rpc("skills.preview", {"source": "pdf-tools@1.0.0"})[1] == {"source": "pdf-tools@1.0.0"}
+    with pytest.raises(ProfileHostError):
+        validate_profile_rpc("skills.preview", {"source": "https://example.com/SKILL.md"})
 
 
 def test_remote_profile_access_policy_is_strictly_bounded() -> None:

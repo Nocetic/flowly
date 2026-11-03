@@ -16,6 +16,9 @@ from flowly.hub import guard
 from flowly.hub.client import HubClient, SkillInfo
 from flowly.profile import get_flowly_home
 
+#: How much of a SKILL.md a preview carries.
+PREVIEW_CHARS = 20_000
+
 
 @dataclass
 class InstalledSkill:
@@ -177,22 +180,7 @@ class SkillManager:
         # so the agent never sees a skill the scan has not let through.
         staging = Path(tempfile.mkdtemp(prefix=".skill-staging-", dir=self.managed_dir.parent))
         try:
-            if source_type == "registry":
-                staged = self._install_from_registry(
-                    params["slug"], params.get("version"), staging, force
-                )
-            elif source_type == "github":
-                staged = self._install_from_github(
-                    params["repo"], params.get("path", "skills"),
-                    params.get("skill_name"), staging, force
-                )
-            elif source_type == "url":
-                staged = self._install_from_url(params["url"], staging, force)
-            elif source_type == "local":
-                staged = self._install_from_local(params["path"], staging, force)
-            else:
-                logger.error(f"Unknown source type: {source_type}")
-                return None
+            staged = self._stage(source_type, params, staging, force)
             if staged is None or staged.path.parent != staging:
                 # Failed, or already installed and not forced.
                 return staged
@@ -201,6 +189,54 @@ class SkillManager:
             )
         finally:
             shutil.rmtree(staging, ignore_errors=True)
+
+    def preview(self, source: str) -> dict | None:
+        """What installing *source* would add and what the safety scan says, installing nothing."""
+        source_type, params = self._client.parse_skill_source(source)
+        staging = Path(tempfile.mkdtemp(prefix=".skill-preview-", dir=self.managed_dir.parent))
+        try:
+            staged = self._stage(source_type, params, staging, force=True)
+            if staged is None or staged.path.parent != staging:
+                return None
+            result = guard.scan(staged.path, guard.trust_for(source_type))
+            allowed, reason = guard.decide(result)
+            try:
+                content = (staged.path / "SKILL.md").read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                content = ""
+            files = sorted(
+                path.relative_to(staged.path).as_posix()
+                for path in staged.path.rglob("*")
+                if path.is_file() and path.name != self.META_FILE
+            )
+            return {
+                "slug": staged.path.name,
+                "name": staged.name,
+                "description": staged.description,
+                "content": content[:PREVIEW_CHARS],
+                "truncated": len(content) > PREVIEW_CHARS,
+                "files": files[:guard.MAX_FILES],
+                "scan": {**result.summary(), "allowed": allowed, "decision": reason},
+            }
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    def _stage(
+        self, source_type: str, params: dict, staging: Path, force: bool
+    ) -> InstalledSkill | None:
+        """Download one source into *staging* (or return the installed one when not forced)."""
+        if source_type == "registry":
+            return self._install_from_registry(params["slug"], params.get("version"), staging, force)
+        if source_type == "github":
+            return self._install_from_github(
+                params["repo"], params.get("path", "skills"), params.get("skill_name"), staging, force
+            )
+        if source_type == "url":
+            return self._install_from_url(params["url"], staging, force)
+        if source_type == "local":
+            return self._install_from_local(params["path"], staging, force)
+        logger.error(f"Unknown source type: {source_type}")
+        return None
 
     def _admit(
         self,
@@ -217,7 +253,7 @@ class SkillManager:
             return None
         result = guard.scan(staged.path, trust)
         allowed, reason = guard.decide(result, accept_caution)
-        _audit_skill("install" if allowed else "blocked", name, source, result.summary(), reason)
+        audit_skill("install" if allowed else "blocked", name, source, result.summary(), reason)
         if not allowed:
             logger.warning(f"Skill {name} blocked: {reason}")
             raise guard.SkillBlocked(result, reason)
@@ -467,7 +503,7 @@ class SkillManager:
         try:
             shutil.rmtree(skill_dir)
             logger.info(f"Removed skill: {slug}")
-            _audit_skill("remove", slug, str(skill_dir), None, "Removed by the owner.")
+            audit_skill("remove", slug, str(skill_dir), None, "Removed by the owner.")
             return True
         except Exception as e:
             logger.error(f"Failed to remove {slug}: {e}")
@@ -587,7 +623,7 @@ class SkillManager:
         self.close()
 
 
-def _audit_skill(action: str, slug: str, source: str, scan: dict | None, reason: str) -> None:
+def audit_skill(action: str, slug: str, source: str, scan: dict | None, reason: str) -> None:
     """One line in the agent's own audit log; never fails an install."""
     try:
         from flowly.audit.logger import AuditLogger

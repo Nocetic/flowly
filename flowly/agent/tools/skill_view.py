@@ -146,11 +146,14 @@ class SkillViewTool(Tool):
                 return skill_md.parent
             return None
 
-        for base in [self._workspace / "skills", self._managed_dir, self._builtin_dir]:
-            skill_dir = base / name
-            if (skill_dir / "SKILL.md").exists():
-                return skill_dir
-        return None
+        # The loader's own resolution: a built-in the owner removed, or a
+        # skill the agent turned off, is not there to read.
+        from flowly.agent.skills import SkillsLoader
+
+        skill_md = SkillsLoader(
+            self._workspace, builtin_skills_dir=self._builtin_dir, managed_skills_dir=self._managed_dir
+        ).skill_file(name)
+        return skill_md.parent if skill_md is not None else None
 
     @property
     def name(self) -> str:
@@ -233,7 +236,9 @@ class SkillViewTool(Tool):
 
         from flowly.agent.skills import SkillsLoader
 
-        loader = SkillsLoader(self._workspace, builtin_skills_dir=self._builtin_dir)
+        loader = SkillsLoader(
+            self._workspace, builtin_skills_dir=self._builtin_dir, managed_skills_dir=self._managed_dir
+        )
         query_terms = {
             token for token in query.lower().replace("-", " ").split() if token
         }

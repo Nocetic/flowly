@@ -149,8 +149,14 @@ class SkillsLoader:
 
     Loading priority (highest to lowest):
     1. Workspace skills (<workspace>/skills/)
-    2. Managed skills (~/.flowly/skills/) - installed via flowly-hub
-    3. Builtin skills (bundled with package)
+    2. Managed skills (~/.flowly/skills/) - the agent's built-in copies,
+       marketplace installs and its own
+    3. Builtin skills (bundled with package) - only a built-in the agent's
+       folder has not taken over yet (``flowly.skills.state``): one the owner
+       removed stays removed
+
+    A skill the agent turned off is left out of everything it reads unless
+    ``include_disabled`` asks for it (the apps' list shows it, switched off).
     """
 
     def __init__(
@@ -168,16 +174,24 @@ class SkillsLoader:
         self.managed_skills = managed_skills_dir or _managed_skills_dir()
         self.builtin_skills = builtin_skills_dir or BUILTIN_SKILLS_DIR
     
-    def list_skills(self, filter_unavailable: bool = True) -> list[dict[str, str]]:
+    def list_skills(
+        self,
+        filter_unavailable: bool = True,
+        *,
+        include_disabled: bool = False,
+    ) -> list[dict[str, str]]:
         """
         List all available skills.
 
         Args:
             filter_unavailable: If True, filter out skills with unmet requirements.
+            include_disabled: Also list the skills this agent turned off.
 
         Returns:
             List of skill info dicts with 'name', 'path', 'source'.
         """
+        from flowly.skills import state
+
         skills = []
 
         # Workspace skills (highest priority)
@@ -201,8 +215,17 @@ class SkillsLoader:
             for skill_dir in self.builtin_skills.iterdir():
                 if skill_dir.is_dir() and not skill_dir.name.startswith("."):
                     skill_file = skill_dir / "SKILL.md"
-                    if skill_file.exists() and not any(s["name"] == skill_dir.name for s in skills):
+                    if (
+                        skill_file.exists()
+                        and not any(s["name"] == skill_dir.name for s in skills)
+                        and state.builtin_loads_from_package(self.managed_skills, skill_dir.name)
+                    ):
                         skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "builtin"})
+
+        if not include_disabled:
+            off = state.disabled(self.managed_skills)
+            if off:
+                skills = [s for s in skills if s["name"] not in off]
 
         # Filter by requirements
         if filter_unavailable:
@@ -218,7 +241,7 @@ class SkillsLoader:
                   (``"<plugin>:<bare_name>"``).
 
         Returns:
-            Skill content or None if not found.
+            Skill content or None if not found (or turned off).
         """
         # Plugin-namespaced lookup (highest precedence — explicit).
         if ":" in name:
@@ -227,22 +250,27 @@ class SkillsLoader:
                 return plugin_skill_path.read_text(encoding="utf-8")
             return None
 
-        # Check workspace first (highest priority)
+        skill_file = self.skill_file(name)
+        return skill_file.read_text(encoding="utf-8") if skill_file else None
+
+    def skill_file(self, name: str, *, include_disabled: bool = False) -> Path | None:
+        """The SKILL.md the agent loads for *name*, in priority order (None: none, or off)."""
+        from flowly.skills import state
+
+        if not name or "/" in name or "\\" in name or name.startswith("."):
+            return None
+        if not include_disabled and name in state.disabled(self.managed_skills):
+            return None
         workspace_skill = self.workspace_skills / name / "SKILL.md"
         if workspace_skill.exists():
-            return workspace_skill.read_text(encoding="utf-8")
-
-        # Check managed skills (installed via flowly-hub)
+            return workspace_skill
         managed_skill = self.managed_skills / name / "SKILL.md"
         if managed_skill.exists():
-            return managed_skill.read_text(encoding="utf-8")
-
-        # Check built-in (lowest priority)
-        if self.builtin_skills:
+            return managed_skill
+        if self.builtin_skills and state.builtin_loads_from_package(self.managed_skills, name):
             builtin_skill = self.builtin_skills / name / "SKILL.md"
             if builtin_skill.exists():
-                return builtin_skill.read_text(encoding="utf-8")
-
+                return builtin_skill
         return None
     
     def load_skills_for_context(self, skill_names: list[str]) -> str:
@@ -311,6 +339,11 @@ class SkillsLoader:
                 except ValueError:
                     continue
                 manifest[f"{source}:{rel}"] = [st.st_mtime_ns, st.st_size]
+        # Removing a built-in or turning a skill off changes what the agent
+        # sees without touching any SKILL.md it still has.
+        from flowly.skills import state
+
+        manifest["@state"] = state.cache_key(self.managed_skills)
         return manifest
 
     def _load_disk_snapshot(self) -> dict | None:
@@ -562,10 +595,13 @@ class SkillsLoader:
         ``fallback_for_tools``).
         """
         # ── Tier 1: in-process LRU ────────────────────────────────────
+        from flowly.skills import state
+
         cache_key = (
             str(self.workspace_skills),
             str(self.managed_skills),
             str(self.builtin_skills),
+            json.dumps(state.cache_key(self.managed_skills)),
             tuple(sorted(available_tools)) if available_tools else (),
             max_chars,
             intent_text[:500].lower() if max_chars is not None else "",
@@ -701,7 +737,11 @@ class SkillsLoader:
         Returns:
             Metadata dict or None.
         """
-        content = self.load_skill(name)
+        if ":" in name:
+            content = self.load_skill(name)
+        else:
+            skill_file = self.skill_file(name, include_disabled=True)
+            content = skill_file.read_text(encoding="utf-8") if skill_file else None
         if not content:
             return None
         

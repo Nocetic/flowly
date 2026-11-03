@@ -4086,58 +4086,85 @@ def logs_events(params: dict) -> dict:
 # ── Skills ──────────────────────────────────────────────────────────────────
 
 
-def skills_list() -> dict:
-    """Installed skills (workspace + managed + builtin) in the rich shape the
-    desktop Skills UI expects."""
-    from flowly.agent.skills import SkillsLoader
+def _skills_home() -> Path:
+    """The agent's own skills folder (its built-in copies, installs and its own)."""
+    return get_flowly_home() / "skills"
 
-    ws = workspace_dir()
-    _src = {"builtin": "bundled", "managed": "marketplace", "workspace": "local"}
 
-    def _frontmatter(skill_file: Path) -> dict:
-        out: dict = {"category": "", "tags": []}
-        try:
-            text = skill_file.read_text(encoding="utf-8")
-        except Exception:
-            return out
-        if not text.startswith("---"):
-            return out
-        end = text.find("\n---", 3)
-        if end == -1:
-            return out
-        for line in text[3:end].splitlines():
-            line = line.strip()
-            if line.startswith("category:"):
-                out["category"] = line.split(":", 1)[1].strip().strip("\"'")
-            elif line.startswith("tags:"):
-                raw = line.split(":", 1)[1].strip().strip("[]")
-                out["tags"] = [t.strip().strip("\"'") for t in raw.split(",") if t.strip()]
+def _skill_frontmatter(skill_file: Path) -> dict:
+    out: dict = {"category": "", "tags": [], "description": ""}
+    try:
+        text = skill_file.read_text(encoding="utf-8")
+    except Exception:
         return out
+    if not text.startswith("---"):
+        return out
+    end = text.find("\n---", 3)
+    if end == -1:
+        return out
+    for line in text[3:end].splitlines():
+        line = line.strip()
+        if line.startswith("category:"):
+            out["category"] = line.split(":", 1)[1].strip().strip("\"'")
+        elif line.startswith("description:"):
+            out["description"] = line.split(":", 1)[1].strip().strip("\"'")
+        elif line.startswith("tags:"):
+            raw = line.split(":", 1)[1].strip().strip("[]")
+            out["tags"] = [t.strip().strip("\"'") for t in raw.split(",") if t.strip()]
+    return out
 
-    loader = SkillsLoader(ws)
+
+def skills_list() -> dict:
+    """The agent's skills in the shape the apps' Skills pages read.
+
+    Every skill it has, on or off (``enabled``), with where it came from
+    (``source``: bundled / marketplace / local) and whether the apps may
+    remove it (``removable``: a built-in copy or a marketplace install in
+    the agent's own folder; the owner's own skills are turned off, never
+    deleted from here). ``removedBuiltIns`` are the built-ins the owner
+    removed that this Flowly still ships, which ``skills.restore`` brings back.
+    """
+    from flowly.agent.skills import SkillsLoader
+    from flowly.skills import state
+
+    managed = _skills_home()
+    loader = SkillsLoader(workspace_dir(), managed_skills_dir=managed)
+    off = state.disabled(managed)
     skills = []
-    for s in loader.list_skills(filter_unavailable=False):
+    for s in loader.list_skills(filter_unavailable=False, include_disabled=True):
         name = s.get("name", "")
-        fm = _frontmatter(Path(s["path"])) if s.get("path") else {"category": "", "tags": []}
-        desc = ""
-        try:
-            desc = loader._get_skill_description(name) or ""
-        except Exception:
-            pass
-        source = _src.get(s.get("source", ""), "local")
+        path = Path(s["path"]) if s.get("path") else None
+        fm = _skill_frontmatter(path) if path else {"category": "", "tags": [], "description": ""}
+        source = (
+            state.provenance(managed, name, path.parent)
+            if path is not None and s.get("source") != "workspace"
+            else state.LOCAL
+        )
+        in_managed = path is not None and path.parent.parent.resolve() == managed.resolve()
         skills.append(
             {
                 "slug": name,
                 "name": name,
-                "description": desc,
+                "description": fm.get("description") or "",
                 "category": fm.get("category") or "General",
                 "tags": fm.get("tags") or [],
                 "source": source,
-                "isLocal": source == "local",
+                "isLocal": source == state.LOCAL,
                 "installed": True,
+                "enabled": name not in off,
+                "removable": in_managed and source in (state.BUNDLED, state.MARKETPLACE),
             }
         )
-    return {"skills": skills}
+    removed = []
+    for name in state.removed_builtins(managed):
+        fm = _skill_frontmatter(state.BUNDLED_DIR / name / "SKILL.md")
+        removed.append({
+            "slug": name,
+            "name": name,
+            "description": fm.get("description") or "",
+            "category": fm.get("category") or "General",
+        })
+    return {"skills": skills, "removedBuiltIns": removed}
 
 
 async def skills_install(params: dict) -> dict:
@@ -4184,28 +4211,123 @@ async def skills_install(params: dict) -> dict:
     }
 
 
-async def skills_remove(params: dict) -> dict:
-    """Remove one profile-managed skill; bundled skills are never targeted."""
-    slug = str(params.get("slug") or params.get("name") or "").strip()
-    if not slug:
-        raise FeatureRpcError("INVALID", "slug is required")
+def _skill_slug_param(params: dict, *keys: str) -> str:
+    for key in keys:
+        value = params.get(key)
+        if isinstance(value, str) and value.strip():
+            slug = value.strip()
+            if "/" in slug or "\\" in slug or slug.startswith(".") or len(slug) > 128:
+                raise FeatureRpcError("INVALID", "a skill's name is required")
+            return slug
+    raise FeatureRpcError("INVALID", "slug is required")
 
-    def _remove() -> bool:
+
+async def skills_remove(params: dict) -> dict:
+    """Remove a built-in copy or a marketplace install from the agent's folder.
+
+    A removed built-in stays removed (the package's copy is not loaded in its
+    place) until ``skills.restore``. The owner's own skills are never deleted
+    here (NOT_REMOVABLE): they can be turned off with ``skills.toggle``.
+    """
+    slug = _skill_slug_param(params, "slug", "name")
+
+    def _remove() -> str:
+        from flowly.agent.skills import SkillsLoader, clear_skills_snapshot
+        from flowly.hub.manager import SkillManager
+        from flowly.skills import state
+
+        managed = _skills_home()
+        skill_file = SkillsLoader(workspace_dir(), managed_skills_dir=managed).skill_file(
+            slug, include_disabled=True
+        )
+        if skill_file is None:
+            raise FeatureRpcError("NOT_FOUND", f"skill not found: {slug}")
+        source = state.provenance(managed, slug, skill_file.parent)
+        if skill_file.parent.parent.resolve() != managed.resolve() or source not in (
+            state.BUNDLED, state.MARKETPLACE,
+        ):
+            raise FeatureRpcError(
+                "NOT_REMOVABLE",
+                "Only a built-in or marketplace skill is removed here; your own skills can be turned off.",
+            )
+        with SkillManager(managed_dir=managed, workspace_dir=workspace_dir()) as manager:
+            if not manager.remove(slug):
+                raise FeatureRpcError("NOT_FOUND", f"skill not found: {slug}")
+        # A skill put back later starts on, as a new one would.
+        if slug in state.disabled(managed):
+            state.set_enabled(managed, slug, True)
+        clear_skills_snapshot()
+        return source
+
+    source = await asyncio.to_thread(_remove)
+    return {
+        "ok": True,
+        "restorable": source == "bundled",
+        "willRestart": bool(params.get("restart", True)),
+    }
+
+
+async def skills_toggle(params: dict) -> dict:
+    """Turn one of the agent's skills on or off (kept on disk either way)."""
+    slug = _skill_slug_param(params, "slug", "name")
+    enabled = params.get("enabled")
+    if not isinstance(enabled, bool):
+        raise FeatureRpcError("INVALID", "enabled must be true or false")
+
+    def _toggle() -> None:
+        from flowly.agent.skills import SkillsLoader, clear_skills_snapshot
+        from flowly.hub.manager import audit_skill
+        from flowly.skills import state
+
+        managed = _skills_home()
+        if SkillsLoader(workspace_dir(), managed_skills_dir=managed).skill_file(
+            slug, include_disabled=True
+        ) is None:
+            raise FeatureRpcError("NOT_FOUND", f"skill not found: {slug}")
+        state.set_enabled(managed, slug, enabled)
+        clear_skills_snapshot()
+        audit_skill("enable" if enabled else "disable", slug, "", None, "Changed by the owner.")
+
+    await asyncio.to_thread(_toggle)
+    return {"ok": True, "slug": slug, "enabled": enabled}
+
+
+async def skills_restore(params: dict) -> dict:
+    """Bring back a built-in the owner removed, as this Flowly ships it."""
+    slug = _skill_slug_param(params, "slug", "name")
+
+    def _restore() -> bool:
         from flowly.agent.skills import clear_skills_snapshot
+        from flowly.hub.manager import audit_skill
+        from flowly.skills import state
+
+        if not state.restore_builtin(_skills_home(), slug):
+            return False
+        clear_skills_snapshot()
+        audit_skill("restore", slug, "bundled", None, "Restored by the owner.")
+        return True
+
+    if not await asyncio.to_thread(_restore):
+        raise FeatureRpcError("NOT_FOUND", f"no removed built-in skill named {slug}")
+    return {"ok": True, "slug": slug}
+
+
+async def skills_preview(params: dict) -> dict:
+    """What installing ``source`` would add and the safety scan's verdict; installs nothing."""
+    source = str(params.get("source") or "").strip()
+    if not source:
+        raise FeatureRpcError("INVALID", "source is required")
+
+    def _preview():
         from flowly.hub.manager import SkillManager
 
-        with SkillManager(
-            managed_dir=get_flowly_home() / "skills",
-            workspace_dir=workspace_dir(),
-        ) as manager:
-            removed = manager.remove(slug)
-        if removed:
-            clear_skills_snapshot()
-        return removed
+        with SkillManager(managed_dir=_skills_home(), workspace_dir=workspace_dir()) as manager:
+            return manager.preview(source)
 
-    if not await asyncio.to_thread(_remove):
-        raise FeatureRpcError("NOT_FOUND", f"managed skill not found: {slug}")
-    return {"ok": True, "willRestart": bool(params.get("restart", True))}
+    result = await asyncio.to_thread(_preview)
+    if result is None:
+        raise FeatureRpcError("NOT_FOUND", f"could not fetch skill: {source}")
+    return {"ok": True, **result}
 
 
 # ── Knowledge graph ─────────────────────────────────────────────────────────
@@ -6187,6 +6309,9 @@ _DISPATCH: dict[str, tuple] = {
     "skills.list": (skills_list, False, False),
     "skills.install": (skills_install, True, True),
     "skills.remove": (skills_remove, True, True),
+    "skills.toggle": (skills_toggle, True, False),
+    "skills.restore": (skills_restore, True, False),
+    "skills.preview": (skills_preview, True, False),
     "kg.graph": (kg_graph, False, False),
     "kg.delete_entity": (kg_delete_entity, True, False),
     "sessions.list": (sessions_list, True, False),
@@ -6267,6 +6392,9 @@ LONG_RUNNING_METHODS = frozenset({
     "tools.semantic.enable",
     # A cold catalog sync walks every category over the network.
     "media.models.refresh",
+    # A marketplace download, scanned before anything is written.
+    "skills.install",
+    "skills.preview",
     # A blocking (``wait``) manual run lasts a whole agent turn. Without this
     # the relay transport's receive loop is stalled for its duration — no
     # pings, no Stop, no other RPC. Detached runs return at once and don't
