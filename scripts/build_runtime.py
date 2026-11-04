@@ -40,6 +40,13 @@ RUNTIME_DIR = "flowly-runtime"
 MANIFEST = "flowly-runtime.json"
 DEFAULT_PYTHON = "3.12"
 
+# The runtime carries every optional extra in pyproject.toml, so nothing is
+# downloaded after install (as the open agent's desktop bundle does), except:
+#   dev:    test and lint tools.
+#   screen: Linux only. Its own installer puts playwright and Chrome into a
+#           virtualenv on the machine (the cloud image), never into a runtime.
+LEFT_OUT_EXTRAS = frozenset({"dev", "screen"})
+
 # Every launch runs with -s (no user site-packages), -P (the working folder is
 # not on sys.path, so a checkout there can't shadow Core) and -B (Python never
 # writes .pyc files: the folder may sit inside a signed app; the build
@@ -127,11 +134,19 @@ def compile_stdlib(python: Path) -> None:
          "-x", r"[/\\](test|tests|lib2to3[/\\]tests|idle_test)[/\\]", stdlib])
 
 
+def runtime_extras(source: Path) -> list[str]:
+    """The optional extras the runtime installs: all of them but LEFT_OUT_EXTRAS."""
+    with (source / "pyproject.toml").open("rb") as f:
+        extras = tomllib.load(f)["project"].get("optional-dependencies", {})
+    return sorted(set(extras) - LEFT_OUT_EXTRAS)
+
+
 def install_core(source: Path, python: Path, work: Path) -> None:
     """Install the locked dependencies, then Core itself, into the runtime's Python."""
     requirements = work / "requirements.txt"
+    extras = [arg for extra in runtime_extras(source) for arg in ("--extra", extra)]
     exported = output(["uv", "export", "--frozen", "--no-dev", "--no-default-groups",
-                       "--no-emit-project", "--no-hashes", "--no-header",
+                       "--no-emit-project", "--no-hashes", "--no-header", *extras,
                        "--format", "requirements-txt"], cwd=source)
     requirements.write_text(exported + "\n")
     wheels = work / "wheel"

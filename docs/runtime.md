@@ -34,6 +34,8 @@ What the builder does, in order:
 2. **Python.** It copies uv's portable CPython into `python/` and removes its `EXTERNALLY-MANAGED` marker: this interpreter is ours to fill.
 3. **Standard library.** It byte-compiles the standard library.
 4. **Dependencies.** It installs exactly what `uv.lock` pins (`uv export --frozen --no-dev`), then installs Core's wheel with `--no-deps`. Everything is byte-compiled.
+   - Every optional extra in `pyproject.toml` goes in too, so nothing is downloaded after install. A new extra ships without touching the builder.
+   - Two stay out (`LEFT_OUT_EXTRAS`): `dev` (test tools) and `screen` (Linux only; its own installer puts playwright and Chrome into a virtualenv on the cloud machine).
 5. **Launchers and manifest.** It writes the launchers and `flowly-runtime.json`.
 6. **Smoke test.** It runs the launcher from a neutral folder, and the build fails unless:
    - it reports the tag's version;
