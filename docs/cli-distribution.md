@@ -4,7 +4,8 @@ This document defines the public install contract for Flowly CLI/TUI.
 
 Flowly Desktop and Flowly CLI are distributed differently:
 
-- Desktop ships an embedded Nuitka runtime inside the Electron app.
+- Desktop ships the Flowly runtime inside the Electron app: a portable Python
+  with Core, built from a release tag (`docs/runtime.md`).
 - CLI installs from a **git checkout**: the native script clones the repository,
   builds an isolated uv-managed virtualenv, and installs Flowly into it as an
   editable checkout. That checkout is what lets `flowly update` fast-forward with
@@ -96,7 +97,7 @@ executable.
 
 ## Desktop Runtime Note
 
-The Nuitka build workflow remains useful for Flowly Desktop. It produces the
-runtime that Desktop embeds in the app bundle. It should not be presented as the
-public CLI installation path, and `flowly update` no-ops inside it (the managed
-binary is owned by the desktop app's own updater).
+Flowly Desktop carries the Flowly runtime (`docs/runtime.md`), built by
+`scripts/build_runtime.py` and published with each Core release. It is not a
+CLI install path, and `flowly update` no-ops inside it (the desktop app's own
+updater replaces it).

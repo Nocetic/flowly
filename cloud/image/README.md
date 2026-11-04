@@ -74,13 +74,28 @@ the boot step logs that the agent will not dial the server and continues.
 
 ## Build and publish
 
+A release image is built from the Core release tag and labelled with its
+version, so the cloud computer runs the same Core (same source, same
+`uv.lock`) as the runtime Flowly Desktop carries:
+
 ```sh
 CTX=$(mktemp -d)/ctx
-cloud/image/build-context.sh "$CTX"
+cloud/image/build-context.sh "$CTX" --ref v3.4.0     # without --ref: this working tree, for trials
 cp cloud/image/fly.toml.example "$CTX/fly.toml"    # set app = the image's registry app
-(cd "$CTX" && fly deploy --build-only --push --remote-only --image-label <tag>)
-# → registry.fly.io/<app>:<tag>; machines of other apps in the org can use it.
+(cd "$CTX" && fly deploy --build-only --push --remote-only --image-label 3.4.0)
+# → registry.fly.io/<app>:3.4.0; machines of other apps in the org can use it.
 ```
+
+The image installs Core from source into a virtualenv (`uv sync --frozen`)
+instead of unpacking the runtime archive: the screen's optional Python
+packages install only into the agent's virtualenv
+(`flowly/desktop_runtime/python_installer.py`).
+
+Existing homes move to a new image with the server's
+`server/scripts/roll-cloud-image.ts --image <ref> --version <core version>`:
+one home first, then batches; each running machine must answer `/health`
+with the new version before the next batch, and the first failure stops it.
+New homes take the image in the server's `FLOWLY_CLOUD_IMAGE`.
 
 Use a long-lived org token (`fly tokens create org`) as `FLY_API_TOKEN` for the
 machine manager. `fly auth token` returns a user session token that flyctl rotates.
