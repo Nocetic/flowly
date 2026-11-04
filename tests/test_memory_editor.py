@@ -159,7 +159,10 @@ async def test_remote_editor_requires_profile_identity(monkeypatch, tmp_path):
     monkeypatch.setattr(profiles, '_PROFILES_ROOT', tmp_path / 'profiles')
     from flowly.profile_host import ProfileHost
     from flowly.profile_host_contract import ProfileHostError, validate_profile_rpc
-    for method in ('memory.editor.list', 'memory.editor.document', 'memory.editor.save'):
+    for method in ('memory.editor.list', 'memory.editor.document', 'memory.editor.save',
+                   'memory.gov_list', 'memory.review', 'memory.stats', 'memory.accept',
+                   'memory.reject', 'memory.correct', 'memory.feedback', 'memory.update_user',
+                   'memory.consolidate', 'memory.dream', 'memory.import_prompt', 'memory.import'):
         assert validate_profile_rpc(method, {}) == (method, {})
         host = ProfileHost()
         host._target_rpc = AsyncMock()

@@ -64,6 +64,22 @@ PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     "memory.editor.list": 30_000,
     "memory.editor.document": 30_000,
     "memory.editor.save": 30_000,
+    # The agent's memory as its owner reviews it: what it learned, the
+    # review queue, accept/reject (forget)/correct/feedback, and its profile
+    # of the owner. Each runs on the named agent's own governance store.
+    "memory.gov_list": 30_000,
+    "memory.review": 30_000,
+    "memory.stats": 30_000,
+    "memory.accept": 30_000,
+    "memory.reject": 30_000,
+    "memory.correct": 30_000,
+    "memory.feedback": 30_000,
+    "memory.update_user": 30_000,
+    # Tidying and importing call the agent's model.
+    "memory.consolidate": 180_000,
+    "memory.dream": 180_000,
+    "memory.import_prompt": 30_000,
+    "memory.import": 180_000,
     "mcp.capabilities": 30_000,
     "mcp.connections.list": 30_000,
     "mcp.connections.action": 60_000,

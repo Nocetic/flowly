@@ -45,6 +45,9 @@ def test_mobile_profile_rpc_surface_is_bot_scoped() -> None:
         "mcp.install",
         "skills.update",
         "cli.exec",
+        # The legacy flat memory read stays host-only; the review surface
+        # (memory.gov_list and friends) is the named agent's.
+        "memory.entries",
     ):
         with pytest.raises(ProfileHostError) as raised:
             validate_profile_rpc(forbidden, {})
