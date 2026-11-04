@@ -73,6 +73,10 @@ def _resolve_flowly_exec_argv() -> list[str]:
     """Resolve the executable argv prefix used for service definitions.
 
     Resolution order (highest priority first):
+      0. Running from a Flowly runtime (the folder Desktop ships, see
+         `flowly/runtime_bundle.py`) → this interpreter with `-s -P -m flowly`.
+         A PATH lookup there could find a developer's own checkout; `-P` keeps
+         the working folder off sys.path, so a checkout there can't shadow it.
       1. Running as a Nuitka-compiled standalone binary → use sys.executable,
          which points directly at the compiled binary (e.g. flowly-bin bundled
          inside an Electron app). This must win over PATH lookups so the
@@ -90,6 +94,12 @@ def _resolve_flowly_exec_argv() -> list[str]:
       4. `~/.local/bin/flowly` fallback.
       5. `uv run flowly` as a last resort.
     """
+    # (0) The Flowly runtime Desktop ships: run this interpreter, never PATH.
+    from flowly.runtime_bundle import runtime_root
+
+    if runtime_root() is not None:
+        return [str(Path(sys.executable)), "-s", "-P", "-m", "flowly"]
+
     # (1) Nuitka-compiled standalone or PyInstaller frozen binary.
     # For Nuitka, sys.executable points at the compiled binary (e.g. flowly-bin).
     # For regular Python, sys.executable points at the python interpreter.
