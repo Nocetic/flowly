@@ -101,6 +101,15 @@ def maybe_reexec_sandboxed() -> None:
     if "__compiled__" in globals() or getattr(sys, "frozen", False):
         return
 
+    #    The runtime Flowly Desktop carries in place of that compiled build
+    #    (its manifest names the host, see flowly/runtime_bundle.py) runs
+    #    as the compiled build did, so moving Desktop off the compiled build
+    #    does not change what the agent on a person's Mac may reach.
+    from flowly.runtime_bundle import runtime_host
+
+    if runtime_host() is not None:
+        return
+
     # 1. Recursion guard. Must be first — saves work in the inner run.
     if env.get(_RECURSION_MARKER) == "1":
         return

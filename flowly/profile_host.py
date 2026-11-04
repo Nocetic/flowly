@@ -144,7 +144,9 @@ def _runtime_command() -> list[str]:
     """Launch the same installed Flowly build as the owning gateway."""
     if getattr(sys, "frozen", False) or "__compiled__" in globals():
         return [sys.executable]
-    return [sys.executable, "-m", "flowly.cli.entry"]
+    from flowly.runtime_bundle import python_command
+
+    return [*python_command(), "-m", "flowly.cli.entry"]
 
 
 def _profile_runtime_environment() -> dict[str, str]:

@@ -31,7 +31,10 @@ def _callback_command() -> tuple[str, list[str]]:
         if not executable.is_file() or not os.access(executable, os.X_OK):
             raise ToolBridgeError("The bundled tool callback executable is unavailable")
         return str(executable), ["mcp", "tools"]
-    return sys.executable, ["-m", "flowly", "mcp", "tools"]
+    from flowly.runtime_bundle import python_command
+
+    executable, *flags = python_command()
+    return executable, [*flags, "-m", "flowly", "mcp", "tools"]
 
 
 @asynccontextmanager
