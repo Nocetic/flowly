@@ -1,6 +1,6 @@
 # Model settings, provider sign-ins and Grok by device code (2026-11-01 – 2026-11-02)
 
-Status (2026-11-02): on `main`, pushed to `Nocetic/flowly-core`.
+Status (2026-11-02): on `main`, pushed.
 
 This page records what Core gained for the model settings window that every
 app now shows (Desktop, iOS, Android), and why each rule is the way it is. The

@@ -1,6 +1,6 @@
 # The first ten minutes: fixes from an outside audit
 
-Status: branch `fix/first-ten-minutes` (2026-10-28), not merged, not pushed.
+Status: on `main` since 2026-10-28.
 Engineering gotchas found along the way are in [`notes.md`](../../notes.md).
 
 ## Where this came from

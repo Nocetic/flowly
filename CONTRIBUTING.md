@@ -1,11 +1,13 @@
-# Contributing to Flowly Core
+# Contributing to Flowly
 
-Where things live and how to get a change merged. To get Core running, start
-with the [README](README.md#run-core-from-a-checkout).
+Thanks for helping improve Flowly! This guide covers the dev setup, where things
+live, and how to get a change merged. It's short on purpose — when in doubt, read
+the code or open a [discussion](https://github.com/Nocetic/flowly/issues).
 
-> **Scope of this repo.** Core: the `flowly` CLI, the gateway, providers,
-> tools, skills, memory and channels, plus the cloud computer image. The
-> server, Desktop and the mobile apps are separate repos (see the README).
+> **Scope of this repo.** This is the open-source agent core: the `flowly` CLI,
+> the gateway, providers, tools, skills, and channel adapters. The native
+> Mac/iOS/Android apps and the hosted relay are separate, closed components — see
+> [DESKTOP_VS_OSS.md](content/docs/using-flowly/desktop-vs-oss.md). PRs here target the CLI/gateway.
 
 ---
 
@@ -27,8 +29,10 @@ Most new capabilities should be a **skill** or a **plugin**, not a core tool.
 
 ## Development setup
 
-The README has the whole loop: clone, `login --no-relay`, `server connect`,
-`gateway`. This section only adds the tools around it.
+Flowly keeps everything it knows in one place — `~/.flowly` — and a checkout
+uses that same state. That is deliberate: your providers, memory, channels and
+Desktop all keep working while you develop, because there is only ever one
+config. No second account, no state to keep in sync.
 
 ### Prerequisites
 
@@ -54,13 +58,104 @@ sudo apt install -y ffmpeg ripgrep           # Debian / Ubuntu
 winget install Gyan.FFmpeg BurntSushi.ripgrep.MSVC   # Windows
 ```
 
-### Two things not to do in a checkout
+### The loop
 
-- Don't run `flowly update`: it is the *user* update path and acts on the
-  checkout it runs from (stash, `git pull --ff-only`, reinstall, restart).
-  Use `git` directly.
-- Don't use Desktop's own start/restart control while your gateway is up: it
-  reinstalls the service onto the port and takes yours down.
+```bash
+git clone https://github.com/Nocetic/flowly.git
+cd flowly
+
+uv run flowly setup       # only on a machine that has never run Flowly
+uv run flowly gateway
+```
+
+`uv run` builds the virtualenv and installs Flowly on first use, so there is no
+separate install step. The gateway then serves its usual port (18790) against
+your real `~/.flowly`. Edit code, restart, repeat.
+
+**`setup` is for the empty machine.** Flowly needs one provider before the
+agent can answer anything, and a fresh checkout inherits nothing — there is no
+config yet to inherit from. `flowly setup` asks that one question (sign in, or
+paste a key) and is a no-op for anyone who already uses Flowly, so it is safe
+to run either way. Skip it and `flowly gateway` stops with
+`Error: No LLM provider available` and the same instruction, which works but
+wastes a round trip.
+
+A gateway with no messaging channel is normal for development — you talk to it
+from the terminal (`flowly`) or from Flowly Desktop. It says so at startup;
+`flowly setup channels` is there when you actually want Telegram or Slack.
+
+**If Flowly is already installed and running,** its background service holds
+that port — and the gateway handles the handover itself. It detects the
+service, asks before stopping it, serves the port from your checkout, and
+reinstalls + restarts the service when you exit (Ctrl+C included). Only the
+machine's own service is ever touched; anything else on the port is left alone
+and surfaces as the normal bind error. Without a terminal it refuses and
+prints the two commands (`flowly service stop`, then
+`flowly service install --start`) so automation never stops a service
+silently. Don't `kill` the service by hand — launchd (`KeepAlive`) and systemd
+(`Restart=always`) bring it straight back; that's exactly why the gateway does
+this dance for you.
+
+For tests and lint, add the dev tooling once:
+
+```bash
+uv pip install -e ".[dev]"    # pytest + ruff
+uv run pytest
+uv run ruff check flowly/
+```
+
+**Trap worth knowing:** the `flowly` on your PATH is your *installed* copy, not
+this checkout — `install.sh` puts its own checkout in
+`~/.local/share/flowly/repo`, and `uv tool install` lives under
+`~/.local/share/uv/tools/`. Inside the checkout, run the CLI through
+`uv run flowly …` so you're exercising your code.
+
+### Desktop and iOS
+
+Run `uv run flowly login --no-relay` and `uv run flowly server connect` once
+(see the [README](README.md#develop-from-source)). The apps reach your machine
+through the Flowly server, and the gateway on that machine is now your
+checkout, so Desktop, iOS and Android talk to your code with your real account
+and channels.
+
+While your foreground gateway is up, don't use Desktop's own start/restart
+control: it runs `flowly service install --port … --start --force`, which puts
+the installed build back on the port and takes yours down.
+
+### When you need an isolated instance
+
+Sometimes sharing the real state is wrong: a migration that rewrites memory, a
+destructive experiment, or a second agent you want running beside your own.
+`scripts/dev-install.sh` builds a separate instance — its own home, its own
+gateway port (18890), its own entry on the Flowly server, and every copied
+channel disabled so two agents never fight over one Telegram token.
+
+```bash
+mkdir ~/flowly-isolated && cd ~/flowly-isolated
+bash /path/to/flowly/scripts/dev-install.sh
+
+./flowly-dev            # this instance's CLI — never `uv run flowly`, which
+./flowly-dev gateway    # targets ~/.flowly instead
+```
+
+It copies your real `~/.flowly/config.json` when there is one, so providers and
+keys work immediately; otherwise it runs the normal `flowly setup` wizard. The
+copy drops your machine's Flowly server entry, so the isolated instance can
+never re-register (and rotate the secret of) your real machine.
+
+To see it in the apps, give it its own entry on the Flowly server. It shows up
+in Desktop, iOS and Android beside your real machine:
+
+```bash
+./flowly-dev login --no-relay
+./flowly-dev server connect --name "<machine> dev"
+```
+
+### Don't run `flowly update` in your checkout
+
+It is the *user* update path, and it acts on whatever checkout it's running
+from: fetch, autostash your uncommitted work, `git pull --ff-only`, reinstall
+dependencies, restart the gateway. Use `git` directly on a dev clone.
 
 ---
 
@@ -99,7 +194,7 @@ flowly/
 ├── sandbox/        # sandbox-exec (macOS) / bwrap (Linux) re-exec wrapper
 ├── config/         # config.json schema + loader (camelCase → snake_case)
 ├── session/  board/  cron/  mcp/  voice/  multiagent/  …
-cloud/image/        # the cloud computer's image (Fly)
+cloud/image/        # the image a Flowly cloud computer runs
 tests/              # 100+ test modules
 ```
 
@@ -205,9 +300,9 @@ docs(readme): clarify BYOK cascade order
 
 ## Reporting issues
 
-Use [GitHub Issues](https://github.com/Nocetic/flowly-core/issues). Include
-your OS, Python version, `flowly --version`, the full traceback, and steps to
-reproduce. Search existing issues first.
+Use [GitHub Issues](https://github.com/Nocetic/flowly/issues). Include your OS,
+Python version, `flowly` version, the full traceback, and steps to reproduce.
+Search existing issues first.
 
 ---
 

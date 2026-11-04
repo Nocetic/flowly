@@ -61,7 +61,7 @@
 
 set -euo pipefail
 
-FLOWLY_REPO_URL="${FLOWLY_REPO_URL:-https://github.com/Nocetic/flowly-core.git}"
+FLOWLY_REPO_URL="${FLOWLY_REPO_URL:-https://github.com/Nocetic/flowly.git}"
 FLOWLY_BRANCH="${FLOWLY_BRANCH:-main}"
 FLOWLY_DEV_PORT="${FLOWLY_DEV_PORT:-18890}"
 FLOWLY_PYTHON="${FLOWLY_PYTHON:-3.12}"

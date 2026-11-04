@@ -1,116 +1,256 @@
-# Flowly Core (private)
+<div align="center">
+  <img src="assets/banner.png" alt="Flowly — the personal AI agent you own, everywhere you are" width="100%">
+  <p>
+    <img src="https://img.shields.io/badge/python-≥3.11-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python">
+    <img src="https://img.shields.io/badge/macOS%20·%20Linux%20·%20Windows-14181F?style=for-the-badge" alt="Platform">
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-3B82F6?style=for-the-badge" alt="License"></a>
+  </p>
+</div>
 
-Core is the agent: the gateway, the agent loop, tools, skills, memory and
-channels. It runs in three places:
+<p align="center"><b>Knows your world. Answers to you.</b></p>
 
-- **On a user's Mac.** Flowly Desktop carries it compiled
-  (`Flowly.app/Contents/Helpers/FlowlyAgent.app`) and runs it as the
-  `ai.flowly.gateway` service.
-- **On a cloud computer.** One Fly machine per paying user, built from
-  [`cloud/image`](cloud/image/README.md).
-- **From your checkout**, while you develop.
+**Flowly is the personal AI agent you own** — it runs on _your_ machine, on _your_ LLM keys, and gets better the longer you use it. One governed **memory of your world** that learns across conversations and corrects itself, one library of skills, one agent that meets you on every channel you already use. It acts on your behalf in a visible, sandboxed loop, schedules its own work, and connects to anything that speaks [MCP](content/docs/features/mcp.md) — from a $5 VPS, a Mac mini, or the laptop in front of you. **Open source, yours to run, no account required.**
 
-Wherever it runs, Core connects out to the Flowly server
-(`wss://cloud.useflowlyapp.com/v1/agent`). The apps never talk to Core
-directly: they sign in to a Flowly account, and the server shows them every
-computer and agent on that account. The relay code is still here for older
-installs; new work uses the server.
+<div align="center">
+  <img src="assets/demo-tui.png" alt="Flowly terminal UI" width="80%">
+  <br><br>
+  <img src="assets/demo-desktop.gif" alt="Flowly Desktop" width="80%">
+  <br><br>
+  <img src="assets/demo-mobile.gif" alt="Flowly on iOS and Android" width="80%">
+</div>
 
-## The repos
+<div align="center">
+  <img src="assets/diagram.png" alt="Channels → Flowly core → your LLM provider (BYOK) or Flowly Cloud" width="100%">
+</div>
 
-| Repo | What |
-|---|---|
-| `Nocetic/flowly-core` (this one) | Core and the cloud computer image |
-| `Nocetic/flowly-server` | The Flowly server, its protocol (`server/PROTOCOL.md`) and the internal docs (`docs/cloud/`: decisions, roadmap, log) |
-| `Nocetic/flowly-bots-desktop` | Flowly Desktop (macOS, Windows, Linux) |
-| `Nocetic/Flowly-iOS`, `Nocetic/flowly-android` | The mobile apps |
-| `hakansoren/flowlyai-build` | Compiles Core (Nuitka) for Desktop |
-| `Nocetic/flowly` | The public open-source Core, frozen on 2026-10-26; nothing is pushed there |
+---
 
-## Run Core from a checkout
-
-You need [uv](https://docs.astral.sh/uv/) and Git. uv installs Python itself.
+## Quick start
 
 ```bash
-git clone https://github.com/Nocetic/flowly-core.git ~/flowly-core
-cd ~/flowly-core
-uv run flowly login --no-relay
-uv run flowly server connect
+# Install — sets up uv, Python, and Flowly itself; `flowly update` keeps it current
+curl -fsSL https://useflowlyapp.com/install.sh | bash     # macOS / Linux
+irm https://useflowlyapp.com/install.ps1 | iex            # Windows (PowerShell)
+
+# First-time setup — pick an LLM provider, add any channels
+flowly setup
+
+# Start chatting (bare `flowly` opens the terminal UI)
+flowly
+```
+
+`flowly setup` walks you through a provider (OpenRouter, Anthropic, OpenAI, Gemini, Groq, xAI/Grok, Zhipu, or a local model) and any channels you want. Two minutes, done. Add a Telegram bot? `flowly setup` → Telegram → paste token. The gateway hot-reloads each channel as you save.
+
+To keep the agent running with nobody at the terminal — channels reachable,
+cron firing, across reboots:
+
+```bash
+flowly service install --start    # launchd (macOS) / systemd (Linux) / Task Scheduler (Windows)
+```
+
+---
+
+## What's inside
+
+<table>
+<tr>
+  <td width="30%"><b>One agent, every channel</b></td>
+  <td>Terminal TUI · Telegram · Discord · Slack · Microsoft Teams · WhatsApp · iMessage · Email · voice. A single gateway process speaks to all of them, with one conversation memory shared across every surface. Native Mac / iOS / Android apps and a browser extension come via <a href="https://useflowlyapp.com">Flowly Cloud</a> (optional).</td>
+</tr>
+<tr>
+  <td><b>40+ first-class tools</b></td>
+  <td>Workspace-sandboxed file I/O and an allowlisted shell with per-command approval; web search + page fetch + live X/Twitter; macOS computer-use (Accessibility control, screenshots, browser-tab + clipboard); PDF/DOCX/XLSX/PPTX, image generation, <code>video_analyze</code>; Linear, Trello, Home Assistant, and Google Workspace (Calendar, Contacts, Drive, Tasks).</td>
+</tr>
+<tr>
+  <td><b>A closed learning loop</b></td>
+  <td>Every fact you share becomes part of a governed <b>memory of your world</b> with a calibrated trust score — 👍/👎 to retune it, and a background consolidation pass merges duplicates and retires stale notes. Structured facts also land in a <b>knowledge graph</b>. Opt in and Flowly mines your recurring procedures to <b>write and refine its own skills</b>, every change snapshotted and reversible. → <a href="docs/memory-governance-architecture.md">memory</a> · <a href="docs/skill-self-improvement-architecture.md">skills</a></td>
+</tr>
+<tr>
+  <td><b>135 built-in skills</b></td>
+  <td>Plus skill <b>bundles</b> (one keystroke enables a whole stack) and drop-in Markdown skills. Compatible with the open <a href="https://agentskills.io">agentskills.io</a> standard.</td>
+</tr>
+<tr>
+  <td><b>Delegates and parallelizes</b></td>
+  <td>Spawn isolated sub-agents for parallel workstreams (<code>delegate</code>, <code>spawn</code>), run a cross-channel <b>task board</b> sequentially or in parallel (<a href="content/docs/features/board.md">task board docs</a>), and hand heavy coding off to a local <b>Codex</b> session (opt-in).</td>
+</tr>
+<tr>
+  <td><b>MCP, both directions</b></td>
+  <td>Connect any <a href="content/docs/features/mcp.md">MCP</a> server (<code>flowly mcp install …</code>) <i>and</i> run Flowly itself as an MCP server (<code>flowly mcp serve</code>) for Claude Desktop, Cursor, or Claude Code.</td>
+</tr>
+<tr>
+  <td><b>Scheduled & unattended</b></td>
+  <td>Built-in <b>cron</b> — schedule any natural-language prompt and deliver the result to any channel. Run the gateway as a background service that survives reboots.</td>
+</tr>
+<tr>
+  <td><b>Yours to extend & contain</b></td>
+  <td>Full Python <b>plugins</b> (tools, slash commands, channels, lifecycle hooks → <a href="content/docs/features/plugins.md">plugins</a>), switchable <b>personas</b>, and a <b>sandbox</b> (macOS <code>sandbox-exec</code>, Linux <code>bwrap</code>; opt out with <code>FLOWLY_SANDBOX=0</code>).</td>
+</tr>
+</table>
+
+---
+
+## Providers — bring your own key
+
+Adapters for **[OpenRouter](https://openrouter.ai), [Anthropic](https://www.anthropic.com), [OpenAI](https://openai.com), [Google Gemini](https://ai.google.dev), [Groq](https://groq.com), [xAI / Grok](https://x.ai), [Zhipu / GLM](https://z.ai)**, any **OpenAI-compatible local model** ([Ollama](https://ollama.com), [LM Studio](https://lmstudio.ai), [vLLM](https://github.com/vllm-project/vllm)), and a hosted **Flowly Cloud** option. Sign in to xAI with your **SuperGrok / X Premium+** subscription instead of an API key. Switch any time:
+
+```bash
+flowly                     # open the chat
+/provider openrouter       # pick provider
+/model anthropic/claude-haiku-4.5
+```
+
+Or edit `~/.flowly/config.json`. When nothing is pinned, Flowly cascades through whatever you've configured (OpenRouter → Anthropic → OpenAI → xAI → …) so it always has a working model.
+
+---
+
+## CLI vs messaging — quick reference
+
+Two entry points: start the terminal UI with `flowly`, or run the gateway and talk to Flowly from Telegram, Discord, Slack, WhatsApp, iMessage, or email. Once you're in a conversation, most slash commands work the same in both.
+
+| Action | Terminal (TUI) | Messaging channels |
+|---|---|---|
+| Start chatting | `flowly` | `flowly setup` → add channel, then message your agent |
+| New / reset conversation | `/new` | `/new` |
+| Change model / provider | `/model`, `/provider` | `/model`, `/provider` |
+| Switch persona | `/persona [name]` | `/persona [name]` |
+| Browse & run skills | `/skills` or `/<skill>` | `/<skill>` |
+| Inspect / correct memory | `/memory`, `flowly memory list` | `/memory` |
+| Sessions & history | `/sessions` | `/sessions` |
+| Interrupt current work | `Ctrl+C` or send a message | `/stop` or send a message |
+
+---
+
+## Self-host or cloud
+
+Flowly's agent core is **Apache 2.0**. Self-host on your laptop, a VPS, or a Mac mini — your keys, your data, your machine. **Everything in this repo works with no Flowly account.** → [self-hosting guide](content/docs/using-flowly/self-hosting.md) · [open source vs. Desktop/Cloud](content/docs/using-flowly/desktop-vs-oss.md)
+
+Optional [Flowly Cloud](https://useflowlyapp.com) adds the native Mac/iOS/Android apps, cross-device sync, hosted LLM access, and a managed relay that keeps your agent reachable when your laptop sleeps. Sign-in is opt-in (`flowly login`) and only affects the cloud features; the agent is unchanged.
+
+---
+
+## Common commands
+
+```bash
+flowly                         # terminal chat (TUI)
+flowly setup                   # interactive wizard (LLM, channels, integrations)
+flowly agent -m "..."          # one-shot prompt
+flowly service install --start # run the gateway as a background service
+flowly restart                 # smart restart (launchd / systemd / Task Scheduler)
+flowly doctor                  # diagnose config + runtime health
+flowly memory list             # inspect / correct long-term memory
+flowly skill mine --dry-run    # preview self-improved skills (opt-in subsystem)
+flowly mcp install <name>      # add an MCP server from the catalog
+flowly mcp serve               # expose Flowly as an MCP server
+flowly login / logout          # Flowly Cloud account (optional)
+```
+
+Other command groups: `flowly channels · cron · plugins · skills · bundles · persona · codex · xai · sessions · approvals · pairing`. Full reference: `flowly --help`.
+
+---
+
+## Architecture
+
+<div align="center">
+  <img src="assets/architecture.png" alt="Flowly architecture: clients → gateway (running inside the sandbox) → your LLM provider" width="100%">
+</div>
+
+The gateway runs as a local daemon, and the **whole process runs inside the OS sandbox** (`sandbox-exec` on macOS, `bwrap` on Linux). Channels route through an in-process message bus; the TUI, desktop, and mobile apps connect as clients over one WebSocket protocol (`ws://127.0.0.1:18790`) — desktop and mobile can also reach it remotely via the Flowly Cloud relay. Config lives at `~/.flowly/config.json`, shared by every client. → [internal RPC protocol](docs/internal-gateway-rpc-architecture.md)
+
+---
+
+## Develop from source
+
+Clone it anywhere and run it. Flowly keeps its state in one place — `~/.flowly`
+— and a checkout uses that same state, so there is no second config to keep in
+sync and nothing to set up twice:
+
+```bash
+git clone https://github.com/Nocetic/flowly.git
+cd flowly
+
+uv run flowly setup       # first time on this machine: pick a provider
+uv run flowly gateway     # your code, serving the usual gateway port
+```
+
+**Already use Flowly?** Skip the first line — your provider, memory and
+channels are already there, and the gateway will use them. **New to it?** The
+agent can't answer without a provider, so `setup` is the one step that isn't
+optional; it takes a minute and you never repeat it.
+
+**Using the Flowly apps?** Sign in to your Flowly account instead of `setup`,
+and register this machine once:
+
+```bash
+uv run flowly login --no-relay   # sign in; --no-relay skips the old relay entry
+uv run flowly server connect     # this machine shows up in Desktop, iOS and Android
 uv run flowly gateway
 ```
 
-1. **`login`** opens the browser to sign in to your Flowly account and saves
-   the account key the agent's models bill to. No provider setup is needed.
-   `--no-relay` skips the old "reach from your phone" relay entry; the server
-   replaces it.
-2. **`server connect`** registers this Mac on your account and writes the
-   server address, the Mac's id and its secret into `~/.flowly/config.json`
-   (`channels.flowlyServer`). Run it once; running it again re-registers the
-   same Mac.
-3. **`gateway`** runs your code. It connects to the server, and from then on
-   the apps see this Mac.
+That's it. Edit, restart, repeat.
 
-Then sign in to Flowly Desktop, iOS or Android with the same account. The Mac
-shows up under its name, and agents you create there run from your checkout.
-No IP, port, token or QR code is involved.
+If Flowly is already installed and running, its service holds that port — and
+the gateway handles the handover itself: it asks, stops the service, serves in
+its place, and restores the service when you press Ctrl+C. Nothing else to
+learn.
 
-Edit, stop the gateway with Ctrl+C, start it again.
-
-### Where to put the checkout
-
-Clone it into your home folder, not under `~/Desktop`, `~/Documents` or
-`~/Downloads` (macOS can keep background processes out of those), and don't
-move it afterwards: `.venv` remembers the absolute path. When Core can't read
-the checkout, creating an agent fails with `No module named 'flowly.cli'`.
-
-### Your state
-
-Core keeps everything in `~/.flowly`: config, memory, sessions, each agent's
-home under `~/.flowly/profiles/`. A checkout uses the same folder as an
-installed Flowly.
-
-If Flowly Desktop is installed, its agent service already holds the gateway
-port (18790). `uv run flowly gateway` asks before stopping it, serves the port
-itself, and puts the service back when you press Ctrl+C. Don't kill the
-service by hand; launchd starts it again.
-
-## Tests and lint
+Tests and lint:
 
 ```bash
-uv run --extra dev pytest
-uv run --extra dev ruff check flowly/
+uv pip install -e ".[dev]"    # pytest + ruff
+uv run pytest                 # ~3,800 tests, about a minute
+uv run ruff check flowly/
 ```
 
-Tests set their own `FLOWLY_HOME` and never touch `~/.flowly`. CI runs both on
-pushes to `main` and on pull requests (`.github/workflows/ci.yml`).
+**Working on Flowly Desktop or the iOS app?** Nothing extra — they connect to
+the gateway on its usual port, which is now yours.
 
-## Traps
+**Want an instance that can't touch your real one?** For risky work — a
+migration, a destructive experiment, a second agent running side by side —
+`scripts/dev-install.sh` builds a fully isolated instance (its own home, port,
+and account). It's the exception, not the starting point.
 
-- **The `flowly` on your PATH is not your checkout.** It is whatever Desktop
-  or `uv tool install` put there. Inside the checkout, always run
-  `uv run flowly …`.
-- **Don't run `flowly update` in your checkout.** It stashes your changes,
-  pulls and restarts.
-- **Don't say yes to the relay** if `login` asks. It creates a second entry
-  for the same Mac.
-- **A second, isolated instance** (a migration that rewrites memory, a
-  destructive experiment): `scripts/dev-install.sh` builds one with its own
-  home and port. It drops your Mac's server entry from the copied config, so
-  its `./flowly-dev server connect` adds a separate computer to your account.
+Full walkthrough — system dependencies, the isolated instance, PR conventions —
+in **[CONTRIBUTING.md](CONTRIBUTING.md#development-setup)**.
 
-## Where Core ships
+---
 
-- **Desktop:** `flowlyai-build`'s `nuitka-binary.yml` compiles `main` of
-  this repo; Desktop's `scripts/stage-agent-runtime.sh` takes a build into
-  the app.
-- **Cloud computer:** `cloud/image` builds Core from this repo's tracked files.
+## Documentation
 
-So `main` is what the next release runs. Push to it only with Hakan's OK.
+**Full docs:** [useflowlyapp.com/docs](https://useflowlyapp.com/docs) — searchable, with everything below. The Markdown sources live in [`content/docs/`](content/docs).
 
-## More
+- [MCP](content/docs/features/mcp.md) — connect external MCP servers + run Flowly as an MCP server
+- [Plugins](content/docs/features/plugins.md) — extend Flowly with custom tools, hooks, commands, skills
+- [Task board](content/docs/features/board.md) — the cross-channel task board (sequential + parallel agents)
+- [Self-hosting](content/docs/using-flowly/self-hosting.md) — run Flowly on your own machine or a VPS
+- [Open source vs. Desktop & Cloud](content/docs/using-flowly/desktop-vs-oss.md) — what's in this repo vs. the apps
+- [Security](SECURITY.md) — trust model + vulnerability reporting
+- [Contributing](CONTRIBUTING.md) — dev setup, project layout, PR process
+- **Engineering deep-dives:** [memory governance](docs/memory-governance-architecture.md) · [skill self-improvement](docs/skill-self-improvement-architecture.md) · [internal gateway RPC](docs/internal-gateway-rpc-architecture.md)
 
-- [CONTRIBUTING.md](CONTRIBUTING.md): project layout, skills, plugins and
-  tools, commit and PR conventions.
-- [SECURITY.md](SECURITY.md): the trust model.
-- `content/docs/`: the user docs published at useflowlyapp.com/docs.
-- `flowly --help`: every command.
+---
+
+## Community
+
+- 🐛 [Issues](https://github.com/Nocetic/flowly/issues) — bugs and feature requests
+- 🌐 [useflowlyapp.com](https://useflowlyapp.com) — apps, hosted cloud, and docs
+- 📚 [agentskills.io](https://agentskills.io) — the open skills standard Flowly speaks
+
+---
+
+## Status
+
+Flowly was open-source in v1.x, closed during the v2 rewrite, and is back open under **Apache 2.0**. The agent, 40+ tools, 135 skills, and every channel adapter in this repo are the same code that ships inside the Flowly Desktop app — there is no separate "lite" build.
+
+Active development. Issues and PRs welcome.
+
+---
+
+## License
+
+[Apache 2.0](LICENSE). Fork it, ship it, embed it. Self-hosted use with your own LLM keys is unrestricted. Commercial use of *Flowly Cloud* credentials (account / relay / gateway tokens) is governed by our [Acceptable Use Policy](https://useflowlyapp.com/terms#acceptable-use) — broadly: use them via official Flowly clients, not custom harnesses that proxy our subscription.
+
+---
+
+## Acknowledgments
+
+Inspired by [Claude Code](https://github.com/anthropics/claude-code) (Anthropic) and the broader open-source agent community. Built by [Nocetic Limited](https://useflowlyapp.com).
