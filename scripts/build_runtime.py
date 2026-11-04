@@ -40,6 +40,10 @@ RUNTIME_DIR = "flowly-runtime"
 MANIFEST = "flowly-runtime.json"
 DEFAULT_PYTHON = "3.12"
 
+# Every launch runs with -s (no user site-packages), -P (the working folder is
+# not on sys.path, so a checkout there can't shadow Core) and -B (Python never
+# writes .pyc files: the folder may sit inside a signed app; the build
+# compiles everything ahead instead).
 UNIX_LAUNCHER = """#!/bin/sh
 # Flowly CLI: runs Core on the Python that ships beside it.
 # Follows symlinks, so a link on PATH (~/.local/bin/flowly) works.
@@ -52,12 +56,12 @@ while [ -L "$self" ]; do
   esac
 done
 here=$(cd "$(dirname "$self")" && pwd -P)
-exec "$here/../python/bin/python3" -s -P -m flowly "$@"
+exec "$here/../python/bin/python3" -s -P -B -m flowly "$@"
 """
 
 WINDOWS_LAUNCHER = """@echo off
 rem Flowly CLI: runs Core on the Python that ships beside it.
-"%~dp0..\\python\\python.exe" -s -P -m flowly %*
+"%~dp0..\\python\\python.exe" -s -P -B -m flowly %*
 """
 
 
@@ -115,6 +119,14 @@ def install_python(version: str, work: Path, destination: Path) -> Path:
     return exe
 
 
+def compile_stdlib(python: Path) -> None:
+    """Byte-compile the standard library: the runtime runs with -B, so nothing compiles later."""
+    stdlib = output([python, "-I", "-c", "import sysconfig; print(sysconfig.get_paths()['stdlib'])"])
+    # The test suites hold files that are invalid on purpose.
+    run([python, "-I", "-m", "compileall", "-q", "-j", "0",
+         "-x", r"[/\\](test|tests|lib2to3[/\\]tests|idle_test)[/\\]", stdlib])
+
+
 def install_core(source: Path, python: Path, work: Path) -> None:
     """Install the locked dependencies, then Core itself, into the runtime's Python."""
     requirements = work / "requirements.txt"
@@ -149,16 +161,25 @@ def smoke_test(runtime: Path, version: str) -> None:
     python = runtime / "python" / ("python.exe" if sys.platform == "win32" else "bin/python3")
     # From a neutral folder: run from the checkout, `-m flowly` would quietly
     # import the checkout's code instead of the runtime's.
+    before = _files(runtime)
     with tempfile.TemporaryDirectory(prefix="flowly-runtime-smoke-") as neutral:
         reported = output([launcher, "--version"], env=env, cwd=neutral)
         if version not in reported:
             raise SystemExit(f"build_runtime: launcher reports {reported!r}, expected {version}")
-        located = output([python, "-s", "-P", "-c",
+        located = output([python, "-s", "-P", "-B", "-c",
                           "import flowly, flowly.cli.commands, flowly.gateway.server, "
                           "fitz, PIL, cryptography, pydantic_core; print(flowly.__file__)"],
                          env=env, cwd=neutral)
     if not Path(located).resolve().is_relative_to(runtime.resolve()):
         raise SystemExit(f"build_runtime: Core imported from {located}, outside the runtime")
+    # Inside a signed app a written file breaks the signature's seal.
+    written = sorted(_files(runtime) - before)
+    if written:
+        raise SystemExit(f"build_runtime: running Core wrote into the runtime: {written[:5]}")
+
+
+def _files(root: Path) -> set[str]:
+    return {str(p.relative_to(root)) for p in root.rglob("*")}
 
 
 def archive(runtime: Path, out: Path, name: str) -> Path:
@@ -198,6 +219,7 @@ def main() -> None:
         version = tomllib.loads((source / "pyproject.toml").read_text())["project"]["version"]
         runtime.mkdir()
         python = install_python(args.python, work, runtime / "python")
+        compile_stdlib(python)
         install_core(source, python, work)
 
     write_launchers(runtime)
