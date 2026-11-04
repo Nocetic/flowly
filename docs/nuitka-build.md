@@ -1,3 +1,8 @@
+> **Retired (2026-11-04).** Flowly Desktop no longer carries a Nuitka build: it
+> carries the Flowly runtime (`docs/runtime.md`). This page describes the old
+> build, kept for history; `scripts/nuitka_preflight.py` and the `nuitka`
+> dependency group remain until they are removed.
+
 # macOS standalone build checks
 
 The build workflow lives in `Nocetic/flowlyai-build`. It checks out this repository
