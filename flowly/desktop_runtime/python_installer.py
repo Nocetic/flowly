@@ -15,6 +15,7 @@ from pathlib import Path
 from flowly.desktop_runtime import python_install_worker as worker
 from flowly.desktop_runtime.authority import ScreenError
 from flowly.desktop_runtime.installer import _operation
+from flowly.runtime_bundle import runtime_root
 
 
 def find_uv() -> str | None:
@@ -54,7 +55,8 @@ def python_plan() -> dict:
     uv = find_uv()
     if sys.platform != "linux" or platform.machine() not in {"aarch64", "x86_64"}:
         reason = "INSTALL_UNSUPPORTED_HOST"
-    elif getattr(sys, "frozen", False) or "__compiled__" in globals():
+    elif runtime_root() is not None:
+        # Desktop's runtime is replaced whole on every app update.
         reason = "INSTALL_MANAGED_BUILD_REQUIRED"
     elif sys.prefix == sys.base_prefix or not (Path(sys.prefix) / "pyvenv.cfg").is_file():
         reason = "INSTALL_VIRTUALENV_REQUIRED"

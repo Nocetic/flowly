@@ -1,8 +1,8 @@
 """Resolve stdio command paths for MCP subprocesses.
 
 In a normal shell, bare ``npx``, ``npm``, ``node`` etc. resolve via
-``$PATH``. Flowly ships as a Nuitka-bundled binary where the launcher
-sanitizes ``PATH`` to a known-safe subset — which often excludes the
+``$PATH``. Flowly's agent runs as a service (launchd, systemd, Task
+Scheduler) whose ``PATH`` is a minimal subset — which often excludes the
 user's Homebrew or nvm install. The result: Node-based MCP servers
 fail with ``ENOENT`` before they ever try to start.
 

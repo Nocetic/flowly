@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
-import sys
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,11 +24,6 @@ class ManagedToolLaunch:
 
 
 def _callback_command() -> tuple[str, list[str]]:
-    if "__compiled__" in globals() or getattr(sys, "frozen", False):
-        executable = Path(sys.argv[0]).resolve()
-        if not executable.is_file() or not os.access(executable, os.X_OK):
-            raise ToolBridgeError("The bundled tool callback executable is unavailable")
-        return str(executable), ["mcp", "tools"]
     from flowly.runtime_bundle import python_command
 
     executable, *flags = python_command()

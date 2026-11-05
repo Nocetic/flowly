@@ -50,8 +50,7 @@ def setup_main(ctx: typer.Context):
         flowly setup tools     — browser, voice, Trello, etc.
         flowly setup byok <p>  — quick BYOK one-shot (no UI)
 
-    Non-interactive contexts (the Nuitka binary under Flowly Desktop, piped
-    installers) seed the workspace and skip the prompt — never hanging.
+    Non-interactive contexts (Core run by Flowly Desktop, piped installers) seed the workspace and skip the prompt — never hanging.
     """
     if ctx.invoked_subcommand is not None:
         return

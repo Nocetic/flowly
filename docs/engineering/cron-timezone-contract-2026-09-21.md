@@ -70,20 +70,19 @@ input. Clients that omit `tz` remain accepted, but their recurring schedules
 follow the agent host rather than the user's device after future recomputations.
 
 Core declares `python-dateutil` directly for host-zone discovery and `tzdata`
-directly for the IANA database. The Nuitka entry includes the `tzdata` package
-and resource files so a standalone Windows agent does not depend on an OS IANA
-database. Local checks cover the dependency lock and build directives; native
-Windows artifact smoke testing remains part of the external build workflow.
+directly for the IANA database, so a Windows agent does not depend on an OS
+IANA database. (When this was written Desktop carried a Nuitka build whose entry
+had to name `tzdata` explicitly. Since 2026-11-05 that build is gone: the Flowly
+runtime installs `tzdata` from `uv.lock` like every other dependency.)
 
 ## Reproducing the validation
 
 Run these commands from the Core worktree containing this commit. The first
 command creates or updates that worktree's `.venv` from its `pyproject.toml` and
-`uv.lock`, including `tzdata==2026.4`, test dependencies, and the pinned Nuitka
-toolchain:
+`uv.lock`, including `tzdata==2026.4` and test dependencies:
 
 ```sh
-uv sync --locked --extra dev --group nuitka
+uv sync --locked --extra dev
 uv run --no-sync pytest -q \
   tests/test_cron.py \
   tests/test_cron_cli_compat.py \
@@ -94,10 +93,7 @@ uv run --no-sync pytest -q \
   tests/test_cron_timer_resilience.py \
   tests/test_cron_timezone.py \
   tests/test_exec_cron_mode.py \
-  tests/test_profile_host_runtime_integration.py \
-  tests/test_nuitka_preflight.py
-uv run --no-sync python scripts/nuitka_preflight.py \
-  --check-only --standalone flowly/cli/entry.py
+  tests/test_profile_host_runtime_integration.py
 uv lock --check --offline
 ```
 

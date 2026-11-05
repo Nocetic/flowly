@@ -15,20 +15,6 @@ import pytest
 from flowly.cli import update_cmd
 
 
-def test_managed_mode_when_compiled(monkeypatch):
-    # Simulate Nuitka: __main__ carries a __compiled__ attribute.
-    fake_main = type(sys)("__main__")
-    fake_main.__compiled__ = object()
-    monkeypatch.setitem(sys.modules, "__main__", fake_main)
-    assert update_cmd.is_managed_binary() is True
-    assert update_cmd.detect_install_mode() == "managed"
-
-
-def test_managed_mode_when_sys_frozen(monkeypatch):
-    monkeypatch.setattr(sys, "frozen", True, raising=False)
-    assert update_cmd.is_managed_binary() is True
-
-
 def test_uv_tool_mode(monkeypatch):
     monkeypatch.setattr(update_cmd, "is_managed_binary", lambda: False)
     monkeypatch.setattr(sys, "prefix", "/home/u/.local/share/uv/tools/flowly-ai")

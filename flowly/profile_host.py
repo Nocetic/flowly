@@ -16,7 +16,6 @@ import os
 import re
 import secrets
 import signal
-import sys
 import time
 import uuid
 from weakref import WeakValueDictionary
@@ -142,8 +141,6 @@ _PROFILE_RUNTIME_ENV_DENY = frozenset({
 
 def _runtime_command() -> list[str]:
     """Launch the same installed Flowly build as the owning gateway."""
-    if getattr(sys, "frozen", False) or "__compiled__" in globals():
-        return [sys.executable]
     from flowly.runtime_bundle import python_command
 
     return [*python_command(), "-m", "flowly.cli.entry"]

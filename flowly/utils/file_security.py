@@ -10,7 +10,7 @@ This module gives credential writes equivalent protection on every platform:
 
 * **POSIX** — ``os.chmod(path, mode)`` (unchanged behavior).
 * **Windows** — a real owner-only ACL applied via the built-in ``icacls``
-  tool (no third-party dependency, Nuitka-safe): inheritance is removed and
+  tool (no third-party dependency): inheritance is removed and
   full control is granted to the current user only.
 
 Both helpers are **best-effort and never raise** — a failed hardening must not

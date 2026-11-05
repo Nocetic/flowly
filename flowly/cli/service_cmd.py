@@ -80,13 +80,9 @@ def _resolve_flowly_exec_argv() -> list[str]:
          flowly`. A PATH lookup there could find a developer's own checkout;
          `-P` keeps the working folder off sys.path, so a checkout there can't
          shadow it, and `-B` keeps Python from writing into the signed app.
-      1. Running as a Nuitka-compiled standalone binary → use sys.executable,
-         which points directly at the compiled binary (e.g. flowly-bin bundled
-         inside an Electron app). This must win over PATH lookups so the
-         launchd/systemd service always targets the bundled runtime.
-      2. argv[0] starts with "flowly" and points at an existing file → trust it
-         (covers direct invocation of either `flowly` or `flowly-bin`).
-      3. `flowly` on PATH (legacy pip/uv installs) — UNLESS it resolves to a
+      1. argv[0] starts with "flowly" and points at an existing file → trust it
+         (direct invocation of `flowly`).
+      2. `flowly` on PATH (legacy pip/uv installs) — UNLESS it resolves to a
          `.cmd`/`.bat` shim (the git-checkout install's Windows launcher),
          which Windows can only execute via `cmd.exe /c`. The Windows service
          supervisor deliberately runs with no console in the chain (see
@@ -94,8 +90,8 @@ def _resolve_flowly_exec_argv() -> list[str]:
          can't reap the gateway; a `.cmd` would reintroduce a console. Run the
          current interpreter with `-m flowly` instead — equally correct (this
          process IS that interpreter) and console-free.
-      4. `~/.local/bin/flowly` fallback.
-      5. `uv run flowly` as a last resort.
+      3. `~/.local/bin/flowly` fallback.
+      4. `uv run flowly` as a last resort.
     """
     # (0) The Flowly runtime Desktop ships: run this interpreter, never PATH.
     from flowly.runtime_bundle import host_launcher, python_command, runtime_root
@@ -106,41 +102,25 @@ def _resolve_flowly_exec_argv() -> list[str]:
             return [str(launcher)]
         return [*python_command(), "-m", "flowly"]
 
-    # (1) Nuitka-compiled standalone or PyInstaller frozen binary.
-    # For Nuitka, sys.executable points at the compiled binary (e.g. flowly-bin).
-    # For regular Python, sys.executable points at the python interpreter.
-    # We treat anything whose basename does not start with "python" as a
-    # compiled runtime and trust sys.executable directly.
-    exe = Path(sys.executable).expanduser().resolve()
-    exe_name = exe.name.lower()
-    looks_like_python = exe_name.startswith("python")
-    is_frozen = (
-        getattr(sys, "frozen", False)
-        or bool(getattr(sys.modules.get("__main__"), "__compiled__", None))
-        or (not looks_like_python and exe.exists())
-    )
-    if is_frozen and exe.exists():
-        return [str(exe)]
-
-    # (2) argv[0] points at a flowly* binary
+    # (1) argv[0] points at a flowly* binary
     argv0 = Path(sys.argv[0]).expanduser()
     if argv0.exists() and argv0.name.startswith("flowly"):
         return [str(argv0.resolve())]
 
-    # (3) PATH lookup
+    # (2) PATH lookup
     flowly_bin = shutil.which("flowly")
     if flowly_bin:
         flowly_path = Path(flowly_bin).expanduser()
         if flowly_path.suffix.lower() in (".cmd", ".bat"):
-            return [str(exe), "-m", "flowly"]
+            return [str(Path(sys.executable).expanduser().resolve()), "-m", "flowly"]
         return [str(flowly_path)]
 
-    # (4) Standard user-local path
+    # (3) Standard user-local path
     local_bin = (Path.home() / ".local" / "bin" / "flowly").expanduser()
     if local_bin.exists():
         return [str(local_bin)]
 
-    # (5) uv fallback
+    # (4) uv fallback
     uv_bin = shutil.which("uv")
     if uv_bin:
         return [str(Path(uv_bin).expanduser()), "run", "flowly"]

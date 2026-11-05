@@ -62,8 +62,8 @@ def semantic_runtime_available() -> bool:
     if any(importlib.util.find_spec(name) is None for name in required_modules):
         return False
     try:
-        # FastEmbed imports its own distribution version at module import.
-        # Nuitka builds therefore need both package code and metadata.
+        # FastEmbed imports its own distribution version at module import,
+        # so it cannot load without its distribution metadata.
         version("fastembed")
     except PackageNotFoundError:
         return False

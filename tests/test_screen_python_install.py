@@ -79,7 +79,7 @@ def test_plan_does_not_create_state_and_stays_stable_after_packages_are_installe
 
 
 @pytest.mark.parametrize("kind,code", [("system", "INSTALL_VIRTUALENV_REQUIRED"), ("windows", "INSTALL_UNSUPPORTED_HOST"),
-    ("uv", "INSTALL_UV_REQUIRED"), ("frozen", "INSTALL_MANAGED_BUILD_REQUIRED")])
+    ("uv", "INSTALL_UV_REQUIRED"), ("runtime", "INSTALL_MANAGED_BUILD_REQUIRED")])
 def test_unsupported_installation_never_spawns(host, monkeypatch, kind, code):
     if kind == "system":
         monkeypatch.setattr(installer.sys, "prefix", sys.base_prefix)
@@ -89,7 +89,8 @@ def test_unsupported_installation_never_spawns(host, monkeypatch, kind, code):
         monkeypatch.setattr(installer.shutil, "which", lambda name: None)
         monkeypatch.setattr(installer.Path, "home", lambda: host.home / "empty-home")
     else:
-        monkeypatch.setattr(installer.sys, "frozen", True, raising=False)
+        # Desktop's runtime, which Desktop replaces whole on every update.
+        monkeypatch.setattr(installer, "runtime_root", lambda: host.home / "flowly-runtime")
     assert installer.python_plan()["reason"] == code
     with pytest.raises(ScreenError, match=code):
         installer.install_python(host.plan["planId"], OPERATION)

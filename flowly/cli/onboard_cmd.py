@@ -136,8 +136,7 @@ def _create_workspace_templates(workspace: Path) -> int:
 # a single picker where the managed option sits at the top of the same list as
 # the BYOK providers. Then offer to start the gateway.
 #
-# Nuitka / Flowly Desktop safety: the binary is spawned by Electron as a
-# non-TTY subprocess. The interactive menu is gated on ``sys.stdin.isatty()`` so
+# Flowly Desktop safety: Desktop runs Core as a non-TTY subprocess. The interactive menu is gated on ``sys.stdin.isatty()`` so
 # it NEVER prompts (and never hangs) there — it just seeds the workspace and
 # returns. InquirerPy / prompt_toolkit are imported lazily INSIDE the TTY branch,
 # so the non-interactive path never touches them either.

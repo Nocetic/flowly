@@ -1,11 +1,10 @@
 """Tests for stdio command resolution.
 
-Why this matters: Flowly's Nuitka-bundled launcher sanitizes ``PATH``
-to a known-safe subset. Without an explicit resolver, bare commands
-like ``npx`` fail with ``ENOENT`` and the user sees nothing useful.
+Why this matters: Flowly's agent runs as a service whose ``PATH`` is a
+minimal subset. Without an explicit resolver, bare commands like ``npx``
+fail with ``ENOENT`` and the user sees nothing useful.
 
-We don't exercise the Nuitka path directly — we just verify the
-fallback search order against synthetic candidate locations using a
+We don't run a service here — we just verify the fallback search order against synthetic candidate locations using a
 ``tmp_path``.
 """
 

@@ -83,17 +83,9 @@ def request() -> bool:
 def command() -> list[str] | None:
     """The command line that started this process, ready for ``execv``.
 
-    A compiled (Nuitka) build runs as its own binary: ``sys.argv[0]`` names
-    it, while ``sys.executable`` may name an interpreter placeholder that
-    does not exist on disk. An interpreter run is replayed from
-    ``sys.orig_argv``, which keeps ``-m`` and the script path.
+    Replayed from ``sys.orig_argv``, which keeps the interpreter's flags,
+    ``-m`` and the script path.
     """
-    if getattr(sys, "frozen", False) or "__compiled__" in globals():
-        for candidate in (sys.argv[0] if sys.argv else "", sys.executable):
-            path = os.path.abspath(candidate) if candidate else ""
-            if path and os.path.isfile(path) and os.access(path, os.X_OK):
-                return [path, *_kept(sys.argv[1:])]
-        return None
     argv = list(getattr(sys, "orig_argv", None) or [])
     executable = sys.executable
     if not argv or not executable or not os.access(executable, os.X_OK):

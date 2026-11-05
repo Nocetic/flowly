@@ -153,10 +153,10 @@ class _AccountReplySocket:
 def _build_ssl_context() -> ssl.SSLContext | None:
     """Build an SSL context using certifi's CA bundle.
 
-    In a Nuitka-bundled binary the system CA store is not available, so
-    websockets.connect() would fall back to an empty trust store and fail
-    every wss:// handshake with CERTIFICATE_VERIFY_FAILED. Explicitly
-    loading certifi's cacert.pem fixes this for wss connections.
+    A portable Python (the runtime Desktop carries) may not find the host's
+    CA store, and websockets.connect() would then fall back to an empty trust
+    store and fail every wss:// handshake with CERTIFICATE_VERIFY_FAILED.
+    Explicitly loading certifi's cacert.pem avoids this for wss connections.
 
     Returns None on unexpected failure so callers fall back to default.
     """

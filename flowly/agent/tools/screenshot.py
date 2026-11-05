@@ -411,9 +411,8 @@ class ScreenshotTool(Tool):
         path inside the Electron UI session), falls back to spawning PowerShell
         directly from this process if Electron isn't reachable.
 
-        The direct-spawn fallback is unreliable when this process is a
-        Nuitka-bundled binary: Windows Defender often blocks or delays
-        subprocess creation, and PowerShell execution policy on some
+        The direct-spawn fallback is unreliable from the background agent:
+        Windows Defender often blocks or delays its subprocess creation, and PowerShell execution policy on some
         corporate machines rejects -Command scripts. Delegating to Electron
         sidesteps both issues because Electron runs as a normal app.
 

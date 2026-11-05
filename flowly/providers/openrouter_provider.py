@@ -2,7 +2,7 @@
 
 Talks to any OpenAI-compatible endpoint (OpenRouter, Flowly proxy, direct OpenAI).
 Replaces the previous LiteLLM-based provider — significantly smaller dependency
-footprint (no tokenizers/jinja2/jsonschema) and Nuitka-friendly static imports.
+footprint (no tokenizers/jinja2/jsonschema).
 
 Key behaviors matched to the legacy LiteLLMProvider to keep downstream consumers
 (agent loop, subagent manager, compaction summarizer) working without changes:

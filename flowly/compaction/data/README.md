@@ -17,7 +17,6 @@ with a heuristic. This prevents a cold encoding-cache HTTP fetch from blocking
 the agent's event loop and screen/relay control RPCs. A corrupt/missing package
 resource requires repair/reinstallation; it cannot trigger a runtime download.
 
-The wheel/sdist package includes this directory. The CLI entry's Nuitka
-package-data directive includes it in standalone artifacts too; target-platform
-packaged acceptance remains a separate release gate. When updating the encoding,
+The wheel/sdist package includes this directory, and the Flowly runtime
+Desktop carries installs that wheel, so it has the data too. When updating the encoding,
 update definition, verified data/hash, provenance and parity tests together.

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import threading
 from pathlib import Path
 
@@ -47,23 +46,6 @@ def test_fresh_config_never_enables_or_downloads_semantic_model() -> None:
     assert discovery.semantic_routing_enabled is False
     assert discovery.semantic_model_auto_download is False
     assert discovery.semantic_routing_consent == "undecided"
-
-
-def test_nuitka_entry_preserves_lazy_runtime_and_fastembed_metadata() -> None:
-    entry = Path(semantic_feature.__file__).parents[2] / "cli" / "entry.py"
-    source = entry.read_text(encoding="utf-8")
-
-    for package in ("fastembed", "huggingface_hub", "onnxruntime", "tokenizers"):
-        assert re.search(
-            rf"^#\s+nuitka-project:\s+--include-package={re.escape(package)}$",
-            source,
-            re.MULTILINE,
-        )
-    assert re.search(
-        r"^#\s+nuitka-project:\s+--include-distribution-metadata=fastembed$",
-        source,
-        re.MULTILINE,
-    )
 
 
 def test_enabled_preference_with_missing_model_is_repairable(monkeypatch) -> None:

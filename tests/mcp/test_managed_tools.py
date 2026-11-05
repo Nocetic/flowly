@@ -544,20 +544,6 @@ async def test_missing_persisted_history_is_not_silently_replaced():
     assert session.thread_id == "persisted"
 
 
-async def test_bundled_callback_does_not_use_placeholder_python(tmp_path, monkeypatch):
-    from flowly.mcp.server import managed_tools
-
-    executable = tmp_path / "flowly-bundled"
-    executable.write_text("fixture")
-    executable.chmod(0o700)
-    monkeypatch.setattr(managed_tools.sys, "argv", [str(executable)])
-    monkeypatch.setattr(managed_tools.sys, "frozen", True, raising=False)
-    assert managed_tools._callback_command() == (str(executable), ["mcp", "tools"])
-    executable.chmod(0o600)
-    with pytest.raises(ToolBridgeError, match="unavailable"):
-        managed_tools._callback_command()
-
-
 async def test_catalog_pagination_shares_one_deadline(monkeypatch):
     from flowly.codex import live_tools
 

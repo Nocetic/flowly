@@ -2,11 +2,10 @@
 
 Install-mode aware: Flowly ships in several shapes and each has its own native
 upgrade path. The keystone is the **managed** mode — when Flowly runs from the runtime
-Flowly Desktop ships (`flowly/runtime_bundle.py`), or as the older
-Nuitka-compiled binary, there is nothing for this command to do: the desktop
-app's own auto-updater owns that runtime, and the CLI package on PATH (if any)
-is a physically separate install. So in managed mode we
-no-op with guidance instead of attempting (and failing at) a package upgrade.
+Flowly Desktop ships (`flowly/runtime_bundle.py`), there is nothing for this
+command to do: the desktop app's own auto-updater owns that runtime, and the
+CLI package on PATH (if any) is a physically separate install. So in managed
+mode we no-op with guidance instead of attempting (and failing at) a package upgrade.
 
 Modes and their upgrade command:
     managed   → no-op (Flowly Desktop manages the runtime)
@@ -36,22 +35,14 @@ PACKAGE = "flowly-ai"
 # Install-mode detection
 # ---------------------------------------------------------------------------
 def is_managed_binary() -> bool:
-    """True when Flowly Desktop owns this install: its runtime, or a compiled binary.
+    """True when Flowly Desktop owns this install: it runs from Desktop's runtime.
 
     The runtime (`scripts/build_runtime.py`) carries a manifest beside its
-    Python; Desktop replaces the whole folder on every app update.
-
-    Nuitka injects a module-level ``__compiled__`` global into ``__main__``;
-    ``sys.frozen`` is the belt-and-braces fallback. This is the Flowly Desktop
-    discriminator: the embedded binary is the only place compiled Flowly runs,
-    and it must never try to upgrade itself."""
+    Python; Desktop replaces the whole folder on every app update, so it must
+    never try to upgrade itself."""
     from flowly.runtime_bundle import runtime_root
 
-    if runtime_root() is not None:
-        return True
-    return bool(getattr(sys.modules.get("__main__"), "__compiled__", None)) or bool(
-        getattr(sys, "frozen", False)
-    )
+    return runtime_root() is not None
 
 
 def _is_source_checkout() -> bool:

@@ -94,59 +94,6 @@ class TestGateEnvVar:
                 execve.assert_not_called()
 
 
-# ── Gate decision: Nuitka-compiled bundle skip ───────────────────────
-
-
-class TestGateNuitkaBundle:
-    """In a Nuitka --standalone bundle ``sys.executable`` is a
-    placeholder path (``<dist>/python3``) that does not exist on
-    disk, so ``os.execve`` would ENOENT and the process would abort
-    with exit 71 before any flowly code runs. The desktop bundle
-    establishes its own outer sandbox, so the self-wrap is both
-    redundant and broken inside Nuitka. This guards the early-return
-    branch that detects the bundle.
-    """
-
-    def test_compiled_global_skips_reexec(self, monkeypatch):
-        # Nuitka injects ``__compiled__`` into every compiled module's
-        # globals. We inject it manually here to simulate the bundle
-        # without actually compiling — both the function-local globals
-        # lookup and the module attribute land in the same place.
-        monkeypatch.setattr(cli_wrap, "__compiled__", object(), raising=False)
-        # Force-on env to make sure the only reason we skip is the
-        # compiled detection (not the off-switch).
-        with mock.patch.dict(os.environ, {"FLOWLY_SANDBOX": "1"}, clear=False):
-            with mock.patch("os.execve") as execve:
-                cli_wrap.maybe_reexec_sandboxed()
-                execve.assert_not_called()
-
-    def test_sys_frozen_skips_reexec(self, monkeypatch):
-        # Belt-and-braces fallback: PyInstaller-style ``sys.frozen``
-        # flag also triggers the skip in case a future Nuitka version
-        # drops ``__compiled__``.
-        monkeypatch.setattr(sys, "frozen", True, raising=False)
-        with mock.patch.dict(os.environ, {"FLOWLY_SANDBOX": "1"}, clear=False):
-            with mock.patch("os.execve") as execve:
-                cli_wrap.maybe_reexec_sandboxed()
-                execve.assert_not_called()
-
-    def test_unfrozen_cpython_does_not_skip_on_nuitka_branch(self, monkeypatch):
-        # Make sure plain CPython does NOT take the Nuitka branch.
-        # We can't easily prove "execve called" without actually
-        # re-execing — that's what the macos-only integration test
-        # below covers — but we can prove the function gets past the
-        # compiled check by triggering the next gate (recursion guard)
-        # and observing the early-return there instead.
-        monkeypatch.delattr(cli_wrap, "__compiled__", raising=False)
-        monkeypatch.delattr(sys, "frozen", raising=False)
-        with mock.patch.dict(
-            os.environ, {"FLOWLY_SANDBOX_WRAPPED": "1"}, clear=False
-        ):
-            with mock.patch("os.execve") as execve:
-                cli_wrap.maybe_reexec_sandboxed()
-                execve.assert_not_called()  # Stopped by recursion guard, not Nuitka guard
-
-
 # ── Gate decision: config fallback ───────────────────────────────────
 
 

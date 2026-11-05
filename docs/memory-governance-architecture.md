@@ -717,8 +717,8 @@ or detection code** — the config default *is* the rollout mechanism:
 - No existing `config.json` carries a `memory_dreaming` key, so the Python loader
   fills the default on load → the feature is active on the next gateway start.
 - This holds for **both** distribution paths: the CLI/bot (Python package update)
-  and Desktop (the Nuitka-compiled Python embedded in the Electron app uses the
-  same `schema.py`, so the same default applies).
+  and Desktop (the Flowly runtime the Electron app carries runs the same
+  `schema.py`, so the same default applies).
 
 Why the Desktop needs zero changes: `flowly-desktop` never writes the
 `memoryDreaming` key. `flowlyai-service.ts::writeConfig` merges only the specific

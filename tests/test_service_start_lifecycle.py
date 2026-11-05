@@ -11,7 +11,6 @@ from __future__ import annotations
 import io
 import plistlib
 import subprocess
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -712,18 +711,6 @@ def test_requested_start_without_provider_installs_but_returns_failure(
     assert exc.value.exit_code == 1
     assert unit_path.exists()
     assert "not starting the service" in output.getvalue()
-
-
-def test_nuitka_binary_remains_the_service_executable(tmp_path, monkeypatch):
-    """Desktop's bundled executable must keep winning over PATH launchers."""
-    bundled = tmp_path / "Flowly.app" / "Contents" / "Resources" / "flowly-bin"
-    bundled.parent.mkdir(parents=True)
-    bundled.write_text("", encoding="utf-8")
-    monkeypatch.setattr(sys, "executable", str(bundled))
-    monkeypatch.setattr(sys, "argv", ["flowly"])
-    monkeypatch.setattr(service_cmd.shutil, "which", lambda _name: "/usr/local/bin/flowly")
-
-    assert service_cmd._resolve_flowly_exec_argv() == [str(bundled.resolve())]
 
 
 def test_default_startup_wait_fits_desktop_cli_timeout():

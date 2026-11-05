@@ -73,38 +73,9 @@ def maybe_reexec_sandboxed() -> None:
     """
     env = os.environ
 
-    # 0. Nuitka-compiled standalone binary: skip self-wrap entirely.
-    #
-    #    Two reasons:
-    #
-    #    (a) In a Nuitka --standalone bundle `sys.executable` points at
-    #        ``<dist_dir>/python3`` (Nuitka's compat placeholder for an
-    #        interpreter that is actually embedded in the .bin itself —
-    #        no real file lives there). The os.execve below would then
-    #        ENOENT and exit the process with code 71 before any flowly
-    #        code gets to run. This is exactly the 2026-05-20 CI failure
-    #        on macos-15 / macos-15-intel runners: smoke test
-    #        ``entry.bin --version`` aborted with
-    #        ``sandbox-exec: execvp() of '.../entry.dist/python3' failed``.
-    #
-    #    (b) The Nuitka binary only ships inside the Electron desktop
-    #        bundle, and that bundle already wraps the helper in an
-    #        outer sandbox (flowly-desktop/src/main/local/sandbox/).
-    #        Re-wrapping here would either be a no-op (sandbox-exec
-    #        inside sandbox-exec) or double the per-spawn cost.
-    #
-    #    Detection: Nuitka injects a module-level ``__compiled__`` global
-    #    into every compiled module. Plain CPython has no such name, so
-    #    the ``globals()`` lookup is the cheapest and most reliable
-    #    discriminator. ``sys.frozen`` is checked as a belt-and-braces
-    #    fallback in case a future Nuitka version drops ``__compiled__``.
-    if "__compiled__" in globals() or getattr(sys, "frozen", False):
-        return
-
-    #    The runtime Flowly Desktop carries in place of that compiled build
-    #    (its manifest names the host, see flowly/runtime_bundle.py) runs
-    #    as the compiled build did, so moving Desktop off the compiled build
-    #    does not change what the agent on a person's Mac may reach.
+    # 0. The runtime Flowly Desktop carries (its manifest names the host,
+    #    see flowly/runtime_bundle.py) is never wrapped: the agent on a
+    #    person's Mac runs as Desktop has always run it.
     from flowly.runtime_bundle import runtime_host
 
     if runtime_host() is not None:

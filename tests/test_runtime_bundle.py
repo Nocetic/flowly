@@ -125,16 +125,14 @@ def test_desktop_names_itself_as_the_host(tmp_path):
 
 
 def test_a_desktop_runtime_does_not_wrap_itself_in_the_sandbox(tmp_path, monkeypatch):
-    # Desktop's compiled build never did; moving to the runtime must not change
-    # what the agent on a person's Mac may reach.
+    # Desktop has never wrapped its agent; the runtime must not change what
+    # the agent on a person's Mac may reach.
     from unittest import mock
 
     from flowly.sandbox import cli_wrap
 
     _, python = _runtime(tmp_path, {"name": "flowly-runtime", "host": "flowly-desktop"})
     monkeypatch.setattr(sys, "prefix", str(python))
-    monkeypatch.delattr(cli_wrap, "__compiled__", raising=False)
-    monkeypatch.delattr(sys, "frozen", raising=False)
     monkeypatch.setenv("FLOWLY_SANDBOX", "1")
     monkeypatch.delenv("FLOWLY_SANDBOX_WRAPPED", raising=False)
     with mock.patch("os.execve") as execve, mock.patch.object(cli_wrap, "_reexec_macos") as macos, \
@@ -153,8 +151,6 @@ def test_a_runtime_without_a_host_still_wraps_itself(tmp_path, monkeypatch):
 
     _, python = _runtime(tmp_path)
     monkeypatch.setattr(sys, "prefix", str(python))
-    monkeypatch.delattr(cli_wrap, "__compiled__", raising=False)
-    monkeypatch.delattr(sys, "frozen", raising=False)
     monkeypatch.setenv("FLOWLY_SANDBOX", "1")
     monkeypatch.delenv("FLOWLY_SANDBOX_WRAPPED", raising=False)
     monkeypatch.setattr(cli_wrap.platform, "system", lambda: "Linux")

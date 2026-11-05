@@ -1,25 +1,3 @@
-# Keep the optional semantic-routing runtime usable inside the standalone
-# Desktop/CLI artifact. The model weights are never bundled; Nuitka otherwise
-# may omit these lazy imports and FastEmbed's required distribution metadata.
-# Guarded by an env var so builds on platforms where the optional runtime
-# cannot be installed (Intel macOS: onnxruntime ships no x86_64 wheels) can
-# opt out — semantic_runtime_available() already tolerates the absence.
-# nuitka-project-if: os.getenv("FLOWLY_NUITKA_NO_SEMANTIC", "0") != "1":
-#    nuitka-project: --include-package=fastembed
-#    nuitka-project: --include-package=huggingface_hub
-#    nuitka-project: --include-package=onnxruntime
-#    nuitka-project: --include-package=tokenizers
-#    nuitka-project: --include-distribution-metadata=fastembed
-
-# Python's zoneinfo loads this package dynamically when an OS timezone database
-# is unavailable (notably in Windows standalone builds). Bundle both its module
-# and IANA resource files so explicit cron timezones work in the packaged agent.
-# nuitka-project: --include-package=tzdata
-# nuitka-project: --include-package-data=tzdata
-
-# Token estimation must work offline on the first turn in standalone builds.
-# nuitka-project: --include-package-data=flowly.compaction
-
 """CLI entry point — extracts --profile BEFORE any Flowly module import.
 
 This is critical because many modules evaluate ``get_flowly_home()`` at
@@ -65,12 +43,12 @@ def _configure_windows_utf8_stdio() -> None:
 
 
 def _configure_bundled_ssl_ca() -> None:
-    """Point Python's SSL stack at certifi's CA bundle when running as a
-    Nuitka-compiled standalone binary.
+    """Point Python's SSL stack at certifi's CA bundle.
 
-    In a bundled binary there is no system CA store, so `ssl.create_default_context`
-    fails to load any trusted roots and every HTTPS/WSS connection errors out with
-    `CERTIFICATE_VERIFY_FAILED`. This hits the web channel (wss to the Flowly relay)
+    A portable Python (the runtime Desktop carries) looks for the system CA
+    store where its OpenSSL was built to look, which a host may not have. With
+    no trusted roots `ssl.create_default_context` fails every HTTPS/WSS
+    connection with `CERTIFICATE_VERIFY_FAILED`. This hits the web channel (wss to the Flowly relay)
     and the openai SDK (https to the Flowly proxy) on first boot. Setting
     `SSL_CERT_FILE` (and REQUESTS_CA_BUNDLE for anything old-school) BEFORE any
     other flowly imports makes Python's ssl module pick up certifi's bundle at
@@ -156,8 +134,7 @@ def main() -> None:
     maybe_reexec_sandboxed()
 
     # Configure SSL CA bundle first — must happen before any flowly import so
-    # aiohttp / websockets / openai pick up the correct trust store in the
-    # Nuitka-bundled binary.
+    # aiohttp / websockets / openai pick up the same trust store on every host.
     _configure_bundled_ssl_ca()
 
     _warn_if_dev_home_ignored()

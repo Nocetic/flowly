@@ -324,7 +324,7 @@ def test_quit_without_provider_prints_hint_not_summary(monkeypatch):
     assert calls == []  # nothing configured → hint, no summary panel
 
 
-# ── run_onboarding guards (Nuitka/Desktop safety) ────────────────────────
+# ── run_onboarding guards (Desktop safety) ────────────────────────
 
 def test_non_tty_never_opens_home(monkeypatch):
     calls = []
