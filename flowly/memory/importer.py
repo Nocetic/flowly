@@ -143,11 +143,14 @@ def source_label(source: str) -> str:
     return _SOURCE_LABELS[normalize_source(source)]
 
 
-def memory_export_prompt(source: str = "chatgpt") -> str:
-    """Prompt the user can paste into ChatGPT/Gemini to get a stable dump."""
-    label = source_label(source)
-    return (
-        f"I want to transfer my saved memory/profile from {label} into another "
+# The request the owner pastes into ChatGPT/Gemini, in the app's language.
+# The assistant answers in the language it is asked in, and the extractor keeps
+# the export's language, so a Turkish request yields Turkish memories. The
+# non-English ones also ask outright for that language: saved memories are
+# often stored in English and would otherwise come back verbatim.
+_EXPORT_PROMPTS: dict[str, str] = {
+    "en": (
+        "I want to transfer my saved memory/profile from {label} into another "
         "private assistant that I control.\n\n"
         "Please list everything you currently remember or have saved about me. "
         "Do not invent or infer new facts. Do not include passwords, API keys, "
@@ -159,7 +162,54 @@ def memory_export_prompt(source: str = "chatgpt") -> str:
         "you clearly mark them as uncertain.\n\n"
         "You can paste this list straight back into Flowly, or save it to a plain "
         "text file and upload that — either works."
-    )
+    ),
+    "tr": (
+        "{label} üzerinde kayıtlı hafızamı/profilimi, kendi kontrolümdeki başka "
+        "bir özel asistana taşımak istiyorum.\n\n"
+        "Lütfen hakkımda şu anda hatırladığın ya da kaydettiğin her şeyi listele. "
+        "Yeni bilgi uydurma ya da çıkarım yapma. Parolaları, API anahtarlarını, "
+        "token'ları ve özel anahtarları yazma; böyle bir değer varsa yalnızca "
+        "türünü belirt, değerini yazma.\n\n"
+        "Cevabını Türkçe yaz; İngilizce kaydedilmiş bilgileri de Türkçeye çevir. "
+        "Markdown kullan; kısa maddeleri, uygun olduğunda şu başlıklar altında "
+        "topla: Kimlik, Tercihler, Projeler, Çalışma düzeni, Ortam, İnsanlar, "
+        "Kısıtlar ve Düzeltmeler. Emin olmadığın maddeleri yalnızca açıkça "
+        "\"emin değilim\" diye işaretleyerek ekle.\n\n"
+        "Bu listeyi doğrudan Flowly'ye yapıştırabilir ya da düz metin dosyası "
+        "olarak kaydedip yükleyebilirsin; ikisi de olur."
+    ),
+    "es": (
+        "Quiero trasladar la memoria/el perfil que tengo guardado en {label} a "
+        "otro asistente privado que controlo yo.\n\n"
+        "Por favor, enumera todo lo que recuerdas o tienes guardado sobre mí. No "
+        "inventes ni deduzcas datos nuevos. No incluyas contraseñas, claves de "
+        "API, tokens ni claves privadas; si existe un valor así, menciona solo el "
+        "tipo de secreto, no el valor.\n\n"
+        "Responde en español; traduce también al español lo que tengas guardado "
+        "en inglés. Usa Markdown con viñetas breves agrupadas, cuando "
+        "corresponda, bajo estos encabezados: Identidad, Preferencias, "
+        "Proyectos, Forma de trabajar, Entorno, Personas, Restricciones y "
+        "Correcciones. Incluye elementos dudosos solo si los marcas claramente "
+        "como dudosos.\n\n"
+        "Puedes pegar esta lista directamente en Flowly o guardarla en un archivo "
+        "de texto y subirlo; ambas opciones sirven."
+    ),
+}
+
+
+def prompt_language(locale: object = None) -> str:
+    """The language code an export request is written in: the app's
+    language when there is a request for it ("tr-TR" → "tr"), else English."""
+    if not isinstance(locale, str):
+        return "en"
+    language = locale.strip().lower().replace("_", "-").split("-", 1)[0]
+    return language if language in _EXPORT_PROMPTS else "en"
+
+
+def memory_export_prompt(source: str = "chatgpt", locale: object = None) -> str:
+    """Prompt the user can paste into ChatGPT/Gemini to get a stable dump,
+    in the app's language (``locale``) so the answer comes back in it."""
+    return _EXPORT_PROMPTS[prompt_language(locale)].format(label=source_label(source))
 
 
 def parse_dump(text: str) -> ParsedDump:

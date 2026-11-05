@@ -1848,16 +1848,20 @@ async def memory_dream(params: dict) -> dict:
 
 
 def memory_import_prompt(params: dict) -> dict:
-    """Return the prompt a client can show for ChatGPT/Gemini export."""
-    from flowly.memory.importer import memory_export_prompt, normalize_source
+    """Return the prompt a client can show for ChatGPT/Gemini export, in the
+    app's language (``locale``, e.g. "tr"); English when it has none."""
+    from flowly.memory.importer import memory_export_prompt, normalize_source, prompt_language
 
     source = params.get("source") or "chatgpt"
+    locale = params.get("locale")
+    if locale is not None and (not isinstance(locale, str) or len(locale) > 32):
+        raise FeatureRpcError("INVALID", "locale must be a short language tag")
     try:
         normalized = normalize_source(str(source))
-        prompt = memory_export_prompt(normalized)
+        prompt = memory_export_prompt(normalized, locale=locale)
     except ValueError as exc:
         raise FeatureRpcError("INVALID", str(exc))
-    return {"source": normalized, "prompt": prompt}
+    return {"source": normalized, "locale": prompt_language(locale), "prompt": prompt}
 
 
 def _import_run(params: dict) -> dict:

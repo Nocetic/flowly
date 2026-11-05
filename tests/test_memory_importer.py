@@ -164,3 +164,39 @@ def test_memory_dump_extractor_parses_and_stamps_candidates():
 def test_export_prompt_sources():
     assert "ChatGPT" in memory_export_prompt("chatgpt")
     assert "Google Gemini" in memory_export_prompt("gemini")
+
+
+def test_export_prompt_speaks_the_apps_language():
+    """The request pasted into ChatGPT is in the owner's language, so the
+    answer (and the memories made from it) come back in that language."""
+    tr = memory_export_prompt("chatgpt", locale="tr-TR")
+    assert "ChatGPT" in tr
+    assert "Türkçe" in tr
+    assert "Kimlik" in tr
+    es = memory_export_prompt("gemini", locale="es")
+    assert "Google Gemini" in es
+    assert "español" in es
+    assert "Identidad" in es
+
+
+def test_export_prompt_falls_back_to_english():
+    english = memory_export_prompt("chatgpt")
+    assert memory_export_prompt("chatgpt", locale="en-US") == english
+    assert memory_export_prompt("chatgpt", locale="de") == english
+    assert memory_export_prompt("chatgpt", locale=None) == english
+    assert memory_export_prompt("chatgpt", locale=42) == english
+    assert "Identity" in english
+
+
+def test_import_prompt_rpc_passes_the_locale():
+    from flowly.channels.feature_rpc import FeatureRpcError, memory_import_prompt
+
+    result = memory_import_prompt({"source": "chatgpt", "locale": "tr"})
+    assert result["source"] == "chatgpt"
+    assert result["locale"] == "tr"
+    assert "Türkçe" in result["prompt"]
+    assert memory_import_prompt({})["locale"] == "en"
+    with pytest.raises(FeatureRpcError):
+        memory_import_prompt({"locale": "x" * 64})
+    with pytest.raises(FeatureRpcError):
+        memory_import_prompt({"locale": ["tr"]})
