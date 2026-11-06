@@ -390,3 +390,18 @@ def test_turkish_case_endings_route_to_the_one_meant_guide(text, expected) -> No
 def test_desktop_folder_and_chat_stay_lean(text) -> None:
     decision = route_capability_guidance(text, history=[], available_tools={"computer", "browser_tab"})
     assert decision.active == frozenset()
+
+
+def test_the_turn_clock_sidecar_never_routes_a_playbook() -> None:
+    """Every turn's user message starts with the turn clock, which says "on
+    the agent's computer". The router read that as computer intent, so every
+    turn paid the computer playbook (~8K tokens), "selam" included
+    (found 2026-11-06, comparing a warm-up with a real turn)."""
+    from flowly.agent.turn_clock import turn_clock
+
+    text = f"{turn_clock()}\n\nselam"
+    decision = route_capability_guidance(text, history=[], available_tools={"computer", "browser_tab"})
+    assert decision.active == frozenset()
+    history = [{"role": "user", "content": f"{turn_clock()}\n\nnasılsın"}]
+    assert route_capability_guidance("devam et", history=history,
+                                     available_tools={"computer", "browser_tab"}).active != frozenset({"computer"})

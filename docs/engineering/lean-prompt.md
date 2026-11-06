@@ -53,6 +53,24 @@ any ending. "masaüstü" stays exact, because "masaüstüne / masaüstündeki" m
 the Desktop folder (file work). Tests: `tests/test_capability_guidance.py`
 (6 of the new cases fail without the fix).
 
+## 1b. The turn clock sent the computer playbook with every turn
+
+Every turn's user message starts with the turn clock:
+`<turn_time>… on the agent's computer …</turn_time>`. The guidance router
+read "computer" there as computer intent. So every real turn, "selam"
+included, got the computer playbook. The second system message went from
+8,480 to 40,061 characters, about 8K tokens more, on every provider. The
+measurements above call `build_messages` without the clock, so they never
+showed it. It was found by comparing a warm-up request with a real turn
+byte for byte.
+
+Fix: the router ignores `<turn_time>` blocks, also in history
+(`capability_guidance._owner_text`). The loop also routes playbooks and
+relevant skills on the owner's own words (`build_messages(intent_text=…)`),
+never on the additions Flowly makes to a turn's message: the clock, notes,
+group context, coverage. Tests: `test_capability_guidance.py`,
+`test_lean_prompt.py` (both fail without the fix).
+
 ## 2. Rarely used built-in tools wait behind the bridge
 
 Core already had the bridge (`tool_search` / `tool_call`, intent promotion, a

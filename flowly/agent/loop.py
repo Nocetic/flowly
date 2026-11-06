@@ -8338,6 +8338,7 @@ class AgentLoop:
                 if flush_coverage
                 else user_prompt
             ),
+            intent_text=user_prompt,
             model=self.model,
             channel=channel,
             available_tools=available_tools,
@@ -9684,6 +9685,7 @@ class AgentLoop:
             preview_messages = self.context.build_messages(
                 history=history,
                 current_message=llm_current_message,
+                intent_text=msg.content,
                 memory_search_enabled=self._memory_manager is not None,
                 skip_memory=skip_memory_flag,
                 skip_context_files=skip_context_files_flag,
@@ -9928,6 +9930,7 @@ class AgentLoop:
         messages = self.context.build_messages(
             history=history,
             current_message=llm_current_message,
+            intent_text=msg.content,
             media=msg.media if msg.media else None,
             memory_search_enabled=self._memory_manager is not None,
             skip_memory=skip_memory_flag,
@@ -10436,6 +10439,7 @@ class AgentLoop:
             current_message="\n\n".join(
                 block for block in (turn_clock(), announce_coverage, msg.content) if block
             ),
+            intent_text=msg.content,
             memory_search_enabled=self._memory_manager is not None,
             model=self.model,
             channel=origin_channel,

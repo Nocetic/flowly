@@ -101,7 +101,18 @@ _AMBIGUOUS_UI_ACTION_RE = re.compile(
 )
 
 
+# Text Flowly itself puts in a user message (the turn clock says "on the
+# agent's computer"): never the owner's intent. Routing on it sent the computer
+# playbook with every turn.
+_SIDECAR_RE = re.compile(r"<turn_time>.*?</turn_time>", re.DOTALL | re.IGNORECASE)
+
+
+def _owner_text(text: str) -> str:
+    return _SIDECAR_RE.sub(" ", text or "")
+
+
 def _matches_any(text: str, patterns: Iterable[re.Pattern[str]]) -> bool:
+    text = _owner_text(text)
     return any(pattern.search(text) for pattern in patterns)
 
 
@@ -221,7 +232,7 @@ def route_capability_guidance(
             reason="no routed UI capability tools",
         )
 
-    text = current_message or ""
+    text = _owner_text(current_message or "")
     browser_match = (
         BROWSER_CAPABILITY in available_capabilities
         and _matches_any(text, _BROWSER_PATTERNS)

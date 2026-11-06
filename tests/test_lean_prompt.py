@@ -265,3 +265,23 @@ def test_tools_a_prompt_names_are_not_deferred():
     assert not ({"session_search", "skill_manage", "follow_up", "proactivity", "process", "request_secret",
                  "email", "google_connection"} & names)
     assert not {name for name in names if name.startswith("agent_")}
+
+
+@pytest.mark.asyncio
+async def test_a_plain_turn_carries_no_playbook_and_no_computer_tool(tmp_path, monkeypatch):
+    """The turn clock and the other additions to a turn's message are not the
+    owner's intent: "selam" sends neither the computer playbook nor the tool."""
+    seen: list[dict[str, Any]] = []
+
+    class Provider(_Provider):
+        async def chat(self, *args: Any, **kwargs: Any) -> LLMResponse:
+            seen.append(kwargs)
+            return LLMResponse(content="selam!")
+
+    loop = _loop(tmp_path, monkeypatch, Provider([]))
+    _register(loop, "computer", "screenshot", *COLD)
+    await loop.process_direct("selam", session_key="web:plain")
+    request = next(kwargs for kwargs in seen if kwargs.get("tools"))
+    assert "computer" not in _names(request["tools"])
+    playbooks = [m for m in request["messages"] if m.get("role") == "system" and m.get("_capability_guidance")]
+    assert playbooks == []

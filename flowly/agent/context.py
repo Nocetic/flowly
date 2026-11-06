@@ -2224,9 +2224,15 @@ When in doubt, ASK FIRST. A wrong action can't be undone.""")
         session_key: str | None = None,
         available_tools: set[str] | frozenset[str] | None = None,
         reachable_tools: set[str] | frozenset[str] | None = None,
+        intent_text: str | None = None,
     ) -> list[dict[str, Any]]:
         """
         Build the complete message list for an LLM call.
+
+        ``intent_text`` is the owner's own words, when ``current_message``
+        also carries what Flowly adds to a turn (the turn clock, notes, group
+        context): playbooks and relevant skills are chosen from it, never from
+        those additions.
 
         Args:
             history: Previous conversation messages.
@@ -2271,7 +2277,7 @@ When in doubt, ASK FIRST. A wrong action can't be undone.""")
         if defer_dynamic_guidance:
             dynamic_message = self._build_dynamic_guidance_message(
                 history=history,
-                current_message=current_message,
+                current_message=current_message if intent_text is None else intent_text,
                 skill_names=skill_names,
                 available_tools=available_tools,
                 reachable_tools=reachable_tools,
