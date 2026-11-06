@@ -525,6 +525,7 @@ class ProvidersConfig(BaseModel):
     openrouter: ProviderConfig = Field(default_factory=ProviderConfig)
     zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
     sakana: ProviderConfig = Field(default_factory=ProviderConfig)  # Fugu / Fugu Ultra (OpenAI-compat)
+    ollama: ProviderConfig = Field(default_factory=ProviderConfig)  # Local Ollama OpenAI-compatible endpoint
     vllm: ProviderConfig = Field(default_factory=ProviderConfig)
     gemini: ProviderConfig = Field(default_factory=ProviderConfig)
     groq: ProviderConfig = Field(default_factory=ProviderConfig)  # For voice transcription
@@ -1350,7 +1351,22 @@ class Config(BaseSettings):
         return Path(self.agents.defaults.workspace).expanduser()
 
     def get_api_key(self) -> str | None:
-        """Get API key in priority order: OpenRouter > Anthropic > OpenAI > xAI > Gemini > Zhipu > vLLM."""
+        """Get API key in priority order: OpenRouter > Anthropic > OpenAI > xAI > Gemini > Zhipu > Sakana.
+
+        ``ollama`` and ``vllm`` are explicit-only local providers: they never
+        join the cascade below (a stale/default local config must not silently
+        win over a real cloud key), and only resolve when named as the active
+        pick — where they win outright (a local server needs no real key, so we
+        hand back a dummy bearer the OpenAI SDK will accept). These branches
+        keep the legacy helpers — still used by MCP sampling and a couple of
+        CLI paths — consistent with :func:`resolve_active_provider`, which is
+        what the main gateway runtime uses.
+        """
+        active = (self.providers.active or "").strip()
+        if active == "ollama":
+            return self.providers.ollama.api_key or "ollama"
+        if active == "vllm":
+            return self.providers.vllm.api_key or "local"
         return (
             self.providers.openrouter.api_key or
             self.providers.anthropic.api_key or
@@ -1359,12 +1375,14 @@ class Config(BaseSettings):
             self.providers.gemini.api_key or
             self.providers.zhipu.api_key or
             self.providers.sakana.api_key or
-            self.providers.vllm.api_key or
             None
         )
 
     def get_active_provider_name(self) -> str:
         """Return the name of the active provider (highest-priority configured key)."""
+        active = (self.providers.active or "").strip()
+        if active in ("ollama", "vllm"):
+            return active
         if self.providers.openrouter.api_key:
             return "openrouter"
         if self.providers.anthropic.api_key:
@@ -1379,8 +1397,6 @@ class Config(BaseSettings):
             return "zhipu"
         if self.providers.sakana.api_key:
             return "sakana"
-        if self.providers.vllm.api_key:
-            return "vllm"
         return "unknown"
 
     def get_fallback_keys(self) -> list[str]:
@@ -1392,7 +1408,16 @@ class Config(BaseSettings):
         return provider_cfg.fallback_keys
 
     def get_api_base(self) -> str | None:
-        """Get API base URL if using OpenRouter, xAI, Zhipu or vLLM."""
+        """Get API base URL for the active provider (OpenRouter, xAI, Zhipu,
+        Sakana, or an explicit local ollama/vllm pick)."""
+        active = (self.providers.active or "").strip()
+        if active == "ollama":
+            return self.providers.ollama.api_base or "http://127.0.0.1:11434/v1"
+        if active == "vllm":
+            # Generic local: no default port to fall back to (unlike Ollama);
+            # api_base is whatever the user configured, else None (lets the SDK
+            # error clearly rather than silently borrowing another slot's base).
+            return self.providers.vllm.api_base or None
         if self.providers.openrouter.api_key:
             return self.providers.openrouter.api_base or "https://openrouter.ai/api/v1"
         if self.providers.xai.api_key:
@@ -1401,8 +1426,6 @@ class Config(BaseSettings):
             return self.providers.zhipu.api_base
         if self.providers.sakana.api_key:
             return self.providers.sakana.api_base or "https://api.sakana.ai/v1"
-        if self.providers.vllm.api_base:
-            return self.providers.vllm.api_base
         return None
 
     class Config:

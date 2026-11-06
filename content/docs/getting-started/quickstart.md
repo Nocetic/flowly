@@ -19,7 +19,7 @@ The script manages Python for you (via uv) and installs Flowly as a git checkout
 flowly setup
 ```
 
-`flowly setup` asks how to power Flowly. **Quick** signs you in with a Flowly account — no API key, no billing setup, no model to choose. **Full** opens the complete provider list if you'd rather bring your own key (OpenRouter, Anthropic, OpenAI, Gemini, Groq, xAI, Zhipu, Sakana, a ChatGPT or Grok subscription, or a self-hosted vLLM endpoint) and continues into channels and integrations. This is the only mandatory step — everything else is optional and can be added later.
+`flowly setup` asks how to power Flowly. **Quick** signs you in with a Flowly account — no API key, no billing setup, no model to choose. **Full** opens the complete provider list if you'd rather bring your own key (OpenRouter, Anthropic, OpenAI, Gemini, Groq, xAI, Zhipu, Sakana, a ChatGPT or Grok subscription, or a model on your own machine through Ollama, LM Studio, vLLM or llama.cpp) and continues into channels and integrations. This is the only mandatory step — everything else is optional and can be added later.
 
 Setup then sends one small request to check the provider actually answers, so a mistyped key or an empty balance surfaces here rather than in your first conversation. On a fresh install it opens automatically right after `curl … | bash`.
 
@@ -28,6 +28,7 @@ Setup then sends one small request to check the provider actually answers, so a 
 >
 > ```bash
 > flowly setup byok anthropic --key sk-ant-...
+> flowly setup ollama --model gemma4
 > ```
 
 See [Setup wizard](./setup-wizard.md) for all subcommands.

@@ -53,7 +53,8 @@ def test_every_provider_says_what_it_is_and_how_it_signs_in(keychain):  # noqa: 
     # Grok signs in with a device code too: from a phone, away from the agent's machine.
     assert (rows["xai_oauth"]["kind"], rows["xai_oauth"]["login"]) == ("subscription", "device")
     assert rows["anthropic"]["kind"] == "key" and rows["anthropic"]["login"] is None
-    assert rows["vllm"]["kind"] == "url"
+    # Model servers on the agent's computer (provider.local lists their models).
+    assert rows["vllm"]["kind"] == "local" and rows["ollama"]["kind"] == "local"
     assert all("apiKey" not in row and "value" not in row for row in rows.values())
 
 

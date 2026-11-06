@@ -328,14 +328,21 @@ def status():
         has_anthropic = bool(config.providers.anthropic.api_key)
         has_openai = bool(config.providers.openai.api_key)
         has_gemini = bool(config.providers.gemini.api_key)
+        has_ollama = bool(
+            config.providers.ollama.api_base
+            or (config.providers.active or "").strip() == "ollama"
+        )
         has_vllm = bool(config.providers.vllm.api_base)
 
         console.print(f"OpenRouter API: {'[green]✓[/green]' if has_openrouter else '[dim]not set[/dim]'}")
         console.print(f"Anthropic API: {'[green]✓[/green]' if has_anthropic else '[dim]not set[/dim]'}")
         console.print(f"OpenAI API: {'[green]✓[/green]' if has_openai else '[dim]not set[/dim]'}")
         console.print(f"Gemini API: {'[green]✓[/green]' if has_gemini else '[dim]not set[/dim]'}")
+        ollama_base = config.providers.ollama.api_base or "http://127.0.0.1:11434/v1"
+        ollama_status = f"[green]✓ {ollama_base}[/green]" if has_ollama else "[dim]not set[/dim]"
+        console.print(f"Ollama: {ollama_status}")
         vllm_status = f"[green]✓ {config.providers.vllm.api_base}[/green]" if has_vllm else "[dim]not set[/dim]"
-        console.print(f"vLLM/Local: {vllm_status}")
+        console.print(f"Local (OpenAI-compat): {vllm_status}")
 
 
 if __name__ == "__main__":

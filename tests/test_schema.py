@@ -161,7 +161,7 @@ class TestProviderConfig:
 
     def test_all_providers_exist(self):
         providers = ProvidersConfig()
-        for name in ("anthropic", "openai", "openrouter", "zhipu", "vllm", "gemini", "groq", "xai"):
+        for name in ("anthropic", "openai", "openrouter", "zhipu", "ollama", "vllm", "gemini", "groq", "xai"):
             assert hasattr(providers, name)
             provider = getattr(providers, name)
             assert isinstance(provider, ProviderConfig)

@@ -56,6 +56,8 @@ Setup finishes by offering to keep the gateway running in the background. Declin
 | `flowly setup channels` | Connect messaging channels (Telegram, Discord, Slack, …) |
 | `flowly setup tools` | Configure tool integrations (browser, voice, Trello, …) |
 | `flowly setup byok <slug> [--key K] [--no-set-active]` | Headless: store an API key for a provider, no UI |
+| `flowly setup ollama [--model M] [--api-base URL]` | Headless: use local Ollama through its OpenAI-compatible endpoint |
+| `flowly setup local --api-base URL [--model M] [--api-key K]` | Headless: any other local OpenAI-compatible server — LM Studio, vLLM, llama.cpp server, text-generation-webui |
 | `flowly setup agents` | Set up multi-agent orchestration |
 | `flowly setup google-workspace` | Install and authenticate the Google Workspace CLI (`gws`) |
 
@@ -83,6 +85,15 @@ The key is pinned as the active default automatically, and setup echoes back its
 
 ```bash
 flowly setup byok openrouter --key sk-or-... --no-set-active
+```
+
+## Ollama local
+
+Ollama does not need an API key. Start Ollama, then point Flowly at its OpenAI-compatible endpoint:
+
+```bash
+ollama serve
+flowly setup ollama --model gemma4
 ```
 
 > [!IMPORTANT]

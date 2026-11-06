@@ -171,15 +171,19 @@ Channels are off by default. See [Channels overview](../channels/overview.md).
 | `xaiOAuth` | `enabled=true`, `clientId=""`, `apiBase="https://api.x.ai/v1"` (tokens stored in the OS keychain, not config) |
 | `openaiCodex` | ChatGPT subscription (Codex OAuth) — tokens in the OS keychain, not config |
 | `zaiCoding` | Z.AI GLM Coding Plan — tokens in the OS keychain, not config |
+| `ollama` | `apiKey=""`, `apiBase=null` (local Ollama; default base is `http://127.0.0.1:11434/v1` when active). Explicit-only — never in the cascade. |
+| `vllm` | `apiKey=""`, `apiBase=null` (generic local OpenAI-compatible — LM Studio, vLLM, llama.cpp server, ...; `apiBase` is **required**, no default across backends). Explicit-only — never in the cascade. |
 
-BYOK provider slots — each with `apiKey=""`, `apiBase=null`, `fallbackKeys=[]`: `anthropic`, `openai`, `openrouter`, `zhipu`, `sakana`, `vllm`, `gemini`, `groq`, `xai`.
+BYOK provider slots — each with `apiKey=""`, `apiBase=null`, `fallbackKeys=[]`: `anthropic`, `openai`, `openrouter`, `zhipu`, `sakana`, `gemini`, `groq`, `xai`.
 
 When `active=""`, the cascade picks the first usable provider in priority order:
 
 ```
 openrouter → anthropic → openai → openai_codex → zai_coding → xai
-           → xai_oauth → gemini → groq → zhipu → sakana → vllm
+           → xai_oauth → gemini → groq → zhipu → sakana
 ```
+
+`ollama` and `vllm` are explicit-only and never join this cascade — see [Providers and models](./providers-and-models.md).
 
 Setting a provider explicitly (`/provider`, `flowly setup`, or `active` in this file) skips the cascade entirely — worth doing if more than one credential is present, so the choice is yours rather than the order's. See [Providers and models](./providers-and-models.md).
 

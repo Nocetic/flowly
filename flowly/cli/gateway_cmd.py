@@ -1811,6 +1811,18 @@ Respond to the user now:"""
         # (e.g. OpenRouterProvider refusing an empty api_key) leaves the
         # old, working provider in place rather than wedging the agent.
         new_model = fresh_cfg.agents.defaults.model
+        # Switching to a local endpoint? Make sure the model is one the server
+        # actually serves — otherwise the first message 404s with a stale cloud
+        # model id. Single chokepoint for every switch that reloads (TUI
+        # /provider, the picker, desktop provider_set).
+        if new_active.key in ("ollama", "vllm"):
+            try:
+                from flowly.integrations import model_catalog
+                filled = await model_catalog.autofill_model_for_local(new_active.key)
+                if filled:
+                    new_model = filled
+            except Exception as exc:
+                logger.warning(f"[provider] local model autofill skipped: {exc}")
         try:
             new_provider = build_provider(
                 new_active,

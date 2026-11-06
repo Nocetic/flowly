@@ -254,6 +254,18 @@ def test_byok_not_saved_skips_model(monkeypatch):
     assert calls == ["key:anthropic"]  # no model picker when the key wasn't saved
 
 
+def test_ollama_provider_step_skips_api_key_prompt(monkeypatch):
+    calls = []
+    monkeypatch.setattr(ob, "_onboarding_menu", lambda: "ollama")
+    monkeypatch.setattr(ob, "_run_ollama_setup", lambda: calls.append("ollama") or True)
+    monkeypatch.setattr(ob, "_prompt_byok_key", lambda s: calls.append(f"key:{s}") or True)
+    monkeypatch.setattr(ob, "_prompt_model", lambda s: calls.append(f"model:{s}"))
+    monkeypatch.setattr(ob, "_already_configured", lambda: True)
+
+    assert ob._run_provider_step() is True
+    assert calls == ["ollama", "model:ollama"]
+
+
 def test_prompt_model_saves_selection(monkeypatch):
     from InquirerPy import inquirer as _inq
 
@@ -299,6 +311,7 @@ def test_byok_providers_list_is_complete():
     slugs = {s for s, _, _ in ob._BYOK_PROVIDERS}
     # every key-based provider with a config slot is offered inline
     assert {"openrouter", "anthropic", "openai", "gemini", "groq", "xai", "zhipu", "sakana"} <= slugs
+    assert "ollama" not in slugs  # local/no-key provider is a separate picker row
 
 
 # ── section navigation (loops back to home) ──────────────────────────────

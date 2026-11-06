@@ -3032,7 +3032,15 @@ class FlowlyTUI(App[None]):
         """
         field = _inline_provider_key_field(card)
         if field is None:
-            return False
+            # No single pasteable key (a local endpoint needs a base URL, not
+            # just an api_key) → open the full-fields composer setup instead of
+            # silently doing nothing. Explicit-only local providers get activated
+            # on save inside _configure_card_inline, so the picker's switch
+            # intent is honored.
+            saved = await self._configure_card_inline(card)
+            if saved:
+                self._refresh_active_provider_status()
+            return bool(saved)
 
         value = await self._show_inline_secret(
             InlineSecretPromptRequest(
@@ -3169,6 +3177,22 @@ class FlowlyTUI(App[None]):
             return False
 
         if card.category == "provider":
+            # Explicit-only local providers (ollama/vllm) are never picked up by
+            # the credential cascade, so a plain save would leave them
+            # configured-but-unused. Activate on save when usable (matching
+            # `flowly setup local` / onboarding). Set active BEFORE the reload so
+            # it resolves to the just-saved provider, not a cascade fallthrough.
+            from flowly.integrations.active_provider import (
+                _EXPLICIT_ONLY, _build_for,
+            )
+            if card.key in _EXPLICIT_ONLY:
+                try:
+                    from flowly.config.loader import load_config
+                    from flowly.integrations.active_provider import set_active_provider
+                    if _build_for(load_config(), card.key) is not None:
+                        await asyncio.to_thread(set_active_provider, card.key)
+                except Exception:
+                    pass
             tail = await self._reload_gateway_provider()
         elif card.needs_gateway_restart:
             tail = await self._restart_gateway_after_setup()
@@ -3244,11 +3268,14 @@ class FlowlyTUI(App[None]):
         from flowly.integrations import get_card
         from flowly.integrations.active_provider import (
             _build_for,
+            resolve_provider_alias,
             set_active_provider,
         )
 
         transcript = self.query_one(TranscriptPane)
-        rest = (rest or "").strip()
+        # Normalize friendly synonyms (e.g. "local" → the "vllm" slot) so
+        # `/provider local` matches the same card `flowly setup local` writes.
+        rest = resolve_provider_alias((rest or "").strip())
 
         # No-arg → open the arrow-key picker.
         if not rest:

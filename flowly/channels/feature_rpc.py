@@ -2803,13 +2803,15 @@ _PROVIDER_SLOTS = (
     ("zai_coding", "Z.AI GLM Coding Plan", True),
     ("zhipu", "Zhipu GLM", True),
     ("sakana", "Sakana Fugu", True),
-    ("vllm", "vLLM (self-hosted)", True),
+    ("ollama", "Ollama (local)", False),
+    ("vllm", "Local OpenAI-compatible", False),
 )
 
 
 #: What each provider is, for the app's list: ``account`` (Flowly credit),
-#: ``subscription`` (signed in to a plan), ``key`` (an API key), ``url`` (a
-#: self-hosted address). ``login``: how a subscription signs in from the app —
+#: ``subscription`` (signed in to a plan), ``key`` (an API key), ``local`` (a
+#: model server on the agent's computer: Ollama, LM Studio, any OpenAI-compatible
+#: address; it was ``url`` before local servers were found by themselves). ``login``: how a subscription signs in from the app —
 #: ``device`` (a code approved on any device; flowly/auth/provider_login.py) or
 #: ``loopback`` (a browser on the agent's own machine only; none today: xAI's
 #: Grok sign-in moved to a device code so a phone signs in the agent too).
@@ -2818,7 +2820,10 @@ _PROVIDER_KINDS: dict[str, tuple[str, str | None]] = {
     "openai_codex": ("subscription", "device"),
     "xai_oauth": ("subscription", "device"),
     "zai_coding": ("subscription", None),
-    "vllm": ("url", None),
+    # A model server on the agent's own computer (provider.local lists them).
+    # An older app does not know this kind and shows the row only once in use.
+    "ollama": ("local", None),
+    "vllm": ("local", None),
 }
 
 
@@ -2868,6 +2873,16 @@ def provider_list() -> dict:
                 has_key = resolve_runtime_credentials(config=cfg) is not None
             except Exception:
                 has_key = False
+        elif key == "ollama":
+            has_key = bool(
+                (cfg.providers.active or "").strip() == "ollama"
+                or (getattr(slot, "api_base", None) or "").strip()
+            )
+        elif key == "vllm":
+            # Generic local endpoint: api_base is the required field (no
+            # default across LM Studio/vLLM/llama.cpp), api_key is optional —
+            # so "configured" means api_base is set, not that a key exists.
+            has_key = bool((getattr(slot, "api_base", None) or "").strip())
         else:
             has_key = bool(getattr(slot, "api_key", "")) if keyable else True
         kind, login = _PROVIDER_KINDS.get(key, ("key", None))
@@ -3040,6 +3055,112 @@ def provider_login_cancel(params: dict) -> dict:
         return provider_login.cancel(_login_id(params))
     except provider_login.ProviderLoginError as exc:
         raise FeatureRpcError(exc.code, exc.message) from None
+
+
+async def provider_local(params: dict) -> dict:
+    """Model servers on the agent's computer (Ollama, LM Studio): whether each
+    is installed and running, and the models it holds, each with whether it
+    calls tools and the context it runs with (flowly/integrations/local_models.py).
+    No secrets; a machine without them answers two empty servers quickly."""
+    from flowly.integrations import local_models
+
+    return {
+        "servers": await local_models.scan(),
+        "minContext": local_models.MIN_CONTEXT,
+        "recommendedContext": local_models.RECOMMENDED_CONTEXT,
+    }
+
+
+async def provider_use_local(params: dict) -> dict:
+    """Run the agent on a model of a server on its computer, in one step:
+    ``{server: "ollama" | "lmstudio", model}``.
+
+    The model must be one the server holds now. Ollama loads it first, so a
+    model too big for this computer fails here (``LOAD_FAILED``) and the
+    first message does not wait; the context it then runs with comes back
+    (``context``, ``contextOk``). Writes the provider slot's address, the
+    active provider and the default model together, then reloads once.
+    Reasoning effort and service tier go back to their defaults: those of a
+    cloud model mean nothing to a local one.
+    """
+    from flowly.integrations import local_models
+
+    server_id = params.get("server")
+    model = params.get("model")
+    server = local_models.server_by_id(server_id) if isinstance(server_id, str) else None
+    if server is None:
+        raise FeatureRpcError("INVALID", "server must be 'ollama' or 'lmstudio'")
+    if not isinstance(model, str) or not model.strip() or len(model) > 300:
+        raise FeatureRpcError("INVALID", "model must be a non-empty string")
+    model = model.strip()
+    found = await local_models.scan_server(server)
+    if not found["running"]:
+        raise FeatureRpcError("UNREACHABLE", f"{server.name} is not running on this computer")
+    listed = next((m for m in found["models"] if m["id"] == model), None)
+    if listed is None:
+        raise FeatureRpcError("NOT_FOUND", f"{server.name} has no model named {model}")
+    try:
+        context = await local_models.load(server, model)
+    except local_models.LocalServerError as exc:
+        raise FeatureRpcError(exc.code, exc.message) from None
+    context = context or listed.get("context")
+
+    from flowly.config.loader import load_config, save_config
+    from flowly.integrations.active_provider import set_active_provider
+
+    set_active_provider(server.slot)
+    cfg = load_config()
+    slot = getattr(cfg.providers, server.slot)
+    slot.api_base = server.base
+    cfg.agents.defaults.model = model
+    cfg.agents.defaults.reasoning_effort = ""
+    cfg.agents.defaults.service_tier = ""
+    save_config(cfg)
+    from flowly.integrations import model_catalog
+
+    model_catalog.flush_cache()
+    result = {
+        "ok": True,
+        "server": server.id,
+        "key": server.slot,
+        "model": model,
+        "tools": listed.get("tools"),
+        "context": context,
+        "contextOk": None if context is None else context >= local_models.MIN_CONTEXT,
+    }
+    if await _live_provider_reload_succeeded():
+        return {**result, "willRestart": False}
+    return {**result, "willRestart": True}
+
+
+async def provider_set_base(params: dict) -> dict:
+    """Set or clear a provider's ``api_base`` (``value=""`` clears it).
+
+    For local providers (ollama / vllm) the base URL — not an API key — is the
+    primary field: ``provider_list`` reports them configured by base presence,
+    so this is the write path that matches it. Symmetric with
+    :func:`provider_set_key`; flushes the model-catalogue cache and live-reloads.
+    """
+    key = params.get("key")
+    value = params.get("value", "")
+    if not isinstance(key, str) or not key.strip():
+        raise FeatureRpcError("INVALID", "key must be a non-empty string")
+    if not isinstance(value, str):
+        raise FeatureRpcError("INVALID", "value must be a string")
+    key = key.strip()
+    value = value.strip().rstrip("/")
+    from flowly.config.loader import load_config, save_config
+    cfg = load_config()
+    slot = getattr(cfg.providers, key, None)
+    if slot is None or not hasattr(slot, "api_base"):
+        raise FeatureRpcError("INVALID", f"provider '{key}' has no api_base slot")
+    slot.api_base = value
+    save_config(cfg)
+    from flowly.integrations import model_catalog
+    model_catalog.flush_cache()
+    if await _live_provider_reload_succeeded():
+        return {"ok": True, "key": key, "hasBase": bool(value), "willRestart": False}
+    return {"ok": True, "key": key, "hasBase": bool(value), "willRestart": True}
 
 
 async def provider_set_flowly_account(params: dict) -> dict:
@@ -6273,6 +6394,9 @@ _DISPATCH: dict[str, tuple] = {
     "provider.login.start": (provider_login_start, True, False),
     "provider.login.status": (provider_login_status, True, False),
     "provider.login.cancel": (provider_login_cancel, True, False),
+    "provider.set_base": (provider_set_base, True, True),
+    "provider.local": (provider_local, True, False),
+    "provider.use_local": (provider_use_local, True, True),
     "provider.set_flowly_account": (provider_set_flowly_account, True, True),
     "provider.bind_flowly_account": (provider_bind_flowly_account, True, True),
     "logs.tail": (logs_tail, True, False),

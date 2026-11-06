@@ -463,6 +463,47 @@ async def warm_cache(provider_key: str) -> None:
         pass
 
 
+# Providers whose model id is defined by whatever the local server currently
+# serves (no cloud catalogue to validate against). Kept here rather than
+# importing the resolver's tuple to avoid a cycle (active_provider is sync).
+_LOCAL_PROVIDER_KEYS = ("ollama", "vllm")
+
+
+async def autofill_model_for_local(provider_key: str) -> str | None:
+    """Ensure the configured default model is one the local endpoint serves.
+
+    Switching to a local provider (via ``/provider``, the picker, or the
+    desktop RPC) leaves ``agents.defaults.model`` untouched — so a cloud model
+    id like ``anthropic/claude-haiku-4.5`` left over from the previous provider
+    would 404 on the first message. This queries ``/v1/models`` and, when the
+    current model isn't served, persists a served one (the CLI wizards already
+    do this at setup time; this covers the switch paths).
+
+    Returns the newly-set model id, or ``None`` when nothing changed — the
+    current model is already served, the provider isn't local, or the endpoint
+    has no models / is unreachable (in which case the switch still proceeds and
+    the user can fix the model manually).
+    """
+    if provider_key not in _LOCAL_PROVIDER_KEYS:
+        return None
+    try:
+        models = await fetch_models(provider_key, force_refresh=True)
+    except Exception:
+        models = []
+    if not models:
+        return None
+    served = {m.id for m in models}
+    from flowly.config.loader import load_config, save_config
+    cfg = load_config()
+    current = (cfg.agents.defaults.model or "").strip()
+    if current in served:
+        return None
+    new_model = models[0].id
+    cfg.agents.defaults.model = new_model
+    save_config(cfg)
+    return new_model
+
+
 # ── per-provider fetchers ──────────────────────────────────────────
 
 
@@ -1008,6 +1049,134 @@ async def _fetch_zai_coding() -> list[Model]:
     ]
 
 
+async def _fetch_ollama() -> list[Model]:
+    """Local Ollama models, from its native API (flowly/integrations/local_models.py).
+
+    Embedding models are left out (they cannot hold a conversation), and each
+    model's ``context_window`` is the context Ollama actually runs it with
+    when that is known: compaction then keeps the conversation inside it
+    instead of the model's trained window, which Ollama would silently cut.
+    An Ollama reached only through its OpenAI-compatible route (a proxy in
+    front of it) still lists its models, from ``/v1/models``, without them.
+    """
+    from flowly.config.loader import load_config
+    from flowly.integrations import local_models
+
+    cfg = load_config()
+    ocfg = getattr(cfg.providers, "ollama", None)
+    base = (
+        str(getattr(ocfg, "api_base", "") or "http://127.0.0.1:11434/v1")
+        .strip()
+        .rstrip("/")
+    )
+    api_key = str(getattr(ocfg, "api_key", "") or "ollama").strip() or "ollama"
+    root = base[: -len("/v1")] if base.endswith("/v1") else base
+    server = local_models.LocalServer("ollama", "Ollama", "ollama", base, root)
+    found: list[local_models.LocalModel] = []
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as c:
+        try:
+            found = await local_models._scan_ollama(c, server)
+        except Exception:  # noqa: BLE001 - the native API is optional; the list below is not
+            found = []
+        if found:
+            out = [
+                Model(
+                    id=m.id,
+                    name=m.id,
+                    description="Ollama · " + ("cloud" if m.cloud else (m.parameters or "local")),
+                    context_window=m.context,
+                    tags=["cloud" if m.cloud else "local"] + (["tools"] if m.tools else []),
+                )
+                for m in found
+            ]
+        else:
+            r = await c.get(
+                f"{base}/models",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Accept": "application/json",
+                    "User-Agent": _UA,
+                },
+            )
+            r.raise_for_status()
+            out = []
+            for item in r.json().get("data", []):
+                mid = str(item.get("id") or item.get("model") or "").strip()
+                if not mid:
+                    continue
+                out.append(Model(
+                    id=mid,
+                    name=mid,
+                    description=f"Ollama · {item.get('owned_by') or 'local'}",
+                    tags=["cloud" if mid.endswith(":cloud") else "local"],
+                ))
+    out.sort(key=lambda m: (1 if "cloud" in m.tags else 0, m.id.lower()))
+    return out
+
+
+async def _fetch_vllm() -> list[Model]:
+    """Generic local OpenAI-compatible models from ``{api_base}/models`` — LM
+    Studio, vLLM, llama.cpp server, text-generation-webui, koboldcpp, etc.
+
+    Unlike Ollama there's no default port to fall back to across those
+    backends, so a missing ``api_base`` returns an empty catalog (the caller
+    shows a "not configured" hint) rather than guessing a URL.
+    """
+    from flowly.config.loader import load_config
+    cfg = load_config()
+    vcfg = getattr(cfg.providers, "vllm", None)
+    base = str(getattr(vcfg, "api_base", "") or "").strip().rstrip("/")
+    if not base:
+        return []
+    api_key = str(getattr(vcfg, "api_key", "") or "local").strip() or "local"
+    # LM Studio says more about each model through its native API: which are
+    # embedding models (left out) and the context a loaded one runs with.
+    # Other servers answer 404 there and keep the plain list.
+    from flowly.integrations import local_models
+
+    root = base[: -len("/v1")] if base.endswith("/v1") else base
+    details: dict[str, local_models.LocalModel] = {}
+    skip: set[str] = set()
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as c:
+        try:
+            native = await c.get(f"{root}/api/v0/models", headers={"Accept": "application/json"})
+            if native.status_code == 200:
+                for item in native.json().get("data") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("type") == "embeddings" and isinstance(item.get("id"), str):
+                        skip.add(item["id"])
+                    model = local_models._lmstudio_model(item)
+                    if model is not None:
+                        details[model.id] = model
+        except Exception:  # noqa: BLE001 - only LM Studio has it; the plain list below is enough
+            pass
+        r = await c.get(
+            f"{base}/models",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Accept": "application/json",
+                "User-Agent": _UA,
+            },
+        )
+    r.raise_for_status()
+    out: list[Model] = []
+    for item in r.json().get("data", []):
+        mid = str(item.get("id") or item.get("model") or "").strip()
+        if not mid or mid in skip:
+            continue
+        known = details.get(mid)
+        out.append(Model(
+            id=mid,
+            name=mid,
+            description=f"Local · {item.get('owned_by') or 'self-hosted'}",
+            context_window=known.context if known else None,
+            tags=["local"] + (["tools"] if known and known.tools else []),
+        ))
+    out.sort(key=lambda m: m.id.lower())
+    return out
+
+
 _FETCHERS: dict[str, "Any"] = {
     "openrouter": _fetch_openrouter,
     "flowly": _fetch_flowly_hosted,
@@ -1015,6 +1184,8 @@ _FETCHERS: dict[str, "Any"] = {
     "xai": _fetch_xai_apikey,
     "openai_codex": _fetch_openai_codex,
     "zai_coding": _fetch_zai_coding,
+    "ollama": _fetch_ollama,
+    "vllm": _fetch_vllm,
     # anthropic / openai / gemini / groq / zhipu — not implemented yet.
     # Their /v1/models endpoints need the user's API key; we'll plumb
     # that through once the OpenRouter MVP feels good.

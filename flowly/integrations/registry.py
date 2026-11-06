@@ -32,6 +32,7 @@ from flowly.integrations.probes import (
     probe_imessage,
     probe_linear,
     probe_obsidian,
+    probe_ollama,
     probe_openai,
     probe_openai_codex,
     probe_openrouter,
@@ -45,6 +46,7 @@ from flowly.integrations.probes import (
     probe_telegram,
     probe_trello,
     probe_twilio,
+    probe_vllm,
     probe_web_channel,
     probe_whatsapp,
     probe_x,
@@ -551,6 +553,53 @@ _PROVIDERS: list[IntegrationCard] = [
                        "Format: sk-or-v1-… (from openrouter.ai/keys). "
                        "NOT your Flowly account token."
                    )),
+    IntegrationCard(
+        key="ollama", label="Ollama (local)", category="provider",
+        description=(
+            "Run Flowly on models served by your local Ollama daemon. "
+            "Uses Ollama's OpenAI-compatible endpoint; no API key required."
+        ),
+        docs_url="https://docs.ollama.com/api/openai-compatibility",
+        config_path="providers.ollama",
+        fields=[
+            Field("api_base", "API base URL", FieldType.TEXT, required=False,
+                  default="",
+                  placeholder="http://127.0.0.1:11434/v1",
+                  help="Ollama's OpenAI-compatible endpoint."),
+            Field("api_key", "API key", FieldType.PASSWORD, required=False,
+                  default="",
+                  placeholder="ollama",
+                  help="Optional dummy key; Ollama ignores it locally."),
+        ],
+        probe=probe_ollama,
+        custom_action="ollama_local",
+        needs_gateway_restart=False,
+    ),
+    IntegrationCard(
+        key="vllm", label="Local OpenAI-compatible", category="provider",
+        description=(
+            "LM Studio, vLLM, llama.cpp server, text-generation-webui, "
+            "koboldcpp, or any other local server that speaks the OpenAI "
+            "chat-completions API. Distinct from the Ollama card above — "
+            "use this for anything else."
+        ),
+        docs_url="https://lmstudio.ai/docs/developer/openai-compat",
+        config_path="providers.vllm",
+        fields=[
+            Field("api_base", "API base URL", FieldType.TEXT, required=True,
+                  default="",
+                  placeholder="http://127.0.0.1:1234/v1",
+                  help="Your server's OpenAI-compatible endpoint "
+                       "(LM Studio default: :1234, vLLM default: :8000)."),
+            Field("api_key", "API key", FieldType.PASSWORD, required=False,
+                  default="",
+                  placeholder="local",
+                  help="Optional; most local servers ignore it."),
+        ],
+        probe=probe_vllm,
+        custom_action="vllm_local",
+        needs_gateway_restart=False,
+    ),
     _provider_card("gemini", "Google Gemini",
                    "Gemini 1.5/2.0 via Google AI Studio.",
                    "https://aistudio.google.com/app/apikey",

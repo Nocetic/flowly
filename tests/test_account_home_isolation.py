@@ -189,6 +189,7 @@ def test_provider_slots_include_oauth_subscriptions():
     keys = [key for key, _, _ in feature_rpc._PROVIDER_SLOTS]
     assert "xai_oauth" in keys
     assert "openai_codex" in keys
+    assert "ollama" in keys
 
 
 def test_provider_list_surfaces_oauth_subscriptions_as_non_keyable(
@@ -210,6 +211,10 @@ def test_provider_list_surfaces_oauth_subscriptions_as_non_keyable(
     assert "openai_codex" in by_key
     assert by_key["openai_codex"]["keyable"] is False
     assert by_key["openai_codex"]["hasKey"] is False
+
+    assert "ollama" in by_key
+    assert by_key["ollama"]["keyable"] is False
+    assert by_key["ollama"]["hasKey"] is False
 
 
 def test_provider_list_reflects_a_connected_codex_subscription(

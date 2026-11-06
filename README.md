@@ -40,6 +40,8 @@ flowly
 ```
 
 `flowly setup` walks you through a provider (OpenRouter, Anthropic, OpenAI, Gemini, Groq, xAI/Grok, Zhipu, or a local model) and any channels you want. Two minutes, done. Add a Telegram bot? `flowly setup` → Telegram → paste token. The gateway hot-reloads each channel as you save.
+Using Ollama locally? `ollama serve` then `flowly setup ollama --model gemma4`.
+Running LM Studio, vLLM, or llama.cpp instead? `flowly setup local --api-base http://localhost:1234/v1 --model <id>`.
 
 To keep the agent running with nobody at the terminal — channels reachable,
 cron firing, across reboots:

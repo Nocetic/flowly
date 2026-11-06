@@ -15,7 +15,16 @@ Priority (first match wins)
    AND the user is signed in. Used when ``providers.active`` is empty.
 3. **External cascade** — openrouter → anthropic → openai →
    openai_codex → zai_coding → xai → xai_oauth → gemini → groq →
-   zhipu → sakana → vllm. First usable provider wins.
+   zhipu → sakana. First usable provider wins.
+
+``ollama`` and ``vllm`` (generic local OpenAI-compatible — LM Studio, vLLM,
+llama.cpp server, text-generation-webui, …) are explicit-only: a local server's
+availability isn't implied by a saved config value the way a cloud API key is
+— it may be offline, or the config may be a leftover from a server the user
+isn't running anymore. Including either in the credential cascade would let a
+stale/default config silently win over a provider the user actually intends to
+use. Users opt in with ``providers.active = "ollama" | "vllm"`` or
+``flowly setup ollama`` / ``flowly setup local``.
 
 The explicit ``active`` choice is sticky: it survives until the user
 changes it (or until that provider becomes unusable, e.g. signs out of
@@ -25,8 +34,10 @@ through the cascade and surface a warning at boot rather than crashing.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 from flowly.config.schema import Config
 
@@ -44,8 +55,73 @@ _BYOK_PRIORITY = (
     "groq",
     "zhipu",
     "sakana",
+)
+
+_EXPLICIT_ONLY = (
+    "ollama",
     "vllm",
 )
+
+_PROVIDER_KEYS = _BYOK_PRIORITY + _EXPLICIT_ONLY
+
+# User-facing synonyms → canonical config slug. The generic local slot is keyed
+# ``vllm`` on disk (historical), but the CLI command and UI call it "local", so
+# accept "local" wherever a provider name is typed (e.g. ``/provider local``)
+# and normalize to the real slot. Kept tiny on purpose — this is a friendly
+# alias, not a plugin alias system.
+_PROVIDER_ALIASES = {"local": "vllm"}
+
+
+def resolve_provider_alias(key: str) -> str:
+    """Map a user-typed provider synonym to its canonical config slug.
+    Unknown/blank input is returned unchanged (case-insensitive match)."""
+    if not key:
+        return key
+    return _PROVIDER_ALIASES.get(key.strip().lower(), key)
+
+
+_DEFAULT_OLLAMA_BASE = "http://127.0.0.1:11434/v1"
+# Dummy bearer token for local servers that don't check one — the OpenAI SDK
+# still requires a non-empty Authorization header to construct the request.
+# (The generic-local default base — LM Studio's :1234 — lives at each entry
+# point instead: the `flowly setup local` flag default, the setup card
+# placeholder, and the onboarding prompt. There's no single canonical port
+# across LM Studio/vLLM/llama.cpp, so the resolver never guesses one.)
+_LOCAL_DUMMY_KEY = "local"
+
+
+def is_local_endpoint(base_url: str | None) -> bool:
+    """True when ``base_url`` points at the local machine or a private network
+    — loopback, RFC-1918/link-local, Tailscale CGNAT (100.64.0.0/10), a
+    ``.local`` mDNS name, or a bare (dot-less) LAN hostname.
+
+    Consumers use this to grant local model servers (Ollama, LM Studio, vLLM,
+    llama.cpp) a longer default request timeout: prefill + decode of a full
+    response on CPU / modest GPU routinely runs for minutes, well past the
+    cloud-tuned default. Deliberately conservative — a false negative just
+    means the shorter default, never a wrong endpoint.
+    """
+    if not base_url:
+        return False
+    try:
+        host = (urlparse(base_url).hostname or "").strip().lower()
+    except Exception:
+        return False
+    if not host:
+        return False
+    if host == "localhost" or host.endswith((".local", ".localhost")):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        # Tailscale hands out 100.64.0.0/10 (CGNAT) addresses, which stdlib
+        # doesn't count as "private" — but a model server reached over a
+        # Tailscale mesh is as local (and as slow-to-prefill) as one on the LAN.
+        in_cgnat = ip in ipaddress.ip_network("100.64.0.0/10")
+        return ip.is_loopback or ip.is_private or ip.is_link_local or in_cgnat
+    except ValueError:
+        # Not an IP literal. A dot-less hostname ("myserver", a Docker service
+        # name, ...) is almost always a LAN box, not a public endpoint.
+        return "." not in host
 
 
 @dataclass(frozen=True)
@@ -224,6 +300,29 @@ def resolve_named_provider(config: Config, name: str) -> ActiveProvider | None:
     return _build_for(config, key)
 
 
+def _build_local(
+    config: Config, name: str, *, default_base: str | None, dummy_key: str, source: str,
+) -> ActiveProvider | None:
+    """Shared resolver for local/self-hosted OpenAI-compatible providers
+    (Ollama, generic ``vllm``). Both need no real API key — the OpenAI SDK
+    still requires a non-empty bearer, so an empty slot gets ``dummy_key``.
+
+    ``default_base=None`` makes ``api_base`` required (no safe guess exists
+    across arbitrary local servers); an empty slot then resolves to
+    unusable (``None``) rather than a wrong default.
+    """
+    provider_cfg = getattr(config.providers, name, None)
+    if provider_cfg is None:
+        return None
+    base = (getattr(provider_cfg, "api_base", None) or "").strip()
+    if not base:
+        if default_base is None:
+            return None
+        base = default_base
+    key = (getattr(provider_cfg, "api_key", "") or "").strip() or dummy_key
+    return ActiveProvider(key=name, api_key=key, api_base=base, source=source)
+
+
 def _build_for(config: Config, name: str) -> ActiveProvider | None:
     """Construct an ``ActiveProvider`` for ``name``, or ``None`` if not usable.
 
@@ -379,6 +478,24 @@ def _build_for(config: Config, name: str) -> ActiveProvider | None:
             source=source,
         )
 
+    if name == "ollama":
+        return _build_local(
+            config, "ollama",
+            default_base=_DEFAULT_OLLAMA_BASE, dummy_key="ollama",
+            source="Local · Ollama",
+        )
+
+    if name == "vllm":
+        # Generic local OpenAI-compatible endpoint (LM Studio, vLLM, llama.cpp
+        # server, text-generation-webui, …). Unlike Ollama there's no single
+        # sensible default port across those backends, so api_base is
+        # required — an empty slot means "not configured", not "use a guess".
+        return _build_local(
+            config, "vllm",
+            default_base=None, dummy_key=_LOCAL_DUMMY_KEY,
+            source="Local · OpenAI-compatible",
+        )
+
     if name not in _BYOK_PRIORITY:
         return None
     provider_cfg = getattr(config.providers, name, None)
@@ -506,7 +623,8 @@ def set_active_provider(key: str) -> str | None:
     Returns the auto-applied model id, or ``None`` when the model was left
     alone — callers surface it as "model → X".
     """
-    if key and key != "flowly" and key not in _BYOK_PRIORITY:
+    key = resolve_provider_alias(key)
+    if key and key != "flowly" and key not in _PROVIDER_KEYS:
         raise ValueError(f"unknown provider key: {key}")
     from flowly.integrations.config_io import _atomic_write_json, _load_raw, _set_path
     raw = _load_raw()
@@ -572,9 +690,9 @@ def _default_base_for(provider_name: str) -> str | None:
     can't accidentally override it with a wrong host).
 
     Returning ``None`` means "let the OpenAI SDK pick its own default".
-    Used only for ``openai`` (SDK already targets api.openai.com) and
-    ``vllm`` (self-hosted; runtime would fail loudly without a URL,
-    but vllm is exotic enough that we punt on the form for now).
+    Used only for ``openai`` (SDK already targets api.openai.com). ``ollama``
+    and ``vllm`` (generic local) don't reach this function at all — both are
+    explicit-only and resolved by :func:`_build_local` instead.
 
     Most endpoints listed here speak the OpenAI Chat-Completions wire
     protocol and are handled by :class:`OpenRouterProvider`. Anthropic is
@@ -595,7 +713,4 @@ def _default_base_for(provider_name: str) -> str | None:
         "zhipu":      "https://open.bigmodel.cn/api/paas/v4",
         "zai_coding": "https://api.z.ai/api/coding/paas/v4",
         "sakana":     "https://api.sakana.ai/v1",
-        # vllm is self-hosted; user must set api_base manually if they
-        # use this slot. Returning None means resolver still works
-        # (it just hands None to the SDK, which then uses its default).
     }.get(provider_name)

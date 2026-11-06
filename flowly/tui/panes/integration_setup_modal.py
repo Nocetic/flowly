@@ -724,6 +724,23 @@ class IntegrationSetupModal(ModalScreen[dict[str, Any] | None]):
         # • channels/tools/voice → service restart via launchd/systemd
         # • no-op fields → next request picks them up naturally
         if self._card.category == "provider":
+            # Explicit-only local providers (ollama / vllm) are never picked up
+            # by the credential cascade, so a plain save would leave them
+            # configured-but-unused — unlike cloud BYOK, whose new key the
+            # cascade selects on reload. Activate them on save (matching
+            # `flowly setup local` / onboarding, which both set active), but
+            # only when the just-saved config is actually usable.
+            from flowly.integrations.active_provider import (
+                _EXPLICIT_ONLY, _build_for,
+            )
+            if self._card.key in _EXPLICIT_ONLY:
+                try:
+                    from flowly.config.loader import load_config
+                    from flowly.integrations.active_provider import set_active_provider
+                    if _build_for(load_config(), self._card.key) is not None:
+                        await asyncio.to_thread(set_active_provider, self._card.key)
+                except Exception:
+                    pass
             tail = await self._trigger_provider_reload()
             self._set_status(f"✓ saved · {tail}", "ok")
         elif self._card.needs_gateway_restart:

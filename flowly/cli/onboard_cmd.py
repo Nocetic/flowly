@@ -271,8 +271,9 @@ def _onboarding_menu() -> str | None:
     """Provider picker — the full list inline.
 
     Returns ``"flowly"`` (managed sign-in), ``"xai_oauth"`` (Grok subscription
-    browser flow), ``"zai_coding"`` (GLM Coding Plan), a BYOK provider slug,
-    or ``None`` (backed out / cancelled).
+    browser flow), ``"zai_coding"`` (GLM Coding Plan), ``"ollama"`` / ``"vllm"``
+    (local endpoints), a BYOK provider slug, or ``None`` (backed out /
+    cancelled).
     """
     from InquirerPy.base.control import Choice
     from InquirerPy.separator import Separator
@@ -280,6 +281,14 @@ def _onboarding_menu() -> str | None:
     choices = [
         Choice(value="flowly", name="Sign in with Flowly      (recommended — hosted, nothing to configure)"),
         Separator("  ── or bring your own ──"),
+        Choice(
+            value="ollama",
+            name="Ollama local  ·  no key, uses http://127.0.0.1:11434/v1",
+        ),
+        Choice(
+            value="vllm",
+            name="Local OpenAI-compatible  ·  LM Studio / vLLM / llama.cpp (enter a URL)",
+        ),
     ]
     for slug, label, hint in _BYOK_PROVIDERS:
         choices.append(Choice(value=slug, name=f"{label}  ·  {hint}"))
@@ -366,6 +375,65 @@ def _run_zai_coding_login() -> None:
         pass
     except KeyboardInterrupt:
         console.print("  [dim]GLM Coding setup cancelled.[/dim]")
+
+
+def _run_ollama_setup() -> bool:
+    """Configure Ollama's local OpenAI-compatible endpoint."""
+    from flowly.config.loader import load_config, save_config
+    from flowly.integrations.active_provider import set_active_provider
+
+    cfg = load_config()
+    cfg.providers.ollama.api_base = (
+        cfg.providers.ollama.api_base or "http://127.0.0.1:11434/v1"
+    )
+    save_config(cfg)
+    set_active_provider("ollama")
+    console.print(
+        "  [green]✓[/green] Ollama endpoint → "
+        f"[b]{cfg.providers.ollama.api_base}[/b] · active provider → [b]ollama[/b]"
+    )
+    return True
+
+
+def _run_local_setup() -> bool:
+    """Configure a generic local OpenAI-compatible endpoint (LM Studio, vLLM,
+    llama.cpp server, ...). Unlike Ollama there's no default port across
+    backends, so we prompt for the URL (defaulting to LM Studio's :1234, the
+    most common first landing point). Returns False if the user backs out."""
+    from rich.prompt import Prompt
+
+    from flowly.config.loader import load_config, save_config
+    from flowly.integrations.active_provider import set_active_provider
+
+    api_base = Prompt.ask(
+        "  Server base URL",
+        default="http://127.0.0.1:1234/v1",
+    ).strip().rstrip("/")
+    if not api_base:
+        console.print("  [yellow]No URL entered — skipped.[/yellow]")
+        return False
+    # Optional — most local servers ignore it; blank is fine (a dummy bearer
+    # is used at runtime).
+    api_key = Prompt.ask(
+        "  API key [dim](optional — press Enter to skip)[/dim]",
+        default="",
+        password=True,
+    ).strip()
+
+    cfg = load_config()
+    cfg.providers.vllm.api_base = api_base
+    # Only write the key when one was entered — pressing Enter to skip must not
+    # wipe a key set earlier (mirrors `flowly setup local`). Empty is the common
+    # case; the resolver supplies a dummy bearer.
+    if api_key:
+        cfg.providers.vllm.api_key = api_key
+    save_config(cfg)
+    set_active_provider("vllm")
+    console.print(
+        "  [green]✓[/green] Local endpoint → "
+        f"[b]{api_base}[/b] · active provider → [b]Local OpenAI-compatible[/b]"
+    )
+    return True
 
 
 def _prompt_byok_key(slug: str) -> bool:
@@ -569,6 +637,12 @@ def _run_provider_step(*, ask_model: bool = True) -> bool:
         _run_codex_oauth_login()
     elif choice == "zai_coding":
         _run_zai_coding_login()
+    elif choice == "ollama":
+        if not _run_ollama_setup():
+            return False
+    elif choice == "vllm":
+        if not _run_local_setup():
+            return False
     else:
         if not _prompt_byok_key(choice):
             return False

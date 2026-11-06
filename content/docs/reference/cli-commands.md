@@ -103,6 +103,8 @@ The first-run onboarding + configuration surface. Bare `flowly setup` seeds the 
 | `setup channels` | Connect messaging channels (Telegram / Discord / Slack). |
 | `setup tools` | Configure tool integrations (browser, voice, Trello, …). |
 | `setup byok <slug>` | Quick BYOK one-shot: save an API key (slugs: `openrouter`, `anthropic`, `openai`, `xai`, `gemini`, `groq`, `zhipu`, `sakana`). |
+| `setup ollama [--model M]` | Configure local Ollama via `http://127.0.0.1:11434/v1` (no API key). |
+| `setup local --api-base URL [--model M]` | Configure any other local OpenAI-compatible server — LM Studio, vLLM, llama.cpp server, text-generation-webui (API key optional). |
 | `setup agents` | Set up multi-agent orchestration. |
 | `setup google-workspace` | Install and authenticate the Google Workspace CLI (gws). |
 

@@ -739,6 +739,64 @@ probe_zhipu = _provider_probe("https://open.bigmodel.cn/api/paas")
 probe_sakana = _provider_probe("https://api.sakana.ai")
 
 
+async def probe_ollama(values: dict[str, Any]) -> ProbeResult:
+    """Probe a local Ollama OpenAI-compatible endpoint.
+
+    Ollama does not require an API key on localhost, but OpenAI-compatible
+    clients still pass a dummy bearer. We intentionally do not require one in
+    the setup card.
+    """
+    base = (values.get("api_base") or "http://127.0.0.1:11434/v1").strip().rstrip("/")
+    key = (values.get("api_key") or "ollama").strip() or "ollama"
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as c:
+            r = await c.get(
+                f"{base}/models",
+                headers={"Authorization": f"Bearer {key}", "User-Agent": _UA},
+            )
+    except Exception as exc:
+        return _net_error(exc)
+    if r.status_code != 200:
+        return ProbeResult("down", f"HTTP {r.status_code}")
+    try:
+        data = r.json()
+        models = data.get("data") or data.get("models") or []
+        return ProbeResult("ok", f"{len(models)} models")
+    except Exception:
+        return ProbeResult("ok", "reachable")
+
+
+async def probe_vllm(values: dict[str, Any]) -> ProbeResult:
+    """Probe a generic local OpenAI-compatible endpoint — LM Studio, vLLM,
+    llama.cpp server, text-generation-webui, koboldcpp, or anything else that
+    speaks ``/v1/chat/completions`` + ``/v1/models``.
+
+    Unlike Ollama there's no single sensible default port across those
+    backends, so (unlike :func:`probe_ollama`) an empty ``api_base`` is a hard
+    "not configured" rather than falling back to a guessed URL.
+    """
+    base = (values.get("api_base") or "").strip().rstrip("/")
+    if not base:
+        return ProbeResult("not_configured", "enter the server's base URL")
+    key = (values.get("api_key") or "local").strip() or "local"
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as c:
+            r = await c.get(
+                f"{base}/models",
+                headers={"Authorization": f"Bearer {key}", "User-Agent": _UA},
+            )
+    except Exception as exc:
+        return _net_error(exc)
+    if r.status_code != 200:
+        return ProbeResult("down", f"HTTP {r.status_code}")
+    try:
+        data = r.json()
+        models = data.get("data") or data.get("models") or []
+        return ProbeResult("ok", f"{len(models)} models")
+    except Exception:
+        return ProbeResult("ok", "reachable")
+
+
 async def probe_zai_coding(values: dict[str, Any]) -> ProbeResult:
     if not values.get("enabled", True):
         return ProbeResult("disabled", "GLM Coding Plan disabled")
