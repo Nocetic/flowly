@@ -15,7 +15,7 @@ from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Iterable
 
 from collections import OrderedDict
 from loguru import logger
@@ -4820,10 +4820,12 @@ class AgentLoop:
         *,
         intent_text: str = "",
         semantic_promoted_tools: tuple[str, ...] | None = None,
+        pinned_tools: Iterable[str] = (),
     ):
         """Compact one already-routed tool surface without losing reachability."""
         from flowly.agent.tools.discovery import (
             DEFAULT_ALWAYS_VISIBLE_TOOLS,
+            DEFAULT_DEFERRED_TOOLS,
             DEFAULT_DEFERRED_TOOLSETS,
             build_tool_disclosure,
         )
@@ -4846,6 +4848,12 @@ class AgentLoop:
             always_visible_tools=getattr(
                 discovery_cfg, "always_visible_tools", DEFAULT_ALWAYS_VISIBLE_TOOLS
             ),
+            deferred_tools=(
+                DEFAULT_DEFERRED_TOOLS
+                if getattr(discovery_cfg, "deferred_tools", None) is None
+                else discovery_cfg.deferred_tools
+            ),
+            pinned_tools=pinned_tools,
             minimum_deferred_schema_tokens=int(getattr(
                 discovery_cfg, "minimum_deferred_schema_tokens", 750
             )),
@@ -5105,6 +5113,7 @@ class AgentLoop:
         *,
         disabled_tools: list[str] | set[str] | None = None,
         intent_text: str = "",
+        pinned_tools: Iterable[str] = (),
     ):
         """Return the compact model surface and its full reachable catalog."""
         return self._build_tool_disclosure(
@@ -5113,7 +5122,66 @@ class AgentLoop:
                 disabled_tools=disabled_tools,
             ),
             intent_text=intent_text,
+            pinned_tools=pinned_tools,
         )
+
+    # ── tools a session keeps direct ─────────────────────────────────────
+    #
+    # A deferred tool a session promoted or used stays direct for the rest of
+    # that session: the tool list then only ever grows within a session, so it
+    # changes the provider's prompt cache (and a local server's KV cache) once
+    # per newly needed tool instead of flipping back every turn.
+
+    _SESSION_PINS_LIMIT = 512
+
+    def _session_pins(self, session_key: str) -> frozenset[str]:
+        pins = getattr(self, "_session_tool_pins", None)
+        if not session_key or pins is None:
+            return frozenset()
+        return frozenset(pins.get(session_key, ()))
+
+    def _pin_for_session(self, session_key: str, names: Iterable[str]) -> None:
+        names = {str(name).strip() for name in names if str(name).strip()}
+        if not session_key or not names:
+            return
+        pins = getattr(self, "_session_tool_pins", None)
+        if pins is None:
+            pins = self._session_tool_pins = OrderedDict()
+        current = pins.pop(session_key, set())
+        current |= names
+        pins[session_key] = current
+        while len(pins) > self._SESSION_PINS_LIMIT:
+            pins.popitem(last=False)
+
+    @staticmethod
+    def _turn_playbook_pins(text: str) -> frozenset[str]:
+        """The playbook tools this message asks for, before its messages are
+        built (the turn's first estimate); each request then reads the exact
+        routing from its own messages (``_playbook_pins``)."""
+        try:
+            from flowly.agent.capability_guidance import route_capability_guidance
+
+            decision = route_capability_guidance(
+                text or "", history=[], available_tools={"computer", "browser_tab"})
+        except Exception:  # noqa: BLE001 - a pin is an optimisation, never a gate
+            return frozenset()
+        return AgentLoop._playbook_pins([{"role": "system", "_capability_guidance": sorted(decision.active)}])
+
+    @staticmethod
+    def _playbook_pins(messages: list[dict[str, Any]]) -> frozenset[str]:
+        """The tools of the capability playbooks routed into this request
+        (context.build_messages marks them on its guidance message), so a
+        playbook and its tool always arrive together."""
+        active: set[str] = set()
+        for message in messages[:3]:
+            if isinstance(message, dict) and message.get("role") == "system":
+                active.update(message.get("_capability_guidance") or ())
+        pins: set[str] = set()
+        if "computer" in active:
+            pins.update(("computer", "screenshot"))
+        if "browser" in active:
+            pins.update(("browser_tab", "browser_plan"))
+        return frozenset(pins)
 
     def _extract_action_intent_text(self, content: str) -> str:
         """
@@ -6581,9 +6649,13 @@ class AgentLoop:
             # Build the deterministic/lossless view first. Small external
             # catalogs remain eager, so they should not initialize or download
             # a semantic model that cannot save any schema tokens.
+            # What this session already promoted or used, and the tools of
+            # the playbooks routed into this request, stay direct.
+            iteration_pins = self._session_pins(session_key) | self._playbook_pins(messages)
             disclosure = self._build_tool_disclosure(
                 tool_defs,
                 intent_text=turn_content,
+                pinned_tools=iteration_pins,
             )
             semantic_decision = None
             if disclosure.enabled:
@@ -6600,7 +6672,9 @@ class AgentLoop:
                     tool_defs,
                     intent_text=turn_content,
                     semantic_promoted_tools=semantic_promotions,
+                    pinned_tools=iteration_pins,
                 )
+            self._pin_for_session(session_key, disclosure.promoted_names)
             tool_defs = list(disclosure.definitions)
             if disabled_tools:
                 disabled_set = set(disabled_tools)
@@ -7215,12 +7289,27 @@ class AgentLoop:
                         _protocol_tool_name == "tool_call"
                         and _effective_tool_name in disclosure.external
                     )
+                    if _is_advertised_external:
+                        # Used through the bridge: direct from the next step on.
+                        self._pin_for_session(session_key, (_effective_tool_name,))
                     if not (_is_advertised_direct or _is_advertised_external):
                         blocked_tools.append(_effective_tool_name)
-                        result = (
-                            f"Error: Tool '{_effective_tool_name}' is unavailable for "
-                            f"platform '{tool_platform or outbound_channel or 'unknown'}'."
-                        )
+                        if _effective_tool_name in disclosure.deferred:
+                            # A real tool behind the bridge, called without its
+                            # schema: still not run (its arguments were guessed),
+                            # but its full schema is direct from the next step.
+                            self._pin_for_session(session_key, (_effective_tool_name,))
+                            result = (
+                                f"Error: Tool '{_effective_tool_name}' is unavailable as a "
+                                "direct call in this step: its schema was behind tool "
+                                "search. Its full schema is visible from the next step; "
+                                "call it again with arguments that match it."
+                            )
+                        else:
+                            result = (
+                                f"Error: Tool '{_effective_tool_name}' is unavailable for "
+                                f"platform '{tool_platform or outbound_channel or 'unknown'}'."
+                            )
                         logger.warning(
                             "Tool routing blocked unadvertised call: {} platform={}",
                             _effective_tool_name,
@@ -9216,6 +9305,7 @@ class AgentLoop:
                 msg.channel,
                 disabled_tools=disabled_tools,
                 intent_text=msg.content,
+                pinned_tools=self._session_pins(msg.session_key) | self._turn_playbook_pins(msg.content),
             )
             if tools_allowed
             else self._build_tool_disclosure([], intent_text=msg.content)

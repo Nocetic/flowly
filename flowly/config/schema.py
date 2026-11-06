@@ -993,6 +993,12 @@ class ToolDiscoveryConfig(BaseModel):
         "extensions",
     ])
     always_visible_tools: list[str] = Field(default_factory=list)
+    # Built-in tools that wait behind the bridge until a turn needs them.
+    # None = the curated default (discovery.DEFAULT_DEFERRED_TOOLS, chosen from
+    # real use); a list replaces it wholesale, [] keeps every built-in direct.
+    # None rather than the list itself, so a saved config follows the default
+    # when it is revised.
+    deferred_tools: list[str] | None = None
     minimum_deferred_schema_tokens: int = Field(default=750, ge=0, le=100_000)
     catalog_max_chars: int = Field(default=6_000, ge=500, le=50_000)
     search_default_limit: int = Field(default=5, ge=1, le=50)

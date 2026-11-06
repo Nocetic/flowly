@@ -38,6 +38,37 @@ VISIBLE_DISCOVERY_TOOL_NAMES = frozenset({TOOL_SEARCH_NAME, TOOL_CALL_NAME})
 DEFAULT_DEFERRED_TOOLSETS = frozenset({"mcp", "extensions"})
 DEFAULT_ALWAYS_VISIBLE_TOOLS: frozenset[str] = frozenset()
 
+#: Built-in tools whose full schemas wait behind the bridge until a turn needs
+#: them. Chosen from real use (2026-11-06: 1267 sessions, 3973 tool calls on
+#: the owner's Mac): each ran in at most 5 sessions. Every request still pays
+#: for the hot ones; these ~4.3K tokens went out on every request for tools
+#: almost never called.
+#:
+#: Left direct on purpose, however rare: tools a flow instructs the model to
+#: call by name (``session_search`` in the identity's search tools,
+#: ``skill_manage`` for /learn, ``agent_*`` after ``spawn``, ``follow_up`` and
+#: ``proactivity`` for check-ins, ``process`` for background ``exec``) — called
+#: by name while waiting, each would cost a step —, ``email`` and
+#: ``google_connection`` (a mail request does not name the tool, so it would not
+#: be promoted), ``request_secret`` (hidden, a model may ask for a key in chat),
+#: and the media generators and board (their own contract,
+#: tests/test_tool_routing.py).
+#:
+#: ``computer`` and ``screenshot`` are pinned back whenever the computer
+#: playbook is routed for a turn (AgentLoop), so the guide and the tool always
+#: arrive together. A tool a session promotes or uses stays direct for the rest
+#: of that session, so the tool list does not churn the prompt cache.
+DEFAULT_DEFERRED_TOOLS: frozenset[str] = frozenset({
+    "computer", "screenshot",
+    "linear", "docker",
+    "obsidian_ingest", "obsidian_write", "obsidian_append",
+    "obsidian_read", "obsidian_search", "obsidian_list",
+    "template_draft",
+    "video_analyze", "image_analyze",
+    "memory_import", "memory_feedback", "memory_consolidate",
+    "skill_improve",
+})
+
 _TOKEN_RE = re.compile(r"[\w]+", re.UNICODE)
 _STOP_WORDS = frozenset({
     # English routing noise.
@@ -749,8 +780,9 @@ def _build_catalog(
         )
 
     header = (
-        "Connected external sources below are available now. Exact hidden tool "
-        "schemas come from tool_search; do not treat a summarized source as missing."
+        "Sources below (rarely used built-ins, connected services) are available "
+        "now via tool_call. Exact hidden schemas come from tool_search; do not "
+        "treat a summarized source as missing."
     )
 
     def capabilities_for(items: list[tuple[str, dict[str, Any]]]) -> str:
@@ -837,7 +869,7 @@ def _bridge_definitions(
             "function": {
                 "name": TOOL_SEARCH_NAME,
                 "description": (
-                    "Search every route-enabled external tool by capability, provider, "
+                    "Search every route-enabled deferred or external tool by capability, provider, "
                     "name, or toolset, including tools whose full schema is already "
                     "visible. Results report direct/deferred visibility, valid invocation "
                     "options, and complete input_schema. Search is optional when a visible "
@@ -872,7 +904,7 @@ def _bridge_definitions(
             "function": {
                 "name": TOOL_CALL_NAME,
                 "description": (
-                    "Invoke any route-enabled external tool by exact name, whether its "
+                    "Invoke any route-enabled deferred or external tool by exact name, whether its "
                     "schema is direct or deferred. This is an alternative to a direct "
                     "call. tool_search is available when the name or schema is unclear."
                 ),
@@ -902,6 +934,8 @@ def build_tool_disclosure(
     enabled: bool = True,
     deferred_toolsets: Iterable[str] = DEFAULT_DEFERRED_TOOLSETS,
     always_visible_tools: Iterable[str] = DEFAULT_ALWAYS_VISIBLE_TOOLS,
+    deferred_tools: Iterable[str] = DEFAULT_DEFERRED_TOOLS,
+    pinned_tools: Iterable[str] = (),
     minimum_deferred_schema_tokens: int = 750,
     catalog_max_chars: int = 6_000,
     search_default_limit: int = 5,
@@ -912,7 +946,15 @@ def build_tool_disclosure(
     intent_min_score: float = 4.0,
     semantic_promoted_tools: Iterable[str] | None = None,
 ) -> ToolDisclosure:
-    """Build a compact, lossless, intent-aware view of routed definitions."""
+    """Build a compact, lossless, intent-aware view of routed definitions.
+
+    A tool waits behind the bridge when its toolset is in ``deferred_toolsets``
+    (connected external sources) or its name is in ``deferred_tools`` (rarely
+    used built-ins). ``always_visible_tools`` never wait; ``pinned_tools`` are
+    this request's exceptions (what the session already promoted or used, and
+    the tools of a routed capability playbook). Either way every one of them
+    stays callable through ``tool_call``. Only already-routed definitions are
+    considered: neither list can surface a tool the route left out."""
     raw = [dict(definition) for definition in definitions]
     original_tokens = estimate_schema_tokens(raw) if raw else 0
     declared_toolsets = {
@@ -927,7 +969,9 @@ def build_tool_disclosure(
     }
     routed_toolsets: dict[str, str] = {}
     deferred_sets = {str(value).strip().lower() for value in deferred_toolsets}
+    deferred_names = {str(value).strip() for value in deferred_tools}
     always = {str(value).strip() for value in always_visible_tools}
+    pinned = {str(value).strip() for value in pinned_tools}
     external: dict[str, dict[str, Any]] = {}
     candidates: dict[str, dict[str, Any]] = {}
 
@@ -937,9 +981,9 @@ def build_tool_disclosure(
             continue
         item_toolset = declared_toolsets.get(name, infer_toolset(name))
         routed_toolsets[name] = item_toolset
-        if item_toolset in deferred_sets:
+        if item_toolset in deferred_sets or name in deferred_names:
             external[name] = definition
-            if name not in always:
+            if name not in always and name not in pinned:
                 candidates[name] = definition
 
     named_definitions = {
@@ -987,17 +1031,26 @@ def build_tool_disclosure(
     else:
         promoted = deterministic_promoted
     promoted_names = frozenset(promoted)
-    direct = [
-        definition
-        for definition in raw
-        if _definition_name(definition) not in candidates
-        or _definition_name(definition) in promoted_names
-    ]
     deferred = {
         name: definition
         for name, definition in candidates.items()
         if name not in promoted_names
     }
+    # Each kind of deferral must pay for itself on its own: a toolset's few
+    # small tools (an unlisted built-in inferred as ``extensions``) do not hide
+    # merely because the named built-ins crossed the threshold together.
+    minimum = max(0, minimum_deferred_schema_tokens)
+    by_toolset = [name for name in deferred if name not in deferred_names]
+    by_name = [name for name in deferred if name in deferred_names]
+    for group in (by_toolset, by_name):
+        if group and estimate_schema_tokens(deferred[name] for name in group) < minimum:
+            for name in group:
+                del deferred[name]
+    direct = [
+        definition
+        for definition in raw
+        if _definition_name(definition) not in deferred
+    ]
 
     deferred_tokens = estimate_schema_tokens(deferred.values()) if deferred else 0
     if enabled and candidates and not deferred:

@@ -220,7 +220,9 @@ def test_configured_builtin_generators_and_board_stay_direct(
 
     assert expected <= disclosure.direct_names
     assert not (expected & set(disclosure.deferred))
-    assert not disclosure.enabled
+    # Only the rarely used built-ins wait behind the bridge (lean-prompt, 2026-11-06).
+    from flowly.agent.tools.discovery import DEFAULT_DEFERRED_TOOLS
+    assert set(disclosure.deferred) <= DEFAULT_DEFERRED_TOOLS
 
 
 def test_discovery_never_resurrects_tool_outside_platform_route() -> None:
