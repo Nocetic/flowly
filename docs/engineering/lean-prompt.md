@@ -142,6 +142,13 @@ prompt cached.
   The system prompt depends on no session (the time is in the user message;
   memory freezing is off), so one warm-up serves every new conversation.
 - **Waits for MCP discovery** (up to 60 s), so the tool list is final.
+- **Sets the window first.** Before warming it runs the same server check a
+  turn runs (`LocalWindowSync.before_request`, forced). Tried live on
+  2026-11-06: the warm-up skipped it. At 23:08 LM Studio held the model at
+  8K and refused the prompt. At 23:10 it warmed at 64K, and at 23:11 the first
+  turn's check reloaded the model at 96K, so the cache was lost. Now the
+  model is loaded with the needed window (or loaded at all, if unloaded)
+  before the warm-up, and the turn finds nothing to change.
 - **A real request waits for it.** `_run_llm_tool_loop` waits for a warm-up
   in flight (up to 300 s, then stops it; an owner's stop ends the wait).
   First version cancelled the warm-up instead, expecting the server to reuse

@@ -45,6 +45,18 @@ class _Server(LLMProvider):
         return LLMResponse(content="ok", finish_reason="stop")
 
 
+@pytest.fixture(autouse=True)
+def _no_live_server(monkeypatch):
+    """The window check would ask the real local server (these fakes use its
+    address); here it answers nothing, as on a computer without one."""
+    from flowly.integrations.local_window import LocalWindowSync
+
+    async def checked(self, provider, model, *, reserve, force=False):
+        return None
+
+    monkeypatch.setattr(LocalWindowSync, "before_request", checked)
+
+
 def _loop(tmp_path, monkeypatch, provider) -> AgentLoop:
     monkeypatch.setenv("FLOWLY_HOME", str(tmp_path / "home"))
     return AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, main_config=Config())
@@ -212,3 +224,28 @@ async def test_ollama_on_this_computer_is_warmed(tmp_path, monkeypatch):
     loop = _loop(tmp_path, monkeypatch, server)
     assert await loop.schedule_prompt_warm("test") is True
     assert server.requests[-1]["max_tokens"] == 1
+
+
+@pytest.mark.asyncio
+async def test_the_window_is_set_before_warming_so_the_turn_does_not_reload(tmp_path, monkeypatch):
+    """LM Studio, 2026-11-06: warmed at 64K, then the first turn's window
+    check reloaded the model at 96K and the cache was gone."""
+    order: list[str] = []
+    server = _Server()
+    original_chat = server.chat
+
+    async def chat(*args, **kwargs):
+        order.append("chat")
+        return await original_chat(*args, **kwargs)
+
+    server.chat = chat
+    loop = _loop(tmp_path, monkeypatch, server)
+
+    class Window:
+        async def before_request(self, provider, model, *, reserve, force=False):
+            order.append(f"window force={force}")
+            return None
+
+    loop._local_window = Window()
+    assert await loop.schedule_prompt_warm("test") is True
+    assert order == ["window force=True", "chat"]

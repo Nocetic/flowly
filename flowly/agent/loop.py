@@ -5298,6 +5298,14 @@ class AgentLoop:
                 available_tools=visible,
                 reachable_tools=set(disclosure.all_names),
             )
+            # The server must run the model with the window a turn needs
+            # first, as a turn would check (local_window.py). Otherwise the
+            # first turn reloads it and the warm cache is lost (LM Studio,
+            # 2026-11-06 23:11: warmed at 64K, then reloaded at 96K by the
+            # turn). This also loads a model the server holds at 8K, or
+            # has unloaded, with enough.
+            reserve = int(getattr(getattr(self.compaction, "config", None), "reserve_tokens_floor", 20_000) or 20_000)
+            await _local_window_sync(self).before_request(self.provider, self.model, reserve=reserve, force=True)
             self._prompt_warm_reading = True
             try:
                 response = await self.provider.chat(
