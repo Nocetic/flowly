@@ -45,10 +45,30 @@ cloud provider gets exactly what it got before.
 `test_build_provider_cloud_stock_config_keeps_the_configured_timeout` fails on
 the old logic (180 ≠ 120).
 
-**Provider kinds.** `provider.list` gives `ollama` and `vllm` the kind `local`
-(it was `url` for `vllm`, and nothing for `ollama`, which an app read as "needs
-an API key"). An app that does not know `local` shows the row only once it is
-in use.
+**Nothing changes for what exists** (checked before merging, 2026-11-06):
+
+- `provider.list` keeps the kind `url` for `ollama` and `vllm`. The iOS,
+  Android and older Desktop lists show a `url` row only once it is set up or
+  in use, but list an unknown kind as one more provider; a new kind would
+  have put two greyed rows under every phone's list. A fresh config reports
+  both as not set up. (`test_local_slots_stay_hidden_in_older_apps`.)
+- A self-hosted endpoint with an API key stays the cascade's last resort, in
+  `resolve_active_provider` and the legacy `Config` helpers, as on main. The
+  old branch had taken it out, which would have left a config that relied on
+  it with no provider. Without a key it is explicit-only; Ollama always is.
+  The one difference: a key with no address no longer resolves (it sent the
+  key to OpenAI's own address before).
+- The longer timeout is for the local slots only. A cloud provider pointed
+  at a proxy on this machine (the Flowly server in development, LiteLLM) keeps
+  its timeout. (`test_a_cloud_provider_behind_a_local_proxy_keeps_its_timeout`.)
+- The TUI opens the all-fields setup for a provider without a key field only
+  for the local slots; picking the Flowly account card while signed out still
+  does what it did.
+- Provider cards are not among the connections the apps list
+  (`CONNECTION_CATEGORIES`), so the new cards show only in the CLI and TUI.
+- Visible on purpose: the CLI first-run picker and `/provider` offer Ollama
+  and "Local OpenAI-compatible"; `flowly status` prints an Ollama line; the
+  self-hosted row is named "Local OpenAI-compatible" (shown only once set up).
 
 ## New: finding the servers (`flowly/integrations/local_models.py`)
 
