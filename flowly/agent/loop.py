@@ -5177,7 +5177,11 @@ class AgentLoop:
         )
 
     #: The longest a request waits for a warm-up; past it, the warm-up stops.
-    _WARM_WAIT_SECONDS = 300.0
+    #: Above the local request timeout (600 s), which already ends a warm-up
+    #: that hangs: a slow one is still worth waiting for (a 27B model read the
+    #: prompt at ~96 tokens/s on a laptop, 2026-11-07, about six minutes), as
+    #: the request would read the same prompt anyway.
+    _WARM_WAIT_SECONDS = 660.0
 
     async def _await_prompt_warm(self, run_id: str = "") -> None:
         """Wait for a warm-up in flight before a real request.

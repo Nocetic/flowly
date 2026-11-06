@@ -168,7 +168,7 @@ prompt cached.
   model is loaded with the needed window (or loaded at all, if unloaded)
   before the warm-up, and the turn finds nothing to change.
 - **A real request waits for it.** `_run_llm_tool_loop` waits for a warm-up
-  in flight (up to 300 s, then stops it; an owner's stop ends the wait).
+  in flight (up to 660 s, above the 600 s local request timeout that already ends a hung warm-up; a 27B model read the prompt at ~96 tokens/s, about six minutes; an owner's stop ends the wait).
   First version cancelled the warm-up instead, expecting the server to reuse
   what it had read. Tried live (19:07, 2026-11-06), LM Studio released the
   cancelled slot ~2.5 s after it had already put the new request in an
