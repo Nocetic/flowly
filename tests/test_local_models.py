@@ -605,3 +605,52 @@ def test_the_catalogue_reads_lm_studios_loaded_context(tmp_path, monkeypatch):
     assert [m.id for m in models] == ["google/gemma-4-e2b"]
     assert models[0].context_window == 98_304
     model_catalog.flush_cache()
+
+
+# ── a local server's catalogue stays current ────────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", ["vllm", "ollama"])
+async def test_a_model_deleted_on_the_local_server_leaves_the_picker(monkeypatch, key):
+    """2026-11-07: Gemma was deleted in LM Studio and Bonsai downloaded, but
+    Desktop's model list still showed Gemma. The gateway kept a local
+    server's catalogue from its first read for as long as it ran."""
+    from flowly.integrations import model_catalog
+
+    model_catalog.flush_cache()
+    on_server = [["google/gemma-4-e2b"]]
+    now = [1000.0]
+
+    async def fetch():
+        return [model_catalog.Model(id=mid, name=mid) for mid in on_server[0]]
+
+    monkeypatch.setitem(model_catalog._FETCHERS, key, fetch)
+    monkeypatch.setattr(model_catalog, "_now", lambda: now[0])
+
+    assert [m.id for m in await model_catalog.fetch_models(key)] == ["google/gemma-4-e2b"]
+    on_server[0] = ["prism-ml/bonsai-27b"]
+    now[0] += 1  # the same list opened twice in a row: no second scan
+    assert [m.id for m in await model_catalog.fetch_models(key)] == ["google/gemma-4-e2b"]
+    now[0] += model_catalog.LOCAL_CATALOGUE_TTL_SECONDS
+    assert [m.id for m in await model_catalog.fetch_models(key)] == ["prism-ml/bonsai-27b"]
+    model_catalog.flush_cache()
+
+
+@pytest.mark.asyncio
+async def test_a_cloud_catalogue_is_still_read_once(monkeypatch):
+    from flowly.integrations import model_catalog
+
+    model_catalog.flush_cache()
+    reads = []
+
+    async def fetch():
+        reads.append(1)
+        return [model_catalog.Model(id="x-ai/grok-4.7", name="Grok")]
+
+    monkeypatch.setitem(model_catalog._FETCHERS, "openrouter", fetch)
+    monkeypatch.setattr(model_catalog, "_now", lambda: 10_000_000.0 + len(reads) * 3600)
+    await model_catalog.fetch_models("openrouter")
+    await model_catalog.fetch_models("openrouter")
+    assert len(reads) == 1
+    model_catalog.flush_cache()

@@ -105,6 +105,29 @@ _RUNTIME_WINDOWS: dict[str, int] = {}
 _FLOWLY_POLICY: FlowlyModelPolicy | None = None
 
 
+#: A model server on the owner's computer (or their own vLLM): its models
+#: change whenever the owner downloads or deletes one, and asking it is cheap.
+#: Its list is read again after this long (2026-11-07: a model deleted in LM
+#: Studio stayed in the picker for as long as the gateway ran).
+LOCAL_CATALOGUE_TTL_SECONDS = 10.0
+_LOCAL_CATALOGUES = frozenset({"ollama", "vllm"})
+_CACHED_AT: dict[str, float] = {}
+
+
+def _now() -> float:
+    import time
+
+    return time.monotonic()
+
+
+def _cache_is_current(provider_key: str) -> bool:
+    if provider_key not in _CACHE:
+        return False
+    if provider_key not in _LOCAL_CATALOGUES:
+        return True
+    return _now() - _CACHED_AT.get(provider_key, float("-inf")) < LOCAL_CATALOGUE_TTL_SECONDS
+
+
 async def fetch_models(provider_key: str, *, force_refresh: bool = False) -> list[Model]:
     """Get the model catalog for ``provider_key``.
 
@@ -113,7 +136,7 @@ async def fetch_models(provider_key: str, *, force_refresh: bool = False) -> lis
     programmer error (unknown key with no fallback); network failures
     are swallowed and reported as an empty list.
     """
-    if not force_refresh and provider_key in _CACHE:
+    if not force_refresh and _cache_is_current(provider_key):
         return _CACHE[provider_key]
     fetcher = _FETCHERS.get(provider_key)
     if fetcher is None:
@@ -128,12 +151,14 @@ async def fetch_models(provider_key: str, *, force_refresh: bool = False) -> lis
         if provider_key == "anthropic":
             _with_anthropic_efforts(models)
         _CACHE[provider_key] = models
+        _CACHED_AT[provider_key] = _now()
         return models
     try:
         models = await fetcher()
     except Exception:
         models = []
     _CACHE[provider_key] = models
+    _CACHED_AT[provider_key] = _now()
     return models
 
 
@@ -141,6 +166,7 @@ def flush_cache() -> None:
     """Drop every cached provider catalog. Call after credentials change."""
     global _FLOWLY_POLICY
     _CACHE.clear()
+    _CACHED_AT.clear()
     _RUNTIME_WINDOWS.clear()
     _FLOWLY_POLICY = None
 

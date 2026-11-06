@@ -236,3 +236,18 @@ from `load_config`; `lms ps` showed the same.
 - Shrinking the need itself: the open agent defers cold built-in tools behind
   its tool-search bridge too; Flowly defers only MCP and extensions, which is
   why the overhead is 55-68K. A design decision for all agents, cloud too.
+
+## The picker follows the server (2026-11-07)
+
+Hakan deleted Gemma in LM Studio and downloaded Bonsai, but Desktop's model
+list still showed Gemma. The gateway kept each provider's catalogue from its
+first read (`model_catalog._CACHE`) until credentials changed. For a cloud
+catalogue that is fine. A local server's models change whenever the owner
+downloads or deletes one.
+
+Ollama and the `vllm` slot (LM Studio, the owner's own vLLM) are now read
+again when their list is older than `LOCAL_CATALOGUE_TTL_SECONDS` (10 s). A
+list opened twice in a row is not scanned twice. Cloud catalogues are still
+read once. Desktop asks `model.list` each time the list opens, so it shows
+the server's current models. Tests: the two catalogue tests at the end of
+`tests/test_local_models.py` (both fail without it).
