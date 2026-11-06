@@ -67,10 +67,11 @@ def test_levels_are_known_lower_case_and_ordered():
     ("model", "levels", "default"),
     [
         ("claude-opus-5-5", ["low", "medium", "high", "xhigh", "max"], "medium"),
-        ("anthropic/claude-haiku-5.5", ["low", "medium", "high", "xhigh", "max"], "medium"),
-        ("claude-sonnet-5-5", ["low", "medium", "high", "xhigh", "max"], "high"),
-        ("claude-opus-4-7", ["low", "medium", "high", "xhigh", "max"], "high"),
-        ("claude-opus-4-6", ["low", "medium", "high", "max"], "high"),
+        # ``none`` first where thinking can be switched off (thinking-controls.md).
+        ("anthropic/claude-haiku-5.5", ["none", "low", "medium", "high", "xhigh", "max"], "medium"),
+        ("claude-sonnet-5-5", ["none", "low", "medium", "high", "xhigh", "max"], "high"),
+        ("claude-opus-4-7", ["none", "low", "medium", "high", "xhigh", "max"], "high"),
+        ("claude-opus-4-6", ["none", "low", "medium", "high", "max"], "high"),
         ("claude-opus-4-5-20251101", ["low", "medium", "high"], "high"),
         ("claude-haiku-4-5", [], None),
         ("claude-sonnet-4-5", [], None),
@@ -279,7 +280,9 @@ def test_anthropic_turns_carry_effort_only_on_models_that_take_it():
     assert _anthropic_payload("claude-opus-4-5", "ultra")["output_config"] == {"effort": "high"}
     assert "output_config" not in _anthropic_payload("claude-haiku-4-5", "low")
     assert "output_config" not in _anthropic_payload("claude-opus-4-7", "")
-    assert "thinking" not in _anthropic_payload("claude-opus-4-7", "high")
+    # Opus 4.7 does not think until asked: a level turns adaptive thinking on.
+    assert _anthropic_payload("claude-opus-4-7", "high")["thinking"] == {"type": "adaptive"}
+    assert "thinking" not in _anthropic_payload("claude-opus-4-5", "high")
 
 
 def test_every_built_provider_carries_the_configured_effort():

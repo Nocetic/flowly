@@ -140,7 +140,7 @@ async def test_the_picker_rows_carry_the_levels_and_whether_temperature_is_taken
 
 async def test_anthropic_keeps_the_levels_of_its_model_families():
     anthropic = await _catalogue("anthropic")
-    assert anthropic["claude-opus-4-7"].efforts == ["low", "medium", "high", "xhigh", "max"]
+    assert anthropic["claude-opus-4-7"].efforts == ["none", "low", "medium", "high", "xhigh", "max"]
     assert anthropic["claude-opus-4-7"].default_effort == "high"
 
 

@@ -100,30 +100,113 @@ def capped(effort: str, cap: str | None) -> str:
     return cap if cap and above_cap(effort, cap) else effort
 
 
-# Anthropic's Messages API (``output_config.effort``), by model family, as
-# documented in 2026-10. Families not listed take no effort: the API answers
-# 400 (Sonnet 4.5, Haiku 4.5 and older).
+# Anthropic's Messages API, by model family, as documented in 2026-11
+# (platform docs, model migration guides). Each family says:
+#
+# - ``levels``: what ``output_config.effort`` takes;
+# - ``off``: the ``thinking`` field that switches thinking off, or None when it
+#   cannot be (Fable, Mythos and Opus 5.5 always think: ``disabled`` is a
+#   400). Sonnet 5.5's off is ``between_tools`` (``disabled`` is a 400
+#   there); Opus 5 and Haiku 5.5 take ``disabled`` only at effort high or
+#   lower, so off sends no effort;
+# - ``thinks``: whether it thinks when no ``thinking`` is sent. Opus 4.6 to
+#   4.8 do not: thinking on is ``{"type": "adaptive"}``;
+# - ``sampling``: whether it takes ``temperature`` (with thinking off). Opus
+#   4.7 and later refuse it outright, Sonnet 5.5 and Haiku 5.5 refuse any
+#   value but the default, so it is left out.
+#
+# Opus 4.5 takes an effort but thinks only with a token budget, which Flowly
+# does not send: no switch. Families not listed (Sonnet 4.5, Haiku 4.5 and
+# older) take no effort: the API answers 400.
 _ANTHROPIC_FULL = ("low", "medium", "high", "xhigh", "max")
-_ANTHROPIC_FAMILIES: tuple[tuple[re.Pattern[str], tuple[str, ...], str], ...] = (
-    (re.compile(r"opus-5[.-]5\b"), _ANTHROPIC_FULL, "medium"),
-    (re.compile(r"haiku-5[.-]5\b"), _ANTHROPIC_FULL, "medium"),
-    (re.compile(r"(opus|sonnet|fable|mythos)-5\b"), _ANTHROPIC_FULL, "high"),
-    (re.compile(r"(sonnet|fable|mythos)-5[.-]\d\b"), _ANTHROPIC_FULL, "high"),
-    (re.compile(r"opus-4[.-][78]\b"), _ANTHROPIC_FULL, "high"),
-    (re.compile(r"(opus|sonnet)-4[.-]6\b"), ("low", "medium", "high", "max"), "high"),
-    (re.compile(r"opus-4[.-]5\b"), ("low", "medium", "high"), "high"),
+_DISABLED = {"type": "disabled"}
+
+
+@dataclass(frozen=True)
+class AnthropicThinking:
+    levels: tuple[str, ...]
+    default: str
+    off: dict[str, str] | None
+    thinks: bool
+    sampling: bool
+
+
+_ANTHROPIC_FAMILIES: tuple[tuple[re.Pattern[str], AnthropicThinking], ...] = (
+    (re.compile(r"opus-5[.-]5\b"), AnthropicThinking(_ANTHROPIC_FULL, "medium", None, True, False)),
+    (re.compile(r"(fable|mythos)-5\b"), AnthropicThinking(_ANTHROPIC_FULL, "high", None, True, False)),
+    (re.compile(r"haiku-5[.-]5\b"), AnthropicThinking(_ANTHROPIC_FULL, "medium", _DISABLED, True, False)),
+    (re.compile(r"sonnet-5[.-]\d\b"),
+     AnthropicThinking(_ANTHROPIC_FULL, "high", {"type": "between_tools"}, True, False)),
+    (re.compile(r"(opus|sonnet)-5\b"), AnthropicThinking(_ANTHROPIC_FULL, "high", _DISABLED, True, False)),
+    (re.compile(r"opus-4[.-][78]\b"), AnthropicThinking(_ANTHROPIC_FULL, "high", _DISABLED, False, False)),
+    (re.compile(r"(opus|sonnet)-4[.-]6\b"),
+     AnthropicThinking(("low", "medium", "high", "max"), "high", _DISABLED, False, True)),
+    (re.compile(r"opus-4[.-]5\b"), AnthropicThinking(("low", "medium", "high"), "high", None, False, True)),
 )
+_CLAUDE_VERSION = re.compile(r"(opus|sonnet|haiku|fable|mythos)-(\d+)(?:[.-](\d{1,2})(?=$|[.-]))?")
+
+
+def anthropic_thinking(model: str) -> AnthropicThinking | None:
+    """How an Anthropic model's thinking is set; None for a family that
+    takes no effort. ``model`` may carry a provider prefix
+    (``anthropic/claude-opus-4.7``) and a dated suffix."""
+    low = (model or "").strip().lower()
+    for pattern, rules in _ANTHROPIC_FAMILIES:
+        if pattern.search(low):
+            return rules
+    return None
 
 
 def anthropic_efforts(model: str) -> tuple[list[str], str | None]:
-    """The levels an Anthropic model takes and its default; ``([], None)``
-    for a model that takes none. ``model`` may carry a provider prefix
-    (``anthropic/claude-opus-4.7``) and a dated suffix."""
-    low = (model or "").strip().lower()
-    for pattern, levels, default in _ANTHROPIC_FAMILIES:
-        if pattern.search(low):
-            return list(levels), default
-    return [], None
+    """The levels an Anthropic model takes (``none`` first where thinking
+    can be switched off) and its default; ``([], None)`` for one that takes
+    none."""
+    rules = anthropic_thinking(model)
+    if rules is None:
+        return [], None
+    return (["none"] if rules.off is not None else []) + list(rules.levels), rules.default
+
+
+def anthropic_takes_sampling(model: str) -> bool:
+    """Whether ``temperature`` may be sent (with thinking off). A model no
+    family lists keeps it only when it is older than Claude 4.7: newer ones
+    refuse it."""
+    rules = anthropic_thinking(model)
+    if rules is not None:
+        return rules.sampling
+    match = _CLAUDE_VERSION.search((model or "").lower())
+    if match is None:
+        return True
+    family, major, minor = match.group(1), int(match.group(2)), int(match.group(3) or 0)
+    if family in ("fable", "mythos"):
+        return False
+    return (major, minor) < (4, 7)
+
+
+def anthropic_request(model: str, effort: str) -> tuple[dict[str, object], bool]:
+    """``(fields, thinks)`` for an agent at ``effort``: the ``thinking`` and
+    ``output_config`` fields a request carries, and whether the model will
+    think on it (its thinking blocks are then passed back, and
+    ``temperature`` is left out). No level set: nothing is sent, and the
+    model does what it does by default."""
+    rules = anthropic_thinking(model)
+    if rules is None:
+        return {}, False
+    if not effort:
+        return {}, rules.thinks
+    levels, _default = anthropic_efforts(model)
+    level = clamp_effort(effort, levels)
+    if level not in levels:
+        return {}, rules.thinks
+    if level == "none":
+        return {"thinking": dict(rules.off or {})}, False
+    fields: dict[str, object] = {"output_config": {"effort": level}}
+    if rules.thinks:
+        return fields, True
+    if rules.off is not None:
+        fields["thinking"] = {"type": "adaptive"}
+        return fields, True
+    return fields, False
 
 
 def clamp_effort(effort: str, levels: list[str] | tuple[str, ...] | None) -> str:
@@ -315,8 +398,8 @@ def models_dev_efforts(options: object, provider_key: str) -> ThinkingControl:
 def thinking_body(provider_key: str, control: ThinkingControl, effort: str) -> dict[str, object]:
     """The body fields an agent at ``effort`` sends to a model with
     ``control`` on ``provider_key`` (openai, gemini, groq, zhipu,
-    zai_coding). Nothing when no level is set or the model takes none: it
-    then thinks as it does by default.
+    zai_coding). Nothing when no level is set
+    or the model takes none: it then thinks as it does by default.
 
     - OpenAI, Gemini, Groq: ``reasoning_effort``; on a switch-only model,
       ``none`` for off and nothing for on.

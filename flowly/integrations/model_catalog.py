@@ -34,6 +34,7 @@ from flowly.providers.effort import (
     FREE_PLAN_EFFORT_CAP,
     above_cap,
     anthropic_efforts,
+    anthropic_thinking,
     normalize_effort,
     openrouter_efforts,
     ordered_efforts,
@@ -259,6 +260,10 @@ def _with_anthropic_efforts(models: list[Model]) -> None:
     for model in models:
         if not model.efforts:
             model.efforts, model.default_effort = anthropic_efforts(model.id)
+            # Opus 4.6 to 4.8 do not think until asked: the switch shows off.
+            rules = anthropic_thinking(model.id)
+            if rules is not None and rules.off is not None:
+                model.default_thinking = rules.thinks
 
 
 def _openrouter_efforts(item: dict[str, Any]) -> tuple[list[str], str | None, bool]:

@@ -98,8 +98,60 @@ Tests: `tests/test_thinking_controls.py`. The models.dev rows in it are copied
 from the live catalogue. With the catalogue change alone (no provider change),
 17 of its request tests fail.
 
+## Claude with an Anthropic key
+
+Before: only `output_config.effort` was sent. Thinking was never switched on
+or off, `temperature` was always sent (a 400 on Opus 4.7 and later, and on any
+value but the default on Sonnet 5.5 and Haiku 5.5), and the thinking blocks
+Claude returned were dropped, so its reasoning was lost between tool calls.
+
+**Per family** (`effort.anthropic_thinking`, from Anthropic's docs and
+migration guides, 2026-11):
+
+| Family | Levels | Thinks unasked | Off | `temperature` |
+|---|---|---|---|---|
+| Opus 5.5, Fable 5.x, Mythos 5.x | low…max | yes | cannot (weakest level) | no |
+| Haiku 5.5 | none, low…max | yes | `disabled` | no |
+| Sonnet 5.5 | none, low…max | yes | `between_tools` (`disabled` is a 400) | no |
+| Opus 5, Sonnet 5 | none, low…max | yes | `disabled` | no |
+| Opus 4.7, 4.8 | none, low…max | no | `disabled` | no |
+| Opus / Sonnet 4.6 | none, low, medium, high, max | no | `disabled` | only with thinking off |
+| Opus 4.5 | low, medium, high | no (needs a token budget, not sent) | no switch | yes |
+| Sonnet / Haiku 4.5 and older | none | | | yes |
+
+- On is the level in `output_config.effort`, plus `thinking: {type:
+  "adaptive"}` on the families that do not think unasked
+  (`effort.anthropic_request`).
+- Off sends no effort: Opus 5 and Haiku 5.5 take `disabled` only at effort
+  high or lower.
+- A Claude model no family lists keeps `temperature` only if it is older than
+  4.7 (`anthropic_takes_sampling`).
+- The catalogue sends `defaultThinking: false` for Opus 4.6 to 4.8, so the
+  apps show the switch off until a level is picked.
+
+**Thinking blocks** (`anthropic_provider.py`):
+
+- The `thinking` and `redacted_thinking` blocks of a response are kept with
+  the assistant message in `LLMResponse.provider_replay` (`provider`, `model`,
+  `items`, and `layout`: where each thinking, text and tool block sat). The
+  loop persists it like the ChatGPT subscription's replay.
+- They are sent back in that order, only to the same model, only when the
+  request thinks, and only to `api.anthropic.com` (the API that checks the
+  signatures).
+- The API checks each block against the conversation before it. If Flowly's
+  history changed under a block (compaction, a rebuilt system prompt), the
+  request is refused with a 400 naming the signature. Then every block that
+  request carried is remembered as refused (`_REJECTED_THINKING`, by
+  fingerprint), left out, and the request is sent once more. This is the
+  API's documented recovery: a history without thinking blocks is always
+  valid. Streamed requests do the same before anything is streamed.
+- Compaction counts the thinking text sent back (`compaction/estimator.py`).
+
+Tests: `tests/test_anthropic_thinking.py` (24 of its 29 fail without the
+change); `tests/test_reasoning_effort.py` updated for `none` and adaptive.
+
 ## Not verified live
 
-No OpenAI, Gemini, Groq or Z.AI key was used: the request shapes follow the
-providers' docs and models.dev, and a field a model refuses is dropped
-automatically.
+No OpenAI, Gemini, Groq, Z.AI or Anthropic key was used: the request shapes
+follow the providers' docs, models.dev and Anthropic's migration guides, and a
+field a model refuses is dropped automatically.

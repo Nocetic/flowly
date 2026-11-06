@@ -10,21 +10,25 @@ OpenAI-compatible provider.
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import os
 import re
+from urllib.parse import urlparse
 from typing import Any, AsyncIterator
 
 import httpx
 from loguru import logger
 
 from flowly.providers.base import (
+    PROVIDER_REPLAY_KEY,
     LLMProvider,
     LLMResponse,
     ToolCallRequest,
     error_info_from_exception,
 )
-from flowly.providers.effort import anthropic_efforts
+from flowly.providers.effort import anthropic_request, anthropic_takes_sampling
 from flowly.providers.key_rotator import KeyRotator, classify_error
 from flowly.providers.prompt_caching import apply_cache_control, is_cacheable_model
 from flowly.providers.tool_preview import ToolPreviewSnapshots
@@ -32,6 +36,120 @@ from flowly.providers.tool_preview import ToolPreviewSnapshots
 _DEFAULT_ANTHROPIC_BASE = "https://api.anthropic.com/v1"
 _ANTHROPIC_VERSION = "2023-06-01"
 _USER_AGENT = "flowly/anthropic-provider"
+
+# ── thinking blocks ───────────────────────────────────────────────────────
+#
+# A model that thinks returns ``thinking`` (signed) and ``redacted_thinking``
+# blocks beside its text and tool calls. They are kept with the assistant
+# message (``LLMResponse.provider_replay``, persisted by the loop) in the order
+# they came, and sent back unchanged, so the model keeps its reasoning across
+# tool calls and turns. The API checks each block's signature against the
+# conversation before it; a block the history no longer matches (compaction,
+# a rebuilt system prompt) is refused with a 400. Then every block that
+# request carried is remembered as refused and left out, and the request is
+# sent once more (the API's documented recovery: a history without thinking
+# blocks is always valid). Only Anthropic's own API verifies the signatures:
+# blocks go nowhere else.
+_REPLAY_PROVIDER = "anthropic"
+_THINKING_TYPES = frozenset({"thinking", "redacted_thinking"})
+#: Fingerprints of thinking blocks a request was refused for.
+_REJECTED_THINKING: set[str] = set()
+_REJECTED_THINKING_LIMIT = 4096
+
+
+def _thinking_fingerprint(block: dict[str, Any]) -> str | None:
+    kind = block.get("type")
+    value = block.get("signature" if kind == "thinking" else "data")
+    if kind not in _THINKING_TYPES or not isinstance(value, str) or not value:
+        return None
+    return hashlib.sha256(f"{kind}\0{value}".encode("utf-8", "replace")).hexdigest()
+
+
+def _thinking_refused(exc: Exception) -> bool:
+    if not isinstance(exc, AnthropicAPIError) or exc.status_code != 400:
+        return False
+    text = str(exc).lower()
+    return "signature" in text or ("thinking" in text and "block" in text)
+
+
+def _remember_refused(blocks: list[dict[str, Any]]) -> None:
+    if len(_REJECTED_THINKING) > _REJECTED_THINKING_LIMIT:
+        _REJECTED_THINKING.clear()
+    for block in blocks:
+        fingerprint = _thinking_fingerprint(block)
+        if fingerprint:
+            _REJECTED_THINKING.add(fingerprint)
+
+
+class _ThinkingCollector:
+    """The thinking blocks of one response, and where each content block
+    sat: ``t`` a thinking block, ``x`` text, ``u:<id>`` a tool call."""
+
+    def __init__(self) -> None:
+        self.items: list[dict[str, Any]] = []
+        self.layout: list[str] = []
+        self._open: dict[int, dict[str, Any]] = {}
+
+    def start(self, block: dict[str, Any], index: int | None = None) -> None:
+        kind = block.get("type")
+        if kind == "thinking":
+            item = {"type": "thinking", "thinking": str(block.get("thinking") or ""),
+                    "signature": str(block.get("signature") or "")}
+        elif kind == "redacted_thinking":
+            item = {"type": "redacted_thinking", "data": str(block.get("data") or "")}
+        else:
+            if kind == "text" and (not self.layout or self.layout[-1] != "x"):
+                self.layout.append("x")
+            elif kind == "tool_use":
+                self.layout.append(f"u:{block.get('id') or ''}")
+            return
+        self.items.append(item)
+        self.layout.append("t")
+        if index is not None:
+            self._open[index] = item
+
+    def delta(self, index: int, delta: dict[str, Any]) -> None:
+        item = self._open.get(index)
+        if item is None:
+            return
+        if delta.get("type") == "thinking_delta" and isinstance(delta.get("thinking"), str):
+            item["thinking"] += delta["thinking"]
+        elif delta.get("type") == "signature_delta" and isinstance(delta.get("signature"), str):
+            item["signature"] += delta["signature"]
+
+    def replay(self, model: str) -> dict[str, Any]:
+        """The envelope the loop keeps with the assistant message; empty when
+        the response carried no block worth sending back."""
+        items = [item for item in self.items if _thinking_fingerprint(item)]
+        if not items or len(items) != len(self.items):
+            return {}
+        return {"provider": _REPLAY_PROVIDER, "model": model, "items": items, "layout": list(self.layout)}
+
+
+def _replayed_thinking(envelope: Any, model: str) -> tuple[list[dict[str, Any]], list[str]] | None:
+    """The thinking blocks to send back with one assistant message, and their
+    layout; None when there are none for ``model`` (another provider's or
+    model's envelope, or blocks refused before)."""
+    if not isinstance(envelope, dict) or envelope.get("provider") != _REPLAY_PROVIDER:
+        return None
+    if envelope.get("model") != model:
+        return None
+    items = envelope.get("items")
+    layout = envelope.get("layout")
+    if not isinstance(items, list) or not isinstance(layout, list):
+        return None
+    blocks: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict) or item.get("type") not in _THINKING_TYPES:
+            return None
+        fingerprint = _thinking_fingerprint(item)
+        if fingerprint is None or fingerprint in _REJECTED_THINKING:
+            return None
+        blocks.append(copy.deepcopy(item))
+    if not blocks or layout.count("t") != len(blocks):
+        return None
+    return blocks, [str(token) for token in layout]
+
 
 _STOP_REASON_MAP = {
     "end_turn": "stop",
@@ -188,16 +306,25 @@ def _content_to_blocks(content: Any, *, empty_text: str) -> list[dict[str, Any]]
 
 def _apply_message_cache_control(blocks: list[dict[str, Any]], msg: dict[str, Any]) -> None:
     marker = msg.get("cache_control")
-    if isinstance(marker, dict) and blocks:
-        blocks[-1]["cache_control"] = marker
+    if not isinstance(marker, dict):
+        return
+    # A thinking block takes no cache marker.
+    for block in reversed(blocks):
+        if block.get("type") not in _THINKING_TYPES:
+            block["cache_control"] = marker
+            return
 
 
-def _assistant_message_to_anthropic(msg: dict[str, Any]) -> dict[str, Any]:
-    blocks: list[dict[str, Any]] = []
+def _assistant_message_to_anthropic(
+    msg: dict[str, Any],
+    thinking: tuple[list[dict[str, Any]], list[str]] | None = None,
+) -> dict[str, Any]:
+    text_blocks: list[dict[str, Any]] = []
     content = msg.get("content")
     if content not in (None, ""):
-        blocks.extend(_content_to_blocks(content, empty_text=""))
+        text_blocks.extend(_content_to_blocks(content, empty_text=""))
 
+    tool_blocks: list[dict[str, Any]] = []
     for tc in msg.get("tool_calls") or []:
         if not isinstance(tc, dict):
             continue
@@ -205,17 +332,52 @@ def _assistant_message_to_anthropic(msg: dict[str, Any]) -> dict[str, Any]:
         name = fn.get("name")
         if not isinstance(name, str) or not name:
             continue
-        blocks.append({
+        tool_blocks.append({
             "type": "tool_use",
-            "id": str(tc.get("id") or f"toolu_{len(blocks)}"),
+            "id": str(tc.get("id") or f"toolu_{len(text_blocks) + len(tool_blocks)}"),
             "name": name,
             "input": _parse_args(fn.get("arguments")),
         })
 
-    if not blocks:
-        blocks = [{"type": "text", "text": "(empty)"}]
+    if thinking is None:
+        blocks = text_blocks + tool_blocks
+    else:
+        blocks = _laid_out(thinking, text_blocks, tool_blocks)
+    if not any(block.get("type") not in _THINKING_TYPES for block in blocks):
+        blocks.append({"type": "text", "text": "(empty)"})
     _apply_message_cache_control(blocks, msg)
     return {"role": "assistant", "content": blocks}
+
+
+def _laid_out(
+    thinking: tuple[list[dict[str, Any]], list[str]],
+    text_blocks: list[dict[str, Any]],
+    tool_blocks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """The assistant's blocks in the order the model wrote them: a thinking
+    block is checked against everything before it."""
+    items, layout = thinking
+    pending_items = list(items)
+    tools = {block["id"]: block for block in tool_blocks}
+    out: list[dict[str, Any]] = []
+    text_placed = False
+    for token in layout:
+        if token == "t" and pending_items:
+            out.append(pending_items.pop(0))
+        elif token == "x" and not text_placed:
+            out.extend(text_blocks)
+            text_placed = True
+        elif token.startswith("u:") and token[2:] in tools:
+            out.append(tools.pop(token[2:]))
+    out.extend(pending_items)
+    if not text_placed:
+        # Text the layout did not place goes after the leading thinking.
+        lead = 0
+        while lead < len(out) and out[lead].get("type") in _THINKING_TYPES:
+            lead += 1
+        out[lead:lead] = text_blocks
+    out.extend(block for block in tool_blocks if block["id"] in tools)
+    return out
 
 
 def _append_tool_result(result: list[dict[str, Any]], msg: dict[str, Any]) -> None:
@@ -250,11 +412,14 @@ def _append_tool_result(result: list[dict[str, Any]], msg: dict[str, Any]) -> No
 
 def _messages_to_anthropic(
     messages: list[dict[str, Any]],
+    thinking: list[tuple[list[dict[str, Any]], list[str]] | None] | None = None,
 ) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]]]:
+    """``thinking`` (aligned with ``messages``) holds the blocks to send back
+    with each assistant message."""
     system_blocks: list[dict[str, Any]] = []
     out: list[dict[str, Any]] = []
 
-    for msg in messages:
+    for position, msg in enumerate(messages):
         if not isinstance(msg, dict):
             continue
         role = msg.get("role")
@@ -267,7 +432,8 @@ def _messages_to_anthropic(
             _apply_message_cache_control(blocks, msg)
             out.append({"role": "user", "content": blocks})
         elif role == "assistant":
-            out.append(_assistant_message_to_anthropic(msg))
+            replay = thinking[position] if thinking is not None and position < len(thinking) else None
+            out.append(_assistant_message_to_anthropic(msg, replay))
         elif role == "tool":
             _append_tool_result(out, msg)
 
@@ -439,17 +605,31 @@ class AnthropicProvider(LLMProvider):
         effort: str = "",
     ) -> dict[str, Any]:
         resolved_model = self._prepare_model(model)
+        # The agent's effort, lowered to the nearest level the model takes
+        # (any other level answers 400), and thinking switched as the family
+        # takes it (effort.anthropic_request).
+        thinking_fields, thinks = anthropic_request(resolved_model, effort)
+        # Thinking blocks go back only to a model that will think, on
+        # Anthropic's own API (the one that verifies them).
+        replay: list[tuple[list[dict[str, Any]], list[str]] | None] | None = None
+        if thinks and self._verifies_thinking:
+            replay = [
+                _replayed_thinking(msg.get(PROVIDER_REPLAY_KEY), resolved_model) if isinstance(msg, dict) else None
+                for msg in messages
+            ]
         prepared = _strip_internal_keys(messages)
         if is_cacheable_model(resolved_model):
             prepared = apply_cache_control(prepared)
-        system, anthropic_messages = _messages_to_anthropic(prepared)
+        system, anthropic_messages = _messages_to_anthropic(prepared, replay)
 
         payload: dict[str, Any] = {
             "model": resolved_model,
             "messages": anthropic_messages,
             "max_tokens": max_tokens,
-            "temperature": temperature,
         }
+        # Thinking takes no temperature, and newer models take none at all.
+        if not thinks and anthropic_takes_sampling(resolved_model):
+            payload["temperature"] = temperature
         if system:
             payload["system"] = system
         anthropic_tools = _tools_to_anthropic(tools)
@@ -460,16 +640,42 @@ class AnthropicProvider(LLMProvider):
                 payload["tool_choice"] = choice
         if stream:
             payload["stream"] = True
-        # The agent's effort, lowered to the nearest level the model takes (any
-        # other level answers 400). Thinking itself is left as the model has it.
-        if effort:
-            from flowly.providers.effort import clamp_effort
-
-            levels, _default = anthropic_efforts(resolved_model)
-            level = clamp_effort(effort, levels) if levels else ""
-            if level and level in levels:
-                payload["output_config"] = {"effort": level}
+        payload.update(copy.deepcopy(thinking_fields))
         return payload
+
+    @property
+    def _verifies_thinking(self) -> bool:
+        """Anthropic's own API: the one that verifies thinking signatures."""
+        host = (urlparse(self._base_url).hostname or "").lower()
+        return host == "api.anthropic.com"
+
+    @staticmethod
+    def _replayed_blocks(payload: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            block
+            for message in payload.get("messages") or []
+            if message.get("role") == "assistant"
+            for block in message.get("content") or []
+            if isinstance(block, dict) and block.get("type") in _THINKING_TYPES
+        ]
+
+    def _without_refused_thinking(self, payload: dict[str, Any], exc: Exception) -> bool:
+        """True when ``exc`` refused the thinking blocks ``payload`` carried:
+        they are remembered and taken out of it, to be sent once more."""
+        blocks = self._replayed_blocks(payload)
+        if not blocks or not _thinking_refused(exc):
+            return False
+        _remember_refused(blocks)
+        for message in payload.get("messages") or []:
+            if message.get("role") != "assistant" or not isinstance(message.get("content"), list):
+                continue
+            kept = [block for block in message["content"] if block.get("type") not in _THINKING_TYPES]
+            message["content"] = kept or [{"type": "text", "text": "(empty)"}]
+        logger.warning(
+            "[LLM] {} refused {} replayed thinking block(s); sending again without them",
+            payload.get("model"), len(blocks),
+        )
+        return True
 
     async def _raise_for_error(self, response: httpx.Response) -> None:
         if response.status_code < 400:
@@ -506,7 +712,7 @@ class AnthropicProvider(LLMProvider):
         purpose: str | None = None,
         reasoning: bool | None = None,
     ) -> LLMResponse:
-        del purpose  # extended thinking is off unless asked for
+        del purpose
         payload = self._build_payload(
             messages=messages,
             tools=tools,
@@ -526,8 +732,14 @@ class AnthropicProvider(LLMProvider):
             try:
                 async with httpx.AsyncClient(timeout=request_timeout) as client:
                     response = await client.post(url, json=payload, headers=self._headers(current_key))
-                await self._raise_for_error(response)
-                return self._parse_response(response.json())
+                    try:
+                        await self._raise_for_error(response)
+                    except AnthropicAPIError as refused:
+                        if not self._without_refused_thinking(payload, refused):
+                            raise
+                        response = await client.post(url, json=payload, headers=self._headers(current_key))
+                        await self._raise_for_error(response)
+                return self._parse_response(response.json(), payload["model"])
             except Exception as exc:
                 last_exc = exc
                 reason = _classify_anthropic_error(exc)
@@ -546,15 +758,17 @@ class AnthropicProvider(LLMProvider):
         assert last_exc is not None
         return self._error_response(last_exc)
 
-    def _parse_response(self, data: dict[str, Any]) -> LLMResponse:
+    def _parse_response(self, data: dict[str, Any], model: str = "") -> LLMResponse:
         if not isinstance(data, dict):
             return LLMResponse(content="Error calling LLM: malformed Anthropic response", finish_reason="error")
 
         text_parts: list[str] = []
         tool_calls: list[ToolCallRequest] = []
+        thinking = _ThinkingCollector()
         for block in data.get("content") or []:
             if not isinstance(block, dict):
                 continue
+            thinking.start(block)
             block_type = block.get("type")
             if block_type == "text":
                 text = block.get("text")
@@ -573,6 +787,7 @@ class AnthropicProvider(LLMProvider):
             tool_calls=tool_calls,
             finish_reason=_STOP_REASON_MAP.get(stop_reason, stop_reason or "stop"),
             usage=_usage_from_anthropic(data.get("usage")),
+            provider_replay=thinking.replay(model) if model else {},
         )
 
     async def chat_stream(
@@ -585,7 +800,6 @@ class AnthropicProvider(LLMProvider):
         tool_choice: str = "auto",
         reasoning: bool | None = None,
     ) -> AsyncIterator[LLMResponse]:
-        # extended thinking is off unless asked for
         payload = self._build_payload(
             messages=messages,
             tools=tools,
@@ -601,98 +815,111 @@ class AnthropicProvider(LLMProvider):
 
         tool_call_accum: dict[int, dict[str, Any]] = {}
         previews = ToolPreviewSnapshots()
+        thinking = _ThinkingCollector()
         finish_reason = ""
         usage: dict[str, int] = {}
 
         try:
             async with httpx.AsyncClient(timeout=self.stream_timeout_seconds) as client:
-                async with client.stream(
-                    "POST",
-                    url,
-                    json=payload,
-                    headers=self._headers(current_key),
-                ) as response:
-                    if response.status_code >= 400:
-                        await response.aread()
-                        await self._raise_for_error(response)
+                # Refused replayed thinking is taken out and the request sent
+                # once more, before anything was streamed.
+                for attempt in range(2):
+                    async with client.stream(
+                        "POST",
+                        url,
+                        json=payload,
+                        headers=self._headers(current_key),
+                    ) as response:
+                        if response.status_code >= 400:
+                            await response.aread()
+                            try:
+                                await self._raise_for_error(response)
+                            except AnthropicAPIError as refused:
+                                if attempt == 0 and self._without_refused_thinking(payload, refused):
+                                    continue
+                                raise
 
-                    async for raw_line in response.aiter_lines():
-                        line = raw_line.strip()
-                        if not line or not line.startswith("data:"):
-                            continue
-                        raw_data = line[len("data:"):].strip()
-                        if not raw_data or raw_data == "[DONE]":
-                            continue
-                        try:
-                            event = json.loads(raw_data)
-                        except json.JSONDecodeError:
-                            continue
-                        if not isinstance(event, dict):
-                            continue
-
-                        event_type = event.get("type")
-                        if event_type == "message_start":
-                            usage.update(_usage_from_anthropic(
-                                (event.get("message") or {}).get("usage")
-                                if isinstance(event.get("message"), dict) else None
-                            ))
-                        elif event_type == "content_block_start":
-                            index = int(event.get("index") or 0)
-                            block = event.get("content_block")
-                            if isinstance(block, dict) and block.get("type") == "tool_use":
-                                initial_input = block.get("input")
-                                tool_call_accum[index] = {
-                                    "id": str(block.get("id") or f"toolu_{index}"),
-                                    "name": str(block.get("name") or ""),
-                                    "arguments_str": (
-                                        json.dumps(initial_input)
-                                        if isinstance(initial_input, dict) and initial_input else ""
-                                    ),
-                                }
-                                entry = tool_call_accum[index]
-                                preview = previews.update(index, entry["id"], entry["name"], entry["arguments_str"])
-                                if preview is not None:
-                                    yield LLMResponse(content=None, finish_reason="", tool_call_previews=[preview])
-                        elif event_type == "content_block_delta":
-                            index = int(event.get("index") or 0)
-                            delta = event.get("delta")
-                            if not isinstance(delta, dict):
+                        async for raw_line in response.aiter_lines():
+                            line = raw_line.strip()
+                            if not line or not line.startswith("data:"):
                                 continue
-                            delta_type = delta.get("type")
-                            if delta_type == "text_delta":
-                                text = delta.get("text")
-                                if isinstance(text, str) and text:
-                                    yield LLMResponse(content=text, finish_reason="")
-                            elif delta_type == "input_json_delta":
-                                partial = delta.get("partial_json")
-                                if isinstance(partial, str):
-                                    entry = tool_call_accum.setdefault(
-                                        index,
-                                        {
-                                            "id": f"toolu_{index}",
-                                            "name": "",
-                                            "arguments_str": "",
-                                        },
-                                    )
-                                    entry["arguments_str"] += partial
+                            raw_data = line[len("data:"):].strip()
+                            if not raw_data or raw_data == "[DONE]":
+                                continue
+                            try:
+                                event = json.loads(raw_data)
+                            except json.JSONDecodeError:
+                                continue
+                            if not isinstance(event, dict):
+                                continue
+
+                            event_type = event.get("type")
+                            if event_type == "message_start":
+                                usage.update(_usage_from_anthropic(
+                                    (event.get("message") or {}).get("usage")
+                                    if isinstance(event.get("message"), dict) else None
+                                ))
+                            elif event_type == "content_block_start":
+                                index = int(event.get("index") or 0)
+                                block = event.get("content_block")
+                                if isinstance(block, dict):
+                                    thinking.start(block, index)
+                                if isinstance(block, dict) and block.get("type") == "tool_use":
+                                    initial_input = block.get("input")
+                                    tool_call_accum[index] = {
+                                        "id": str(block.get("id") or f"toolu_{index}"),
+                                        "name": str(block.get("name") or ""),
+                                        "arguments_str": (
+                                            json.dumps(initial_input)
+                                            if isinstance(initial_input, dict) and initial_input else ""
+                                        ),
+                                    }
+                                    entry = tool_call_accum[index]
                                     preview = previews.update(index, entry["id"], entry["name"], entry["arguments_str"])
                                     if preview is not None:
                                         yield LLMResponse(content=None, finish_reason="", tool_call_previews=[preview])
-                        elif event_type == "message_delta":
-                            delta = event.get("delta")
-                            if isinstance(delta, dict) and delta.get("stop_reason"):
-                                finish_reason = _STOP_REASON_MAP.get(
-                                    str(delta["stop_reason"]),
-                                    str(delta["stop_reason"]),
-                                )
-                            delta_usage = _usage_from_anthropic(event.get("usage"))
-                            if delta_usage:
-                                usage.update({k: v for k, v in delta_usage.items() if v})
-                        elif event_type == "error":
-                            error = event.get("error")
-                            detail = error.get("message") if isinstance(error, dict) else str(error)
-                            yield self._error_response(RuntimeError(detail))
-                            return
+                            elif event_type == "content_block_delta":
+                                index = int(event.get("index") or 0)
+                                delta = event.get("delta")
+                                if not isinstance(delta, dict):
+                                    continue
+                                delta_type = delta.get("type")
+                                thinking.delta(index, delta)
+                                if delta_type == "text_delta":
+                                    text = delta.get("text")
+                                    if isinstance(text, str) and text:
+                                        yield LLMResponse(content=text, finish_reason="")
+                                elif delta_type == "input_json_delta":
+                                    partial = delta.get("partial_json")
+                                    if isinstance(partial, str):
+                                        entry = tool_call_accum.setdefault(
+                                            index,
+                                            {
+                                                "id": f"toolu_{index}",
+                                                "name": "",
+                                                "arguments_str": "",
+                                            },
+                                        )
+                                        entry["arguments_str"] += partial
+                                        preview = previews.update(index, entry["id"], entry["name"], entry["arguments_str"])
+                                        if preview is not None:
+                                            yield LLMResponse(content=None, finish_reason="", tool_call_previews=[preview])
+                            elif event_type == "message_delta":
+                                delta = event.get("delta")
+                                if isinstance(delta, dict) and delta.get("stop_reason"):
+                                    finish_reason = _STOP_REASON_MAP.get(
+                                        str(delta["stop_reason"]),
+                                        str(delta["stop_reason"]),
+                                    )
+                                delta_usage = _usage_from_anthropic(event.get("usage"))
+                                if delta_usage:
+                                    usage.update({k: v for k, v in delta_usage.items() if v})
+                            elif event_type == "error":
+                                error = event.get("error")
+                                detail = error.get("message") if isinstance(error, dict) else str(error)
+                                yield self._error_response(RuntimeError(detail))
+                                return
+                    break
         except Exception as exc:
             yield self._error_response(exc)
             return
@@ -729,6 +956,7 @@ class AnthropicProvider(LLMProvider):
             tool_calls=tool_calls,
             finish_reason=finish_reason,
             usage=final_usage,
+            provider_replay=thinking.replay(payload["model"]),
         )
 
     def get_default_model(self) -> str:
