@@ -100,6 +100,65 @@ def _strip_known_prefixes(model: str) -> str:
     return model
 
 
+#: Providers whose servers render messages through the model's own chat
+#: template. Many (Qwen and others) raise "System message must be at the
+#: beginning" for a second system message, and some require user and
+#: assistant turns to alternate.
+_STRICT_TEMPLATE_PROVIDERS = frozenset({"ollama", "vllm"})
+
+
+def _text_of(content: Any) -> str | None:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list) and all(
+        isinstance(part, dict) and part.get("type") == "text" for part in content
+    ):
+        return "".join(str(part.get("text") or "") for part in content)
+    return None
+
+
+def _one_leading_system(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """``messages`` as a strict chat template takes them: one system message,
+    first. Flowly sends its instructions and the turn's routed guidance as two
+    system messages (and compaction and threads may add more); a template that
+    accepts one refused every request ("System message must be at the
+    beginning", LM Studio with prism-ml/bonsai-27b, 2026-11-07).
+
+    The leading system messages are joined in order, so the instructions stay
+    first and a server's prompt cache still covers them. A later system
+    message becomes a user note (``[System note]``), joined with a user
+    message next to it so turns still alternate."""
+    leading: list[str] = []
+    index = 0
+    while index < len(messages) and messages[index].get("role") == "system":
+        text = _text_of(messages[index].get("content"))
+        if text is None:
+            break
+        if text:
+            leading.append(text)
+        index += 1
+    if index <= 1 and not any(m.get("role") == "system" for m in messages[index:]):
+        return messages
+    out: list[dict[str, Any]] = []
+    if leading:
+        out.append({"role": "system", "content": "\n\n".join(leading)})
+    for message in messages[index:]:
+        if message.get("role") == "system":
+            text = _text_of(message.get("content"))
+            message = {"role": "user", "content": f"[System note]\n{text if text is not None else ''}"}
+        previous = out[-1] if out else None
+        if (
+            previous is not None
+            and message.get("role") == "user" == previous.get("role")
+            and _text_of(previous.get("content")) is not None
+            and _text_of(message.get("content")) is not None
+        ):
+            out[-1] = {**previous, "content": f"{_text_of(previous['content'])}\n\n{_text_of(message['content'])}"}
+            continue
+        out.append(message)
+    return out
+
+
 def _model_consumes_thought_signature(model: str | None) -> bool:
     """True when ``model`` is a Gemini-family model that requires the
     ``extra_content`` (thought_signature) on tool calls to be replayed.
@@ -300,6 +359,8 @@ class OpenRouterProvider(LLMProvider):
         # API call; copy-based so the caller's list keeps them for persistence
         # filtering afterwards.
         messages = _strip_internal_keys(messages)
+        if self.provider_name in _STRICT_TEMPLATE_PROVIDERS:
+            messages = _one_leading_system(messages)
         if not _model_consumes_thought_signature(model):
             messages = _strip_tool_call_extra_content(messages)
         if is_cacheable_model(model):

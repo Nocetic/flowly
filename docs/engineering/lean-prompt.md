@@ -199,3 +199,25 @@ How much a warm-up saves also depends on the model's chat template. The
 second system message (the routed playbook and skills index) varies per
 message. A template that renders the tools after all system messages
 re-reads the tools from that point.
+
+## 4. Strict chat templates on local servers
+
+Found 2026-11-07 while testing the warm-up with `prism-ml/bonsai-27b` on LM
+Studio: its template raises "System message must be at the beginning". Flowly
+sends its instructions and the turn's routed guidance as two system messages,
+so every request failed, the owner's messages included. Qwen-family templates
+do the same, and some templates also need user and assistant turns to
+alternate.
+
+Requests to `ollama` and `vllm` (servers that render the model's own template)
+are now shaped for that (`openrouter_provider._one_leading_system`):
+
+- The leading system messages are joined into one, in order. The instructions
+  stay first, so a server's prompt cache still covers them.
+- A later system message (a compaction summary, thread context) becomes a
+  `[System note]` user message, joined with a user message beside it.
+
+Cloud providers keep the two system messages: Anthropic's cache relies on the
+first one being byte-stable on its own. Tests: `tests/test_strict_templates.py`
+(11 of 14 fail without it; the other three check cloud providers are
+unchanged), with a stand-in for the template's checks.
