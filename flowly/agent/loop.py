@@ -74,10 +74,12 @@ from flowly.compaction.pruning import (
 )
 from flowly.compaction.request_guard import (
     ProviderRequestCoordinator,
+    RequestFit,
     request_fingerprint,
     request_too_large_response,
     unfit_response,
 )
+from flowly.integrations.local_window import LocalWindowSync
 from flowly.compaction.types import (
     CompactionConfig,
     CompactionError,
@@ -1019,6 +1021,19 @@ def _turn_user_extras(metadata: dict) -> dict[str, Any]:
     if not isinstance(extras, dict) or extras.get("origin") != "voice" or not isinstance(extras.get("voiceCallId"), str):
         return {}
     return {"origin": "voice", "voiceCallId": extras["voiceCallId"][:128]}
+
+
+def _local_window_sync(loop: object) -> LocalWindowSync:
+    """The loop's local-server context check, made on first use (lightweight
+    harnesses build loops without ``__init__``)."""
+    sync = getattr(loop, "_local_window", None)
+    if sync is None:
+        sync = LocalWindowSync()
+        try:
+            setattr(loop, "_local_window", sync)
+        except AttributeError:
+            pass
+    return sync
 
 class AgentLoop:
     """
@@ -5775,14 +5790,29 @@ class AgentLoop:
         def cancelled() -> bool:
             return bool(run_id) and self.is_run_aborted(run_id)
 
-        try:
-            fitted = await coordinator.fit(
+        # A local model server's real context, current before the request is
+        # sized (flowly/integrations/local_window.py): a no-op elsewhere.
+        local_window = _local_window_sync(self)
+        reserve = int(getattr(getattr(self.compaction, "config", None), "reserve_tokens_floor", 20_000) or 20_000)
+        await local_window.before_request(self.provider, model, reserve=reserve)
+
+        async def fit_request() -> RequestFit:
+            return await coordinator.fit(
                 messages,
                 tools,
                 model,
                 session_key=session_key,
                 should_cancel=cancelled,
             )
+
+        try:
+            fitted = await fit_request()
+            if not fitted.fits and fitted.before.compactable_budget <= 0:
+                # The window cannot hold even the fixed overhead. On a local
+                # server that may be stale (the model reloaded with more, or
+                # unloaded): ask it now, and size the request again once.
+                if await local_window.before_request(self.provider, model, reserve=reserve, force=True):
+                    fitted = await fit_request()
         except Exception as exc:  # noqa: BLE001 — preflight must fail closed
             logger.error("Provider request fitting failed: {}", exc)
             return self._request_too_large_response(str(exc)), messages

@@ -148,6 +148,39 @@ model catalogue (`_fetch_ollama`, `_fetch_vllm`) carries the same figure in
   (`/api/create`) would work but writes models into the owner's Ollama; not
   done.
 
+## New: the window kept current between turns (`flowly/integrations/local_window.py`)
+
+Also seen on the Mac: after the owner reloaded the model in LM Studio at
+128K, every message was still refused as too large until the gateway
+restarted. The window was read once, when the provider was switched, from a
+catalogue cache that never expires. The other way round, LM Studio unloads an
+idle model and loads it again on the next request with its own small
+default, behind the agent's back.
+
+Now, before every main-agent request on a local slot (`ollama`, `vllm` on a
+local address), at most every 30 s:
+
+- the server is asked (`local_models.runtime_window`): LM Studio is made to
+  hold the model with the context the agent needs (loaded if it is not,
+  reloaded if it holds it with less, left alone otherwise); Ollama is read;
+  a `vllm` address that is not LM Studio (vLLM, llama.cpp) is left alone;
+- the answer goes to `model_catalog.set_runtime_context_window`, which
+  outranks the catalogue in `get_context_window`, the figure compaction sizes
+  requests from (the picker's list is untouched; a flush clears it).
+
+When a request is refused because the window cannot hold the fixed overhead,
+the server is asked at once and the request sized again, once
+(`AgentLoop._call_provider_with_context_recovery`). A check that fails is
+logged and changes nothing; the refusal still says why. Cloud providers,
+the Flowly account (even a development server on localhost) and remote
+addresses are never asked.
+
+`tests/test_local_window.py` (14) covers the loads, the 30 s spacing and the
+forced check, what is never asked, failures, the runtime window outranking
+the catalogue, and the loop: a stale 8K window with the model now at 128K
+goes through (it fails without the check: the request is refused), a model
+whose window really is 8K is still refused with the numbers.
+
 ## New: using one (`provider.use_local {server, model}`)
 
 Nothing is written unless the agent can run on it:
@@ -171,6 +204,7 @@ from `load_config`; `lms ps` showed the same.
 
 ## Tests
 
+- `tests/test_local_window.py` (14): see above.
 - `tests/test_window_need.py` (12): the need from the overhead, the cautious
   default, the largest recent figure, ageing out, a restart reading it back,
   writes only on change, a broken file ignored, the load sizes, the

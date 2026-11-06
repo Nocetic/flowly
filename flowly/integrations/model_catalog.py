@@ -88,6 +88,11 @@ _UA = "flowly-tui/model-catalog"
 
 # Session cache: provider_key → list[Model]. Cleared on flush_cache().
 _CACHE: dict[str, list[Model]] = {}
+# The context a local model server runs a model with now (model id → tokens),
+# kept current between turns (flowly/integrations/local_window.py). It
+# outranks the catalogue, which was read once and goes stale when the owner
+# reloads the model with another context.
+_RUNTIME_WINDOWS: dict[str, int] = {}
 _FLOWLY_POLICY: FlowlyModelPolicy | None = None
 
 
@@ -127,6 +132,7 @@ def flush_cache() -> None:
     """Drop every cached provider catalog. Call after credentials change."""
     global _FLOWLY_POLICY
     _CACHE.clear()
+    _RUNTIME_WINDOWS.clear()
     _FLOWLY_POLICY = None
 
 
@@ -308,12 +314,22 @@ def get_context_window(model_id: str) -> int | None:
     """
     if not model_id:
         return None
+    runtime = _RUNTIME_WINDOWS.get(model_id)
+    if runtime:
+        return runtime
     candidates = _id_candidates(model_id)
     for models in _CACHE.values():
         for m in models:
             if m.id in candidates and m.context_window:
                 return m.context_window
     return None
+
+
+def set_runtime_context_window(model_id: str, tokens: int) -> None:
+    """Record the context a local server runs ``model_id`` with now; it
+    outranks the catalogue in :func:`get_context_window`."""
+    if model_id and isinstance(tokens, int) and not isinstance(tokens, bool) and tokens > 0:
+        _RUNTIME_WINDOWS[model_id] = tokens
 
 
 def get_pricing(model_id: str) -> tuple[float | None, float | None] | None:

@@ -369,6 +369,40 @@ async def _load_lmstudio(client: httpx.AsyncClient, server: LocalServer, model: 
     return reread.context if reread else None
 
 
+# ── the server behind a running agent ───────────────────────────────────────
+
+
+async def runtime_window(
+    slot: str, base: str, model: str, *, required: int, client: httpx.AsyncClient | None = None,
+) -> int | None:
+    """The context the server at ``base`` runs ``model`` with, made enough
+    where Flowly can: on LM Studio a model it does not hold, or holds with
+    less than ``required``, is loaded with enough (as LM Studio would load it
+    on the next request anyway, with its own small default). On Ollama it is
+    read, never changed. None for any other server, or when it does not say.
+    Raises :class:`LocalServerError` when LM Studio refuses."""
+    root = base.rstrip("/")
+    root = root[: -len("/v1")] if root.endswith("/v1") else root
+    owned = client is None
+    client = client or httpx.AsyncClient(timeout=_SCAN_TIMEOUT)
+    try:
+        if slot == "ollama":
+            server = LocalServer("ollama", "Ollama", "ollama", base, root)
+            context = (await _ollama_running(client, server)).get(model) or None
+            if context:
+                _SEEN_CONTEXT[model] = context
+            return context or _SEEN_CONTEXT.get(model)
+        if slot == "vllm":
+            server = LocalServer("lmstudio", "LM Studio", "vllm", base, root)
+            if await _lmstudio_v1_entries(client, server) is None:
+                return None  # vLLM, llama.cpp …: nothing to ask
+            return await _load_lmstudio(client, server, model, required)
+        return None
+    finally:
+        if owned:
+            await client.aclose()
+
+
 # ── scanning and loading ────────────────────────────────────────────────────
 
 
