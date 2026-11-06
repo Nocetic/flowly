@@ -5153,6 +5153,128 @@ class AgentLoop:
         while len(pins) > self._SESSION_PINS_LIMIT:
             pins.popitem(last=False)
 
+    # ── warming a local server's cache ───────────────────────────────────
+    #
+    # A model on this computer reads the agent's fixed prompt (instructions and
+    # tool schemas, ~35K tokens) before it can answer, at ~600-1000 tokens/s on
+    # a laptop: a minute or more for the first message after the gateway
+    # starts or the model changes. Every later request reuses what the server
+    # cached. Warming sends that prompt once, built exactly as a fresh turn
+    # builds it, asking for one token, so the first message finds it cached.
+
+    #: The message a warm-up asks with; only the prompt before it matters.
+    _WARM_MESSAGE = "hi"
+    #: How long the MCP catalog may take to join before warming anyway.
+    _WARM_MCP_WAIT_SECONDS = 60.0
+
+    def _warms_prompt_cache(self) -> bool:
+        from flowly.integrations.active_provider import is_local_endpoint
+
+        provider = self.provider
+        return (
+            getattr(provider, "provider_name", "") in ("ollama", "vllm")
+            and is_local_endpoint(getattr(provider, "api_base", None))
+        )
+
+    def _cancel_prompt_warm(self) -> None:
+        task = getattr(self, "_prompt_warm_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+            logger.info("[warm] a request arrived; warming stopped")
+
+    def schedule_prompt_warm(self, reason: str, *, channel: str | None = None) -> asyncio.Task | None:
+        """Warm the local server's cache in the background, once at a time;
+        nothing for a model that is not on this computer."""
+        if not self._warms_prompt_cache():
+            return None
+        task = getattr(self, "_prompt_warm_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+        self._prompt_warm_task = asyncio.get_running_loop().create_task(
+            self._warm_prompt_cache(reason, channel=channel))
+        return self._prompt_warm_task
+
+    def _turn_route_path(self) -> Path:
+        return self._state_dir / "warm-route.json"
+
+    def _remember_turn_route(self, channel: str | None, disabled_tools: Any) -> None:
+        """Keep the route of the latest real turn (its channel and the tools it
+        switched off; names only), so a warm-up builds the same tool list and
+        prompt the next turn will. Written only when it changes."""
+        route = {
+            "channel": str(channel or "web"),
+            "disabled": sorted({str(name) for name in disabled_tools or () if isinstance(name, str)}),
+        }
+        if route == getattr(self, "_last_turn_route", None):
+            return
+        self._last_turn_route = route
+        if not self._warms_prompt_cache():
+            return
+        try:
+            path = self._turn_route_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(route), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+    def _warm_route(self, channel: str | None) -> tuple[str, list[str]]:
+        """The route a warm-up builds: the latest real turn's (in memory, else
+        as the last run left it), else a fresh conversation's own."""
+        route = getattr(self, "_last_turn_route", None)
+        if route is None:
+            try:
+                route = json.loads(self._turn_route_path().read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                route = None
+        if isinstance(route, dict) and isinstance(route.get("disabled"), list):
+            return str(route.get("channel") or channel or "web"), [str(n) for n in route["disabled"]]
+        from flowly.agent_home import SETUP_TOOLS
+
+        return channel or "web", sorted((SETUP_TOOLS & set(self.tools.tool_names)) | {"message_profile"})
+
+    async def _warm_prompt_cache(self, reason: str, *, channel: str | None = None) -> bool:
+        started = time.monotonic()
+        try:
+            if self.mcp_discovery_pending:
+                await asyncio.to_thread(self.wait_for_mcp_discovery, self._WARM_MCP_WAIT_SECONDS)
+            channel, disabled = self._warm_route(channel)
+            disclosure = self._routed_tool_disclosure(
+                channel, disabled_tools=disabled, intent_text=self._WARM_MESSAGE)
+            visible = {
+                str(item.get("function", {}).get("name", ""))
+                for item in disclosure.definitions
+            }
+            messages = self.context.build_messages(
+                history=[],
+                current_message=self._WARM_MESSAGE,
+                memory_search_enabled=self._memory_manager is not None,
+                model=self.model,
+                channel=channel,
+                available_tools=visible,
+                reachable_tools=set(disclosure.all_names),
+            )
+            response = await self.provider.chat(
+                messages=messages,
+                tools=list(disclosure.definitions) or None,
+                model=self.model,
+                max_tokens=1,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - an optimisation, never an error
+            logger.info("[warm] skipped ({}): {}", reason, type(exc).__name__)
+            return False
+        if response.finish_reason == "error":
+            logger.info("[warm] the server refused ({}): {}", reason, (response.content or "")[:160])
+            return False
+        logger.info(
+            "[warm] {} has the agent's prompt cached ({}, {:.1f}s)",
+            self.model, reason, time.monotonic() - started,
+        )
+        return True
+
     @staticmethod
     def _turn_playbook_pins(text: str) -> frozenset[str]:
         """The playbook tools this message asks for, before its messages are
@@ -6210,6 +6332,9 @@ class AgentLoop:
         mutate the durable turn delta. Ephemeral model nudges are intentionally
         excluded.
         """
+        # A real request outranks a warm-up: stop it so the two do not share
+        # the local server (what it already read stays in the server's cache).
+        self._cancel_prompt_warm()
         iteration = 0
         from flowly.agent.tools.discovery import annotate_search_repetition
         _tool_search_result_sets: dict[tuple[str, ...], int] = {}
@@ -9300,6 +9425,7 @@ class AgentLoop:
             if "message_profile" not in disabled_tools:
                 disabled_tools.append("message_profile")
             msg.metadata["disabled_tools"] = disabled_tools
+        self._remember_turn_route(msg.channel, disabled_tools)
         turn_disclosure = (
             self._routed_tool_disclosure(
                 msg.channel,

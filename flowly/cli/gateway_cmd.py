@@ -1903,6 +1903,12 @@ Respond to the user now:"""
         logger.info(
             f"[provider] hot-reloaded → {new_active.source} · model={new_model}"
         )
+        # A model on this computer reads the agent's prompt before its first
+        # answer: have it cached before the owner writes.
+        try:
+            agent.schedule_prompt_warm("provider changed")
+        except Exception as exc:  # noqa: BLE001 - an optimisation only
+            logger.info(f"[warm] not scheduled: {type(exc).__name__}")
         return {
             "ok": True,
             "key": new_active.key,
@@ -3018,6 +3024,13 @@ Respond to the user now:"""
                         agent.resume_active_goals()
                     except Exception:
                         logger.exception("[goal] restart resume failed")
+
+                # A model on this computer: cache the agent's prompt now so the
+                # first message after a start does not wait for it.
+                try:
+                    agent.schedule_prompt_warm("gateway started")
+                except Exception as exc:  # noqa: BLE001 - an optimisation only
+                    logger.info(f"[warm] not scheduled: {type(exc).__name__}")
 
                 await asyncio.gather(
                     agent.run(),
