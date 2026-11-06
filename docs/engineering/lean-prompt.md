@@ -137,7 +137,7 @@ prompt cached.
 - **The same prompt as the next turn.** It is built through the same path as
   a fresh turn (`_routed_tool_disclosure` + `build_messages`). It uses the
   route the latest real turn used (channel and the tools it switched off),
-  kept in memory and in `<workspace>/.flowly_state/warm-route.json`. That file
+  kept in memory and in `warm-route.json` in the loop's state directory (`~/.flowly/warm-route.json` for the gateway). That file
   holds names only, no content, and is written only when the route changes.
   The system prompt depends on no session (the time is in the user message;
   memory freezing is off), so one warm-up serves every new conversation.
