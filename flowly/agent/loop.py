@@ -76,6 +76,7 @@ from flowly.compaction.request_guard import (
     ProviderRequestCoordinator,
     request_fingerprint,
     request_too_large_response,
+    unfit_response,
 )
 from flowly.compaction.types import (
     CompactionConfig,
@@ -5792,10 +5793,7 @@ class AgentLoop:
                 usage={},
             ), messages
         if not fitted.fits:
-            return (
-                self._request_too_large_response(fitted.failure or "request does not fit"),
-                messages,
-            )
+            return unfit_response(fitted, self.compaction, model), messages
         working = fitted.messages
         if fitted.changed:
             logger.info(

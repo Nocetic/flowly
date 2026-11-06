@@ -70,93 +70,127 @@ the old logic (180 ≠ 120).
   and "Local OpenAI-compatible"; `flowly status` prints an Ollama line; the
   self-hosted row is named "Local OpenAI-compatible" (shown only once set up).
 
+## New: what the agent needs (`flowly/compaction/window_need.py`)
+
+First tried on a real Mac (2026-11-06) with LM Studio and gemma-4-e2b held at
+8 192 tokens: every message, even "selam", was refused before dispatch with
+"This request is too large. Compact the conversation…". The gateway log said
+why: `Fixed request overhead (68013 tokens) leaves no room in a 8192-token
+window`. The agent's system instructions and tool schemas alone are 55-68K
+tokens. The first version of this branch judged models against a fixed 32K,
+so it would have let that model, and any 32-64K one, through.
+
+The need is now measured, not guessed:
+
+- `ProviderRequestCoordinator.fit` records every request's fixed overhead
+  (`fixed_prefix_tokens + tool_schema_tokens`).
+- The largest of the last 32 decides. It is kept on disk
+  (`<home>/state/window-need.json`, written only when it changes), so a
+  restarted gateway knows it before its first request.
+- Need = overhead + the reply reserve (`compaction.reserveTokensFloor`, 20 000)
+  + 8 192 of conversation, rounded up to 1K, at least 32K. For 68 013 that is
+  96 256.
+- An agent that never made a request has nothing measured; the need is then
+  65 536 (the floor other agents use for tool use), and `provider.local`
+  says `requiredMeasured: false`.
+
+The refusal is now honest about it. When the fixed overhead alone leaves no
+room, `unfit_response` (request_guard) adds the window, the overhead and the
+need (`LLMErrorInfo.context_window`, `fixed_overhead`, `required_context`,
+`code: "context_window_too_small"`). The presentation becomes
+`MODEL_CONTEXT_WINDOW_TOO_SMALL`: "The model runs with 8,192 tokens of
+context, and your agent's instructions and tools alone take about 68,013.
+Load the model with at least 96,256…". The classification stays
+`INPUT_TOO_LARGE`, so retry and recovery rules do not change; a long
+conversation still reads as before.
+
 ## New: finding the servers (`flowly/integrations/local_models.py`)
 
-`provider.local` → `{servers, minContext, recommendedContext}`. Each server:
-`{id, name, slot, base, installed, running, models[]}`; each model:
-`{id, tools, maxContext, context, contextOk, loaded, size, parameters, cloud}`.
+`provider.local` → `{servers, requiredContext, requiredMeasured,
+recommendedContext, minContext}` (`minContext` = `requiredContext`, the name
+apps read before). Each server: `{id, name, slot, base, installed, running,
+models[]}`; each model: `{id, tools, maxContext, maxContextOk, context,
+contextOk, loaded, size, parameters, cloud}`, judged against the need.
 
 - Only the two fixed loopback addresses are probed (Ollama `:11434`, LM Studio
   `:1234`), with a 0.5 s connect timeout. A machine without them (a cloud
   agent) answers two servers that are off, at once.
 - `installed`: the app is on the computer even if it is off (`ollama` on PATH
-  or `Ollama.app`; `~/.lmstudio` or `LM Studio.app`). The app then says how to
-  turn it on instead of saying nothing.
+  or `Ollama.app`; `~/.lmstudio` or `LM Studio.app`).
 - Ollama: `/api/tags`, `/api/ps`, `/api/show` (four at a time, at most 60
-  models). Embedding-only models are left out (`capabilities` without
-  `completion`). `tools` from `capabilities`.
-- LM Studio: `/api/v0/models` (0.3.6+), else the OpenAI `/v1/models` list.
-  Embedding models are left out; `tools` from `capabilities: ["tool_use"]`
-  when it says.
+  models). Embedding-only models are left out; `tools` from `capabilities`.
+- LM Studio: its REST API `/api/v1/models` (key, type, `loaded_instances[]
+  .config.context_length`, `max_context_length`,
+  `capabilities.trained_for_tool_use`); else `/api/v0/models`; else the
+  OpenAI `/v1/models` list. Embedding and decision models are left out.
 - Something else answering on the port is an `error`, not a server.
 
-### Context, the trap
+`context` is what the server will actually use, never the trained window:
+Ollama's loaded `context_length` (`/api/ps`), else a `num_ctx` the model was
+built with, else the last one seen loaded; LM Studio's loaded instance. The
+model catalogue (`_fetch_ollama`, `_fetch_vllm`) carries the same figure in
+`context_window`, so compaction sizes the conversation to it.
 
-A local server runs a model with its own context length: Ollama's default is
-4096 tokens below 24 GiB of VRAM, LM Studio's for a model loaded on demand is
-4096 too. The agent's instructions and tool definitions alone are longer.
-The OpenAI-compatible API has no field for it (Ollama's documentation says so),
-so the server silently cuts the start of the prompt, and a local model looks
-stupid.
+### Who sets the context
 
-So `context` is what the server will actually use, never the trained window:
-
-- Ollama: the loaded model's `context_length` from `/api/ps`; else the
-  `num_ctx` the model was built with (`/api/show` `parameters`); else the last
-  one seen loaded (kept in memory, since Ollama unloads a model after its
-  keep-alive and loads it again the same way); else unknown.
-- LM Studio: `loaded_context_length` of a loaded model; else unknown.
-- `contextOk` = `context >= MIN_CONTEXT` (32 768: compaction alone keeps 20 000
-  free); null when unknown. `RECOMMENDED_CONTEXT` is 65 536, what Ollama's
-  documentation asks of agents.
-
-The model catalogue uses the same numbers: `_fetch_ollama` (now through this
-module; an Ollama reached only through its OpenAI route, behind a proxy, still
-lists its models from `/v1/models`) and `_fetch_vllm` (enriched from LM
-Studio's native list when it answers) put the running context in
-`context_window`. Compaction reads the
-catalogue first (`CompactionService.model_context_window_for`), so it keeps the
-conversation inside what the server really runs, not the model's trained
-window.
-
-Nothing changes a server's settings. Raising the context is the owner's
-choice (memory use grows with it); the app says where to do it.
+- **LM Studio: Flowly does.** `POST /api/v1/models/load {model,
+  context_length, echo_load_config}` loads it with the next common size at or
+  above the need (98 304 for 96 256), within its trained window. A model held
+  with less is unloaded (`/api/v1/models/unload {instance_id}`) and loaded
+  again; one held with enough is left alone. The applied size comes back
+  from `load_config` (or a re-read).
+- **Ollama: the owner does.** Its OpenAI route builds options only from the
+  standard fields (`ollama/openai/openai.go`: stop, num_predict, temperature,
+  seed, penalties, top_p); `num_ctx` sent there is ignored. Its context is the
+  app's Context length setting or `OLLAMA_CONTEXT_LENGTH`. Flowly loads the
+  model and reads back what Ollama gave it, and says what to set
+  (`recommendedContext`). Building a derived model with `num_ctx`
+  (`/api/create`) would work but writes models into the owner's Ollama; not
+  done.
 
 ## New: using one (`provider.use_local {server, model}`)
 
-One call does what used to take three (`provider.set_base`, `provider.set`,
-`model.set`) and two reloads:
+Nothing is written unless the agent can run on it:
 
-1. The model must be one the server holds now (`NOT_FOUND`; `UNREACHABLE`
-   when the server is off; `INVALID` for anything but `ollama` / `lmstudio`).
-2. Ollama loads it (`POST /api/generate` with no prompt). A model too big for
-   the computer fails here with Ollama's own reason (`LOAD_FAILED`), not in the
-   middle of a conversation, and the first message does not wait for the load.
-   The loaded context comes back. LM Studio loads on the first request.
-3. Then, and only then, the config: the slot's address, `providers.active`,
-   `agents.defaults.model`; reasoning effort and service tier go back to their
-   defaults (a cloud model's mean nothing here). One reload.
+1. `UNREACHABLE` (server off), `NOT_FOUND` (no such model), `INVALID`.
+2. `CONTEXT_TOO_SMALL`: the trained window is below the need.
+3. The load: `LOAD_FAILED` with the server's own reason (a model too big for
+   the computer fails here, not mid-conversation). LM Studio gets the need.
+4. `CONTEXT_NOT_APPLIED`: the server then runs it with less than the need
+   (Ollama's setting; LM Studio short of memory). The message says how much
+   is needed and what to set.
+5. Then the slot's address, `providers.active`, `agents.defaults.model`
+   (effort and tier back to defaults), one reload. The result carries
+   `context`, `requiredContext`, `contextOk`.
 
-A failure in steps 1–2 changes nothing (tested by comparing the config file
-byte for byte).
+Every failure leaves the config file byte for byte as it was (tested).
+
+Checked live against LM Studio 0.4.28 on this Mac (2026-11-06): the scan read
+the v1 list, and `load` loaded google/gemma-4-e2b with 98 304 tokens, read back
+from `load_config`; `lms ps` showed the same.
 
 ## Tests
 
-- `tests/test_local_models.py` (22): the scan against the servers' documented
-  responses (embedding models out, tools, loaded context against built
-  `num_ctx` against unknown, not running, installed but off, something else on
-  the port, LM Studio native and older), loading (context remembered after
-  unload, a model too big), the RPCs (one-step switch for both servers, effort
-  and tier reset, refusals, nothing written on failure, kinds, dispatch), and
-  the running context reaching the catalogue that compaction reads.
-- `tests/test_local_provider.py`, `tests/test_ollama_provider.py`: carried
-  over, plus the cloud timeout test.
-- `tests/test_provider_switching.py`: the `vllm` kind is `local` now.
-- Full suite: 10 395 passed; the only failures are the 12 screen tests
-  (`test_screen_desktop_still.py`, `test_screen_capture_service.py`) that fail
-  on `main` the same way.
-- Not run against a real Ollama or LM Studio: neither had a chat model on the
-  machine this was written on (LM Studio held only an embedding model).
+- `tests/test_window_need.py` (12): the need from the overhead, the cautious
+  default, the largest recent figure, ageing out, a restart reading it back,
+  writes only on change, a broken file ignored, the load sizes, the
+  coordinator recording every request, and the refusal saying the window is
+  too small with the numbers (classification unchanged) while a long
+  conversation still reads as one.
+- `tests/test_local_models.py` (30): the scans against the servers'
+  documented responses (LM Studio's v1 entry is the one a real 0.4.28
+  returned), judging against the need; LM Studio loading with the need,
+  unloading and reloading a model held with 8K (the case hit), leaving one
+  held with enough alone, refusing a too-small window before touching
+  anything, passing its refusal on, an LM Studio without v1; Ollama loading
+  and reading its context; every `provider.use_local` refusal leaving the
+  config untouched; the catalogue carrying the running context to
+  compaction for both servers; old apps not seeing the slots.
+- `tests/test_local_provider.py`, `tests/test_ollama_provider.py`,
+  `tests/test_provider_switching.py`: carried over, plus the compatibility
+  tests above.
+- Full suite on the branch merged with main: 10 404 passed; the only failures
+  are the 12 screen tests that fail on main the same way.
 
 ## Not done
 
@@ -164,5 +198,7 @@ byte for byte).
   minutes; it belongs in the model menu with progress, later.
 - Named agents: `provider.use_local` is not in the profile host's contract, so
   only the main agent runs on a local model from the app.
-- Ollama's server default context cannot be read before a model is loaded;
-  until then `context` is unknown and the app says so.
+- Ollama's context cannot be set from Flowly (see above); the owner sets it.
+- Shrinking the need itself: the open agent defers cold built-in tools behind
+  its tool-search bridge too; Flowly defers only MCP and extensions, which is
+  why the overhead is 55-68K. A design decision for all agents, cloud too.

@@ -19,6 +19,7 @@ from loguru import logger
 
 from flowly.compaction.estimator import estimate_messages_tokens, estimate_tokens
 from flowly.compaction.service import CompactionService
+from flowly.compaction.window_need import record_fixed_overhead, required_window
 from flowly.compaction.types import (
     SUMMARY_METADATA_KEY,
     CompactionError,
@@ -90,22 +91,55 @@ def request_fingerprint(messages: list[dict[str, Any]]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def request_too_large_response(reason: str) -> LLMResponse:
+def request_too_large_response(
+    reason: str,
+    *,
+    context_window: int | None = None,
+    fixed_overhead: int | None = None,
+    required_context: int | None = None,
+) -> LLMResponse:
     """A provider-shaped refusal for a request that cannot be made to fit.
 
     Fails closed with machine-routable metadata (classified INPUT_TOO_LARGE)
     and user-safe prose instead of sending a payload the provider would
-    reject.
+    reject. With the window figures it is the window that is too small, not
+    the conversation (``code == "context_window_too_small"``): the owner is
+    told the numbers instead of being asked to compact a chat that is empty.
     """
     logger.warning("Provider request blocked before dispatch: {}", reason)
+    too_small = None not in (context_window, fixed_overhead, required_context)
     return LLMResponse(
         content="Error calling LLM: request input is too large after compaction",
         finish_reason="error",
         error_info=LLMErrorInfo(
             status_code=413,
-            code="input_too_large",
+            code="context_window_too_small" if too_small else "input_too_large",
             type="request_too_large",
+            context_window=context_window if too_small else None,
+            fixed_overhead=fixed_overhead if too_small else None,
+            required_context=required_context if too_small else None,
         ),
+    )
+
+
+def unfit_response(fit: "RequestFit", compaction: Any, model: str) -> LLMResponse:
+    """The refusal for a request ``fit`` could not make fit. When the fixed
+    overhead alone (system instructions + tool schemas) leaves no room, it
+    carries the window, that overhead and the window the agent needs."""
+    reason = fit.failure or "request does not fit"
+    if fit.before.compactable_budget > 0:
+        return request_too_large_response(reason)
+    overhead = fit.before.fixed_prefix_tokens + fit.before.tool_schema_tokens
+    try:
+        window = int(compaction.effective_context_window_for(model))
+        reserve = int(getattr(getattr(compaction, "config", None), "reserve_tokens_floor", 20_000))
+    except Exception:  # noqa: BLE001 - the plain refusal is still correct
+        return request_too_large_response(reason)
+    return request_too_large_response(
+        reason,
+        context_window=window,
+        fixed_overhead=overhead,
+        required_context=required_window(overhead, reserve),
     )
 
 
@@ -238,6 +272,9 @@ class ProviderRequestCoordinator:
         """
         original = list(messages)
         before = self.budget(original, tools, model, pinned=pinned, pin_at=pin_at)
+        # What every request carries before any conversation: how large a
+        # context window this agent needs (compaction/window_need.py).
+        record_fixed_overhead(before.fixed_prefix_tokens + before.tool_schema_tokens)
         if not force_reduction and before.estimated_input_tokens <= before.input_limit:
             return RequestFit(original, before, before)
 

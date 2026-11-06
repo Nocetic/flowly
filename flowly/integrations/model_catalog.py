@@ -1139,16 +1139,27 @@ async def _fetch_vllm() -> list[Model]:
     skip: set[str] = set()
     async with httpx.AsyncClient(timeout=_TIMEOUT) as c:
         try:
-            native = await c.get(f"{root}/api/v0/models", headers={"Accept": "application/json"})
+            native = await c.get(f"{root}/api/v1/models", headers={"Accept": "application/json"})
             if native.status_code == 200:
-                for item in native.json().get("data") or []:
-                    if not isinstance(item, dict):
+                for item in native.json().get("models") or []:
+                    if not isinstance(item, dict) or not isinstance(item.get("key"), str):
                         continue
-                    if item.get("type") == "embeddings" and isinstance(item.get("id"), str):
-                        skip.add(item["id"])
-                    model = local_models._lmstudio_model(item)
-                    if model is not None:
+                    model = local_models._lmstudio_v1_model(item)
+                    if model is None:
+                        skip.add(item["key"])  # embedding and decision models
+                    else:
                         details[model.id] = model
+            else:
+                native = await c.get(f"{root}/api/v0/models", headers={"Accept": "application/json"})
+                if native.status_code == 200:
+                    for item in native.json().get("data") or []:
+                        if not isinstance(item, dict):
+                            continue
+                        if item.get("type") == "embeddings" and isinstance(item.get("id"), str):
+                            skip.add(item["id"])
+                        model = local_models._lmstudio_model(item)
+                        if model is not None:
+                            details[model.id] = model
         except Exception:  # noqa: BLE001 - only LM Studio has it; the plain list below is enough
             pass
         r = await c.get(

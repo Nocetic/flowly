@@ -48,6 +48,12 @@ class LLMErrorInfo:
     code: str | None = None
     type: str | None = None
     retry_after_seconds: float | None = None
+    # A request refused because the model's context window cannot hold even
+    # the agent's fixed overhead (``code == "context_window_too_small"``):
+    # the window, that overhead, and the window the agent needs.
+    context_window: int | None = None
+    fixed_overhead: int | None = None
+    required_context: int | None = None
 
 
 class ProviderHTTPError(RuntimeError):

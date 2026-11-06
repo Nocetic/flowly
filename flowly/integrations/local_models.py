@@ -6,14 +6,24 @@ them at their default addresses, lists the models they hold, and says what
 the app needs to know before one is picked:
 
 - whether the model can call tools (an agent that cannot is a chat box);
-- how much context it will actually get. A local server runs a model with
-  its own context length, often 4096 tokens (Ollama's default below 24 GiB
-  of VRAM, LM Studio's for a model loaded on demand). The agent's own
-  instructions and tools are longer than that, and the OpenAI API has no
-  way to ask for more: the server silently drops the start of the prompt.
-  So the length is read from the server (Ollama ``/api/ps`` for a loaded
-  model, a ``num_ctx`` the model was built with; LM Studio's loaded length)
-  and reported against :data:`MIN_CONTEXT`.
+- whether the context the server runs it with holds the agent. Every request
+  carries the agent's instructions and tool schemas, measured on each request
+  (flowly/compaction/window_need.py; 55-68K tokens on a Desktop agent), and a
+  local server runs a model with its own context length, often 4-8K. The
+  OpenAI API has no field to ask for more, so a request that does not fit is
+  refused before it is sent, and the agent cannot answer at all.
+
+So a model is run only with enough context:
+
+- LM Studio is told the context to load the model with (its REST API,
+  ``/api/v1/models/load``); a model it holds with less is unloaded and loaded
+  again.
+- Ollama decides the context itself (its app setting or
+  ``OLLAMA_CONTEXT_LENGTH``; its OpenAI route ignores ``num_ctx``, see
+  ollama/openai/openai.go). The model is loaded and the context Ollama gives
+  it is read back (``/api/ps``); when it is too small nothing is switched and
+  the owner is told what to set.
+- A model whose trained window is below the need is refused outright.
 
 Only the servers' fixed loopback addresses are probed, with a short timeout,
 so a scan on a machine without them (a cloud agent) costs nothing.
@@ -30,16 +40,13 @@ from typing import Any
 
 import httpx
 
-#: Below this the agent's instructions, tools and the reply reserve leave no
-#: room for the conversation (compaction keeps 20k tokens free on its own).
-MIN_CONTEXT = 32_768
-#: What Ollama's own documentation asks of agents and coding tools.
-RECOMMENDED_CONTEXT = 65_536
+from flowly.compaction.window_need import load_size, required_context
 
 _SCAN_TIMEOUT = httpx.Timeout(2.0, connect=0.5)
 _SHOW_CONCURRENCY = 4
 _MAX_MODELS = 60
-_LOAD_TIMEOUT = httpx.Timeout(180.0, connect=2.0)
+#: Reading a large model from disk into memory.
+_LOAD_TIMEOUT = httpx.Timeout(300.0, connect=2.0)
 
 
 @dataclass(frozen=True)
@@ -64,6 +71,20 @@ def server_by_id(server_id: str) -> LocalServer | None:
     return next((server for server in SERVERS if server.id == server_id), None)
 
 
+def agent_need() -> tuple[int, bool]:
+    """``(tokens, measured)``: the context this agent needs, from its own
+    requests when there were any (window_need.py), with the configured reply
+    reserve."""
+    reserve = 20_000
+    try:
+        from flowly.config.loader import load_config
+
+        reserve = int(load_config().agents.defaults.compaction.reserve_tokens_floor)
+    except Exception:  # noqa: BLE001 - the schema default
+        pass
+    return required_context(reserve)
+
+
 @dataclass
 class LocalModel:
     id: str
@@ -79,13 +100,16 @@ class LocalModel:
     #: An Ollama cloud model: it runs on Ollama's servers, not this computer.
     cloud: bool = False
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, required: int) -> dict[str, Any]:
         return {
             "id": self.id,
             "tools": self.tools,
             "maxContext": self.max_context,
+            #: The model can hold the agent at all (its trained window).
+            "maxContextOk": None if self.max_context is None else self.max_context >= required,
             "context": self.context,
-            "contextOk": None if self.context is None else self.context >= MIN_CONTEXT,
+            #: The server runs it with enough now.
+            "contextOk": None if self.context is None else self.context >= required,
             "loaded": self.loaded,
             "size": self.size,
             "parameters": self.parameters,
@@ -98,6 +122,22 @@ class LocalServerError(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+def _positive_int(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _error_text(response: httpx.Response) -> str:
+    """A server's own reason for a refusal (both servers answer ``{"error": …}``)."""
+    try:
+        body = response.json()
+    except ValueError:
+        return response.text[:300].strip()
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, dict):
+        error = error.get("message")
+    return str(error or "")[:300].strip()
 
 
 # ── what is installed ───────────────────────────────────────────────────────
@@ -116,12 +156,8 @@ def _installed(server: LocalServer) -> bool:
 _NUM_CTX = re.compile(r"^\s*num_ctx\s+(\d+)\s*$", re.MULTILINE)
 
 #: The context a model ran with when last seen loaded, so it is still known
-#: after Ollama unloads it (keep-alive) — it loads again with the same one.
+#: after Ollama unloads it (keep-alive): it loads again with the same one.
 _SEEN_CONTEXT: dict[str, int] = {}
-
-
-def _positive_int(value: Any) -> int | None:
-    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 
 def _ollama_model(name: str, tag: dict, show: dict | None, running: dict[str, int]) -> LocalModel | None:
@@ -157,18 +193,23 @@ def _ollama_model(name: str, tag: dict, show: dict | None, running: dict[str, in
     )
 
 
+async def _ollama_running(client: httpx.AsyncClient, server: LocalServer) -> dict[str, int]:
+    running: dict[str, int] = {}
+    try:
+        ps = (await client.get(f"{server.root}/api/ps")).raise_for_status().json()
+    except (httpx.HTTPError, ValueError):
+        return running
+    for item in ps.get("models") or []:
+        if isinstance(item, dict) and isinstance(item.get("name"), str):
+            running[item["name"]] = _positive_int(item.get("context_length")) or 0
+    return running
+
+
 async def _scan_ollama(client: httpx.AsyncClient, server: LocalServer) -> list[LocalModel]:
     tags = (await client.get(f"{server.root}/api/tags")).raise_for_status().json()
     entries = [m for m in tags.get("models") or [] if isinstance(m, dict) and isinstance(m.get("name"), str)]
     entries = entries[:_MAX_MODELS]
-    running: dict[str, int] = {}
-    try:
-        ps = (await client.get(f"{server.root}/api/ps")).raise_for_status().json()
-        for item in ps.get("models") or []:
-            if isinstance(item, dict) and isinstance(item.get("name"), str):
-                running[item["name"]] = _positive_int(item.get("context_length")) or 0
-    except (httpx.HTTPError, ValueError):
-        pass
+    running = await _ollama_running(client, server)
     gate = asyncio.Semaphore(_SHOW_CONCURRENCY)
 
     async def show(name: str) -> dict | None:
@@ -184,10 +225,48 @@ async def _scan_ollama(client: httpx.AsyncClient, server: LocalServer) -> list[L
     return [model for model in models if model is not None]
 
 
+async def _load_ollama(client: httpx.AsyncClient, server: LocalServer, model: str) -> int | None:
+    """Load ``model`` now (an empty generate request) and read back the
+    context Ollama gave it. Ollama decides that context; Flowly cannot."""
+    try:
+        response = await client.post(f"{server.root}/api/generate", json={"model": model}, timeout=_LOAD_TIMEOUT)
+    except httpx.HTTPError as exc:
+        raise LocalServerError("LOAD_FAILED", f"{server.name} could not load {model}: {type(exc).__name__}") from exc
+    if response.status_code >= 400:
+        raise LocalServerError(
+            "LOAD_FAILED", _error_text(response) or f"{server.name} could not load {model} (HTTP {response.status_code})")
+    context = (await _ollama_running(client, server)).get(model) or None
+    if context:
+        _SEEN_CONTEXT[model] = context
+    return context
+
+
 # ── LM Studio ───────────────────────────────────────────────────────────────
 
 
+def _lmstudio_v1_model(item: dict) -> LocalModel | None:
+    """One entry of ``/api/v1/models`` (LM Studio's REST API)."""
+    key = item.get("key")
+    if not isinstance(key, str) or not key or item.get("type") != "llm":
+        return None  # embedding and decision models cannot hold a conversation
+    instances = [i for i in item.get("loaded_instances") or [] if isinstance(i, dict)]
+    contexts = [_positive_int((i.get("config") or {}).get("context_length")) for i in instances]
+    context = max((c for c in contexts if c), default=None)
+    capabilities = item.get("capabilities") if isinstance(item.get("capabilities"), dict) else {}
+    tools = capabilities.get("trained_for_tool_use")
+    return LocalModel(
+        id=key,
+        tools=tools if isinstance(tools, bool) else None,
+        max_context=_positive_int(item.get("max_context_length")),
+        context=context,
+        loaded=bool(instances),
+        size=_positive_int(item.get("size_bytes")),
+        parameters=item.get("params_string") if isinstance(item.get("params_string"), str) else None,
+    )
+
+
 def _lmstudio_model(item: dict) -> LocalModel | None:
+    """One entry of the older ``/api/v0/models`` (LM Studio 0.3.6+)."""
     model_id = item.get("id")
     if not isinstance(model_id, str) or not model_id:
         return None
@@ -204,7 +283,20 @@ def _lmstudio_model(item: dict) -> LocalModel | None:
     )
 
 
+async def _lmstudio_v1_entries(client: httpx.AsyncClient, server: LocalServer) -> list[dict] | None:
+    """``/api/v1/models``' entries; None when this LM Studio has no v1 API."""
+    response = await client.get(f"{server.root}/api/v1/models")
+    if response.status_code == 404:
+        return None
+    body = response.raise_for_status().json()
+    return [item for item in body.get("models") or [] if isinstance(item, dict)]
+
+
 async def _scan_lmstudio(client: httpx.AsyncClient, server: LocalServer) -> list[LocalModel]:
+    entries = await _lmstudio_v1_entries(client, server)
+    if entries is not None:
+        models = [_lmstudio_v1_model(item) for item in entries[:_MAX_MODELS]]
+        return [model for model in models if model is not None]
     response = await client.get(f"{server.root}/api/v0/models")
     if response.status_code == 404:
         # Before LM Studio 0.3.6 only the OpenAI list exists: ids, no types.
@@ -220,11 +312,72 @@ async def _scan_lmstudio(client: httpx.AsyncClient, server: LocalServer) -> list
     return [model for model in models if model is not None]
 
 
-# ── scanning ────────────────────────────────────────────────────────────────
+async def _load_lmstudio(client: httpx.AsyncClient, server: LocalServer, model: str, required: int) -> int | None:
+    """Have LM Studio hold ``model`` with at least ``required`` tokens of
+    context: kept when it already does; else every instance it holds with less
+    is unloaded and the model loaded again with enough. Returns the context it
+    then runs with. An LM Studio without the v1 API loads on demand, with its
+    own context (None)."""
+    entries = await _lmstudio_v1_entries(client, server)
+    if entries is None:
+        return None
+    entry = next((item for item in entries if item.get("key") == model), None)
+    if entry is None:
+        raise LocalServerError("NOT_FOUND", f"{server.name} has no model named {model}")
+    found = _lmstudio_v1_model(entry)
+    if found is None:
+        raise LocalServerError("NOT_FOUND", f"{model} is not a chat model")
+    if found.max_context is not None and found.max_context < required:
+        raise LocalServerError(
+            "CONTEXT_TOO_SMALL",
+            f"{model} holds at most {found.max_context:,} tokens of context; your agent needs {required:,}.")
+    instances = [i for i in entry.get("loaded_instances") or [] if isinstance(i, dict)]
+    for instance in instances:
+        context = _positive_int((instance.get("config") or {}).get("context_length"))
+        if context and context >= required:
+            return context
+    for instance in instances:
+        instance_id = instance.get("id")
+        if not isinstance(instance_id, str) or not instance_id:
+            continue
+        try:
+            response = await client.post(
+                f"{server.root}/api/v1/models/unload", json={"instance_id": instance_id},
+                timeout=httpx.Timeout(60.0, connect=2.0))
+        except httpx.HTTPError as exc:
+            raise LocalServerError("LOAD_FAILED", f"{server.name} could not unload {model}: {type(exc).__name__}") from exc
+        if response.status_code >= 400:
+            raise LocalServerError("LOAD_FAILED", _error_text(response) or f"{server.name} could not unload {model}")
+    payload = {"model": model, "context_length": load_size(required, found.max_context), "echo_load_config": True}
+    try:
+        response = await client.post(f"{server.root}/api/v1/models/load", json=payload, timeout=_LOAD_TIMEOUT)
+    except httpx.HTTPError as exc:
+        raise LocalServerError("LOAD_FAILED", f"{server.name} could not load {model}: {type(exc).__name__}") from exc
+    if response.status_code >= 400:
+        raise LocalServerError(
+            "LOAD_FAILED", _error_text(response) or f"{server.name} could not load {model} (HTTP {response.status_code})")
+    try:
+        config = response.json().get("load_config")
+    except (ValueError, AttributeError):
+        config = None
+    applied = _positive_int(config.get("context_length")) if isinstance(config, dict) else None
+    if applied:
+        return applied
+    refreshed = await _lmstudio_v1_entries(client, server) or []
+    entry = next((item for item in refreshed if item.get("key") == model), None)
+    reread = _lmstudio_v1_model(entry) if entry else None
+    return reread.context if reread else None
 
 
-async def scan_server(server: LocalServer, client: httpx.AsyncClient | None = None) -> dict[str, Any]:
-    """One server: whether it is installed and running, and its models."""
+# ── scanning and loading ────────────────────────────────────────────────────
+
+
+async def scan_server(
+    server: LocalServer, client: httpx.AsyncClient | None = None, *, required: int | None = None,
+) -> dict[str, Any]:
+    """One server: whether it is installed and running, and its models,
+    each judged against the context the agent needs (``required``)."""
+    need = required if required is not None else agent_need()[0]
     result: dict[str, Any] = {
         "id": server.id,
         "name": server.name,
@@ -237,13 +390,13 @@ async def scan_server(server: LocalServer, client: httpx.AsyncClient | None = No
     owned = client is None
     client = client or httpx.AsyncClient(timeout=_SCAN_TIMEOUT)
     try:
-        scan = _scan_ollama if server.id == "ollama" else _scan_lmstudio
-        models = await scan(client, server)
+        scan_one = _scan_ollama if server.id == "ollama" else _scan_lmstudio
+        models = await scan_one(client, server)
         result["running"] = True
-        result["models"] = [model.to_dict() for model in models]
+        result["models"] = [model.to_dict(need) for model in models]
     except (httpx.ConnectError, httpx.ConnectTimeout):
         pass  # not running
-    except (httpx.HTTPError, ValueError) as exc:
+    except (httpx.HTTPError, ValueError, AttributeError) as exc:
         # Something answers there but not as this server does.
         result["error"] = type(exc).__name__
     finally:
@@ -253,46 +406,28 @@ async def scan_server(server: LocalServer, client: httpx.AsyncClient | None = No
     return result
 
 
-async def scan(client: httpx.AsyncClient | None = None) -> list[dict[str, Any]]:
+async def scan(client: httpx.AsyncClient | None = None, *, required: int | None = None) -> list[dict[str, Any]]:
     """Every known server on this computer, side by side."""
-    return list(await asyncio.gather(*(scan_server(server, client) for server in SERVERS)))
+    need = required if required is not None else agent_need()[0]
+    return list(await asyncio.gather(*(scan_server(server, client, required=need) for server in SERVERS)))
 
 
-async def load(server: LocalServer, model: str, client: httpx.AsyncClient | None = None) -> int | None:
-    """Load ``model`` into memory now, so the first message does not wait and
-    a model too big for this computer fails here, not mid-conversation.
-    Returns the context the server runs it with, when it says.
-
-    Ollama loads on an empty generate request. LM Studio loads a model the
-    first time it is asked (just in time), so there is nothing to do here.
-    """
-    if server.id != "ollama":
-        return None
+async def load(
+    server: LocalServer, model: str, *, required: int, client: httpx.AsyncClient | None = None,
+) -> int | None:
+    """Load ``model`` so the first message does not wait and a model too big
+    for this computer fails here, not mid-conversation. LM Studio loads it
+    with ``required`` tokens of context (or more); Ollama with its own. Returns
+    the context the server then runs it with, when it says."""
     owned = client is None
-    client = client or httpx.AsyncClient(timeout=_LOAD_TIMEOUT)
+    client = client or httpx.AsyncClient(timeout=_SCAN_TIMEOUT)
     try:
+        if server.id == "ollama":
+            return await _load_ollama(client, server, model)
         try:
-            response = await client.post(f"{server.root}/api/generate", json={"model": model})
-        except httpx.HTTPError as exc:
-            raise LocalServerError("LOAD_FAILED", f"{server.name} could not load {model}: {type(exc).__name__}") from exc
-        if response.status_code >= 400:
-            detail = ""
-            try:
-                detail = str(response.json().get("error") or "")[:300]
-            except ValueError:
-                pass
-            raise LocalServerError("LOAD_FAILED", detail or f"{server.name} could not load {model} (HTTP {response.status_code})")
-        try:
-            ps = (await client.get(f"{server.root}/api/ps")).raise_for_status().json()
-        except (httpx.HTTPError, ValueError):
-            return None
-        for item in ps.get("models") or []:
-            if isinstance(item, dict) and item.get("name") == model:
-                context = _positive_int(item.get("context_length"))
-                if context:
-                    _SEEN_CONTEXT[model] = context
-                return context
-        return None
+            return await _load_lmstudio(client, server, model, required)
+        except (httpx.HTTPError, ValueError) as exc:
+            raise LocalServerError("LOAD_FAILED", f"{server.name} did not answer: {type(exc).__name__}") from exc
     finally:
         if owned:
             await client.aclose()

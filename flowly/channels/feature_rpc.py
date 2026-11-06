@@ -3062,14 +3062,25 @@ def provider_login_cancel(params: dict) -> dict:
 async def provider_local(params: dict) -> dict:
     """Model servers on the agent's computer (Ollama, LM Studio): whether each
     is installed and running, and the models it holds, each with whether it
-    calls tools and the context it runs with (flowly/integrations/local_models.py).
-    No secrets; a machine without them answers two empty servers quickly."""
+    calls tools, whether its trained window can hold the agent
+    (``maxContextOk``) and whether the context the server runs it with does
+    (``contextOk``), against ``requiredContext``: what this agent needs,
+    measured from its own requests (``requiredMeasured``; before the first
+    request, a cautious default). ``recommendedContext`` is the size to set
+    where the owner sets it (Ollama). No secrets; a machine without the
+    servers answers two that are off, at once
+    (flowly/integrations/local_models.py, flowly/compaction/window_need.py)."""
+    from flowly.compaction.window_need import load_size
     from flowly.integrations import local_models
 
+    need, measured = local_models.agent_need()
     return {
-        "servers": await local_models.scan(),
-        "minContext": local_models.MIN_CONTEXT,
-        "recommendedContext": local_models.RECOMMENDED_CONTEXT,
+        "servers": await local_models.scan(required=need),
+        "requiredContext": need,
+        "requiredMeasured": measured,
+        "recommendedContext": load_size(need, None),
+        # The name apps before 2026-11-06 read.
+        "minContext": need,
     }
 
 
@@ -3077,14 +3088,24 @@ async def provider_use_local(params: dict) -> dict:
     """Run the agent on a model of a server on its computer, in one step:
     ``{server: "ollama" | "lmstudio", model}``.
 
-    The model must be one the server holds now. Ollama loads it first, so a
-    model too big for this computer fails here (``LOAD_FAILED``) and the
-    first message does not wait; the context it then runs with comes back
-    (``context``, ``contextOk``). Writes the provider slot's address, the
-    active provider and the default model together, then reloads once.
-    Reasoning effort and service tier go back to their defaults: those of a
-    cloud model mean nothing to a local one.
+    Nothing is written unless the agent can run on it:
+
+    - the server is running (``UNREACHABLE``) and holds the model
+      (``NOT_FOUND``);
+    - the model's trained window holds what this agent needs
+      (``CONTEXT_TOO_SMALL``);
+    - the model loads (``LOAD_FAILED``, with the server's own reason: a model
+      too big for this computer fails here, not mid-conversation). LM Studio
+      loads it with the context the agent needs; Ollama with its own;
+    - the server then runs it with enough context (``CONTEXT_NOT_APPLIED``:
+      Ollama's context setting is lower; set it to ``recommendedContext``).
+
+    Then the provider slot's address, the active provider and the default
+    model are written together and the agent reloads once. Reasoning effort
+    and service tier go back to their defaults: those of a cloud model mean
+    nothing to a local one.
     """
+    from flowly.compaction.window_need import load_size
     from flowly.integrations import local_models
 
     server_id = params.get("server")
@@ -3095,17 +3116,29 @@ async def provider_use_local(params: dict) -> dict:
     if not isinstance(model, str) or not model.strip() or len(model) > 300:
         raise FeatureRpcError("INVALID", "model must be a non-empty string")
     model = model.strip()
-    found = await local_models.scan_server(server)
+    need, _measured = local_models.agent_need()
+    found = await local_models.scan_server(server, required=need)
     if not found["running"]:
         raise FeatureRpcError("UNREACHABLE", f"{server.name} is not running on this computer")
     listed = next((m for m in found["models"] if m["id"] == model), None)
     if listed is None:
         raise FeatureRpcError("NOT_FOUND", f"{server.name} has no model named {model}")
+    if listed.get("maxContextOk") is False:
+        raise FeatureRpcError(
+            "CONTEXT_TOO_SMALL",
+            f"{model} holds at most {listed['maxContext']:,} tokens of context; your agent needs {need:,}.",
+        )
     try:
-        context = await local_models.load(server, model)
+        context = await local_models.load(server, model, required=need)
     except local_models.LocalServerError as exc:
         raise FeatureRpcError(exc.code, exc.message) from None
     context = context or listed.get("context")
+    if context is not None and context < need:
+        raise FeatureRpcError(
+            "CONTEXT_NOT_APPLIED",
+            f"{server.name} runs {model} with {context:,} tokens of context; your agent needs {need:,}. "
+            f"Set its context length to {load_size(need, None):,} or more, then pick the model again.",
+        )
 
     from flowly.config.loader import load_config, save_config
     from flowly.integrations.active_provider import set_active_provider
@@ -3128,7 +3161,8 @@ async def provider_use_local(params: dict) -> dict:
         "model": model,
         "tools": listed.get("tools"),
         "context": context,
-        "contextOk": None if context is None else context >= local_models.MIN_CONTEXT,
+        "requiredContext": need,
+        "contextOk": None if context is None else context >= need,
     }
     if await _live_provider_reload_succeeded():
         return {**result, "willRestart": False}
