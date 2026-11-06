@@ -38,6 +38,8 @@ from flowly.providers.effort import (
     openrouter_efforts,
     ordered_efforts,
     xai_efforts,
+    xai_twin,
+    XAI_SWITCH_LEVELS,
 )
 from flowly.providers.service_tier import ServiceTier, parse_service_tiers
 
@@ -139,6 +141,12 @@ def flush_cache() -> None:
 def get_flowly_model_policy() -> FlowlyModelPolicy | None:
     """Return metadata from the latest authenticated Flowly catalog fetch."""
     return _FLOWLY_POLICY
+
+
+def cached_ids(provider_key: str) -> frozenset[str]:
+    """The model ids the cached catalogue lists for ``provider_key`` (empty
+    when it was not read): what a request may be switched to."""
+    return frozenset(model.id for model in _CACHE.get(provider_key) or [])
 
 
 def cached_efforts(provider_key: str, model_id: str) -> list[str] | None:
@@ -792,6 +800,12 @@ def _xai_models_from_payload(data: Any) -> list[Model]:
             efforts=efforts,
             default_effort=default_effort,
         ))
+    # A reasoning model that takes no level but has its non-reasoning twin in
+    # this account's list: thinking can be switched off (to the twin).
+    listed = {m.id for m in out}
+    for row in out:
+        if not row.efforts and xai_twin(row.id) in listed:
+            row.efforts, row.default_effort = list(XAI_SWITCH_LEVELS), "high"
     # grok-4.3 first, then alphabetical.
     out.sort(key=lambda m: (0 if m.id == _XAI_TOP_MODEL else 1, m.id.lower()))
     return out

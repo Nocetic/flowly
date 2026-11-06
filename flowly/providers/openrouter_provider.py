@@ -336,19 +336,24 @@ class OpenRouterProvider(LLMProvider):
             levels = xai_efforts(model)[0]
         return levels
 
+    def _xai_route(self, model: str, reasoning: bool | None) -> tuple[str, str]:
+        """xAI: the model a turn goes to and the level it carries
+        (flowly/providers/effort.py ``xai_request``): off is ``none`` where the
+        model takes it, else its non-reasoning twin when the account's
+        catalogue lists it."""
+        from flowly.integrations.model_catalog import cached_ids
+        from flowly.providers.effort import xai_request
+
+        return xai_request(model, self.turn_effort(reasoning), listed=cached_ids(self.provider_name))
+
     def _reasoning_body(self, model: str, reasoning: bool | None) -> dict[str, Any]:
         """The body fields a request carries for thinking: OpenRouter's and
         Flowly's ``reasoning`` object, xAI's ``reasoning_effort``, nothing for
         other OpenAI-compatible APIs (they may refuse an unknown field)."""
         if self.provider_name == "xai":
-            effort = self.turn_effort(reasoning)
-            levels = self._model_efforts(model)
-            if levels is not None:
-                from flowly.providers.effort import clamp_effort
-
-                effort = clamp_effort(effort, levels) if levels else ""
-            # Grok cannot switch thinking off: none was lowered to its weakest level.
-            if not effort or effort == "none" or model in _EFFORT_REFUSED_MODELS:
+            # ``model`` is already routed (``_xai_route``): a twin takes no level.
+            _model, effort = self._xai_route(model, reasoning)
+            if not effort or model in _EFFORT_REFUSED_MODELS:
                 return {}
             return {"reasoning_effort": effort}
         field = self._reasoning_field(model, reasoning)
@@ -421,6 +426,8 @@ class OpenRouterProvider(LLMProvider):
     ) -> LLMResponse:
         """Send a non-streaming chat completion request."""
         resolved_model = self._prepare_model(model)
+        if self.provider_name == "xai":
+            resolved_model, _effort = self._xai_route(resolved_model, reasoning)
         prepared_messages = self._prepare_messages(messages, resolved_model)
 
         kwargs: dict[str, Any] = {
@@ -572,6 +579,8 @@ class OpenRouterProvider(LLMProvider):
         in ``flowly/agent/loop.py:1115-1151``.
         """
         resolved_model = self._prepare_model(model)
+        if self.provider_name == "xai":
+            resolved_model, _effort = self._xai_route(resolved_model, reasoning)
         prepared_messages = self._prepare_messages(messages, resolved_model)
 
         kwargs: dict[str, Any] = {

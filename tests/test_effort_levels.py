@@ -160,33 +160,55 @@ async def test_off_on_a_model_that_always_thinks_is_its_weakest_level_and_backgr
 
 
 @pytest.mark.asyncio
-async def test_xai_turns_carry_reasoning_effort_in_the_family_levels():
+async def test_xai_turns_carry_the_levels_each_model_documents():
+    """docs.x.ai model pages, 2026-11-06: 4.6/4.7 reach xhigh, 4.5 stops at
+    high, 4.20 reasoning and the non-reasoning models take no level."""
     provider, sent = _openai_compatible("xai", "ultra")
-    await _turn(provider, "grok-4.6")
-    assert sent[-1]["extra_body"] == {"reasoning_effort": "xhigh"}
-    await _turn(provider, "grok-4.20-reasoning")
-    assert sent[-1]["extra_body"] == {"reasoning_effort": "high"}
-    await _turn(provider, "grok-4-fast-non-reasoning")
-    assert "extra_body" not in sent[-1]
+    for model, level in (("grok-4.7", "xhigh"), ("grok-4.6", "xhigh"), ("grok-4.5", "high"), ("grok-4.3", "xhigh")):
+        await _turn(provider, model)
+        assert sent[-1]["extra_body"] == {"reasoning_effort": level}, model
+    for model in ("grok-4.20-0309-reasoning", "grok-4-fast-non-reasoning", "grok-4.20-multi-agent-0309", "grok-build-0.1"):
+        await _turn(provider, model)
+        assert "extra_body" not in sent[-1], model
 
 
 @pytest.mark.asyncio
-async def test_xai_background_calls_and_off_send_nothing_grok_cannot_switch_off():
-    provider, sent = _openai_compatible("xai", "high")
-    await _turn(provider, "grok-4.6", reasoning=False)
-    assert "extra_body" not in sent[-1]
-    off, sent_off = _openai_compatible("xai", "none")
+async def test_xai_off_is_none_where_the_model_takes_it_and_its_weakest_level_where_it_cannot_stop():
+    off, sent = _openai_compatible("xai", "none")
+    await _turn(off, "grok-4.3")
+    assert sent[-1]["extra_body"] == {"reasoning_effort": "none"}
     await _turn(off, "grok-4.6")
-    assert sent_off[-1]["extra_body"] == {"reasoning_effort": "low"}
+    assert sent[-1]["extra_body"] == {"reasoning_effort": "low"}
+    # Background work keeps the model's own behaviour.
+    background, sent_bg = _openai_compatible("xai", "high")
+    await _turn(background, "grok-4.6", reasoning=False)
+    assert "extra_body" not in sent_bg[-1]
+
+
+@pytest.mark.asyncio
+async def test_xai_off_on_a_reasoning_model_goes_to_its_twin_only_when_the_account_lists_it(monkeypatch):
+    off, sent = _openai_compatible("xai", "none")
+    await _turn(off, "grok-4.20-0309-reasoning")
+    assert sent[-1]["model"] == "grok-4.20-0309-reasoning" and "extra_body" not in sent[-1]
+    monkeypatch.setitem(catalog._CACHE, "xai", [
+        catalog.Model(id="grok-4.20-0309-reasoning", name="r"),
+        catalog.Model(id="grok-4.20-0309-non-reasoning", name="n"),
+    ])
+    await _turn(off, "grok-4.20-0309-reasoning")
+    assert sent[-1]["model"] == "grok-4.20-0309-non-reasoning" and "extra_body" not in sent[-1]
+    # Thinking on: the reasoning model, with no level (it takes none).
+    on, sent_on = _openai_compatible("xai", "high")
+    await _turn(on, "grok-4.20-0309-reasoning")
+    assert sent_on[-1]["model"] == "grok-4.20-0309-reasoning" and "extra_body" not in sent_on[-1]
 
 
 @pytest.mark.asyncio
 async def test_an_xai_model_that_refuses_the_level_is_asked_again_without_it_and_remembered():
     provider, sent = _openai_compatible("xai", "high", refuse="reasoning_effort")
-    result = await _turn(provider, "grok-4.20-reasoning")
+    result = await _turn(provider, "grok-4.5")
     assert result.content == "ok"
     assert sent[0]["extra_body"] == {"reasoning_effort": "high"} and "extra_body" not in sent[1]
-    await _turn(provider, "grok-4.20-reasoning")
+    await _turn(provider, "grok-4.5")
     assert "extra_body" not in sent[2]
 
 
@@ -243,22 +265,50 @@ async def test_signed_in_xai_turns_carry_reasoning_effort(monkeypatch):
 @pytest.mark.asyncio
 async def test_signed_in_xai_refusing_the_level_is_asked_again_without_it_and_remembered(monkeypatch):
     provider, sent = _xai_signed_in(monkeypatch, refuse=True)
-    result = await provider.chat(messages=[{"role": "user", "content": "hi"}], model="grok-4.20-reasoning")
+    result = await provider.chat(messages=[{"role": "user", "content": "hi"}], model="grok-4.5")
     assert result.content == "ok"
     assert "reasoning" in sent[0] and "reasoning" not in sent[1]
-    await provider.chat(messages=[{"role": "user", "content": "again"}], model="grok-4.20-reasoning")
+    await provider.chat(messages=[{"role": "user", "content": "again"}], model="grok-4.5")
     assert "reasoning" not in sent[2]
 
 
-def test_xai_rows_take_their_family_levels():
+@pytest.mark.asyncio
+async def test_signed_in_xai_off_goes_to_the_twin_or_sends_none(monkeypatch):
+    provider, sent = _xai_signed_in(monkeypatch, refuse=False)
+    provider.reasoning_effort = "none"
+    monkeypatch.setitem(catalog._CACHE, "xai_oauth", [
+        catalog.Model(id="grok-4.20-0309-reasoning", name="r"),
+        catalog.Model(id="grok-4.20-0309-non-reasoning", name="n"),
+    ])
+    await provider.chat(messages=[{"role": "user", "content": "hi"}], model="grok-4.20-0309-reasoning")
+    assert sent[-1]["model"] == "grok-4.20-0309-non-reasoning" and "reasoning" not in sent[-1]
+    await provider.chat(messages=[{"role": "user", "content": "hi"}], model="grok-4.3")
+    assert sent[-1]["model"] == "grok-4.3" and sent[-1]["reasoning"] == {"effort": "none"}
+
+
+def test_xai_rows_take_their_documented_levels():
     rows = {row.id: row for row in catalog._xai_models_from_payload([
-        {"id": "grok-4.6"}, {"id": "grok-4.20-reasoning"}, {"id": "grok-4-fast-non-reasoning"}, {"id": "grok-imagine-image"},
+        {"id": "grok-4.7"}, {"id": "grok-4.6"}, {"id": "grok-4.5"}, {"id": "grok-4.3"},
+        {"id": "grok-4.20-0309-reasoning"}, {"id": "grok-4.20-0309-non-reasoning"},
+        {"id": "grok-4.20-multi-agent-0309"}, {"id": "grok-build-0.1"}, {"id": "grok-imagine-image"},
     ])}
+    assert (rows["grok-4.7"].efforts, rows["grok-4.7"].default_effort) == (["low", "medium", "high", "xhigh"], "high")
     assert rows["grok-4.6"].efforts == ["low", "medium", "high", "xhigh"]
-    assert rows["grok-4.20-reasoning"].efforts == ["low", "medium", "high"]
-    assert rows["grok-4-fast-non-reasoning"].efforts == []
+    assert (rows["grok-4.5"].efforts, rows["grok-4.5"].default_effort) == (["low", "medium", "high"], "high")
+    assert (rows["grok-4.3"].efforts, rows["grok-4.3"].default_effort) == (["none", "low", "medium", "high", "xhigh"], "low")
+    # Its twin is listed: a switch, nothing else.
+    assert (rows["grok-4.20-0309-reasoning"].efforts, rows["grok-4.20-0309-reasoning"].default_effort) == (["none", "high"], "high")
+    assert rows["grok-4.20-0309-non-reasoning"].efforts == []
+    # Its effort is the number of agents, not thinking.
+    assert rows["grok-4.20-multi-agent-0309"].efforts == []
+    assert rows["grok-build-0.1"].efforts == []
     assert "grok-imagine-image" not in rows
     assert xai_efforts("gpt-5") == ([], None)
+
+
+def test_a_reasoning_model_without_its_twin_listed_has_no_switch():
+    rows = {row.id: row for row in catalog._xai_models_from_payload([{"id": "grok-4.20-0309-reasoning"}])}
+    assert rows["grok-4.20-0309-reasoning"].efforts == []
 
 
 # ── the ChatGPT catalogue kept for its account ───────────────────────────

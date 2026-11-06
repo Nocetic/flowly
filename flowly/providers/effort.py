@@ -9,7 +9,9 @@ default) reaches every provider that can take it:
   ``reasoning: {"enabled": false}``. The levels each model takes come from
   the catalogue's ``reasoning`` object (``openrouter_efforts``).
 * xAI Grok: ``reasoning_effort`` (API key) or ``reasoning.effort`` (sign-in);
-  the levels follow the model family (``xai_efforts``).
+  the levels follow each model's documented ones (``xai_efforts``); off is
+  ``none`` where the model takes it, else its non-reasoning twin
+  (``xai_request``).
 
 A level a model does not take is lowered to the nearest one it does
 (``clamp_effort``), never raised and never switched off: an agent set to
@@ -165,21 +167,77 @@ def openrouter_efforts(row: dict) -> tuple[list[str], str | None, bool]:
     return [], None, True
 
 
-#: xAI Grok, by family (the levels its API takes, 2026-11): Grok 4.6 reaches
-#: ``xhigh``; earlier reasoning Grok tops out at ``high``. Thinking cannot be
-#: switched off, so ``none`` is never offered. A model that refuses the field
-#: anyway is asked again without it (the providers remember it).
-_XAI_GROK46 = re.compile(r"(^|/)grok-4[.-]6(\b|-)")
-XAI_GROK46_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh")
-XAI_LEGACY_EFFORTS: tuple[str, ...] = ("low", "medium", "high")
+#: xAI Grok, from each model's page on docs.x.ai (2026-11-06):
+#:
+#: - Grok 4.6 and 4.7 take ``low`` to ``xhigh`` and think at ``high`` by default;
+#: - Grok 4.5 takes ``low`` to ``high`` (``xhigh`` is read as ``high``);
+#: - Grok 4.3 also takes ``none`` (thinking off); its default is ``low``;
+#: - Grok 4.20 reasoning takes no level and cannot stop thinking, but has a
+#:   non-reasoning twin (``…-non-reasoning``): off is that twin, when the
+#:   account's catalogue lists it (model_catalog pairs them);
+#: - Grok 4.20 multi-agent's ``reasoning.effort`` sets how many agents
+#:   collaborate, not how hard it thinks: no levels offered;
+#: - Grok Build takes none.
+#:
+#: A model that refuses a level anyway is asked again without it (the
+#: providers remember it).
+_XAI_FAMILIES: tuple[tuple[re.Pattern[str], tuple[str, ...], str], ...] = (
+    (re.compile(r"(^|/)grok-4[.-]3(\b|-)"), ("none", "low", "medium", "high", "xhigh"), "low"),
+    (re.compile(r"(^|/)grok-4[.-]5(\b|-)"), ("low", "medium", "high"), "high"),
+    (re.compile(r"(^|/)grok-4[.-][67](\b|-)"), ("low", "medium", "high", "xhigh"), "high"),
+)
+#: What a reasoning model whose only control is its non-reasoning twin offers:
+#: the switch (``none``) and thinking on, which sends no level.
+XAI_SWITCH_LEVELS: tuple[str, ...] = ("none", "high")
+_XAI_REASONING_SUFFIX = re.compile(r"-reasoning(?=$|-)")
+
+
+def _xai_model(model: str) -> str:
+    low = (model or "").strip().lower()
+    return low if low.startswith(("grok", "x-ai/grok", "xai/grok")) else ""
 
 
 def xai_efforts(model: str) -> tuple[list[str], str | None]:
     """The levels an xAI model takes and its default; ``([], None)`` for one
-    that does not reason (a ``-non-reasoning`` variant)."""
-    low = (model or "").strip().lower()
-    if not low.startswith(("grok", "x-ai/grok", "xai/grok")) or "non-reasoning" in low:
+    that takes none (a non-reasoning or multi-agent model, Grok 4.20
+    reasoning, Grok Build). A Grok 4.20 reasoning model can still be
+    switched off through its twin: see :func:`xai_twin`."""
+    low = _xai_model(model)
+    if not low or "non-reasoning" in low or "multi-agent" in low:
         return [], None
-    if _XAI_GROK46.search(low):
-        return list(XAI_GROK46_EFFORTS), "high"
-    return list(XAI_LEGACY_EFFORTS), "medium"
+    for pattern, levels, default in _XAI_FAMILIES:
+        if pattern.search(low):
+            return list(levels), default
+    return [], None
+
+
+def xai_twin(model: str) -> str:
+    """The non-reasoning twin of a reasoning model that takes no level
+    (``grok-4.20-0309-reasoning`` → ``grok-4.20-0309-non-reasoning``); ``""``
+    when it has none by name. Whether it exists is the catalogue's to say."""
+    low = _xai_model(model)
+    if not low or "non-reasoning" in low or "multi-agent" in low or xai_efforts(model)[0]:
+        return ""
+    if not _XAI_REASONING_SUFFIX.search(model):
+        return ""
+    head, _, tail = model.rpartition("-reasoning")
+    return f"{head}-non-reasoning{tail}"
+
+
+def xai_request(model: str, effort: str, *, listed: frozenset[str] | set[str] = frozenset()) -> tuple[str, str]:
+    """``(model to send, level to send or "")`` for an agent at ``effort``.
+
+    ``none`` turns thinking off: on Grok 4.3 it is sent as is; on a model
+    whose non-reasoning twin is in ``listed`` (the catalogue's ids) the twin
+    is sent instead; on a model that cannot stop thinking it becomes the
+    weakest level it takes. A model that takes no level gets none.
+    """
+    levels, _default = xai_efforts(model)
+    if effort == "none":
+        twin = xai_twin(model)
+        if twin and twin in listed:
+            return twin, ""
+    if not effort or not levels:
+        return model, ""
+    level = clamp_effort(effort, levels)
+    return model, level if level in levels else ""

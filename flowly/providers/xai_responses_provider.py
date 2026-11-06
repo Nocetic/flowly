@@ -275,22 +275,20 @@ class XAIResponsesProvider(LLMProvider):
             error_info=error_info_from_exception(exc),
         )
 
-    def _effort(self, model: str, reasoning: bool | None) -> str:
-        """The ``reasoning.effort`` a request carries: the agent's level,
-        lowered to the nearest one the model takes (Grok cannot switch thinking
-        off, so ``none`` becomes its weakest); none for background work, a model
-        that does not reason, or one that refused the field."""
-        from flowly.integrations.model_catalog import cached_efforts
-        from flowly.providers.effort import clamp_effort, xai_efforts
+    def _route(self, model: str, reasoning: bool | None) -> tuple[str, str]:
+        """The model a turn goes to and its ``reasoning.effort`` ("" for
+        none): the agent's level within the ones the model takes; off is
+        ``none`` where the model takes it, else its non-reasoning twin when the
+        account's catalogue lists it (flowly/providers/effort.py
+        ``xai_request``). Nothing for background work or a model that refused
+        the field."""
+        from flowly.integrations.model_catalog import cached_ids
+        from flowly.providers.effort import xai_request
 
-        effort = self.turn_effort(reasoning)
-        if not effort or model in _EFFORT_REFUSED_MODELS:
-            return ""
-        levels = cached_efforts(self.provider_name, model)
-        if levels is None:
-            levels = xai_efforts(model)[0]
-        level = clamp_effort(effort, levels) if levels else ""
-        return "" if level == "none" else level
+        routed, effort = xai_request(model, self.turn_effort(reasoning), listed=cached_ids(self.provider_name))
+        if routed in _EFFORT_REFUSED_MODELS:
+            return routed, ""
+        return routed, effort
 
     async def _refresh_api_key(self) -> None:
         payload = await _to_thread(refresh_tokens, client_id=self._client_id or None)
@@ -313,7 +311,7 @@ class XAIResponsesProvider(LLMProvider):
         reasoning: bool | None = None,
     ) -> LLMResponse:
         del purpose
-        resolved_model = _normalize_xai_model(model or self.default_model)
+        resolved_model, effort = self._route(_normalize_xai_model(model or self.default_model), reasoning)
         instructions, input_items = _messages_to_responses_input(messages)
         payload: dict[str, Any] = {
             "model": resolved_model,
@@ -322,7 +320,6 @@ class XAIResponsesProvider(LLMProvider):
             "max_output_tokens": max_tokens,
             "temperature": temperature,
         }
-        effort = self._effort(resolved_model, reasoning)
         if effort:
             payload["reasoning"] = {"effort": effort}
         if instructions:
@@ -454,7 +451,7 @@ class XAIResponsesProvider(LLMProvider):
         and any streaming failure degrades to a single blocking ``chat()`` call
         so a turn is NEVER left without a reply.
         """
-        resolved_model = _normalize_xai_model(model or self.default_model)
+        resolved_model, effort = self._route(_normalize_xai_model(model or self.default_model), reasoning)
         instructions, input_items = _messages_to_responses_input(messages)
         payload: dict[str, Any] = {
             "model": resolved_model,
@@ -465,7 +462,6 @@ class XAIResponsesProvider(LLMProvider):
             "stream": True,
         }
         # A refusal fails the stream; the blocking fallback asks again without it and remembers.
-        effort = self._effort(resolved_model, reasoning)
         if effort:
             payload["reasoning"] = {"effort": effort}
         if instructions:
