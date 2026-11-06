@@ -13,12 +13,19 @@ default) reaches every provider that can take it:
   ``none`` where the model takes it, else its non-reasoning twin
   (``xai_request``).
 
+* Anthropic: ``output_config: {"effort": …}``; the levels follow the model
+  family (``anthropic_efforts``).
+* OpenAI (API key), Gemini, Groq, Z.AI GLM (API key and Coding Plan): the
+  levels each model takes come from models.dev's ``reasoning_options``
+  (``models_dev_efforts``); OpenAI, Gemini and Groq take ``reasoning_effort``,
+  GLM takes ``thinking: {"type": "enabled" | "disabled"}`` beside it. A model
+  that can only switch thinking on and off is offered the switch alone
+  (``SWITCH_LEVELS``, ``switch_only``).
+
 A level a model does not take is lowered to the nearest one it does
 (``clamp_effort``), never raised and never switched off: an agent set to
 ``ultra`` runs a model that stops at ``max`` at ``max``, and ``ultra`` again on
 one that has it. The setting itself is kept.
-* Anthropic: ``output_config: {"effort": …}``; the levels follow the model
-  family (``anthropic_efforts``).
 
 The free Flowly plan goes up to ``medium`` (``FREE_PLAN_EFFORT_CAP``); the
 proxy enforces the same cap, Core only shows and applies it. A user's own
@@ -28,6 +35,7 @@ subscription or key is never capped.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 #: Every level any provider takes, lowest first.
 EFFORT_ORDER: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
@@ -241,3 +249,91 @@ def xai_request(model: str, effort: str, *, listed: frozenset[str] | set[str] = 
         return model, ""
     level = clamp_effort(effort, levels)
     return model, level if level in levels else ""
+
+
+#: What a model that can only switch thinking on and off offers: the switch
+#: (``none``) and thinking on. ``high`` there means "on", and carries no level.
+SWITCH_LEVELS: tuple[str, ...] = ("none", "high")
+
+#: The level a model thinks at when none is sent, by provider, as documented
+#: (Gemini 3: ``high``; GLM-5.3: ``max``). Elsewhere ``medium``, the level the
+#: other reasoning APIs default to, or the nearest one the model takes.
+_MODELS_DEV_DEFAULTS: dict[str, str] = {"gemini": "high", "zhipu": "max", "zai_coding": "max"}
+
+
+@dataclass(frozen=True)
+class ThinkingControl:
+    """What a model's thinking can be set to, read from a catalogue."""
+
+    #: The levels offered, lowest first; ``none`` when thinking can be off.
+    levels: list[str]
+    default: str | None
+    #: Only on and off: the ``high`` in ``levels`` means "on" and sends no level.
+    switch_only: bool = False
+
+
+NO_THINKING_CONTROL = ThinkingControl([], None)
+
+
+def models_dev_efforts(options: object, provider_key: str) -> ThinkingControl:
+    """The thinking control a models.dev ``reasoning_options`` list describes.
+
+    ``{"type": "effort", "values": […]}`` lists the levels (``default``, a
+    Groq value meaning "the model's own", is not a level); ``{"type":
+    "toggle"}`` means thinking can be switched off; ``{"type":
+    "budget_tokens", "min": 0}`` too. Gemini's OpenAI-compatible API takes a
+    level for a model that only lists a budget, and maps it to one: those get
+    ``low`` to ``high``. Nothing listed: no control."""
+    if not isinstance(options, list):
+        return NO_THINKING_CONTROL
+    levels: set[str] = set()
+    for option in options:
+        if not isinstance(option, dict):
+            continue
+        kind = option.get("type")
+        if kind == "effort":
+            levels.update(ordered_efforts(option.get("values")))
+        elif kind == "toggle":
+            levels.add("none")
+        elif kind == "budget_tokens":
+            if option.get("min") == 0:
+                levels.add("none")
+            if provider_key == "gemini":
+                levels.update(("low", "medium", "high"))
+    ordered = [level for level in EFFORT_ORDER if level in levels]
+    thinking = [level for level in ordered if level != "none"]
+    if not thinking:
+        if "none" in ordered:
+            return ThinkingControl(list(SWITCH_LEVELS), "high", switch_only=True)
+        return NO_THINKING_CONTROL
+    default = _MODELS_DEV_DEFAULTS.get(provider_key, "medium")
+    if default not in thinking:
+        default = "medium" if "medium" in thinking else clamp_effort("medium", thinking)
+    return ThinkingControl(ordered, default)
+
+
+def thinking_body(provider_key: str, control: ThinkingControl, effort: str) -> dict[str, object]:
+    """The body fields an agent at ``effort`` sends to a model with
+    ``control`` on ``provider_key`` (openai, gemini, groq, zhipu,
+    zai_coding). Nothing when no level is set or the model takes none: it
+    then thinks as it does by default.
+
+    - OpenAI, Gemini, Groq: ``reasoning_effort``; on a switch-only model,
+      ``none`` for off and nothing for on.
+    - Z.AI GLM: ``thinking: {"type": "disabled"}`` for off; ``{"type":
+      "enabled"}`` for on, with ``reasoning_effort`` on a model that has levels.
+      A model that cannot stop thinking gets the level alone.
+    """
+    if not effort or not control.levels:
+        return {}
+    level = clamp_effort(effort, control.levels)
+    if level not in control.levels:
+        return {}
+    glm = provider_key in ("zhipu", "zai_coding")
+    if level == "none":
+        return {"thinking": {"type": "disabled"}} if glm else {"reasoning_effort": "none"}
+    if control.switch_only:
+        return {"thinking": {"type": "enabled"}} if glm else {}
+    if glm and "none" in control.levels:
+        return {"thinking": {"type": "enabled"}, "reasoning_effort": level}
+    return {"reasoning_effort": level}

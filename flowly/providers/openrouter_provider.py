@@ -61,6 +61,17 @@ _REASONING_MANDATORY_MODELS: set[str] = set()
 #: Models that refused a reasoning effort (a 400 naming it): asked without one from then on.
 _EFFORT_REFUSED_MODELS: set[str] = set()
 
+#: Providers whose thinking follows models.dev's ``reasoning_options``
+#: (effort.thinking_body): ``reasoning_effort``, and ``thinking`` for GLM.
+_THINKING_BODY_PROVIDERS = frozenset({"openai", "gemini", "groq", "zhipu", "zai_coding"})
+
+#: Models that refused ``temperature`` (a 400 naming it): asked without it from then on.
+_TEMPERATURE_REFUSED_MODELS: set[str] = set()
+
+
+def _temperature_refused(exc: Exception) -> bool:
+    return isinstance(exc, BadRequestError) and "temperature" in str(exc).lower()
+
 
 def _reasoning_is_mandatory(exc: Exception) -> bool:
     return "reasoning is mandatory" in str(exc).lower()
@@ -70,7 +81,7 @@ def _effort_refused(exc: Exception) -> bool:
     if not isinstance(exc, BadRequestError):
         return False
     text = str(exc).lower()
-    return "effort" in text or "reasoning" in text
+    return "effort" in text or "reasoning" in text or "thinking" in text
 
 
 def _strip_known_prefixes(model: str) -> str:
@@ -356,8 +367,54 @@ class OpenRouterProvider(LLMProvider):
             if not effort or model in _EFFORT_REFUSED_MODELS:
                 return {}
             return {"reasoning_effort": effort}
+        if self.provider_name in _THINKING_BODY_PROVIDERS:
+            if model in _EFFORT_REFUSED_MODELS:
+                return {}
+            from flowly.integrations.model_catalog import cached_model
+            from flowly.providers.effort import ThinkingControl, thinking_body
+
+            row = cached_model(self.provider_name, model)
+            if row is None:
+                # Not in the catalogue (offline, typed by hand): nothing is
+                # known, so nothing is sent and the model thinks as it does.
+                return {}
+            control = ThinkingControl(list(row.efforts), row.default_effort, row.thinking_switch_only)
+            return thinking_body(self.provider_name, control, self.turn_effort(reasoning))
         field = self._reasoning_field(model, reasoning)
         return {} if field is None else {"reasoning": field}
+
+    def _sampling_body(self, model: str, max_tokens: int, temperature: float, thinking: dict[str, Any]) -> dict[str, Any]:
+        """``max_tokens`` and ``temperature`` as ``model`` takes them.
+
+        OpenAI's reasoning models refuse ``max_tokens`` (it is
+        ``max_completion_tokens`` there, which every OpenAI chat model
+        takes) and refuse ``temperature`` unless they are not thinking
+        (``reasoning_effort: none``). Models.dev marks the models that never
+        take it; a model that refused it once is asked without it."""
+        body: dict[str, Any] = {}
+        if self.provider_name == "openai":
+            body["max_completion_tokens"] = max_tokens
+        else:
+            body["max_tokens"] = max_tokens
+        if self._takes_temperature(model, thinking):
+            body["temperature"] = temperature
+        return body
+
+    def _takes_temperature(self, model: str, thinking: dict[str, Any]) -> bool:
+        if model in _TEMPERATURE_REFUSED_MODELS:
+            return False
+        if self.provider_name not in _THINKING_BODY_PROVIDERS:
+            return True
+        from flowly.integrations.model_catalog import cached_model
+
+        row = cached_model(self.provider_name, model)
+        if row is None:
+            return True
+        if row.takes_temperature is False:
+            return False
+        if self.provider_name == "openai" and row.efforts:
+            return thinking.get("reasoning_effort") == "none"
+        return True
 
     def _reasoning_field(self, model: str, reasoning: bool | None) -> dict[str, Any] | None:
         """The ``reasoning`` body field a request carries, if any: OpenRouter's
@@ -388,10 +445,41 @@ class OpenRouterProvider(LLMProvider):
             return None
         return {"effort": effort}
 
+    def _relax_refused(self, model: str, kwargs: dict[str, Any], thinking: dict[str, Any], exc: Exception) -> bool:
+        """Take out of ``kwargs`` what the backend refused in ``exc`` —
+        ``temperature``, or the thinking fields — and remember it for
+        ``model``. False when the refusal is about neither: raise it."""
+        if "temperature" in kwargs and _temperature_refused(exc):
+            _TEMPERATURE_REFUSED_MODELS.add(model)
+            logger.warning(f"[LLM] {model} refused temperature; asking again without it")
+            del kwargs["temperature"]
+            return True
+        if not thinking:
+            return False
+        field = thinking.get("reasoning") if "reasoning" in thinking else thinking
+        if not self._retry_without_reasoning(model, field, exc):
+            return False
+        extra_body = kwargs.get("extra_body") or {}
+        for key in thinking:
+            extra_body.pop(key, None)
+        thinking.clear()
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+        else:
+            kwargs.pop("extra_body", None)
+        return True
+
     def _retry_without_reasoning(self, model: str, field: object, exc: Exception) -> bool:
         """True when ``exc`` is the backend refusing ``field`` (the
-        ``reasoning`` object, or xAI's ``reasoning_effort`` as a string); the
-        model is asked without it from then on."""
+        ``reasoning`` object; xAI's ``reasoning_effort`` as a string; the
+        ``reasoning_effort`` / GLM ``thinking`` fields as a dict of them);
+        the model is asked without it from then on."""
+        if isinstance(field, dict) and ("reasoning_effort" in field or "thinking" in field):
+            if _effort_refused(exc):
+                _EFFORT_REFUSED_MODELS.add(model)
+                logger.warning(f"[LLM] {model} refused thinking fields {sorted(field)}; asking again without them")
+                return True
+            return False
         if isinstance(field, str):
             if _effort_refused(exc):
                 _EFFORT_REFUSED_MODELS.add(model)
@@ -430,11 +518,11 @@ class OpenRouterProvider(LLMProvider):
             resolved_model, _effort = self._xai_route(resolved_model, reasoning)
         prepared_messages = self._prepare_messages(messages, resolved_model)
 
+        thinking = self._reasoning_body(resolved_model, reasoning)
         kwargs: dict[str, Any] = {
             "model": resolved_model,
             "messages": prepared_messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
+            **self._sampling_body(resolved_model, max_tokens, temperature, thinking),
         }
         if tools:
             kwargs["tools"] = tools
@@ -447,7 +535,6 @@ class OpenRouterProvider(LLMProvider):
         extra_body: dict[str, Any] = {}
         if purpose:
             extra_body["purpose"] = purpose
-        thinking = self._reasoning_body(resolved_model, reasoning)
         extra_body.update(thinking)
         if extra_body:
             kwargs["extra_body"] = extra_body
@@ -455,21 +542,16 @@ class OpenRouterProvider(LLMProvider):
         request_timeout = timeout or self.request_timeout_seconds
 
         async def create(client: AsyncOpenAI) -> Any:
-            try:
-                return await client.with_options(timeout=request_timeout).chat.completions.create(**kwargs)
-            except Exception as exc:
-                # A model that refuses the field (always thinks, or takes no
-                # effort): ask it again as it is.
-                key = next(iter(thinking), None)
-                if key is None or not self._retry_without_reasoning(resolved_model, extra_body.get(key), exc):
-                    raise
-                del extra_body[key]
-                thinking.clear()
-                if extra_body:
-                    kwargs["extra_body"] = extra_body
-                else:
-                    kwargs.pop("extra_body", None)
-                return await client.with_options(timeout=request_timeout).chat.completions.create(**kwargs)
+            # A model that refuses a field (temperature; thinking it cannot
+            # switch, or an effort it does not take) is asked again without
+            # it: at most once per field.
+            for _ in range(3):
+                try:
+                    return await client.with_options(timeout=request_timeout).chat.completions.create(**kwargs)
+                except Exception as exc:
+                    if not self._relax_refused(resolved_model, kwargs, thinking, exc):
+                        raise
+            return await client.with_options(timeout=request_timeout).chat.completions.create(**kwargs)
 
         max_attempts = self._rotator.key_count() if self._rotator else 1
         last_exc: Exception | None = None
@@ -583,11 +665,11 @@ class OpenRouterProvider(LLMProvider):
             resolved_model, _effort = self._xai_route(resolved_model, reasoning)
         prepared_messages = self._prepare_messages(messages, resolved_model)
 
+        thinking = self._reasoning_body(resolved_model, reasoning)
         kwargs: dict[str, Any] = {
             "model": resolved_model,
             "messages": prepared_messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
+            **self._sampling_body(resolved_model, max_tokens, temperature, thinking),
             "stream": True,
             # Ensure usage metrics are emitted in the final stream chunk —
             # required for the Flowly proxy's rate-limit + credit tracking.
@@ -596,9 +678,8 @@ class OpenRouterProvider(LLMProvider):
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice
-        # The same field as chat(), with the same retry for a model that
-        # refuses it.
-        thinking = self._reasoning_body(resolved_model, reasoning)
+        # The same fields as chat(), with the same retry for a model that
+        # refuses one.
         if thinking:
             kwargs["extra_body"] = dict(thinking)
 
@@ -608,13 +689,15 @@ class OpenRouterProvider(LLMProvider):
         )
 
         try:
-            try:
-                stream = await client.chat.completions.create(**kwargs)
-            except Exception as exc:
-                key = next(iter(thinking), None)
-                if key is None or not self._retry_without_reasoning(resolved_model, thinking[key], exc):
-                    raise
-                kwargs.pop("extra_body", None)
+            stream = None
+            for _ in range(3):
+                try:
+                    stream = await client.chat.completions.create(**kwargs)
+                    break
+                except Exception as exc:
+                    if not self._relax_refused(resolved_model, kwargs, thinking, exc):
+                        raise
+            if stream is None:
                 stream = await client.chat.completions.create(**kwargs)
         except Exception as exc:
             yield self._error_response(exc)

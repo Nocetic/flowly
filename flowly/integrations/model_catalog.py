@@ -72,6 +72,12 @@ class Model:
     # Whether the model thinks when no level is sent; False (an OpenRouter row's
     # ``default_enabled: false``) shows thinking off until the agent picks a level.
     default_thinking: bool = True
+    # Only on and off (effort.SWITCH_LEVELS): the ``high`` in ``efforts`` means
+    # "on" and the request carries no level (effort.thinking_body).
+    thinking_switch_only: bool = False
+    # Whether the model takes ``temperature``; False (models.dev, reasoning
+    # models) means a request carrying it is refused. None: not known.
+    takes_temperature: bool | None = None
     # Faster tiers the model offers (flowly/providers/service_tier.py); empty:
     # standard speed only, no Fast switch.
     service_tiers: list[ServiceTier] = dc_field(default_factory=list)
@@ -156,6 +162,15 @@ def cached_efforts(provider_key: str, model_id: str) -> list[str] | None:
     for model in _CACHE.get(provider_key) or ():
         if model.id == model_id:
             return list(model.efforts)
+    return None
+
+
+def cached_model(provider_key: str, model_id: str) -> Model | None:
+    """``model_id``'s row in the cached catalogue for ``provider_key``;
+    ``None`` when that catalogue is not cached or does not list it."""
+    for model in _CACHE.get(provider_key) or ():
+        if model.id == model_id:
+            return model
     return None
 
 
@@ -1073,10 +1088,18 @@ async def _fetch_zai_coding() -> list[Model]:
     payload = await asyncio.to_thread(load_token_payload)
     if payload is None or not payload.api_key:
         return []
-    return [
+    models = [
         Model(id=mid, name=mid, description=desc, context_window=ctx, tags=list(tags))
         for mid, desc, ctx, tags in _ZAI_CODING_MODELS
     ]
+    # The plan has no catalogue of its own; how each model thinks is models.dev's.
+    from flowly.integrations import models_dev
+
+    try:
+        await models_dev.apply_thinking_controls(models, "zai_coding")
+    except Exception:  # noqa: BLE001 - the list stands without them
+        pass
+    return models
 
 
 async def _fetch_ollama() -> list[Model]:

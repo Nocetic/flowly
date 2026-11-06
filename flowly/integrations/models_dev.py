@@ -27,6 +27,7 @@ import time
 from typing import Any
 
 from flowly.integrations.model_catalog import Model
+from flowly.providers.effort import NO_THINKING_CONTROL, models_dev_efforts
 
 MODELS_DEV_URL = "https://models.dev/api.json"
 _MEM_TTL_S = 3600           # serve from memory for 1 h
@@ -48,6 +49,20 @@ PROVIDER_TO_MODELS_DEV: dict[str, str] = {
     # entry, so every Fugu model fell through to the 128K "no idea" default
     # against a real 1M window — compacting at about an eighth of it.
     "sakana": "sakana",
+}
+
+# Providers whose requests carry the thinking level models.dev describes
+# (flowly/providers/effort.py ``thinking_body``), mapped to the models.dev
+# catalogue that describes them. Anthropic's levels follow its model families
+# instead (``anthropic_efforts``); xAI and OpenRouter have catalogues of their own.
+THINKING_CATALOGUES: dict[str, str] = {
+    "openai": "openai",
+    "gemini": "google",
+    "groq": "groq",
+    "zhipu": "zai",
+    # The Coding Plan's own list (model_catalog._ZAI_CODING_MODELS) has no
+    # thinking data; it is filled from here by id.
+    "zai_coding": "zai-coding-plan",
 }
 
 # Model ids that are noise for an agent picker (TTS, embeddings, dated preview
@@ -157,6 +172,11 @@ async def fetch_provider_models(provider_key: str) -> list[Model]:
             tags.append("reasoning")
         if raw.get("attachment"):
             tags.append("vision")
+        control = (
+            models_dev_efforts(raw.get("reasoning_options"), provider_key)
+            if provider_key in THINKING_CATALOGUES else NO_THINKING_CONTROL
+        )
+        temperature = raw.get("temperature")
         out.append(Model(
             id=str(mid),
             name=str(raw.get("name") or mid),
@@ -170,9 +190,37 @@ async def fetch_provider_models(provider_key: str) -> list[Model]:
             ),
             tags=tags,
             supports_vision=bool(raw.get("attachment")),
+            efforts=list(control.levels),
+            default_effort=control.default,
+            thinking_switch_only=control.switch_only,
+            takes_temperature=temperature if isinstance(temperature, bool) else None,
         ))
     out.sort(key=lambda m: m.id)
     return out
+
+
+async def apply_thinking_controls(models: list[Model], provider_key: str) -> None:
+    """Fill in how each of ``models`` thinks (levels, default, switch, whether
+    it takes ``temperature``) from the models.dev catalogue that describes
+    ``provider_key`` (``THINKING_CATALOGUES``), by id. A model it does not
+    list is left as it is."""
+    mdev_id = THINKING_CATALOGUES.get(provider_key)
+    data = await _fetch_payload() if mdev_id else None
+    pdata = data.get(mdev_id) if isinstance(data, dict) else None
+    raw_models = pdata.get("models") if isinstance(pdata, dict) else None
+    if not isinstance(raw_models, dict):
+        return
+    for model in models:
+        raw = raw_models.get(model.id)
+        if not isinstance(raw, dict):
+            continue
+        control = models_dev_efforts(raw.get("reasoning_options"), provider_key)
+        model.efforts = list(control.levels)
+        model.default_effort = control.default
+        model.thinking_switch_only = control.switch_only
+        temperature = raw.get("temperature")
+        if isinstance(temperature, bool):
+            model.takes_temperature = temperature
 
 
 def model_known(provider_key: str, model_id: str) -> bool | None:
