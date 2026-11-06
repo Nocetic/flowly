@@ -150,6 +150,12 @@ prompt cached.
   empty slot, so the request read everything again. The warm-up reads the
   very prompt the request needs; waiting costs only what the request would
   read anyway, and then the request finds it cached.
+- **A server started after the gateway.** If the server cannot be reached
+  (no HTTP answer: LM Studio's server off at 23:04 on 2026-11-06), the
+  warm-up tries again after 15, 30, 60, 120 and 240 s, then gives up. A
+  server that answers with an HTTP error is not asked again. A request that
+  arrives during a pause cancels the warm-up instead of waiting (it reads,
+  and caches, the prompt itself); it waits only while the server is reading.
 - A failure is logged at info level and changes nothing.
 
 Tests: `tests/test_prompt_warm.py`. The prefix test compares the warm request

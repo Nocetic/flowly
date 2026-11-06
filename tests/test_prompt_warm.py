@@ -138,14 +138,72 @@ async def test_a_warm_up_that_takes_too_long_is_stopped_for_the_request(tmp_path
     assert task.cancelled() or server.cancelled
 
 
+class _Flaky(_Server):
+    """Unreachable for the first ``down`` tries, then up; or answering with an
+    HTTP error when ``status`` is set."""
+
+    def __init__(self, down: int = 0, status: int | None = None):
+        super().__init__()
+        self.down = down
+        self.status = status
+        self.tries = 0
+
+    async def chat(self, messages, tools=None, model=None, max_tokens=4096, **kwargs):
+        self.tries += 1
+        if self.tries <= self.down:
+            from flowly.providers.base import LLMErrorInfo
+            return LLMResponse(content="Error calling LLM: Connection error.", finish_reason="error",
+                               error_info=LLMErrorInfo())
+        if self.status is not None and max_tokens == 1:
+            from flowly.providers.base import LLMErrorInfo
+            return LLMResponse(content="Error calling LLM: bad request", finish_reason="error",
+                               error_info=LLMErrorInfo(status_code=self.status))
+        return await super().chat(messages, tools, model, max_tokens, **kwargs)
+
+
 @pytest.mark.asyncio
-async def test_a_refusing_server_is_only_logged(tmp_path, monkeypatch):
+async def test_a_server_started_after_the_gateway_is_warmed_when_it_comes_up(tmp_path, monkeypatch):
+    """Seen 2026-11-06 23:04: LM Studio's server was off when the gateway
+    started; the warm-up gave up for good."""
+    monkeypatch.setattr(AgentLoop, "_WARM_RETRY_DELAYS", (0.01, 0.01, 0.01))
+    server = _Flaky(down=2)
+    loop = _loop(tmp_path, monkeypatch, server)
+    assert await loop.schedule_prompt_warm("gateway started") is True
+    assert server.tries == 3
+
+
+@pytest.mark.asyncio
+async def test_a_server_that_answers_with_an_error_is_not_asked_again(tmp_path, monkeypatch):
+    monkeypatch.setattr(AgentLoop, "_WARM_RETRY_DELAYS", (0.01, 0.01))
+    server = _Flaky(status=400)
+    loop = _loop(tmp_path, monkeypatch, server)
+    assert await loop.schedule_prompt_warm("test") is False
+    assert server.tries == 1
+
+
+@pytest.mark.asyncio
+async def test_a_server_that_never_comes_up_is_given_up_quietly(tmp_path, monkeypatch):
     class Down(_Server):
         async def chat(self, *args, **kwargs):
             raise ConnectionError("refused")
 
+    monkeypatch.setattr(AgentLoop, "_WARM_RETRY_DELAYS", (0.01, 0.01))
     loop = _loop(tmp_path, monkeypatch, Down())
     assert await loop.schedule_prompt_warm("test") is False
+
+
+@pytest.mark.asyncio
+async def test_a_request_never_waits_on_a_retry_pause(tmp_path, monkeypatch):
+    monkeypatch.setattr(AgentLoop, "_WARM_RETRY_DELAYS", (60.0,))
+    server = _Flaky(down=1)
+    loop = _loop(tmp_path, monkeypatch, server)
+    task = loop.schedule_prompt_warm("test")
+    await asyncio.sleep(0.05)  # first try failed; pausing before the next
+
+    reply = await asyncio.wait_for(loop.process_direct("hi", session_key="web:now"), timeout=5)
+    assert reply == "ok"
+    await asyncio.sleep(0)
+    assert task.cancelled()
 
 
 @pytest.mark.asyncio

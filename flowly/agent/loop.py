@@ -5192,6 +5192,11 @@ class AgentLoop:
         task = getattr(self, "_prompt_warm_task", None)
         if task is None or task.done():
             return
+        if not getattr(self, "_prompt_warm_reading", False):
+            # Waiting to try again (the server was unreachable): this request
+            # reads the prompt itself, and caches it on the way.
+            task.cancel()
+            return
         logger.info("[warm] a request is waiting for the warm-up to finish")
         started = time.monotonic()
         while not task.done():
@@ -5255,7 +5260,24 @@ class AgentLoop:
 
         return channel or "web", sorted((SETUP_TOOLS & set(self.tools.tool_names)) | {"message_profile"})
 
+    #: Seconds before each new try while the server cannot be reached (it is
+    #: often started after the gateway): about eight minutes in all.
+    _WARM_RETRY_DELAYS: tuple[float, ...] = (15.0, 30.0, 60.0, 120.0, 240.0)
+
     async def _warm_prompt_cache(self, reason: str, *, channel: str | None = None) -> bool:
+        """Warm once; while the server cannot be reached, try again later."""
+        for delay in (0.0, *self._WARM_RETRY_DELAYS):
+            if delay:
+                await asyncio.sleep(delay)
+            outcome = await self._warm_prompt_cache_once(reason, channel=channel)
+            if outcome != "unreachable":
+                return outcome == "cached"
+        logger.info("[warm] the server stayed unreachable ({}); giving up", reason)
+        return False
+
+    async def _warm_prompt_cache_once(self, reason: str, *, channel: str | None = None) -> str:
+        """``cached``, ``refused`` (the server answered with an error: no use
+        trying again) or ``unreachable``."""
         started = time.monotonic()
         try:
             if self.mcp_discovery_pending:
@@ -5276,25 +5298,34 @@ class AgentLoop:
                 available_tools=visible,
                 reachable_tools=set(disclosure.all_names),
             )
-            response = await self.provider.chat(
-                messages=messages,
-                tools=list(disclosure.definitions) or None,
-                model=self.model,
-                max_tokens=1,
-            )
+            self._prompt_warm_reading = True
+            try:
+                response = await self.provider.chat(
+                    messages=messages,
+                    tools=list(disclosure.definitions) or None,
+                    model=self.model,
+                    max_tokens=1,
+                )
+            finally:
+                self._prompt_warm_reading = False
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - an optimisation, never an error
-            logger.info("[warm] skipped ({}): {}", reason, type(exc).__name__)
-            return False
+            logger.info("[warm] server unreachable ({}): {}", reason, type(exc).__name__)
+            return "unreachable"
         if response.finish_reason == "error":
+            info = response.error_info
+            if info is None or info.status_code is None:
+                # No HTTP answer at all: the server is not up (yet).
+                logger.info("[warm] server unreachable ({}); trying again later", reason)
+                return "unreachable"
             logger.info("[warm] the server refused ({}): {}", reason, (response.content or "")[:160])
-            return False
+            return "refused"
         logger.info(
             "[warm] {} has the agent's prompt cached ({}, {:.1f}s)",
             self.model, reason, time.monotonic() - started,
         )
-        return True
+        return "cached"
 
     @staticmethod
     def _turn_playbook_pins(text: str) -> frozenset[str]:
