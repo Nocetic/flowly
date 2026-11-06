@@ -63,7 +63,7 @@ _EFFORT_REFUSED_MODELS: set[str] = set()
 
 #: Providers whose thinking follows models.dev's ``reasoning_options``
 #: (effort.thinking_body): ``reasoning_effort``, and ``thinking`` for GLM.
-_THINKING_BODY_PROVIDERS = frozenset({"openai", "gemini", "groq", "zhipu", "zai_coding"})
+_THINKING_BODY_PROVIDERS = frozenset({"openai", "gemini", "groq", "zhipu", "zai_coding", "ollama", "vllm"})
 
 #: Models that refused ``temperature`` (a 400 naming it): asked without it from then on.
 _TEMPERATURE_REFUSED_MODELS: set[str] = set()

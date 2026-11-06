@@ -395,14 +395,63 @@ def models_dev_efforts(options: object, provider_key: str) -> ThinkingControl:
     return ThinkingControl(ordered, default)
 
 
+#: What "on" sends to a local server for a model that can only be switched:
+#: Ollama reads any level as "think" on such a model, LM Studio publishes
+#: the switch as ``off`` / ``on`` and takes ``on`` as ``medium``.
+_LOCAL_ON = {"ollama": "high", "vllm": "medium"}
+
+
+def ollama_thinking(model_id: str, capabilities: object) -> ThinkingControl:
+    """A model on Ollama: one whose ``/api/show`` capabilities include
+    ``thinking`` can be switched (``reasoning_effort: none`` is ``think:
+    false``); gpt-oss instead takes ``low`` / ``medium`` / ``high`` and
+    cannot stop. Any other model is sent nothing: Ollama answers 400 to a
+    level on a model that does not think."""
+    if not isinstance(capabilities, list) or "thinking" not in capabilities:
+        return NO_THINKING_CONTROL
+    if "gpt-oss" in (model_id or "").lower():
+        return ThinkingControl(["low", "medium", "high"], "medium")
+    return ThinkingControl(list(SWITCH_LEVELS), "high", switch_only=True)
+
+
+_LMSTUDIO_ALIASES = {"off": "none"}
+
+
+def lmstudio_thinking(capabilities: object) -> ThinkingControl:
+    """A model on LM Studio, from ``capabilities.reasoning`` in
+    ``/api/v1/models``: ``allowed_options`` is ``["off", "on"]`` for a model
+    that can only be switched, or its levels (``["off", "minimal", "low"]``).
+    Nothing published: nothing is sent."""
+    reasoning = capabilities.get("reasoning") if isinstance(capabilities, dict) else None
+    options = reasoning.get("allowed_options") if isinstance(reasoning, dict) else None
+    if not isinstance(options, list):
+        return NO_THINKING_CONTROL
+    names = [str(option).strip().lower() for option in options if isinstance(option, str)]
+    levels = ordered_efforts([_LMSTUDIO_ALIASES.get(name, name) for name in names])
+    thinking = [level for level in levels if level != "none"]
+    if not thinking:
+        if "on" in names:
+            if "none" in levels:
+                return ThinkingControl(list(SWITCH_LEVELS), "high", switch_only=True)
+            return NO_THINKING_CONTROL  # always on, nothing to pick
+        return NO_THINKING_CONTROL
+    raw_default = reasoning.get("default") if isinstance(reasoning, dict) else None
+    default = normalize_effort(_LMSTUDIO_ALIASES.get(str(raw_default).lower(), raw_default))
+    if default not in thinking:
+        default = "medium" if "medium" in thinking else thinking[-1]
+    return ThinkingControl(levels, default)
+
+
 def thinking_body(provider_key: str, control: ThinkingControl, effort: str) -> dict[str, object]:
     """The body fields an agent at ``effort`` sends to a model with
     ``control`` on ``provider_key`` (openai, gemini, groq, zhipu,
-    zai_coding). Nothing when no level is set
+    zai_coding, and the local ollama and vllm). Nothing when no level is set
     or the model takes none: it then thinks as it does by default.
 
     - OpenAI, Gemini, Groq: ``reasoning_effort``; on a switch-only model,
       ``none`` for off and nothing for on.
+    - Ollama, LM Studio: ``reasoning_effort``; on a switch-only model "on"
+      is ``high`` (Ollama: think) or ``medium`` (LM Studio's ``on``).
     - Z.AI GLM: ``thinking: {"type": "disabled"}`` for off; ``{"type":
       "enabled"}`` for on, with ``reasoning_effort`` on a model that has levels.
       A model that cannot stop thinking gets the level alone.
@@ -416,6 +465,8 @@ def thinking_body(provider_key: str, control: ThinkingControl, effort: str) -> d
     if level == "none":
         return {"thinking": {"type": "disabled"}} if glm else {"reasoning_effort": "none"}
     if control.switch_only:
+        if provider_key in _LOCAL_ON:
+            return {"reasoning_effort": _LOCAL_ON[provider_key]}
         return {"thinking": {"type": "enabled"}} if glm else {}
     if glm and "none" in control.levels:
         return {"thinking": {"type": "enabled"}, "reasoning_effort": level}

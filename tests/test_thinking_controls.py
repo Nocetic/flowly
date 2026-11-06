@@ -283,3 +283,112 @@ async def test_a_streamed_turn_carries_the_same_fields():
         break
     assert sent[0]["extra_body"] == {"reasoning_effort": "low"}
     assert "temperature" not in sent[0] and sent[0]["max_completion_tokens"] == 4096
+
+
+# ── models on this computer: Ollama and LM Studio ─────────────────────────
+
+from flowly.config.schema import Config
+from flowly.integrations import local_models
+from flowly.providers.effort import lmstudio_thinking, ollama_thinking
+
+
+@pytest.mark.parametrize(("model", "capabilities", "levels", "switch_only"), [
+    ("qwen3:8b", ["completion", "tools", "thinking"], list(SWITCH_LEVELS), True),
+    ("gpt-oss:20b", ["completion", "tools", "thinking"], ["low", "medium", "high"], False),
+    # Ollama answers 400 to a level on a model that does not think.
+    ("llama3.1:8b", ["completion", "tools"], [], False),
+    ("x", None, [], False),
+])
+def test_ollama_models_that_think_get_a_switch(model, capabilities, levels, switch_only):
+    control = ollama_thinking(model, capabilities)
+    assert (control.levels, control.switch_only) == (levels, switch_only)
+
+
+@pytest.mark.parametrize(("reasoning", "levels", "default", "switch_only"), [
+    ({"allowed_options": ["off", "on"], "default": "on"}, list(SWITCH_LEVELS), "high", True),
+    ({"allowed_options": ["off", "minimal", "low"], "default": "low"}, ["none", "minimal", "low"], "low", False),
+    ({"allowed_options": ["low", "medium", "high"]}, ["low", "medium", "high"], "medium", False),
+    ({"allowed_options": ["on"]}, [], None, False),  # always thinks: nothing to pick
+    ({"allowed_options": ["off"]}, [], None, False),
+    (None, [], None, False),
+])
+def test_lm_studio_models_take_the_options_they_publish(reasoning, levels, default, switch_only):
+    control = lmstudio_thinking({"reasoning": reasoning} if reasoning is not None else {})
+    assert (control.levels, control.default, control.switch_only) == (levels, default, switch_only)
+
+
+def _local_http(monkeypatch, app) -> None:
+    real = httpx.AsyncClient
+    monkeypatch.setattr(catalog.httpx, "AsyncClient", lambda *a, **k: real(transport=httpx.MockTransport(app)))
+
+
+async def test_the_ollama_picker_rows_carry_the_switch(monkeypatch):
+    monkeypatch.setattr("flowly.config.loader.load_config", lambda: Config())
+
+    def ollama(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "qwen3:8b"}, {"name": "llama3.1:8b"}]})
+        if request.url.path == "/api/ps":
+            return httpx.Response(200, json={"models": []})
+        if request.url.path == "/api/show":
+            name = json.loads(request.content)["model"]
+            caps = ["completion", "tools"] + (["thinking"] if name.startswith("qwen3") else [])
+            return httpx.Response(200, json={"capabilities": caps})
+        return httpx.Response(404)
+
+    _local_http(monkeypatch, ollama)
+    rows = await _catalogue("ollama")
+    assert rows["qwen3:8b"].efforts == list(SWITCH_LEVELS) and rows["qwen3:8b"].thinking_switch_only
+    assert rows["llama3.1:8b"].efforts == []
+
+
+async def test_the_lm_studio_picker_rows_carry_its_levels(monkeypatch):
+    config = Config()
+    config.providers.vllm.api_base = "http://127.0.0.1:1234/v1"
+    monkeypatch.setattr("flowly.config.loader.load_config", lambda: config)
+
+    def lmstudio(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/models":
+            return httpx.Response(200, json={"models": [
+                {"type": "llm", "key": "qwen/qwen3-8b", "capabilities": {
+                    "trained_for_tool_use": True, "reasoning": {"allowed_options": ["off", "on"], "default": "on"}}},
+                {"type": "llm", "key": "google/gemma-4-e2b", "capabilities": {"trained_for_tool_use": True}},
+            ]})
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": "qwen/qwen3-8b"}, {"id": "google/gemma-4-e2b"}]})
+        return httpx.Response(404)
+
+    _local_http(monkeypatch, lmstudio)
+    rows = await _catalogue("vllm")
+    assert rows["qwen/qwen3-8b"].efforts == list(SWITCH_LEVELS)
+    assert rows["google/gemma-4-e2b"].efforts == []
+
+
+@pytest.mark.parametrize(("name", "effort", "row", "body"), [
+    ("ollama", "none", catalog.Model(id="qwen3:8b", name="q", efforts=list(SWITCH_LEVELS), thinking_switch_only=True),
+     {"reasoning_effort": "none"}),
+    ("ollama", "medium", catalog.Model(id="qwen3:8b", name="q", efforts=list(SWITCH_LEVELS), thinking_switch_only=True),
+     {"reasoning_effort": "high"}),  # Ollama: think
+    ("ollama", "max", catalog.Model(id="gpt-oss:20b", name="g", efforts=["low", "medium", "high"]),
+     {"reasoning_effort": "high"}),
+    ("vllm", "high", catalog.Model(id="qwen/qwen3-8b", name="q", efforts=list(SWITCH_LEVELS), thinking_switch_only=True),
+     {"reasoning_effort": "medium"}),  # LM Studio's "on"
+    ("vllm", "none", catalog.Model(id="qwen/qwen3-8b", name="q", efforts=list(SWITCH_LEVELS), thinking_switch_only=True),
+     {"reasoning_effort": "none"}),
+    ("vllm", "high", catalog.Model(id="m/plain", name="p"), None),  # publishes nothing
+    ("ollama", "high", catalog.Model(id="llama3.1:8b", name="l"), None),
+])
+async def test_local_turns_carry_the_level_only_to_models_that_think(monkeypatch, name, effort, row, body):
+    monkeypatch.setitem(catalog._CACHE, name, [row])
+    provider, sent = _provider(name, effort)
+    await _turn(provider, row.id)
+    assert sent[-1].get("extra_body") == body
+    assert sent[-1]["max_tokens"] == 4096 and sent[-1]["temperature"] == 0.7
+
+
+def test_the_scan_says_how_each_model_thinks():
+    model = local_models._lmstudio_v1_model({"type": "llm", "key": "a", "capabilities": {
+        "reasoning": {"allowed_options": ["off", "low", "high"]}}})
+    assert model is not None and model.thinking.levels == ["none", "low", "high"]
+    ollama = local_models._ollama_model("qwen3:8b", {}, {"capabilities": ["completion", "thinking"]}, {})
+    assert ollama is not None and ollama.thinking.switch_only

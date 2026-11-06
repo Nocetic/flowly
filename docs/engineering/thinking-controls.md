@@ -150,6 +150,30 @@ migration guides, 2026-11):
 Tests: `tests/test_anthropic_thinking.py` (24 of its 29 fail without the
 change); `tests/test_reasoning_effort.py` updated for `none` and adaptive.
 
+## Ollama and LM Studio
+
+Both servers take `reasoning_effort` on their OpenAI-compatible route, but
+only for models that think. Ollama answers 400 to a level on any other model.
+So what each model takes is read from the server itself, during the scan the
+picker already makes (`local_models.py`, `effort.ollama_thinking`,
+`effort.lmstudio_thinking`):
+
+- **Ollama.** A model whose `/api/show` capabilities include `thinking` gets
+  the switch alone. Off is `reasoning_effort: "none"`, which Ollama reads as
+  `think: false`. On is `"high"`, which Ollama reads as `think: true` on a
+  model without named levels (its `ThinkingFromReasoningEffort`). gpt-oss
+  instead takes `low` / `medium` / `high` and cannot stop thinking.
+- **LM Studio.** `capabilities.reasoning.allowed_options` in
+  `/api/v1/models`. `["off", "on"]` gets the switch alone (on is `medium`,
+  LM Studio's own reading of `on`). Graded options (`["off", "minimal",
+  "low"]`) become those levels, with `off` as `none`. Its `default` is read
+  when given.
+- A model the server says nothing about is sent nothing, as before. The same
+  goes for a vLLM or llama.cpp server behind the `vllm` slot: it has no such
+  API.
+
+Tests: the local part of `tests/test_thinking_controls.py`.
+
 ## Not verified live
 
 No OpenAI, Gemini, Groq, Z.AI or Anthropic key was used: the request shapes

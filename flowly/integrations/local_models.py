@@ -41,6 +41,7 @@ from typing import Any
 import httpx
 
 from flowly.compaction.window_need import load_size, required_context
+from flowly.providers.effort import NO_THINKING_CONTROL, ThinkingControl, lmstudio_thinking, ollama_thinking
 
 _SCAN_TIMEOUT = httpx.Timeout(2.0, connect=0.5)
 _SHOW_CONCURRENCY = 4
@@ -99,6 +100,8 @@ class LocalModel:
     parameters: str | None = None
     #: An Ollama cloud model: it runs on Ollama's servers, not this computer.
     cloud: bool = False
+    #: How its thinking can be set (flowly/providers/effort.py).
+    thinking: ThinkingControl = NO_THINKING_CONTROL
 
     def to_dict(self, required: int) -> dict[str, Any]:
         return {
@@ -190,6 +193,7 @@ def _ollama_model(name: str, tag: dict, show: dict | None, running: dict[str, in
         size=_positive_int(tag.get("size")),
         parameters=details.get("parameter_size") if isinstance(details.get("parameter_size"), str) else None,
         cloud=name.endswith(":cloud") or name.endswith("-cloud") or tag.get("remote_host") is not None,
+        thinking=ollama_thinking(name, capabilities),
     )
 
 
@@ -262,6 +266,7 @@ def _lmstudio_v1_model(item: dict) -> LocalModel | None:
         loaded=bool(instances),
         size=_positive_int(item.get("size_bytes")),
         parameters=item.get("params_string") if isinstance(item.get("params_string"), str) else None,
+        thinking=lmstudio_thinking(capabilities),
     )
 
 

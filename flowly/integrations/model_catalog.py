@@ -1144,6 +1144,9 @@ async def _fetch_ollama() -> list[Model]:
                     description="Ollama · " + ("cloud" if m.cloud else (m.parameters or "local")),
                     context_window=m.context,
                     tags=["cloud" if m.cloud else "local"] + (["tools"] if m.tools else []),
+                    efforts=list(m.thinking.levels),
+                    default_effort=m.thinking.default,
+                    thinking_switch_only=m.thinking.switch_only,
                 )
                 for m in found
             ]
@@ -1241,6 +1244,9 @@ async def _fetch_vllm() -> list[Model]:
             description=f"Local · {item.get('owned_by') or 'self-hosted'}",
             context_window=known.context if known else None,
             tags=["local"] + (["tools"] if known and known.tools else []),
+            efforts=list(known.thinking.levels) if known else [],
+            default_effort=known.thinking.default if known else None,
+            thinking_switch_only=bool(known and known.thinking.switch_only),
         ))
     out.sort(key=lambda m: m.id.lower())
     return out
