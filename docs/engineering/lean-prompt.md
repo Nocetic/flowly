@@ -142,9 +142,14 @@ prompt cached.
   The system prompt depends on no session (the time is in the user message;
   memory freezing is off), so one warm-up serves every new conversation.
 - **Waits for MCP discovery** (up to 60 s), so the tool list is final.
-- **Gives way to a real request.** `_run_llm_tool_loop` cancels a running
-  warm-up first. The server keeps what it already read, and llama.cpp picks
-  that slot again by prefix similarity.
+- **A real request waits for it.** `_run_llm_tool_loop` waits for a warm-up
+  in flight (up to 300 s, then stops it; an owner's stop ends the wait).
+  First version cancelled the warm-up instead, expecting the server to reuse
+  what it had read. Tried live (19:07, 2026-11-06), LM Studio released the
+  cancelled slot ~2.5 s after it had already put the new request in an
+  empty slot, so the request read everything again. The warm-up reads the
+  very prompt the request needs; waiting costs only what the request would
+  read anyway, and then the request finds it cached.
 - A failure is logged at info level and changes nothing.
 
 Tests: `tests/test_prompt_warm.py`. The prefix test compares the warm request

@@ -106,18 +106,36 @@ async def test_a_model_not_on_this_computer_is_never_warmed(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_a_real_request_stops_the_warm_up(tmp_path, monkeypatch):
+async def test_a_real_request_waits_for_the_warm_up_and_then_uses_its_cache(tmp_path, monkeypatch):
+    """Cancelling did not hand the partly read prompt over on LM Studio: the
+    request landed in an empty slot and read everything again (2026-11-06)."""
     hold = asyncio.Event()
     server = _Server(hold=hold)
     loop = _loop(tmp_path, monkeypatch, server)
     task = loop.schedule_prompt_warm("test")
-    await asyncio.sleep(0.05)  # the warm-up is now waiting on the server
+    await asyncio.sleep(0.05)  # the warm-up is now reading
 
-    reply = await loop.process_direct("what's up", session_key="web:now")
+    turn = asyncio.create_task(loop.process_direct("what's up", session_key="web:now"))
+    await asyncio.sleep(0.6)
+    assert [r["max_tokens"] for r in server.requests] == [1]  # the request waits
 
-    assert reply == "ok"
+    hold.set()
+    assert await turn == "ok"
+    assert task.done() and not task.cancelled() and not server.cancelled
+    assert server.requests[0]["max_tokens"] == 1 and server.requests[1]["max_tokens"] != 1
+
+
+@pytest.mark.asyncio
+async def test_a_warm_up_that_takes_too_long_is_stopped_for_the_request(tmp_path, monkeypatch):
+    server = _Server(hold=asyncio.Event())  # never released
+    loop = _loop(tmp_path, monkeypatch, server)
+    monkeypatch.setattr(AgentLoop, "_WARM_WAIT_SECONDS", 0.3)
+    task = loop.schedule_prompt_warm("test")
+    await asyncio.sleep(0.05)
+
+    assert await loop.process_direct("what's up", session_key="web:now") == "ok"
+    await asyncio.sleep(0)
     assert task.cancelled() or server.cancelled
-    assert server.cancelled
 
 
 @pytest.mark.asyncio

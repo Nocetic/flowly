@@ -5176,11 +5176,32 @@ class AgentLoop:
             and is_local_endpoint(getattr(provider, "api_base", None))
         )
 
-    def _cancel_prompt_warm(self) -> None:
+    #: The longest a request waits for a warm-up; past it, the warm-up stops.
+    _WARM_WAIT_SECONDS = 300.0
+
+    async def _await_prompt_warm(self, run_id: str = "") -> None:
+        """Wait for a warm-up in flight before a real request.
+
+        Seen on LM Studio (2026-11-06): cancelling the warm-up for the request
+        did not hand its partly read prompt over. The server releases the
+        cancelled slot a second or two later, after it has already placed
+        the new request in an empty slot, so the request read everything again.
+        The warm-up reads the same prompt the request needs; waiting costs only
+        what the request would read anyway, then the request finds it cached.
+        Stopped by the owner, the request stops waiting (the warm-up goes on)."""
         task = getattr(self, "_prompt_warm_task", None)
-        if task is not None and not task.done():
-            task.cancel()
-            logger.info("[warm] a request arrived; warming stopped")
+        if task is None or task.done():
+            return
+        logger.info("[warm] a request is waiting for the warm-up to finish")
+        started = time.monotonic()
+        while not task.done():
+            if run_id and self.is_run_aborted(run_id):
+                return
+            if time.monotonic() - started > self._WARM_WAIT_SECONDS:
+                task.cancel()
+                logger.info("[warm] took too long; stopped for the request")
+                return
+            await asyncio.wait({task}, timeout=0.5)
 
     def schedule_prompt_warm(self, reason: str, *, channel: str | None = None) -> asyncio.Task | None:
         """Warm the local server's cache in the background, once at a time;
@@ -6332,9 +6353,9 @@ class AgentLoop:
         mutate the durable turn delta. Ephemeral model nudges are intentionally
         excluded.
         """
-        # A real request outranks a warm-up: stop it so the two do not share
-        # the local server (what it already read stays in the server's cache).
-        self._cancel_prompt_warm()
+        # A warm-up in flight is reading this very prompt: let it finish and
+        # use its cache rather than read the same prompt again beside it.
+        await self._await_prompt_warm(outbound_run_id)
         iteration = 0
         from flowly.agent.tools.discovery import annotate_search_repetition
         _tool_search_result_sets: dict[tuple[str, ...], int] = {}
