@@ -18,7 +18,9 @@ Priority (first match wins)
    zhipu → sakana. First usable provider wins.
 
 ``ollama`` and ``vllm`` (generic local OpenAI-compatible — LM Studio, vLLM,
-llama.cpp server, text-generation-webui, …) are explicit-only: a local server's
+llama.cpp server, text-generation-webui, …) are explicit-only, with one
+exception kept from before: ``vllm`` with an API key (and an address) is still
+the cascade's last resort. A local server's
 availability isn't implied by a saved config value the way a cloud API key is
 — it may be offline, or the config may be a leftover from a server the user
 isn't running anymore. Including either in the credential cascade would let a
@@ -288,6 +290,13 @@ def resolve_active_provider(config: Config) -> ActiveProvider | None:
         candidate = _build_for(config, name)
         if candidate is not None:
             return candidate
+
+    # 4. A self-hosted endpoint with an API key, last, as before local
+    # providers existed: a config that relied on the cascade keeps working.
+    # Without a key it is explicit-only (a saved address alone says nothing
+    # about whether the server runs), and Ollama always is.
+    if (getattr(config.providers.vllm, "api_key", "") or "").strip():
+        return _build_for(config, "vllm")
 
     return None
 

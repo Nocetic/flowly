@@ -389,13 +389,17 @@ def test_provider_local_reports_both_servers_and_the_bar(monkeypatch):
     assert result["recommendedContext"] >= MIN_CONTEXT
 
 
-def test_local_slots_have_their_own_kind_in_the_provider_list(tmp_path, monkeypatch):
+def test_local_slots_stay_hidden_in_older_apps(tmp_path, monkeypatch):
+    """The iOS, Android and older Desktop lists show a ``url`` row only once it
+    is set up or in use, but treat an unknown kind as one more provider. The
+    local slots keep ``url``, and are not "set up" on a fresh config."""
     from flowly.channels import feature_rpc
 
     _home(tmp_path, monkeypatch, {})
     rows = {row["key"]: row for row in feature_rpc.provider_list()["providers"]}
-    assert rows["ollama"]["kind"] == "local" and rows["ollama"]["keyable"] is False
-    assert rows["vllm"]["kind"] == "local" and rows["vllm"]["keyable"] is False
+    for key in ("ollama", "vllm"):
+        assert rows[key]["kind"] == "url", key
+        assert rows[key]["hasKey"] is False and rows[key]["isActive"] is False, key
 
 
 def test_the_rpcs_are_dispatched():

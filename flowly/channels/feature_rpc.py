@@ -2809,9 +2809,9 @@ _PROVIDER_SLOTS = (
 
 
 #: What each provider is, for the app's list: ``account`` (Flowly credit),
-#: ``subscription`` (signed in to a plan), ``key`` (an API key), ``local`` (a
-#: model server on the agent's computer: Ollama, LM Studio, any OpenAI-compatible
-#: address; it was ``url`` before local servers were found by themselves). ``login``: how a subscription signs in from the app —
+#: ``subscription`` (signed in to a plan), ``key`` (an API key), ``url`` (a
+#: model server: Ollama, LM Studio, any self-hosted OpenAI-compatible address).
+#: ``login``: how a subscription signs in from the app —
 #: ``device`` (a code approved on any device; flowly/auth/provider_login.py) or
 #: ``loopback`` (a browser on the agent's own machine only; none today: xAI's
 #: Grok sign-in moved to a device code so a phone signs in the agent too).
@@ -2820,10 +2820,12 @@ _PROVIDER_KINDS: dict[str, tuple[str, str | None]] = {
     "openai_codex": ("subscription", "device"),
     "xai_oauth": ("subscription", "device"),
     "zai_coding": ("subscription", None),
-    # A model server on the agent's own computer (provider.local lists them).
-    # An older app does not know this kind and shows the row only once in use.
-    "ollama": ("local", None),
-    "vllm": ("local", None),
+    # Model servers on the agent's computer (provider.local lists their models).
+    # ``url`` like the self-hosted row always was: every app shows a ``url`` row
+    # only once it is set up or in use. (A new kind would show in the iOS and
+    # Android lists, which treat an unknown kind as one more provider.)
+    "ollama": ("url", None),
+    "vllm": ("url", None),
 }
 
 

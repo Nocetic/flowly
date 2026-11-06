@@ -369,20 +369,37 @@ def test_config_legacy_helpers_vllm_real_key_and_no_base(tmp_path, monkeypatch) 
     assert cfg.get_api_base() is None
 
 
-def test_config_legacy_helpers_never_cascade_to_vllm(tmp_path, monkeypatch) -> None:
-    """Symmetry with ollama + resolve_active_provider: vllm is explicit-only,
-    so the legacy helpers must NOT auto-select it from the cascade just because
-    a (stale/leftover) vllm key or base is present. Only an explicit
-    active="vllm" engages it."""
+def test_config_legacy_helpers_keep_vllm_as_the_last_resort_as_before(tmp_path, monkeypatch) -> None:
+    """A self-hosted endpoint with an API key was the cascade's last resort
+    before local providers existed, in the legacy helpers too (MCP sampling,
+    a few CLI paths). It stays so: a config that relied on it keeps working.
+    Ollama never joins it."""
     cfg = _isolated_config(tmp_path, monkeypatch)
     cfg.providers.active = ""                       # cascade mode
-    cfg.providers.vllm.api_key = "sk-leftover"
-    cfg.providers.vllm.api_base = "http://localhost:1234/v1"
+    cfg.providers.vllm.api_key = "sk-self-hosted"
+    cfg.providers.vllm.api_base = "http://localhost:8000/v1"
 
-    assert cfg.get_active_provider_name() != "vllm"
-    assert cfg.get_api_key() != "sk-leftover"       # not picked up by cascade
-    # With nothing else configured, cascade yields no key at all.
-    assert cfg.get_api_key() is None
+    assert cfg.get_active_provider_name() == "vllm"
+    assert cfg.get_api_key() == "sk-self-hosted"
+    assert cfg.get_api_base() == "http://localhost:8000/v1"
+    # Any cloud key still comes first.
+    cfg.providers.openrouter.api_key = "sk-or-x"
+    assert cfg.get_active_provider_name() == "openrouter"
+
+
+def test_the_cascade_keeps_a_keyed_self_hosted_endpoint_last_and_never_ollama(tmp_path, monkeypatch) -> None:
+    cfg = _isolated_config(tmp_path, monkeypatch)
+    cfg.providers.flowly.enabled = False
+    cfg.providers.openai_codex.enabled = False
+    cfg.providers.xai_oauth.enabled = False
+    cfg.providers.zai_coding.enabled = False
+    cfg.providers.ollama.api_base = "http://127.0.0.1:11434/v1"
+    assert resolve_active_provider(cfg) is None
+    cfg.providers.vllm.api_key = "sk-self-hosted"
+    cfg.providers.vllm.api_base = "http://localhost:8000/v1"
+    active = resolve_active_provider(cfg)
+    assert active is not None and active.key == "vllm" and active.api_key == "sk-self-hosted"
+    assert active.api_base == "http://localhost:8000/v1"
 
 
 def test_config_legacy_helpers_active_vllm_beats_leftover_cloud_key(
@@ -533,3 +550,16 @@ def test_build_provider_cloud_stock_config_keeps_the_configured_timeout() -> Non
     ):
         provider = build_provider(active, default_model="m", config=cfg)
         assert provider.request_timeout_seconds == _STOCK_LLM_TIMEOUT, active.key
+
+
+def test_a_cloud_provider_behind_a_local_proxy_keeps_its_timeout() -> None:
+    """A cloud provider pointed at this machine (the Flowly server in
+    development, a LiteLLM proxy) is not a local model: no local bump."""
+    from types import SimpleNamespace
+    from flowly.integrations.active_provider import ActiveProvider
+    from flowly.providers.factory import build_provider, _STOCK_LLM_TIMEOUT
+
+    cfg = SimpleNamespace(agents=SimpleNamespace(defaults=SimpleNamespace(llm_timeout_seconds=int(_STOCK_LLM_TIMEOUT))))
+    active = ActiveProvider(key="openai", api_key="sk-x", api_base="http://localhost:4000/v1", source="BYOK")
+    provider = build_provider(active, default_model="gpt-5", config=cfg)
+    assert provider.request_timeout_seconds == _STOCK_LLM_TIMEOUT

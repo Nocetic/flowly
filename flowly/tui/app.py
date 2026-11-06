@@ -3032,11 +3032,13 @@ class FlowlyTUI(App[None]):
         """
         field = _inline_provider_key_field(card)
         if field is None:
-            # No single pasteable key (a local endpoint needs a base URL, not
-            # just an api_key) → open the full-fields composer setup instead of
-            # silently doing nothing. Explicit-only local providers get activated
-            # on save inside _configure_card_inline, so the picker's switch
-            # intent is honored.
+            from flowly.integrations.active_provider import _EXPLICIT_ONLY
+
+            if card.key not in _EXPLICIT_ONLY:
+                return False
+            # A local endpoint needs an address, not a pasted key: open the
+            # all-fields composer setup. It activates the provider on save
+            # (_configure_card_inline), so the picker's switch is honored.
             saved = await self._configure_card_inline(card)
             if saved:
                 self._refresh_active_provider_status()

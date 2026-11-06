@@ -1375,6 +1375,7 @@ class Config(BaseSettings):
             self.providers.gemini.api_key or
             self.providers.zhipu.api_key or
             self.providers.sakana.api_key or
+            self.providers.vllm.api_key or
             None
         )
 
@@ -1397,6 +1398,8 @@ class Config(BaseSettings):
             return "zhipu"
         if self.providers.sakana.api_key:
             return "sakana"
+        if self.providers.vllm.api_key:
+            return "vllm"
         return "unknown"
 
     def get_fallback_keys(self) -> list[str]:
@@ -1426,6 +1429,8 @@ class Config(BaseSettings):
             return self.providers.zhipu.api_base
         if self.providers.sakana.api_key:
             return self.providers.sakana.api_base or "https://api.sakana.ai/v1"
+        if self.providers.vllm.api_base:
+            return self.providers.vllm.api_base
         return None
 
     class Config:

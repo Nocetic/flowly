@@ -81,12 +81,17 @@ def _construct_provider(
         except (AttributeError, TypeError, ValueError):
             timeout_seconds = None
 
-    # A local endpoint on the stock timeout gets the roomier local default:
+    # A local model server on the stock timeout gets the roomier local default:
     # the stock value is what every config carries, not a choice, and a local
     # model's prefill + decode routinely outlasts it. A value the owner
     # changed, or FLOWLY_LLM_TIMEOUT_SECONDS (honored inside the provider),
-    # still wins. Cloud endpoints are untouched.
-    if is_local_endpoint(active.api_base) and timeout_seconds in (None, _STOCK_LLM_TIMEOUT):
+    # still wins. Only the local slots: a cloud provider pointed at a proxy on
+    # this machine (a dev server, a LiteLLM) keeps exactly what it had.
+    if (
+        active.key in ("ollama", "vllm")
+        and is_local_endpoint(active.api_base)
+        and timeout_seconds in (None, _STOCK_LLM_TIMEOUT)
+    ):
         timeout_seconds = _LOCAL_DEFAULT_TIMEOUT_SECONDS
 
     if active.key == "xai_oauth":
