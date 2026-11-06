@@ -359,3 +359,34 @@ async def test_skill_view_search_is_lossless_catalog_fallback(many_skills) -> No
 
     assert payload["total"] >= 1
     assert any(item["name"] == "browser-automation" for item in payload["skills"])
+
+
+# Turkish attaches case endings to the noun ("tarayıcıda" = in the browser,
+# "ekranda" = on the screen). The patterns matched only the bare noun, so these
+# turns fell through to the ambiguous-action rule and paid BOTH playbooks
+# (~15K tokens) when one was meant. Measured 2026-11-06 on "tarayıcıda gmail'i aç".
+@pytest.mark.parametrize(("text", "expected"), [
+    ("tarayıcıda gmail'i aç", {"browser"}),
+    ("tarayıcıdan çıkış yap", {"browser"}),
+    ("yeni sekmede aç", {"browser"}),
+    ("bu web sitesinde formu doldur", {"browser"}),
+    ("ekranda ne yazıyor", {"computer"}),
+    ("ekran görüntüsü al", {"computer"}),
+    ("açık pencerede kaydet tuşuna bas", {"computer"}),
+    ("klavyeden enter'a bas", {"computer"}),
+])
+def test_turkish_case_endings_route_to_the_one_meant_guide(text, expected) -> None:
+    decision = route_capability_guidance(text, history=[], available_tools={"computer", "browser_tab"})
+    assert decision.active == frozenset(expected)
+    assert not decision.fail_open
+
+
+@pytest.mark.parametrize("text", [
+    # The Desktop folder, not the screen: file work pays no UI playbook.
+    "masaüstündeki dosyaları düzenle",
+    "STL dosyalarını masaüstüne topla",
+    "selam",
+])
+def test_desktop_folder_and_chat_stay_lean(text) -> None:
+    decision = route_capability_guidance(text, history=[], available_tools={"computer", "browser_tab"})
+    assert decision.active == frozenset()
