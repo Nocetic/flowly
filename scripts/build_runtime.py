@@ -26,6 +26,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -111,9 +112,12 @@ def install_python(version: str, work: Path, destination: Path) -> Path:
     installs = work / "pythons"
     run(["uv", "python", "install", version, "--install-dir", installs, "--no-bin"],
         env={**os.environ, "UV_PYTHON_DOWNLOADS": "automatic"})
-    # uv also leaves a minor-version link (cpython-3.12-…) beside the install.
+    # uv also leaves a minor-version link (cpython-3.12-…) beside the install:
+    # a symlink on macOS and Linux, a directory junction on Windows, which
+    # is_symlink() does not report. Only the full-version folder is the install.
     found = [p for p in installs.iterdir()
-             if p.is_dir() and not p.is_symlink() and p.name.startswith("cpython-")]
+             if p.is_dir() and not p.is_symlink() and not getattr(p, "is_junction", bool)()
+             and re.match(r"cpython-\d+\.\d+\.\d+", p.name)]
     if len(found) != 1:
         raise SystemExit(f"build_runtime: expected one Python under {installs}, found {found}")
     shutil.copytree(found[0], destination, symlinks=True)

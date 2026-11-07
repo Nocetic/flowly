@@ -71,3 +71,24 @@ def test_a_new_extra_ships_without_touching_the_builder(monkeypatch, tmp_path):
     exported = _exported_extras(builder, monkeypatch, tmp_path, tmp_path / "src")
 
     assert exported == ["new"]
+
+
+def test_the_minor_version_link_uv_leaves_is_not_a_second_python(monkeypatch, tmp_path):
+    # Beside the install uv leaves cpython-3.12-<platform>, a symlink on macOS
+    # and Linux but a directory junction on Windows, which is_symlink() does
+    # not see. The builder must still copy the one real install.
+    builder = _builder()
+    installs = tmp_path / "work" / "pythons"
+
+    def run(argv, **_):
+        real = installs / "cpython-3.12.13-windows-x86_64-none"
+        (real).mkdir(parents=True)
+        (real / "python.exe").write_text("")
+        (real / "bin").mkdir()
+        (real / "bin" / "python3").write_text("")
+        # A junction reads as a plain directory to Path.is_symlink().
+        (installs / "cpython-3.12-windows-x86_64-none").mkdir()
+
+    monkeypatch.setattr(builder, "run", run)
+    exe = builder.install_python("3.12", tmp_path / "work", tmp_path / "python")
+    assert exe.exists()
