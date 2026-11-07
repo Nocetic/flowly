@@ -93,5 +93,13 @@ come-back scenario fails (`grok-4.3`, the default, instead of the chosen
 
 ## Apps
 
-Desktop first (Hakan: "şimdilik sadece desktopta"). iOS and Android read the
-same RPCs later.
+All three read the same RPCs. With an older Core, none of them shows stars.
+
+- **Desktop** (`1d85c58`): a star beside each model; a Favorites section
+  heads the model window, from every provider.
+- **iOS** (`3539b58f`) and **Android** (`336d28f0`): the screens are
+  different. The favourites sit one under another on the settings page,
+  below the Thinking and Fast switches, and the model list has a star on each
+  row. A favourite on another provider moves the agent there in one step and
+  is greyed when that provider is not set up. iOS unstars with a long press,
+  Android with the row's star. Not built here: Hakan builds both apps.
