@@ -92,10 +92,12 @@ packages install only into the agent's virtualenv
 (`flowly/desktop_runtime/python_installer.py`).
 
 A release tag does this in CI (`.github/workflows/runtime.yml`, job
-`cloud-image`, secret `FLY_IMAGE_TOKEN`) before the GitHub release is
-published, and the Flowly server then moves every cloud computer to it on
-its own: canary first, sleeping homes at once, awake ones when they go to
-sleep (flowly-server `docs/cloud/engineering/cloud-auto-update.md`).
+`cloud-image`). The job runs in the `cloud-image` environment, the only place
+that holds `FLY_IMAGE_TOKEN`: it admits only `v*` tags and waits for a
+maintainer to approve each run. The release itself does not wait for the
+image. Once the image is pushed, the Flowly server moves every cloud computer
+to it on its own: canary first, sleeping homes at once, awake ones when they
+go to sleep (flowly-server `docs/cloud/engineering/cloud-auto-update.md`).
 
 By hand, existing homes move to a new image with the server's
 `server/scripts/roll-cloud-image.ts --image <ref> --version <core version>`:

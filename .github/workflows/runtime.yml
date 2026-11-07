@@ -12,13 +12,17 @@ name: runtime
 #
 # A tag also builds the cloud computer's image from the same source
 # (cloud/image/build-context.sh --ref) and pushes it to Fly's registry as
-# registry.fly.io/flowly-bots-image:<version>, before the release is
-# published. The Flowly server watches this repository's latest release and
-# moves every cloud computer to that image on its own (flowly-server
-# docs/cloud/engineering/cloud-auto-update.md). Without the FLY_IMAGE_TOKEN
-# secret (a deploy token of that one app: `fly tokens create deploy -a
-# flowly-bots-image`) the image step is skipped; the server then finds no
-# image for the release and leaves every machine where it is.
+# registry.fly.io/flowly-bots-image:<version>. The Flowly server watches this
+# repository's latest release and moves every cloud computer to that image on
+# its own (flowly-server docs/cloud/engineering/cloud-auto-update.md); until
+# the image exists it waits, so the release does not wait for the image.
+#
+# The image job runs in the `cloud-image` environment: FLY_IMAGE_TOKEN (a
+# deploy token of that one app: `fly tokens create deploy -a
+# flowly-bots-image`) lives only there, the environment admits only v* tags,
+# and a maintainer approves each run before the token is handed out. Nothing
+# else in this public repository can read it. Without the secret the step is
+# skipped and every machine stays where it is.
 
 on:
   push:
@@ -95,6 +99,7 @@ jobs:
   cloud-image:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
+    environment: cloud-image
     steps:
       - uses: actions/checkout@v4
         with:
@@ -121,8 +126,7 @@ jobs:
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    # After the image: a published release always has its cloud image (when the token is set).
-    needs: [build, cloud-image]
+    needs: build
     runs-on: ubuntu-24.04
     permissions:
       contents: write
