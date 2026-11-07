@@ -80,6 +80,10 @@ PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     "memory.dream": 180_000,
     "memory.import_prompt": 30_000,
     "memory.import": 180_000,
+    # The knowledge graph the agent built from its memory: read, and forget
+    # one entity. Each runs on the named agent's own knowledge_graph.sqlite3.
+    "kg.graph": 30_000,
+    "kg.delete_entity": 30_000,
     "mcp.capabilities": 30_000,
     "mcp.connections.list": 30_000,
     "mcp.connections.action": 60_000,

@@ -1247,7 +1247,7 @@ class ProfileHost:
             # Old runtimes ignore the additive parameter and keep legacy events.
             safe["eventVersion"] = 2
         guarded = expected_host_id is not None or expected_bot_id is not None
-        if method.startswith(("mcp.", "gmail.", "memory.", "skills.")) and not guarded:
+        if method.startswith(("mcp.", "gmail.", "memory.", "kg.", "skills.")) and not guarded:
             raise ProfileHostError("INVALID_PARAMS", "This operation requires the selected profile identities.")
         if guarded:
             if not isinstance(expected_host_id, str) or not expected_host_id or not isinstance(expected_bot_id, str) or not expected_bot_id:

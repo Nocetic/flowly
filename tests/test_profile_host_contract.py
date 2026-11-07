@@ -35,6 +35,9 @@ def test_mobile_profile_rpc_surface_is_bot_scoped() -> None:
         "goal.pause",
         "goal.resume",
         "goal.stop",
+        # The knowledge graph panel of a named agent (Desktop's AgentKnowledge).
+        "kg.graph",
+        "kg.delete_entity",
     ):
         assert method in PROFILE_RPC_TIMEOUTS
 
