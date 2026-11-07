@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from flowly.integrations.active_provider import ActiveProvider
+from flowly.integrations.active_provider import ActiveProvider, is_local_endpoint
 from flowly.providers.anthropic_provider import AnthropicProvider
 from flowly.providers.base import LLMProvider
 from flowly.providers.codex_responses_provider import CodexResponsesProvider
@@ -10,6 +10,25 @@ from flowly.providers.effort import normalize_effort
 from flowly.providers.openrouter_provider import OpenRouterProvider
 from flowly.providers.service_tier import normalize_service_tier
 from flowly.providers.xai_responses_provider import XAIResponsesProvider
+
+# Local model servers (Ollama, LM Studio, vLLM, llama.cpp on loopback/LAN)
+# routinely need longer than the cloud-tuned 120s default: prefill + decode of
+# a full response on CPU / a modest GPU can run for minutes. When the user
+# hasn't pinned an explicit timeout, local endpoints get this roomier default
+# so long generations aren't cut off mid-stream. Not unbounded — a hung server
+# should still eventually fail rather than wedge the UI forever.
+_LOCAL_DEFAULT_TIMEOUT_SECONDS = 600.0
+
+# The stock ``agents.defaults.llmTimeoutSeconds``. Read dynamically so it can't
+# drift from the schema. This value is treated as "unset" (not an explicit
+# user choice), so a fresh config on the stock default still lets the local
+# bump above apply — the config field always carries a concrete number, so
+# there's otherwise no way to tell "user picked 120" from "nobody touched it".
+try:
+    from flowly.config.schema import AgentDefaults as _AgentDefaults
+    _STOCK_LLM_TIMEOUT = float(_AgentDefaults.model_fields["llm_timeout_seconds"].default)
+except Exception:  # pragma: no cover - defensive; schema field renamed/removed
+    _STOCK_LLM_TIMEOUT = 120.0
 
 
 def build_provider(
@@ -61,6 +80,19 @@ def _construct_provider(
             timeout_seconds = float(config.agents.defaults.llm_timeout_seconds)
         except (AttributeError, TypeError, ValueError):
             timeout_seconds = None
+
+    # A local model server on the stock timeout gets the roomier local default:
+    # the stock value is what every config carries, not a choice, and a local
+    # model's prefill + decode routinely outlasts it. A value the owner
+    # changed, or FLOWLY_LLM_TIMEOUT_SECONDS (honored inside the provider),
+    # still wins. Only the local slots: a cloud provider pointed at a proxy on
+    # this machine (a dev server, a LiteLLM) keeps exactly what it had.
+    if (
+        active.key in ("ollama", "vllm")
+        and is_local_endpoint(active.api_base)
+        and timeout_seconds in (None, _STOCK_LLM_TIMEOUT)
+    ):
+        timeout_seconds = _LOCAL_DEFAULT_TIMEOUT_SECONDS
 
     if active.key == "xai_oauth":
         providers = getattr(config, "providers", None) if config is not None else None

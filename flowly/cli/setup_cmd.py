@@ -181,6 +181,201 @@ def setup_byok_cmd(
         raise typer.Exit(code=1)
 
 
+@setup_app.command("ollama")
+def setup_ollama_cmd(
+    model: str = typer.Option(
+        "", "--model", "-m",
+        help="Ollama model id to use, e.g. gemma4, qwen3.6, or minimax-m2.5:cloud.",
+    ),
+    api_base: str = typer.Option(
+        "http://127.0.0.1:11434/v1", "--api-base",
+        help="Ollama OpenAI-compatible base URL.",
+    ),
+    set_active: bool = typer.Option(
+        True, "--set-active/--no-set-active",
+        help="Pin Ollama as the active default provider.",
+    ),
+) -> None:
+    """Configure Flowly to use local Ollama via its OpenAI-compatible API."""
+    api_base = (api_base or "").strip().rstrip("/") or "http://127.0.0.1:11434/v1"
+    model = (model or "").strip()
+
+    try:
+        from flowly.config.loader import load_config, save_config
+        from flowly.integrations.active_provider import set_active_provider
+        from flowly.integrations import model_catalog
+
+        cfg = load_config()
+        cfg.providers.ollama.api_base = api_base
+        if model:
+            cfg.agents.defaults.model = model
+        save_config(cfg)
+        if set_active:
+            set_active_provider("ollama")
+        model_catalog.flush_cache()
+
+        if not model:
+            visible = asyncio.run(_list_ollama_models(api_base))
+            if len(visible) == 1:
+                cfg = load_config()
+                cfg.agents.defaults.model = visible[0]
+                save_config(cfg)
+                model = visible[0]
+            elif visible and sys.stdin.isatty():
+                from InquirerPy import inquirer
+                picked = inquirer.select(
+                    message="Pick an Ollama model:",
+                    choices=visible,
+                    default=visible[0],
+                ).execute()
+                if picked:
+                    cfg = load_config()
+                    cfg.agents.defaults.model = str(picked)
+                    save_config(cfg)
+                    model = str(picked)
+
+        console.print(f"  [green]✓[/] Ollama endpoint → [b]{api_base}[/]")
+        if model:
+            console.print(f"  [green]✓[/] Model → [b]{model}[/]")
+        else:
+            console.print(
+                "  [yellow]![/] No model selected; set one with "
+                "[cyan]/model <id>[/] or "
+                "[cyan]flowly setup ollama --model <id>[/]."
+            )
+        if set_active:
+            console.print("  [green]✓[/] Active provider → [b]ollama[/]")
+        console.print("\n  Run [cyan]flowly[/] to start chatting.")
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]✗ Failed to configure Ollama:[/] {exc}")
+        raise typer.Exit(code=1)
+
+
+async def _list_ollama_models(api_base: str) -> list[str]:
+    """Best-effort model discovery for ``flowly setup ollama``."""
+    return await _list_openai_compatible_models(api_base, api_key="ollama")
+
+
+async def _list_openai_compatible_models(api_base: str, *, api_key: str) -> list[str]:
+    """Best-effort model discovery for any OpenAI-compatible ``/models`` route
+    (Ollama, LM Studio, vLLM, llama.cpp server, text-generation-webui, …)."""
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            r = await client.get(
+                f"{api_base.rstrip('/')}/models",
+                headers={
+                    "Authorization": f"Bearer {api_key or 'local'}",
+                    "User-Agent": "flowly-setup/local",
+                },
+            )
+        if r.status_code != 200:
+            return []
+        data = r.json()
+    except Exception:
+        return []
+    out: list[str] = []
+    for item in data.get("data", []):
+        mid = str(item.get("id") or item.get("model") or "").strip()
+        if mid:
+            out.append(mid)
+    return sorted(set(out))
+
+
+@setup_app.command("local")
+def setup_local_cmd(
+    api_base: str = typer.Option(
+        "http://127.0.0.1:1234/v1", "--api-base",
+        help="Base URL of any local OpenAI-compatible server — LM Studio "
+             "(default port 1234), vLLM (8000), llama.cpp server, "
+             "text-generation-webui, koboldcpp, etc.",
+    ),
+    model: str = typer.Option(
+        "", "--model", "-m",
+        help="Model id to use, e.g. qwen3-8b or meta-llama/Llama-3.1-8B-Instruct. "
+             "Omit to pick from /v1/models.",
+    ),
+    api_key: str = typer.Option(
+        "", "--api-key",
+        help="Optional bearer token some local servers check. Most (LM Studio, "
+             "Ollama, llama.cpp) ignore it; leave unset unless yours requires one.",
+    ),
+    set_active: bool = typer.Option(
+        True, "--set-active/--no-set-active",
+        help="Pin this endpoint as the active default provider.",
+    ),
+) -> None:
+    """Configure Flowly to use a local OpenAI-compatible server (LM Studio,
+    vLLM, llama.cpp server, text-generation-webui, ...).
+
+    Distinct from ``flowly setup ollama``: this targets ANY server that speaks
+    the OpenAI ``/v1/chat/completions`` + ``/v1/models`` wire protocol, not
+    just Ollama's. Use ``flowly setup ollama`` if you're specifically running
+    Ollama — it has its own default port and needs no ``--api-base``.
+    """
+    api_base = (api_base or "").strip().rstrip("/") or "http://127.0.0.1:1234/v1"
+    model = (model or "").strip()
+    api_key = (api_key or "").strip()
+
+    try:
+        from flowly.config.loader import load_config, save_config
+        from flowly.integrations.active_provider import set_active_provider
+        from flowly.integrations import model_catalog
+
+        cfg = load_config()
+        cfg.providers.vllm.api_base = api_base
+        # Only write the key when one was actually passed — re-running
+        # `setup local` to change just the URL/model must not wipe a key the
+        # user set earlier (e.g. via the TUI card). Empty is the common case
+        # (local servers ignore it) and the resolver supplies a dummy bearer.
+        if api_key:
+            cfg.providers.vllm.api_key = api_key
+        if model:
+            cfg.agents.defaults.model = model
+        save_config(cfg)
+        if set_active:
+            set_active_provider("vllm")
+        model_catalog.flush_cache()
+
+        if not model:
+            visible = asyncio.run(
+                _list_openai_compatible_models(api_base, api_key=api_key)
+            )
+            if len(visible) == 1:
+                cfg = load_config()
+                cfg.agents.defaults.model = visible[0]
+                save_config(cfg)
+                model = visible[0]
+            elif visible and sys.stdin.isatty():
+                from InquirerPy import inquirer
+                picked = inquirer.select(
+                    message="Pick a model:",
+                    choices=visible,
+                    default=visible[0],
+                ).execute()
+                if picked:
+                    cfg = load_config()
+                    cfg.agents.defaults.model = str(picked)
+                    save_config(cfg)
+                    model = str(picked)
+
+        console.print(f"  [green]✓[/] Local endpoint → [b]{api_base}[/]")
+        if model:
+            console.print(f"  [green]✓[/] Model → [b]{model}[/]")
+        else:
+            console.print(
+                "  [yellow]![/] No model selected; set one with "
+                "[cyan]/model <id>[/] or "
+                "[cyan]flowly setup local --model <id>[/]."
+            )
+        if set_active:
+            console.print("  [green]✓[/] Active provider → [b]Local OpenAI-compatible[/]")
+        console.print("\n  Run [cyan]flowly[/] to start chatting.")
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]✗ Failed to configure local endpoint:[/] {exc}")
+        raise typer.Exit(code=1)
+
+
 # ── Deprecated section wizards (kept one release for backward compat) ──
 #
 # These predate `/integrations`. Each one duplicates a card that the TUI
@@ -259,5 +454,3 @@ def setup_google_workspace_cmd():
     """Install and authenticate the Google Workspace CLI (gws)."""
     from flowly.cli.setup import setup_google_workspace
     setup_google_workspace()
-
-

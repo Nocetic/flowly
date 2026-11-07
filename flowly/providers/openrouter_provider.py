@@ -61,6 +61,17 @@ _REASONING_MANDATORY_MODELS: set[str] = set()
 #: Models that refused a reasoning effort (a 400 naming it): asked without one from then on.
 _EFFORT_REFUSED_MODELS: set[str] = set()
 
+#: Providers whose thinking follows models.dev's ``reasoning_options``
+#: (effort.thinking_body): ``reasoning_effort``, and ``thinking`` for GLM.
+_THINKING_BODY_PROVIDERS = frozenset({"openai", "gemini", "groq", "zhipu", "zai_coding", "ollama", "vllm"})
+
+#: Models that refused ``temperature`` (a 400 naming it): asked without it from then on.
+_TEMPERATURE_REFUSED_MODELS: set[str] = set()
+
+
+def _temperature_refused(exc: Exception) -> bool:
+    return isinstance(exc, BadRequestError) and "temperature" in str(exc).lower()
+
 
 def _reasoning_is_mandatory(exc: Exception) -> bool:
     return "reasoning is mandatory" in str(exc).lower()
@@ -70,7 +81,7 @@ def _effort_refused(exc: Exception) -> bool:
     if not isinstance(exc, BadRequestError):
         return False
     text = str(exc).lower()
-    return "effort" in text or "reasoning" in text
+    return "effort" in text or "reasoning" in text or "thinking" in text
 
 
 def _strip_known_prefixes(model: str) -> str:
@@ -87,6 +98,65 @@ def _strip_known_prefixes(model: str) -> str:
         if model.startswith(prefix):
             return model[len(prefix):]
     return model
+
+
+#: Providers whose servers render messages through the model's own chat
+#: template. Many (Qwen and others) raise "System message must be at the
+#: beginning" for a second system message, and some require user and
+#: assistant turns to alternate.
+_STRICT_TEMPLATE_PROVIDERS = frozenset({"ollama", "vllm"})
+
+
+def _text_of(content: Any) -> str | None:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list) and all(
+        isinstance(part, dict) and part.get("type") == "text" for part in content
+    ):
+        return "".join(str(part.get("text") or "") for part in content)
+    return None
+
+
+def _one_leading_system(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """``messages`` as a strict chat template takes them: one system message,
+    first. Flowly sends its instructions and the turn's routed guidance as two
+    system messages (and compaction and threads may add more); a template that
+    accepts one refused every request ("System message must be at the
+    beginning", LM Studio with prism-ml/bonsai-27b, 2026-11-07).
+
+    The leading system messages are joined in order, so the instructions stay
+    first and a server's prompt cache still covers them. A later system
+    message becomes a user note (``[System note]``), joined with a user
+    message next to it so turns still alternate."""
+    leading: list[str] = []
+    index = 0
+    while index < len(messages) and messages[index].get("role") == "system":
+        text = _text_of(messages[index].get("content"))
+        if text is None:
+            break
+        if text:
+            leading.append(text)
+        index += 1
+    if index <= 1 and not any(m.get("role") == "system" for m in messages[index:]):
+        return messages
+    out: list[dict[str, Any]] = []
+    if leading:
+        out.append({"role": "system", "content": "\n\n".join(leading)})
+    for message in messages[index:]:
+        if message.get("role") == "system":
+            text = _text_of(message.get("content"))
+            message = {"role": "user", "content": f"[System note]\n{text if text is not None else ''}"}
+        previous = out[-1] if out else None
+        if (
+            previous is not None
+            and message.get("role") == "user" == previous.get("role")
+            and _text_of(previous.get("content")) is not None
+            and _text_of(message.get("content")) is not None
+        ):
+            out[-1] = {**previous, "content": f"{_text_of(previous['content'])}\n\n{_text_of(message['content'])}"}
+            continue
+        out.append(message)
+    return out
 
 
 def _model_consumes_thought_signature(model: str | None) -> bool:
@@ -289,6 +359,8 @@ class OpenRouterProvider(LLMProvider):
         # API call; copy-based so the caller's list keeps them for persistence
         # filtering afterwards.
         messages = _strip_internal_keys(messages)
+        if self.provider_name in _STRICT_TEMPLATE_PROVIDERS:
+            messages = _one_leading_system(messages)
         if not _model_consumes_thought_signature(model):
             messages = _strip_tool_call_extra_content(messages)
         if is_cacheable_model(model):
@@ -336,23 +408,74 @@ class OpenRouterProvider(LLMProvider):
             levels = xai_efforts(model)[0]
         return levels
 
+    def _xai_route(self, model: str, reasoning: bool | None) -> tuple[str, str]:
+        """xAI: the model a turn goes to and the level it carries
+        (flowly/providers/effort.py ``xai_request``): off is ``none`` where the
+        model takes it, else its non-reasoning twin when the account's
+        catalogue lists it."""
+        from flowly.integrations.model_catalog import cached_ids
+        from flowly.providers.effort import xai_request
+
+        return xai_request(model, self.turn_effort(reasoning), listed=cached_ids(self.provider_name))
+
     def _reasoning_body(self, model: str, reasoning: bool | None) -> dict[str, Any]:
         """The body fields a request carries for thinking: OpenRouter's and
         Flowly's ``reasoning`` object, xAI's ``reasoning_effort``, nothing for
         other OpenAI-compatible APIs (they may refuse an unknown field)."""
         if self.provider_name == "xai":
-            effort = self.turn_effort(reasoning)
-            levels = self._model_efforts(model)
-            if levels is not None:
-                from flowly.providers.effort import clamp_effort
-
-                effort = clamp_effort(effort, levels) if levels else ""
-            # Grok cannot switch thinking off: none was lowered to its weakest level.
-            if not effort or effort == "none" or model in _EFFORT_REFUSED_MODELS:
+            # ``model`` is already routed (``_xai_route``): a twin takes no level.
+            _model, effort = self._xai_route(model, reasoning)
+            if not effort or model in _EFFORT_REFUSED_MODELS:
                 return {}
             return {"reasoning_effort": effort}
+        if self.provider_name in _THINKING_BODY_PROVIDERS:
+            if model in _EFFORT_REFUSED_MODELS:
+                return {}
+            from flowly.integrations.model_catalog import cached_model
+            from flowly.providers.effort import ThinkingControl, thinking_body
+
+            row = cached_model(self.provider_name, model)
+            if row is None:
+                # Not in the catalogue (offline, typed by hand): nothing is
+                # known, so nothing is sent and the model thinks as it does.
+                return {}
+            control = ThinkingControl(list(row.efforts), row.default_effort, row.thinking_switch_only)
+            return thinking_body(self.provider_name, control, self.turn_effort(reasoning))
         field = self._reasoning_field(model, reasoning)
         return {} if field is None else {"reasoning": field}
+
+    def _sampling_body(self, model: str, max_tokens: int, temperature: float, thinking: dict[str, Any]) -> dict[str, Any]:
+        """``max_tokens`` and ``temperature`` as ``model`` takes them.
+
+        OpenAI's reasoning models refuse ``max_tokens`` (it is
+        ``max_completion_tokens`` there, which every OpenAI chat model
+        takes) and refuse ``temperature`` unless they are not thinking
+        (``reasoning_effort: none``). Models.dev marks the models that never
+        take it; a model that refused it once is asked without it."""
+        body: dict[str, Any] = {}
+        if self.provider_name == "openai":
+            body["max_completion_tokens"] = max_tokens
+        else:
+            body["max_tokens"] = max_tokens
+        if self._takes_temperature(model, thinking):
+            body["temperature"] = temperature
+        return body
+
+    def _takes_temperature(self, model: str, thinking: dict[str, Any]) -> bool:
+        if model in _TEMPERATURE_REFUSED_MODELS:
+            return False
+        if self.provider_name not in _THINKING_BODY_PROVIDERS:
+            return True
+        from flowly.integrations.model_catalog import cached_model
+
+        row = cached_model(self.provider_name, model)
+        if row is None:
+            return True
+        if row.takes_temperature is False:
+            return False
+        if self.provider_name == "openai" and row.efforts:
+            return thinking.get("reasoning_effort") == "none"
+        return True
 
     def _reasoning_field(self, model: str, reasoning: bool | None) -> dict[str, Any] | None:
         """The ``reasoning`` body field a request carries, if any: OpenRouter's
@@ -383,10 +506,41 @@ class OpenRouterProvider(LLMProvider):
             return None
         return {"effort": effort}
 
+    def _relax_refused(self, model: str, kwargs: dict[str, Any], thinking: dict[str, Any], exc: Exception) -> bool:
+        """Take out of ``kwargs`` what the backend refused in ``exc`` —
+        ``temperature``, or the thinking fields — and remember it for
+        ``model``. False when the refusal is about neither: raise it."""
+        if "temperature" in kwargs and _temperature_refused(exc):
+            _TEMPERATURE_REFUSED_MODELS.add(model)
+            logger.warning(f"[LLM] {model} refused temperature; asking again without it")
+            del kwargs["temperature"]
+            return True
+        if not thinking:
+            return False
+        field = thinking.get("reasoning") if "reasoning" in thinking else thinking
+        if not self._retry_without_reasoning(model, field, exc):
+            return False
+        extra_body = kwargs.get("extra_body") or {}
+        for key in thinking:
+            extra_body.pop(key, None)
+        thinking.clear()
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+        else:
+            kwargs.pop("extra_body", None)
+        return True
+
     def _retry_without_reasoning(self, model: str, field: object, exc: Exception) -> bool:
         """True when ``exc`` is the backend refusing ``field`` (the
-        ``reasoning`` object, or xAI's ``reasoning_effort`` as a string); the
-        model is asked without it from then on."""
+        ``reasoning`` object; xAI's ``reasoning_effort`` as a string; the
+        ``reasoning_effort`` / GLM ``thinking`` fields as a dict of them);
+        the model is asked without it from then on."""
+        if isinstance(field, dict) and ("reasoning_effort" in field or "thinking" in field):
+            if _effort_refused(exc):
+                _EFFORT_REFUSED_MODELS.add(model)
+                logger.warning(f"[LLM] {model} refused thinking fields {sorted(field)}; asking again without them")
+                return True
+            return False
         if isinstance(field, str):
             if _effort_refused(exc):
                 _EFFORT_REFUSED_MODELS.add(model)
@@ -421,13 +575,15 @@ class OpenRouterProvider(LLMProvider):
     ) -> LLMResponse:
         """Send a non-streaming chat completion request."""
         resolved_model = self._prepare_model(model)
+        if self.provider_name == "xai":
+            resolved_model, _effort = self._xai_route(resolved_model, reasoning)
         prepared_messages = self._prepare_messages(messages, resolved_model)
 
+        thinking = self._reasoning_body(resolved_model, reasoning)
         kwargs: dict[str, Any] = {
             "model": resolved_model,
             "messages": prepared_messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
+            **self._sampling_body(resolved_model, max_tokens, temperature, thinking),
         }
         if tools:
             kwargs["tools"] = tools
@@ -440,7 +596,6 @@ class OpenRouterProvider(LLMProvider):
         extra_body: dict[str, Any] = {}
         if purpose:
             extra_body["purpose"] = purpose
-        thinking = self._reasoning_body(resolved_model, reasoning)
         extra_body.update(thinking)
         if extra_body:
             kwargs["extra_body"] = extra_body
@@ -448,21 +603,16 @@ class OpenRouterProvider(LLMProvider):
         request_timeout = timeout or self.request_timeout_seconds
 
         async def create(client: AsyncOpenAI) -> Any:
-            try:
-                return await client.with_options(timeout=request_timeout).chat.completions.create(**kwargs)
-            except Exception as exc:
-                # A model that refuses the field (always thinks, or takes no
-                # effort): ask it again as it is.
-                key = next(iter(thinking), None)
-                if key is None or not self._retry_without_reasoning(resolved_model, extra_body.get(key), exc):
-                    raise
-                del extra_body[key]
-                thinking.clear()
-                if extra_body:
-                    kwargs["extra_body"] = extra_body
-                else:
-                    kwargs.pop("extra_body", None)
-                return await client.with_options(timeout=request_timeout).chat.completions.create(**kwargs)
+            # A model that refuses a field (temperature; thinking it cannot
+            # switch, or an effort it does not take) is asked again without
+            # it: at most once per field.
+            for _ in range(3):
+                try:
+                    return await client.with_options(timeout=request_timeout).chat.completions.create(**kwargs)
+                except Exception as exc:
+                    if not self._relax_refused(resolved_model, kwargs, thinking, exc):
+                        raise
+            return await client.with_options(timeout=request_timeout).chat.completions.create(**kwargs)
 
         max_attempts = self._rotator.key_count() if self._rotator else 1
         last_exc: Exception | None = None
@@ -572,13 +722,15 @@ class OpenRouterProvider(LLMProvider):
         in ``flowly/agent/loop.py:1115-1151``.
         """
         resolved_model = self._prepare_model(model)
+        if self.provider_name == "xai":
+            resolved_model, _effort = self._xai_route(resolved_model, reasoning)
         prepared_messages = self._prepare_messages(messages, resolved_model)
 
+        thinking = self._reasoning_body(resolved_model, reasoning)
         kwargs: dict[str, Any] = {
             "model": resolved_model,
             "messages": prepared_messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
+            **self._sampling_body(resolved_model, max_tokens, temperature, thinking),
             "stream": True,
             # Ensure usage metrics are emitted in the final stream chunk —
             # required for the Flowly proxy's rate-limit + credit tracking.
@@ -587,9 +739,8 @@ class OpenRouterProvider(LLMProvider):
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice
-        # The same field as chat(), with the same retry for a model that
-        # refuses it.
-        thinking = self._reasoning_body(resolved_model, reasoning)
+        # The same fields as chat(), with the same retry for a model that
+        # refuses one.
         if thinking:
             kwargs["extra_body"] = dict(thinking)
 
@@ -599,13 +750,15 @@ class OpenRouterProvider(LLMProvider):
         )
 
         try:
-            try:
-                stream = await client.chat.completions.create(**kwargs)
-            except Exception as exc:
-                key = next(iter(thinking), None)
-                if key is None or not self._retry_without_reasoning(resolved_model, thinking[key], exc):
-                    raise
-                kwargs.pop("extra_body", None)
+            stream = None
+            for _ in range(3):
+                try:
+                    stream = await client.chat.completions.create(**kwargs)
+                    break
+                except Exception as exc:
+                    if not self._relax_refused(resolved_model, kwargs, thinking, exc):
+                        raise
+            if stream is None:
                 stream = await client.chat.completions.create(**kwargs)
         except Exception as exc:
             yield self._error_response(exc)

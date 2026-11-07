@@ -19,7 +19,8 @@ description: Flowly talks to LLMs through pluggable providers — the hosted Flo
 | `groq` | BYOK `api_key` | `https://api.groq.com/openai/v1` |
 | `zhipu` | BYOK `api_key` | `https://open.bigmodel.cn/api/paas/v4` |
 | `sakana` | BYOK `api_key` | `https://api.sakana.ai/v1` (Fugu / Fugu Ultra, OpenAI-compat) |
-| `vllm` | BYOK `api_key` | none (self-hosted — you must set `apiBase`) |
+| `ollama` | Local, explicit-only (no key) | `http://127.0.0.1:11434/v1` |
+| `vllm` | Local, explicit-only (`api_key` optional) | none — self-hosted, `apiBase` required. Surfaced as "Local OpenAI-compatible" (LM Studio, vLLM, llama.cpp server, text-generation-webui, ...) |
 
 The API bases are built in; you normally only supply a key. All listed endpoints (except `xai_oauth` and `openai_codex`) speak the OpenAI Chat-Completions wire protocol. `xai_oauth` and `openai_codex` both use a Responses-API wire format instead.
 
@@ -44,14 +45,28 @@ BYOK keys go under `providers.<name>` in `~/.flowly/config.json`. On-disk keys a
 
 | Field | Purpose |
 | --- | --- |
-| `apiKey` | The provider key (whitespace-stripped). |
-| `apiBase` | Overrides the built-in base if set (required for `vllm`). |
+| `apiKey` | The provider key (whitespace-stripped). Optional for `ollama` and `vllm` — a dummy value is used when empty (local servers don't check it). |
+| `apiBase` | Overrides the built-in base if set. **Required** for `vllm` (no default across LM Studio/vLLM/llama.cpp); optional for `ollama` (defaults to `http://127.0.0.1:11434/v1`). |
 | `fallbackKeys` | Extra keys for rotation (see below). |
 
 You can enter a BYOK key via the setup wizard:
 
 ```bash
 flowly setup byok <slot> --key <...>
+```
+
+For local models, use the dedicated setup commands instead of `byok` — both are
+**explicit-only** (see [Switching providers](#switching-providers-and-models-at-runtime)):
+
+```bash
+# Ollama — has its own default port, no API key
+ollama serve
+flowly setup ollama --model gemma4
+
+# Any other OpenAI-compatible server — LM Studio, vLLM, llama.cpp server,
+# text-generation-webui, koboldcpp, ... — api_base is required since there's
+# no single default port to guess across them
+flowly setup local --api-base http://localhost:1234/v1 --model qwen3-8b
 ```
 
 ## Flowly hosted
@@ -111,9 +126,11 @@ The active provider is resolved in this priority order:
 
 1. `providers.active`, if that provider is currently usable (sticky; falls through if not).
 2. `flowly` hosted, if enabled and signed in.
-3. The BYOK cascade — first usable of `openrouter`, `anthropic`, `openai`, `openai_codex`, `zai_coding`, `xai`, `xai_oauth`, `gemini`, `groq`, `zhipu`, `sakana`, `vllm`.
+3. The BYOK cascade — first usable of `openrouter`, `anthropic`, `openai`, `openai_codex`, `zai_coding`, `xai`, `xai_oauth`, `gemini`, `groq`, `zhipu`, `sakana`.
 
 Because `openai_codex` and `zai_coding` can read a login you made in another tool (the Codex CLI, OpenCode), the cascade may find a provider you never configured in Flowly. `flowly setup` surfaces that as a choice rather than using it silently, and picking anything writes `providers.active` — after which the cascade no longer applies.
+
+`ollama` and `vllm` (local OpenAI-compatible) are **explicit-only** — neither is ever in the cascade above, even once configured. A local server's availability isn't implied by a saved config value the way a cloud API key is (it may be offline, or the config may be a leftover from a server you aren't running anymore), so Flowly never auto-selects one. Choose it with `flowly setup ollama` / `flowly setup local`, or `/provider ollama` / `/provider local`. (The generic local slot is keyed `vllm` on disk for historical reasons; `/provider local` and `/provider vllm` both work.)
 
 Switch live from the TUI:
 
@@ -193,10 +210,15 @@ Flowly builds the model picker from a live catalog — each provider's own `/mod
 | `xai_oauth` | Live `GET /v1/models` with the OAuth token. |
 | `openai_codex` | Live authenticated `GET /models` from the ChatGPT Codex backend, filtered to picker-visible entries and kept in server priority order. Falls back to a curated list on network/schema failure; only shown once signed in. |
 | `anthropic`, `openai`, `gemini`, `groq`, `zhipu` | The [models.dev](https://models.dev) community catalogue — cached locally, filtered to tool-capable models (no per-provider fetcher needed). |
-| `sakana`, `vllm` | No catalog — set the model id directly. |
+| `ollama` | Live `GET /v1/models` from the configured local endpoint. |
+| `vllm` | Live `GET {apiBase}/models` from the configured local endpoint (LM Studio, vLLM, llama.cpp server, ...) — empty until `apiBase` is set. |
+| `sakana` | No catalog — set the model id directly. |
 
 > [!NOTE]
-> Only `sakana` and `vllm` have nothing for the `/model` picker to enumerate; for those, set the model id directly with `/model <id>`.
+> `ollama` and `vllm` build the picker from whatever the local server currently has loaded — not a fixed list — so it changes as you load/unload models on the server.
+
+> [!NOTE]
+> Only `sakana` has nothing for the `/model` picker to enumerate; set the model id directly with `/model <id>`. (`vllm` enumerates too, once `apiBase` points at a reachable server.)
 
 ## Related
 

@@ -261,6 +261,25 @@ def present_provider_error(response: "LLMResponse") -> ProviderErrorPresentation
             retryable=False,
             category=category,
         )
+    info = getattr(response, "error_info", None)
+    if (
+        category == ErrorCategory.INPUT_TOO_LARGE
+        and info is not None
+        and info.code == "context_window_too_small"
+        and info.context_window and info.fixed_overhead and info.required_context
+    ):
+        return ProviderErrorPresentation(
+            code="MODEL_CONTEXT_WINDOW_TOO_SMALL",
+            title="This model's context is too small for your agent",
+            message=(
+                f"The model runs with {info.context_window:,} tokens of context, and your "
+                f"agent's instructions and tools alone take about {info.fixed_overhead:,}. "
+                f"Load the model with at least {info.required_context:,} tokens of context, "
+                "or choose another model."
+            ),
+            retryable=False,
+            category=category,
+        )
     if category == ErrorCategory.INPUT_TOO_LARGE:
         return ProviderErrorPresentation(
             code="MODEL_INPUT_LIMIT_EXCEEDED",

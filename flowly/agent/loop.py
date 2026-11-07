@@ -15,7 +15,7 @@ from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Iterable
 
 from collections import OrderedDict
 from loguru import logger
@@ -74,9 +74,12 @@ from flowly.compaction.pruning import (
 )
 from flowly.compaction.request_guard import (
     ProviderRequestCoordinator,
+    RequestFit,
     request_fingerprint,
     request_too_large_response,
+    unfit_response,
 )
+from flowly.integrations.local_window import LocalWindowSync
 from flowly.compaction.types import (
     CompactionConfig,
     CompactionError,
@@ -1018,6 +1021,19 @@ def _turn_user_extras(metadata: dict) -> dict[str, Any]:
     if not isinstance(extras, dict) or extras.get("origin") != "voice" or not isinstance(extras.get("voiceCallId"), str):
         return {}
     return {"origin": "voice", "voiceCallId": extras["voiceCallId"][:128]}
+
+
+def _local_window_sync(loop: object) -> LocalWindowSync:
+    """The loop's local-server context check, made on first use (lightweight
+    harnesses build loops without ``__init__``)."""
+    sync = getattr(loop, "_local_window", None)
+    if sync is None:
+        sync = LocalWindowSync()
+        try:
+            setattr(loop, "_local_window", sync)
+        except AttributeError:
+            pass
+    return sync
 
 class AgentLoop:
     """
@@ -4804,10 +4820,12 @@ class AgentLoop:
         *,
         intent_text: str = "",
         semantic_promoted_tools: tuple[str, ...] | None = None,
+        pinned_tools: Iterable[str] = (),
     ):
         """Compact one already-routed tool surface without losing reachability."""
         from flowly.agent.tools.discovery import (
             DEFAULT_ALWAYS_VISIBLE_TOOLS,
+            DEFAULT_DEFERRED_TOOLS,
             DEFAULT_DEFERRED_TOOLSETS,
             build_tool_disclosure,
         )
@@ -4830,6 +4848,12 @@ class AgentLoop:
             always_visible_tools=getattr(
                 discovery_cfg, "always_visible_tools", DEFAULT_ALWAYS_VISIBLE_TOOLS
             ),
+            deferred_tools=(
+                DEFAULT_DEFERRED_TOOLS
+                if getattr(discovery_cfg, "deferred_tools", None) is None
+                else discovery_cfg.deferred_tools
+            ),
+            pinned_tools=pinned_tools,
             minimum_deferred_schema_tokens=int(getattr(
                 discovery_cfg, "minimum_deferred_schema_tokens", 750
             )),
@@ -5089,6 +5113,7 @@ class AgentLoop:
         *,
         disabled_tools: list[str] | set[str] | None = None,
         intent_text: str = "",
+        pinned_tools: Iterable[str] = (),
     ):
         """Return the compact model surface and its full reachable catalog."""
         return self._build_tool_disclosure(
@@ -5097,7 +5122,252 @@ class AgentLoop:
                 disabled_tools=disabled_tools,
             ),
             intent_text=intent_text,
+            pinned_tools=pinned_tools,
         )
+
+    # ── tools a session keeps direct ─────────────────────────────────────
+    #
+    # A deferred tool a session promoted or used stays direct for the rest of
+    # that session: the tool list then only ever grows within a session, so it
+    # changes the provider's prompt cache (and a local server's KV cache) once
+    # per newly needed tool instead of flipping back every turn.
+
+    _SESSION_PINS_LIMIT = 512
+
+    def _session_pins(self, session_key: str) -> frozenset[str]:
+        pins = getattr(self, "_session_tool_pins", None)
+        if not session_key or pins is None:
+            return frozenset()
+        return frozenset(pins.get(session_key, ()))
+
+    def _pin_for_session(self, session_key: str, names: Iterable[str]) -> None:
+        names = {str(name).strip() for name in names if str(name).strip()}
+        if not session_key or not names:
+            return
+        pins = getattr(self, "_session_tool_pins", None)
+        if pins is None:
+            pins = self._session_tool_pins = OrderedDict()
+        current = pins.pop(session_key, set())
+        current |= names
+        pins[session_key] = current
+        while len(pins) > self._SESSION_PINS_LIMIT:
+            pins.popitem(last=False)
+
+    # ── warming a local server's cache ───────────────────────────────────
+    #
+    # A model on this computer reads the agent's fixed prompt (instructions and
+    # tool schemas, ~35K tokens) before it can answer, at ~600-1000 tokens/s on
+    # a laptop: a minute or more for the first message after the gateway
+    # starts or the model changes. Every later request reuses what the server
+    # cached. Warming sends that prompt once, built exactly as a fresh turn
+    # builds it, asking for one token, so the first message finds it cached.
+
+    #: The message a warm-up asks with; only the prompt before it matters.
+    _WARM_MESSAGE = "hi"
+    #: How long the MCP catalog may take to join before warming anyway.
+    _WARM_MCP_WAIT_SECONDS = 60.0
+
+    def _warms_prompt_cache(self) -> bool:
+        from flowly.integrations.active_provider import is_local_endpoint
+
+        provider = self.provider
+        return (
+            getattr(provider, "provider_name", "") in ("ollama", "vllm")
+            and is_local_endpoint(getattr(provider, "api_base", None))
+        )
+
+    #: The longest a request waits for a warm-up; past it, the warm-up stops.
+    #: Above the local request timeout (600 s), which already ends a warm-up
+    #: that hangs: a slow one is still worth waiting for (a 27B model read the
+    #: prompt at ~96 tokens/s on a laptop, 2026-11-07, about six minutes), as
+    #: the request would read the same prompt anyway.
+    _WARM_WAIT_SECONDS = 660.0
+
+    async def _await_prompt_warm(self, run_id: str = "") -> None:
+        """Wait for a warm-up in flight before a real request.
+
+        Seen on LM Studio (2026-11-06): cancelling the warm-up for the request
+        did not hand its partly read prompt over. The server releases the
+        cancelled slot a second or two later, after it has already placed
+        the new request in an empty slot, so the request read everything again.
+        The warm-up reads the same prompt the request needs; waiting costs only
+        what the request would read anyway, then the request finds it cached.
+        Stopped by the owner, the request stops waiting (the warm-up goes on)."""
+        task = getattr(self, "_prompt_warm_task", None)
+        if task is None or task.done():
+            return
+        if not getattr(self, "_prompt_warm_reading", False):
+            # Waiting to try again (the server was unreachable): this request
+            # reads the prompt itself, and caches it on the way.
+            task.cancel()
+            return
+        logger.info("[warm] a request is waiting for the warm-up to finish")
+        started = time.monotonic()
+        while not task.done():
+            if run_id and self.is_run_aborted(run_id):
+                return
+            if time.monotonic() - started > self._WARM_WAIT_SECONDS:
+                task.cancel()
+                logger.info("[warm] took too long; stopped for the request")
+                return
+            await asyncio.wait({task}, timeout=0.5)
+
+    def schedule_prompt_warm(self, reason: str, *, channel: str | None = None) -> asyncio.Task | None:
+        """Warm the local server's cache in the background, once at a time;
+        nothing for a model that is not on this computer."""
+        if not self._warms_prompt_cache():
+            return None
+        task = getattr(self, "_prompt_warm_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+        self._prompt_warm_task = asyncio.get_running_loop().create_task(
+            self._warm_prompt_cache(reason, channel=channel))
+        return self._prompt_warm_task
+
+    def _turn_route_path(self) -> Path:
+        return self._state_dir / "warm-route.json"
+
+    def _remember_turn_route(self, channel: str | None, disabled_tools: Any) -> None:
+        """Keep the route of the latest real turn (its channel and the tools it
+        switched off; names only), so a warm-up builds the same tool list and
+        prompt the next turn will. Written only when it changes."""
+        route = {
+            "channel": str(channel or "web"),
+            "disabled": sorted({str(name) for name in disabled_tools or () if isinstance(name, str)}),
+        }
+        if route == getattr(self, "_last_turn_route", None):
+            return
+        self._last_turn_route = route
+        if not self._warms_prompt_cache():
+            return
+        try:
+            path = self._turn_route_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(route), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+    def _warm_route(self, channel: str | None) -> tuple[str, list[str]]:
+        """The route a warm-up builds: the latest real turn's (in memory, else
+        as the last run left it), else a fresh conversation's own."""
+        route = getattr(self, "_last_turn_route", None)
+        if route is None:
+            try:
+                route = json.loads(self._turn_route_path().read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                route = None
+        if isinstance(route, dict) and isinstance(route.get("disabled"), list):
+            return str(route.get("channel") or channel or "web"), [str(n) for n in route["disabled"]]
+        from flowly.agent_home import SETUP_TOOLS
+
+        return channel or "web", sorted((SETUP_TOOLS & set(self.tools.tool_names)) | {"message_profile"})
+
+    #: Seconds before each new try while the server cannot be reached (it is
+    #: often started after the gateway): about eight minutes in all.
+    _WARM_RETRY_DELAYS: tuple[float, ...] = (15.0, 30.0, 60.0, 120.0, 240.0)
+
+    async def _warm_prompt_cache(self, reason: str, *, channel: str | None = None) -> bool:
+        """Warm once; while the server cannot be reached, try again later."""
+        for delay in (0.0, *self._WARM_RETRY_DELAYS):
+            if delay:
+                await asyncio.sleep(delay)
+            outcome = await self._warm_prompt_cache_once(reason, channel=channel)
+            if outcome != "unreachable":
+                return outcome == "cached"
+        logger.info("[warm] the server stayed unreachable ({}); giving up", reason)
+        return False
+
+    async def _warm_prompt_cache_once(self, reason: str, *, channel: str | None = None) -> str:
+        """``cached``, ``refused`` (the server answered with an error: no use
+        trying again) or ``unreachable``."""
+        started = time.monotonic()
+        try:
+            if self.mcp_discovery_pending:
+                await asyncio.to_thread(self.wait_for_mcp_discovery, self._WARM_MCP_WAIT_SECONDS)
+            channel, disabled = self._warm_route(channel)
+            disclosure = self._routed_tool_disclosure(
+                channel, disabled_tools=disabled, intent_text=self._WARM_MESSAGE)
+            visible = {
+                str(item.get("function", {}).get("name", ""))
+                for item in disclosure.definitions
+            }
+            messages = self.context.build_messages(
+                history=[],
+                current_message=self._WARM_MESSAGE,
+                memory_search_enabled=self._memory_manager is not None,
+                model=self.model,
+                channel=channel,
+                available_tools=visible,
+                reachable_tools=set(disclosure.all_names),
+            )
+            # The server must run the model with the window a turn needs
+            # first, as a turn would check (local_window.py). Otherwise the
+            # first turn reloads it and the warm cache is lost (LM Studio,
+            # 2026-11-06 23:11: warmed at 64K, then reloaded at 96K by the
+            # turn). This also loads a model the server holds at 8K, or
+            # has unloaded, with enough.
+            reserve = int(getattr(getattr(self.compaction, "config", None), "reserve_tokens_floor", 20_000) or 20_000)
+            await _local_window_sync(self).before_request(self.provider, self.model, reserve=reserve, force=True)
+            self._prompt_warm_reading = True
+            try:
+                response = await self.provider.chat(
+                    messages=messages,
+                    tools=list(disclosure.definitions) or None,
+                    model=self.model,
+                    max_tokens=1,
+                )
+            finally:
+                self._prompt_warm_reading = False
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - an optimisation, never an error
+            logger.info("[warm] server unreachable ({}): {}", reason, type(exc).__name__)
+            return "unreachable"
+        if response.finish_reason == "error":
+            info = response.error_info
+            if info is None or info.status_code is None:
+                # No HTTP answer at all: the server is not up (yet).
+                logger.info("[warm] server unreachable ({}); trying again later", reason)
+                return "unreachable"
+            logger.info("[warm] the server refused ({}): {}", reason, (response.content or "")[:160])
+            return "refused"
+        logger.info(
+            "[warm] {} has the agent's prompt cached ({}, {:.1f}s)",
+            self.model, reason, time.monotonic() - started,
+        )
+        return "cached"
+
+    @staticmethod
+    def _turn_playbook_pins(text: str) -> frozenset[str]:
+        """The playbook tools this message asks for, before its messages are
+        built (the turn's first estimate); each request then reads the exact
+        routing from its own messages (``_playbook_pins``)."""
+        try:
+            from flowly.agent.capability_guidance import route_capability_guidance
+
+            decision = route_capability_guidance(
+                text or "", history=[], available_tools={"computer", "browser_tab"})
+        except Exception:  # noqa: BLE001 - a pin is an optimisation, never a gate
+            return frozenset()
+        return AgentLoop._playbook_pins([{"role": "system", "_capability_guidance": sorted(decision.active)}])
+
+    @staticmethod
+    def _playbook_pins(messages: list[dict[str, Any]]) -> frozenset[str]:
+        """The tools of the capability playbooks routed into this request
+        (context.build_messages marks them on its guidance message), so a
+        playbook and its tool always arrive together."""
+        active: set[str] = set()
+        for message in messages[:3]:
+            if isinstance(message, dict) and message.get("role") == "system":
+                active.update(message.get("_capability_guidance") or ())
+        pins: set[str] = set()
+        if "computer" in active:
+            pins.update(("computer", "screenshot"))
+        if "browser" in active:
+            pins.update(("browser_tab", "browser_plan"))
+        return frozenset(pins)
 
     def _extract_action_intent_text(self, content: str) -> str:
         """
@@ -5774,14 +6044,29 @@ class AgentLoop:
         def cancelled() -> bool:
             return bool(run_id) and self.is_run_aborted(run_id)
 
-        try:
-            fitted = await coordinator.fit(
+        # A local model server's real context, current before the request is
+        # sized (flowly/integrations/local_window.py): a no-op elsewhere.
+        local_window = _local_window_sync(self)
+        reserve = int(getattr(getattr(self.compaction, "config", None), "reserve_tokens_floor", 20_000) or 20_000)
+        await local_window.before_request(self.provider, model, reserve=reserve)
+
+        async def fit_request() -> RequestFit:
+            return await coordinator.fit(
                 messages,
                 tools,
                 model,
                 session_key=session_key,
                 should_cancel=cancelled,
             )
+
+        try:
+            fitted = await fit_request()
+            if not fitted.fits and fitted.before.compactable_budget <= 0:
+                # The window cannot hold even the fixed overhead. On a local
+                # server that may be stale (the model reloaded with more, or
+                # unloaded): ask it now, and size the request again once.
+                if await local_window.before_request(self.provider, model, reserve=reserve, force=True):
+                    fitted = await fit_request()
         except Exception as exc:  # noqa: BLE001 — preflight must fail closed
             logger.error("Provider request fitting failed: {}", exc)
             return self._request_too_large_response(str(exc)), messages
@@ -5792,10 +6077,7 @@ class AgentLoop:
                 usage={},
             ), messages
         if not fitted.fits:
-            return (
-                self._request_too_large_response(fitted.failure or "request does not fit"),
-                messages,
-            )
+            return unfit_response(fitted, self.compaction, model), messages
         working = fitted.messages
         if fitted.changed:
             logger.info(
@@ -6114,6 +6396,9 @@ class AgentLoop:
         mutate the durable turn delta. Ephemeral model nudges are intentionally
         excluded.
         """
+        # A warm-up in flight is reading this very prompt: let it finish and
+        # use its cache rather than read the same prompt again beside it.
+        await self._await_prompt_warm(outbound_run_id)
         iteration = 0
         from flowly.agent.tools.discovery import annotate_search_repetition
         _tool_search_result_sets: dict[tuple[str, ...], int] = {}
@@ -6553,9 +6838,13 @@ class AgentLoop:
             # Build the deterministic/lossless view first. Small external
             # catalogs remain eager, so they should not initialize or download
             # a semantic model that cannot save any schema tokens.
+            # What this session already promoted or used, and the tools of
+            # the playbooks routed into this request, stay direct.
+            iteration_pins = self._session_pins(session_key) | self._playbook_pins(messages)
             disclosure = self._build_tool_disclosure(
                 tool_defs,
                 intent_text=turn_content,
+                pinned_tools=iteration_pins,
             )
             semantic_decision = None
             if disclosure.enabled:
@@ -6572,7 +6861,9 @@ class AgentLoop:
                     tool_defs,
                     intent_text=turn_content,
                     semantic_promoted_tools=semantic_promotions,
+                    pinned_tools=iteration_pins,
                 )
+            self._pin_for_session(session_key, disclosure.promoted_names)
             tool_defs = list(disclosure.definitions)
             if disabled_tools:
                 disabled_set = set(disabled_tools)
@@ -7187,12 +7478,27 @@ class AgentLoop:
                         _protocol_tool_name == "tool_call"
                         and _effective_tool_name in disclosure.external
                     )
+                    if _is_advertised_external:
+                        # Used through the bridge: direct from the next step on.
+                        self._pin_for_session(session_key, (_effective_tool_name,))
                     if not (_is_advertised_direct or _is_advertised_external):
                         blocked_tools.append(_effective_tool_name)
-                        result = (
-                            f"Error: Tool '{_effective_tool_name}' is unavailable for "
-                            f"platform '{tool_platform or outbound_channel or 'unknown'}'."
-                        )
+                        if _effective_tool_name in disclosure.deferred:
+                            # A real tool behind the bridge, called without its
+                            # schema: still not run (its arguments were guessed),
+                            # but its full schema is direct from the next step.
+                            self._pin_for_session(session_key, (_effective_tool_name,))
+                            result = (
+                                f"Error: Tool '{_effective_tool_name}' is unavailable as a "
+                                "direct call in this step: its schema was behind tool "
+                                "search. Its full schema is visible from the next step; "
+                                "call it again with arguments that match it."
+                            )
+                        else:
+                            result = (
+                                f"Error: Tool '{_effective_tool_name}' is unavailable for "
+                                f"platform '{tool_platform or outbound_channel or 'unknown'}'."
+                            )
                         logger.warning(
                             "Tool routing blocked unadvertised call: {} platform={}",
                             _effective_tool_name,
@@ -8036,6 +8342,7 @@ class AgentLoop:
                 if flush_coverage
                 else user_prompt
             ),
+            intent_text=user_prompt,
             model=self.model,
             channel=channel,
             available_tools=available_tools,
@@ -9183,11 +9490,13 @@ class AgentLoop:
             if "message_profile" not in disabled_tools:
                 disabled_tools.append("message_profile")
             msg.metadata["disabled_tools"] = disabled_tools
+        self._remember_turn_route(msg.channel, disabled_tools)
         turn_disclosure = (
             self._routed_tool_disclosure(
                 msg.channel,
                 disabled_tools=disabled_tools,
                 intent_text=msg.content,
+                pinned_tools=self._session_pins(msg.session_key) | self._turn_playbook_pins(msg.content),
             )
             if tools_allowed
             else self._build_tool_disclosure([], intent_text=msg.content)
@@ -9380,6 +9689,7 @@ class AgentLoop:
             preview_messages = self.context.build_messages(
                 history=history,
                 current_message=llm_current_message,
+                intent_text=msg.content,
                 memory_search_enabled=self._memory_manager is not None,
                 skip_memory=skip_memory_flag,
                 skip_context_files=skip_context_files_flag,
@@ -9624,6 +9934,7 @@ class AgentLoop:
         messages = self.context.build_messages(
             history=history,
             current_message=llm_current_message,
+            intent_text=msg.content,
             media=msg.media if msg.media else None,
             memory_search_enabled=self._memory_manager is not None,
             skip_memory=skip_memory_flag,
@@ -10132,6 +10443,7 @@ class AgentLoop:
             current_message="\n\n".join(
                 block for block in (turn_clock(), announce_coverage, msg.content) if block
             ),
+            intent_text=msg.content,
             memory_search_enabled=self._memory_manager is not None,
             model=self.model,
             channel=origin_channel,

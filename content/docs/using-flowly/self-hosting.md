@@ -24,9 +24,17 @@ Pick any provider — OpenRouter, Anthropic, OpenAI, Gemini, Groq, xAI/Grok, Zhi
 
 ```bash
 flowly setup byok openrouter --key sk-or-...
+flowly setup ollama --model gemma4                              # local Ollama, no API key
+flowly setup local --api-base http://localhost:1234/v1 --model qwen3-8b  # LM Studio, vLLM, llama.cpp, ...
 # or run the full wizard (provider + channels + tools)
 flowly setup
 ```
+
+`ollama` and `local` are both explicit-only: Flowly never auto-selects a local
+server just because one is configured — you opt in with `--set-active` (the
+default) or by picking it from `/provider`. `local` targets any other
+OpenAI-compatible server (LM Studio's default port is 1234, vLLM's is 8000);
+use `ollama` specifically for Ollama, which needs no `--api-base`.
 
 This writes `~/.flowly/config.json`. Keys there are **camelCase**:
 

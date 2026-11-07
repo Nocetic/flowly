@@ -1412,6 +1412,14 @@ class ContextBuilder:
             Complete system prompt.
         """
         parts = []
+        # Guidance follows what the route can reach, not what this request
+        # shows directly: a rarely used tool waiting behind the bridge keeps
+        # its guide, and promoting it later leaves this prompt byte-identical
+        # (the provider's prompt cache and a local server's KV cache survive).
+        # Only the bridge note itself depends on what is visible.
+        visible_tools = available_tools
+        if reachable_tools is not None:
+            available_tools = frozenset(reachable_tools) | frozenset(available_tools or ())
 
         # Core identity
         parts.append(self._get_identity(
@@ -1474,15 +1482,16 @@ class ContextBuilder:
             except Exception:
                 logger.exception("[context] channel hint render failed")
 
-        if available_tools is not None and "tool_call" in available_tools:
+        if visible_tools is not None and "tool_call" in visible_tools:
             parts.append(
                 "# Deferred Tools\n\n"
-                "Some available tools are represented by a compact catalog instead of "
-                "their full schemas. External tools may be called directly when visible "
-                "or through `tool_call`. `tool_search` is available when an exact tool or "
-                "schema is unclear; it searches all route-enabled external tools and "
-                "reports complete input schemas plus valid invocation options. Deferred "
-                "tools keep the same permissions and safety rules as direct tools."
+                "Some available tools (rarely used built-ins and connected external "
+                "sources) are represented by a compact catalog instead of their full "
+                "schemas. Call one through `tool_call`; its full schema is shown "
+                "directly from the next step on. `tool_search` is available when an "
+                "exact tool or schema is unclear; it reports complete input schemas "
+                "plus valid invocation options. Deferred tools keep the same "
+                "permissions and safety rules as direct tools."
             )
 
         # P3.1 — Platform-aware command cheatsheet. Detects the live OS
@@ -2215,9 +2224,15 @@ When in doubt, ASK FIRST. A wrong action can't be undone.""")
         session_key: str | None = None,
         available_tools: set[str] | frozenset[str] | None = None,
         reachable_tools: set[str] | frozenset[str] | None = None,
+        intent_text: str | None = None,
     ) -> list[dict[str, Any]]:
         """
         Build the complete message list for an LLM call.
+
+        ``intent_text`` is the owner's own words, when ``current_message``
+        also carries what Flowly adds to a turn (the turn clock, notes, group
+        context): playbooks and relevant skills are chosen from it, never from
+        those additions.
 
         Args:
             history: Previous conversation messages.
@@ -2262,7 +2277,7 @@ When in doubt, ASK FIRST. A wrong action can't be undone.""")
         if defer_dynamic_guidance:
             dynamic_message = self._build_dynamic_guidance_message(
                 history=history,
-                current_message=current_message,
+                current_message=current_message if intent_text is None else intent_text,
                 skill_names=skill_names,
                 available_tools=available_tools,
                 reachable_tools=reachable_tools,
@@ -2302,7 +2317,9 @@ When in doubt, ASK FIRST. A wrong action can't be undone.""")
             route_capability_guidance,
         )
 
-        routed_tools = set(available_tools or ())
+        # A playbook follows what the route can reach: its tool is pinned
+        # direct for the request that carries it (AgentLoop._playbook_pins).
+        routed_tools = set(available_tools or ()) | set(reachable_tools or ())
         try:
             decision = route_capability_guidance(
                 current_message=current_message,

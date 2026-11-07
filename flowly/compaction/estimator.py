@@ -104,7 +104,8 @@ def estimate_message_tokens(message: dict[str, Any]) -> int:
                 tokens += estimate_tokens(func.get("arguments", ""))
                 tokens += oh["tool_call"]
 
-    # Stateless Responses requests replay encrypted reasoning/output items.
+    # Stateless Responses requests replay encrypted reasoning/output items,
+    # and Anthropic requests their thinking blocks.
     # Count their actual wire strings conservatively so a long reasoning chain
     # cannot make the request materially larger than the local budget reports.
     replay = message.get(PROVIDER_REPLAY_KEY)
@@ -116,6 +117,10 @@ def estimate_message_tokens(message: dict[str, Any]) -> int:
             encrypted = item.get("encrypted_content")
             if isinstance(encrypted, str):
                 tokens += estimate_tokens(encrypted)
+            # Anthropic thinking blocks sent back with the message.
+            thinking = item.get("thinking")
+            if isinstance(thinking, str):
+                tokens += estimate_tokens(thinking)
             summary = item.get("summary")
             if isinstance(summary, list):
                 for part in summary:

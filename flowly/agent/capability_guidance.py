@@ -47,6 +47,14 @@ _CONTINUATION_RE = re.compile(
 # Deliberately specific.  Generic words such as "web", "search", "page" or
 # Turkish "ara" belong to web_search as often as they belong to a visible
 # browser and would make greetings/research turns pay the browser playbook.
+#
+# Turkish nouns take case endings ("tarayıcıda", "ekranda", "pencereden"); a
+# bare ``\btarayıcı\b`` missed them, so those turns fell to the ambiguous rule
+# and paid both playbooks. The UI nouns below therefore accept any ending
+# (``\w*``). "masaüstü" does not: "masaüstüne / masaüstündeki" almost always
+# means the Desktop folder (file work), not the screen.
+_TR = r"\w*"
+
 _BROWSER_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -57,7 +65,7 @@ _BROWSER_PATTERNS = tuple(
         r"\bhttps?://",
         r"\b(?:open|visit|navigate to|go to)\s+(?:the\s+)?(?:site|website|url)\b",
         r"\b(?:click|fill|type|select|drag|upload)\b.{0,80}\b(?:site|website|browser|tab)\b",
-        r"\b(?:tarayıcı|sekme|internet sitesi|web sitesi)\b",
+        rf"\b(?:tarayıcı|sekme|internet site|web site){_TR}\b",
         r"\bsiteye\s+(?:gir|git|aç)\b",
         r"\b(?:tıkla|doldur|yaz|seç|sürükle|yükle)\b.{0,80}\b(?:site|tarayıcı|sekme)\b",
         r"\b(?:google sheets|google docs|notion|figma)\b",
@@ -72,7 +80,8 @@ _COMPUTER_PATTERNS = tuple(
         r"\b(?:desktop|screen|mouse|cursor|keyboard|window|menu bar|dock)\b",
         r"\b(?:click|double[- ]click|right[- ]click|drag|scroll|type|press)\b.{0,80}\b(?:app|window|screen|button|menu|dialog)\b",
         r"\b(?:open|close|quit|launch|switch to)\b.{0,60}\b(?:app|application)\b",
-        r"\b(?:ekran|fare|imleç|klavye|pencere|masaüstü|menü çubuğu)\b",
+        rf"\b(?:ekran|imle[çc]|klavye|pencere|menü çubu[ğg]){_TR}\b",
+        r"\b(?:fare|masaüstü)\b",
         r"\b(?:tıkla|çift tıkla|sağ tıkla|sürükle|kaydır|tuşuna bas)\b",
         r"\b(?:uygulamayı|programı|pencereyi)\s+(?:aç|kapat|değiştir)\b",
         r"\b(?:finder|terminal|system settings|sistem ayarları|preview|textedit)\b",
@@ -92,7 +101,18 @@ _AMBIGUOUS_UI_ACTION_RE = re.compile(
 )
 
 
+# Text Flowly itself puts in a user message (the turn clock says "on the
+# agent's computer"): never the owner's intent. Routing on it sent the computer
+# playbook with every turn.
+_SIDECAR_RE = re.compile(r"<turn_time>.*?</turn_time>", re.DOTALL | re.IGNORECASE)
+
+
+def _owner_text(text: str) -> str:
+    return _SIDECAR_RE.sub(" ", text or "")
+
+
 def _matches_any(text: str, patterns: Iterable[re.Pattern[str]]) -> bool:
+    text = _owner_text(text)
     return any(pattern.search(text) for pattern in patterns)
 
 
@@ -212,7 +232,7 @@ def route_capability_guidance(
             reason="no routed UI capability tools",
         )
 
-    text = current_message or ""
+    text = _owner_text(current_message or "")
     browser_match = (
         BROWSER_CAPABILITY in available_capabilities
         and _matches_any(text, _BROWSER_PATTERNS)

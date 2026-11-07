@@ -34,10 +34,13 @@ from flowly.providers.effort import (
     FREE_PLAN_EFFORT_CAP,
     above_cap,
     anthropic_efforts,
+    anthropic_thinking,
     normalize_effort,
     openrouter_efforts,
     ordered_efforts,
     xai_efforts,
+    xai_twin,
+    XAI_SWITCH_LEVELS,
 )
 from flowly.providers.service_tier import ServiceTier, parse_service_tiers
 
@@ -70,6 +73,12 @@ class Model:
     # Whether the model thinks when no level is sent; False (an OpenRouter row's
     # ``default_enabled: false``) shows thinking off until the agent picks a level.
     default_thinking: bool = True
+    # Only on and off (effort.SWITCH_LEVELS): the ``high`` in ``efforts`` means
+    # "on" and the request carries no level (effort.thinking_body).
+    thinking_switch_only: bool = False
+    # Whether the model takes ``temperature``; False (models.dev, reasoning
+    # models) means a request carrying it is refused. None: not known.
+    takes_temperature: bool | None = None
     # Faster tiers the model offers (flowly/providers/service_tier.py); empty:
     # standard speed only, no Fast switch.
     service_tiers: list[ServiceTier] = dc_field(default_factory=list)
@@ -88,7 +97,35 @@ _UA = "flowly-tui/model-catalog"
 
 # Session cache: provider_key → list[Model]. Cleared on flush_cache().
 _CACHE: dict[str, list[Model]] = {}
+# The context a local model server runs a model with now (model id → tokens),
+# kept current between turns (flowly/integrations/local_window.py). It
+# outranks the catalogue, which was read once and goes stale when the owner
+# reloads the model with another context.
+_RUNTIME_WINDOWS: dict[str, int] = {}
 _FLOWLY_POLICY: FlowlyModelPolicy | None = None
+
+
+#: A model server on the owner's computer (or their own vLLM): its models
+#: change whenever the owner downloads or deletes one, and asking it is cheap.
+#: Its list is read again after this long (2026-11-07: a model deleted in LM
+#: Studio stayed in the picker for as long as the gateway ran).
+LOCAL_CATALOGUE_TTL_SECONDS = 10.0
+_LOCAL_CATALOGUES = frozenset({"ollama", "vllm"})
+_CACHED_AT: dict[str, float] = {}
+
+
+def _now() -> float:
+    import time
+
+    return time.monotonic()
+
+
+def _cache_is_current(provider_key: str) -> bool:
+    if provider_key not in _CACHE:
+        return False
+    if provider_key not in _LOCAL_CATALOGUES:
+        return True
+    return _now() - _CACHED_AT.get(provider_key, float("-inf")) < LOCAL_CATALOGUE_TTL_SECONDS
 
 
 async def fetch_models(provider_key: str, *, force_refresh: bool = False) -> list[Model]:
@@ -99,7 +136,7 @@ async def fetch_models(provider_key: str, *, force_refresh: bool = False) -> lis
     programmer error (unknown key with no fallback); network failures
     are swallowed and reported as an empty list.
     """
-    if not force_refresh and provider_key in _CACHE:
+    if not force_refresh and _cache_is_current(provider_key):
         return _CACHE[provider_key]
     fetcher = _FETCHERS.get(provider_key)
     if fetcher is None:
@@ -114,12 +151,14 @@ async def fetch_models(provider_key: str, *, force_refresh: bool = False) -> lis
         if provider_key == "anthropic":
             _with_anthropic_efforts(models)
         _CACHE[provider_key] = models
+        _CACHED_AT[provider_key] = _now()
         return models
     try:
         models = await fetcher()
     except Exception:
         models = []
     _CACHE[provider_key] = models
+    _CACHED_AT[provider_key] = _now()
     return models
 
 
@@ -127,12 +166,20 @@ def flush_cache() -> None:
     """Drop every cached provider catalog. Call after credentials change."""
     global _FLOWLY_POLICY
     _CACHE.clear()
+    _CACHED_AT.clear()
+    _RUNTIME_WINDOWS.clear()
     _FLOWLY_POLICY = None
 
 
 def get_flowly_model_policy() -> FlowlyModelPolicy | None:
     """Return metadata from the latest authenticated Flowly catalog fetch."""
     return _FLOWLY_POLICY
+
+
+def cached_ids(provider_key: str) -> frozenset[str]:
+    """The model ids the cached catalogue lists for ``provider_key`` (empty
+    when it was not read): what a request may be switched to."""
+    return frozenset(model.id for model in _CACHE.get(provider_key) or [])
 
 
 def cached_efforts(provider_key: str, model_id: str) -> list[str] | None:
@@ -142,6 +189,15 @@ def cached_efforts(provider_key: str, model_id: str) -> list[str] | None:
     for model in _CACHE.get(provider_key) or ():
         if model.id == model_id:
             return list(model.efforts)
+    return None
+
+
+def cached_model(provider_key: str, model_id: str) -> Model | None:
+    """``model_id``'s row in the cached catalogue for ``provider_key``;
+    ``None`` when that catalogue is not cached or does not list it."""
+    for model in _CACHE.get(provider_key) or ():
+        if model.id == model_id:
+            return model
     return None
 
 
@@ -230,6 +286,10 @@ def _with_anthropic_efforts(models: list[Model]) -> None:
     for model in models:
         if not model.efforts:
             model.efforts, model.default_effort = anthropic_efforts(model.id)
+            # Opus 4.6 to 4.8 do not think until asked: the switch shows off.
+            rules = anthropic_thinking(model.id)
+            if rules is not None and rules.off is not None:
+                model.default_thinking = rules.thinks
 
 
 def _openrouter_efforts(item: dict[str, Any]) -> tuple[list[str], str | None, bool]:
@@ -308,12 +368,22 @@ def get_context_window(model_id: str) -> int | None:
     """
     if not model_id:
         return None
+    runtime = _RUNTIME_WINDOWS.get(model_id)
+    if runtime:
+        return runtime
     candidates = _id_candidates(model_id)
     for models in _CACHE.values():
         for m in models:
             if m.id in candidates and m.context_window:
                 return m.context_window
     return None
+
+
+def set_runtime_context_window(model_id: str, tokens: int) -> None:
+    """Record the context a local server runs ``model_id`` with now; it
+    outranks the catalogue in :func:`get_context_window`."""
+    if model_id and isinstance(tokens, int) and not isinstance(tokens, bool) and tokens > 0:
+        _RUNTIME_WINDOWS[model_id] = tokens
 
 
 def get_pricing(model_id: str) -> tuple[float | None, float | None] | None:
@@ -461,6 +531,47 @@ async def warm_cache(provider_key: str) -> None:
         await fetch_models(provider_key)
     except Exception:
         pass
+
+
+# Providers whose model id is defined by whatever the local server currently
+# serves (no cloud catalogue to validate against). Kept here rather than
+# importing the resolver's tuple to avoid a cycle (active_provider is sync).
+_LOCAL_PROVIDER_KEYS = ("ollama", "vllm")
+
+
+async def autofill_model_for_local(provider_key: str) -> str | None:
+    """Ensure the configured default model is one the local endpoint serves.
+
+    Switching to a local provider (via ``/provider``, the picker, or the
+    desktop RPC) leaves ``agents.defaults.model`` untouched — so a cloud model
+    id like ``anthropic/claude-haiku-4.5`` left over from the previous provider
+    would 404 on the first message. This queries ``/v1/models`` and, when the
+    current model isn't served, persists a served one (the CLI wizards already
+    do this at setup time; this covers the switch paths).
+
+    Returns the newly-set model id, or ``None`` when nothing changed — the
+    current model is already served, the provider isn't local, or the endpoint
+    has no models / is unreachable (in which case the switch still proceeds and
+    the user can fix the model manually).
+    """
+    if provider_key not in _LOCAL_PROVIDER_KEYS:
+        return None
+    try:
+        models = await fetch_models(provider_key, force_refresh=True)
+    except Exception:
+        models = []
+    if not models:
+        return None
+    served = {m.id for m in models}
+    from flowly.config.loader import load_config, save_config
+    cfg = load_config()
+    current = (cfg.agents.defaults.model or "").strip()
+    if current in served:
+        return None
+    new_model = models[0].id
+    cfg.agents.defaults.model = new_model
+    save_config(cfg)
+    return new_model
 
 
 # ── per-provider fetchers ──────────────────────────────────────────
@@ -735,6 +846,12 @@ def _xai_models_from_payload(data: Any) -> list[Model]:
             efforts=efforts,
             default_effort=default_effort,
         ))
+    # A reasoning model that takes no level but has its non-reasoning twin in
+    # this account's list: thinking can be switched off (to the twin).
+    listed = {m.id for m in out}
+    for row in out:
+        if not row.efforts and xai_twin(row.id) in listed:
+            row.efforts, row.default_effort = list(XAI_SWITCH_LEVELS), "high"
     # grok-4.3 first, then alphabetical.
     out.sort(key=lambda m: (0 if m.id == _XAI_TOP_MODEL else 1, m.id.lower()))
     return out
@@ -1002,10 +1119,163 @@ async def _fetch_zai_coding() -> list[Model]:
     payload = await asyncio.to_thread(load_token_payload)
     if payload is None or not payload.api_key:
         return []
-    return [
+    models = [
         Model(id=mid, name=mid, description=desc, context_window=ctx, tags=list(tags))
         for mid, desc, ctx, tags in _ZAI_CODING_MODELS
     ]
+    # The plan has no catalogue of its own; how each model thinks is models.dev's.
+    from flowly.integrations import models_dev
+
+    try:
+        await models_dev.apply_thinking_controls(models, "zai_coding")
+    except Exception:  # noqa: BLE001 - the list stands without them
+        pass
+    return models
+
+
+async def _fetch_ollama() -> list[Model]:
+    """Local Ollama models, from its native API (flowly/integrations/local_models.py).
+
+    Embedding models are left out (they cannot hold a conversation), and each
+    model's ``context_window`` is the context Ollama actually runs it with
+    when that is known: compaction then keeps the conversation inside it
+    instead of the model's trained window, which Ollama would silently cut.
+    An Ollama reached only through its OpenAI-compatible route (a proxy in
+    front of it) still lists its models, from ``/v1/models``, without them.
+    """
+    from flowly.config.loader import load_config
+    from flowly.integrations import local_models
+
+    cfg = load_config()
+    ocfg = getattr(cfg.providers, "ollama", None)
+    base = (
+        str(getattr(ocfg, "api_base", "") or "http://127.0.0.1:11434/v1")
+        .strip()
+        .rstrip("/")
+    )
+    api_key = str(getattr(ocfg, "api_key", "") or "ollama").strip() or "ollama"
+    root = base[: -len("/v1")] if base.endswith("/v1") else base
+    server = local_models.LocalServer("ollama", "Ollama", "ollama", base, root)
+    found: list[local_models.LocalModel] = []
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as c:
+        try:
+            found = await local_models._scan_ollama(c, server)
+        except Exception:  # noqa: BLE001 - the native API is optional; the list below is not
+            found = []
+        if found:
+            out = [
+                Model(
+                    id=m.id,
+                    name=m.id,
+                    description="Ollama · " + ("cloud" if m.cloud else (m.parameters or "local")),
+                    context_window=m.context,
+                    tags=["cloud" if m.cloud else "local"] + (["tools"] if m.tools else []),
+                    efforts=list(m.thinking.levels),
+                    default_effort=m.thinking.default,
+                    thinking_switch_only=m.thinking.switch_only,
+                )
+                for m in found
+            ]
+        else:
+            r = await c.get(
+                f"{base}/models",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Accept": "application/json",
+                    "User-Agent": _UA,
+                },
+            )
+            r.raise_for_status()
+            out = []
+            for item in r.json().get("data", []):
+                mid = str(item.get("id") or item.get("model") or "").strip()
+                if not mid:
+                    continue
+                out.append(Model(
+                    id=mid,
+                    name=mid,
+                    description=f"Ollama · {item.get('owned_by') or 'local'}",
+                    tags=["cloud" if mid.endswith(":cloud") else "local"],
+                ))
+    out.sort(key=lambda m: (1 if "cloud" in m.tags else 0, m.id.lower()))
+    return out
+
+
+async def _fetch_vllm() -> list[Model]:
+    """Generic local OpenAI-compatible models from ``{api_base}/models`` — LM
+    Studio, vLLM, llama.cpp server, text-generation-webui, koboldcpp, etc.
+
+    Unlike Ollama there's no default port to fall back to across those
+    backends, so a missing ``api_base`` returns an empty catalog (the caller
+    shows a "not configured" hint) rather than guessing a URL.
+    """
+    from flowly.config.loader import load_config
+    cfg = load_config()
+    vcfg = getattr(cfg.providers, "vllm", None)
+    base = str(getattr(vcfg, "api_base", "") or "").strip().rstrip("/")
+    if not base:
+        return []
+    api_key = str(getattr(vcfg, "api_key", "") or "local").strip() or "local"
+    # LM Studio says more about each model through its native API: which are
+    # embedding models (left out) and the context a loaded one runs with.
+    # Other servers answer 404 there and keep the plain list.
+    from flowly.integrations import local_models
+
+    root = base[: -len("/v1")] if base.endswith("/v1") else base
+    details: dict[str, local_models.LocalModel] = {}
+    skip: set[str] = set()
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as c:
+        try:
+            native = await c.get(f"{root}/api/v1/models", headers={"Accept": "application/json"})
+            if native.status_code == 200:
+                for item in native.json().get("models") or []:
+                    if not isinstance(item, dict) or not isinstance(item.get("key"), str):
+                        continue
+                    model = local_models._lmstudio_v1_model(item)
+                    if model is None:
+                        skip.add(item["key"])  # embedding and decision models
+                    else:
+                        details[model.id] = model
+            else:
+                native = await c.get(f"{root}/api/v0/models", headers={"Accept": "application/json"})
+                if native.status_code == 200:
+                    for item in native.json().get("data") or []:
+                        if not isinstance(item, dict):
+                            continue
+                        if item.get("type") == "embeddings" and isinstance(item.get("id"), str):
+                            skip.add(item["id"])
+                        model = local_models._lmstudio_model(item)
+                        if model is not None:
+                            details[model.id] = model
+        except Exception:  # noqa: BLE001 - only LM Studio has it; the plain list below is enough
+            pass
+        r = await c.get(
+            f"{base}/models",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Accept": "application/json",
+                "User-Agent": _UA,
+            },
+        )
+    r.raise_for_status()
+    out: list[Model] = []
+    for item in r.json().get("data", []):
+        mid = str(item.get("id") or item.get("model") or "").strip()
+        if not mid or mid in skip:
+            continue
+        known = details.get(mid)
+        out.append(Model(
+            id=mid,
+            name=mid,
+            description=f"Local · {item.get('owned_by') or 'self-hosted'}",
+            context_window=known.context if known else None,
+            tags=["local"] + (["tools"] if known and known.tools else []),
+            efforts=list(known.thinking.levels) if known else [],
+            default_effort=known.thinking.default if known else None,
+            thinking_switch_only=bool(known and known.thinking.switch_only),
+        ))
+    out.sort(key=lambda m: m.id.lower())
+    return out
 
 
 _FETCHERS: dict[str, "Any"] = {
@@ -1015,6 +1285,8 @@ _FETCHERS: dict[str, "Any"] = {
     "xai": _fetch_xai_apikey,
     "openai_codex": _fetch_openai_codex,
     "zai_coding": _fetch_zai_coding,
+    "ollama": _fetch_ollama,
+    "vllm": _fetch_vllm,
     # anthropic / openai / gemini / groq / zhipu — not implemented yet.
     # Their /v1/models endpoints need the user's API key; we'll plumb
     # that through once the OpenRouter MVP feels good.
