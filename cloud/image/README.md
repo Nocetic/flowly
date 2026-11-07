@@ -91,7 +91,13 @@ instead of unpacking the runtime archive: the screen's optional Python
 packages install only into the agent's virtualenv
 (`flowly/desktop_runtime/python_installer.py`).
 
-Existing homes move to a new image with the server's
+A release tag does this in CI (`.github/workflows/runtime.yml`, job
+`cloud-image`, secret `FLY_IMAGE_TOKEN`) before the GitHub release is
+published, and the Flowly server then moves every cloud computer to it on
+its own: canary first, sleeping homes at once, awake ones when they go to
+sleep (flowly-server `docs/cloud/engineering/cloud-auto-update.md`).
+
+By hand, existing homes move to a new image with the server's
 `server/scripts/roll-cloud-image.ts --image <ref> --version <core version>`:
 one home first, then batches; each running machine must answer `/health`
 with the new version before the next batch, and the first failure stops it.
