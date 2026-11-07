@@ -1,7 +1,7 @@
 # Engineering notes
 
 Short things that are easy to get wrong in this codebase. Each line says what
-to do and why; the long story is in `docs/engineering/`. Add to it when a bug
+to do and why; the long story is in the maintainers' design notes. Add to it when a bug
 teaches you something the code alone does not say.
 
 ## Gateway lifecycle
@@ -11,7 +11,6 @@ teaches you something the code alone does not say.
   command line). `launchctl kickstart ai.flowly.gateway` from a named agent
   bounces the host and every agent; from a hand-started gateway it does
   nothing while the app shows "restarting".
-  ([report](docs/engineering/first-ten-minutes-2026-10-28.md#5-restart-in-place))
 - **"The port answers" is not "it restarted".** The old process, or another
   gateway, answers too. Wait for a new PID.
 - **A restarting gateway closes its sockets with code 4075.** Anything that

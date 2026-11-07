@@ -1,6 +1,6 @@
 """Conformance tests for the chat wire protocol.
 
-The contract these pin is written down in ``docs/chat-wire-protocol.md``.
+The contract these pin is written down in ``flowly-internal/core/docs/chat-wire-protocol.md``.
 It exists because the rules used to live only as assumptions spread across
 four repositories — bot, relay, desktop, iOS — and a single new message type
 that violated one of them broke three clients in three different ways at once

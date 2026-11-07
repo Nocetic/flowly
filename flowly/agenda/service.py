@@ -20,7 +20,7 @@ Once a day, after the review time, the agent reviews its goals and the
 owner's recent conversations in an isolated session and plans the day's
 follow-ups with its tools. It cannot write to the owner from there.
 
-See ``docs/engineering/agent-goals.md``.
+See ``flowly-internal/core/docs/engineering/agent-goals.md``.
 """
 
 from __future__ import annotations

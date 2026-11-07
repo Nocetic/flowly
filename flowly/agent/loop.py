@@ -2260,7 +2260,7 @@ class AgentLoop:
             logger.debug("[title] schedule failed", exc_info=True)
             # titling is best-effort; never disturb the turn
 
-    # ── Activity (docs/engineering/activity-journal.md) ──────────────────
+    # ── Activity (flowly-internal/core/docs/engineering/activity-journal.md) ──────────────────
 
     _ACTIVITY_OWNER_CHANNELS = frozenset({"web", "desktop", "ios", "android", "cli", "api", "voice"})
 
@@ -9048,7 +9048,7 @@ class AgentLoop:
                     # normally arrives mid-turn), and the run would never
                     # settle — the chat would sit on "replying" forever. The
                     # transcript divider comes from the compaction event
-                    # instead; see docs/chat-wire-protocol.md §4.2.
+                    # instead; see flowly-internal/core/docs/chat-wire-protocol.md §4.2.
                     saved = result.get("tokens_before", 0) - result.get("tokens_after", 0)
                     return OutboundMessage(
                         channel=msg.channel, chat_id=msg.chat_id,
@@ -9912,7 +9912,7 @@ class AgentLoop:
                 #
                 # No transcript separator is published here. The boundary row
                 # is written by whichever transport persists the conversation,
-                # keyed off this event — see docs/chat-wire-protocol.md §4.2.
+                # keyed off this event — see flowly-internal/core/docs/chat-wire-protocol.md §4.2.
                 # Publishing it as a reply meant every consumer of terminals
                 # had to recognise a magic string to avoid settling a turn that
                 # was still streaming.

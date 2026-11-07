@@ -1,4 +1,4 @@
-"""A Live Voice call that belongs to the chat it starts in (docs/chat-wire-protocol.md §7).
+"""A Live Voice call that belongs to the chat it starts in (flowly-internal/core/docs/chat-wire-protocol.md §7).
 
 The call's own session (``desktop:voice:<conversationId>``) stays its ledger:
 connections, transcript revisions, tools. A bound call adds three things to

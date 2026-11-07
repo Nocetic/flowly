@@ -15,7 +15,7 @@ A command holding characters a reader cannot see is never shown. The owner
 can switch the content off (``notifications.preview: minimal``). Tapping it
 opens the conversation that asked, when the phone has it (see
 :func:`phone_conversation`), where the waiting request is restored. See
-``docs/engineering/notification-policy.md``.
+``flowly-internal/core/docs/engineering/notification-policy.md``.
 """
 
 from __future__ import annotations

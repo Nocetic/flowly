@@ -1,7 +1,7 @@
 """Every announced compaction cycle is closed, and by the right event.
 
 The wire contract says a `started` is followed by exactly one terminal
-carrying the SAME `compactionId` (docs/chat-wire-protocol.md §5). Three paths
+carrying the SAME `compactionId` (flowly-internal/core/docs/chat-wire-protocol.md §5). Three paths
 announce, and each had a way to walk off without closing:
 
   * the manual path committed OUTSIDE its try, so a refusal to commit (a reset

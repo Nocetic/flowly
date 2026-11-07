@@ -163,7 +163,7 @@ def test_chat_inflight_in_feature_methods():
 
 
 def test_every_piece_of_a_run_gets_the_next_seq_and_the_snapshot_names_the_last():
-    # docs/chat-wire-protocol.md §8: a client shows the snapshot, then adds
+    # flowly-internal/core/docs/chat-wire-protocol.md §8: a client shows the snapshot, then adds
     # only pieces with a higher seq, so none is shown twice or skipped.
     inflight.begin("web:c1", "run1", "go")
     assert inflight.append("web:c1", "run1", "Look") == 1

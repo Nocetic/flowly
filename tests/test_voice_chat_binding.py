@@ -1,4 +1,4 @@
-"""A voice call belongs to the chat it starts in (docs/chat-wire-protocol.md §7)."""
+"""A voice call belongs to the chat it starts in (flowly-internal/core/docs/chat-wire-protocol.md §7)."""
 from __future__ import annotations
 
 import asyncio

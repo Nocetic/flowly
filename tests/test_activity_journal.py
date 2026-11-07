@@ -1,6 +1,6 @@
 """A bot's activity: the work it does, recorded from the turn, summarized by its model.
 
-See ``docs/engineering/activity-journal.md``.
+See ``flowly-internal/core/docs/engineering/activity-journal.md``.
 """
 
 from __future__ import annotations

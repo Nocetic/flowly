@@ -141,7 +141,7 @@ SUMMARY_REFERENCE_END = "</historical_conversation_reference>"
 
 #: Text of a transcript context-boundary row. Clients that predate the typed
 #: ``kind`` field match on this, so it is a compatibility shim — the bot never
-#: puts it on the wire as a reply. See ``docs/chat-wire-protocol.md`` §4.2.
+#: puts it on the wire as a reply. See ``flowly-internal/core/docs/chat-wire-protocol.md`` §4.2.
 CONTEXT_BOUNDARY_CONTENT = "[context-optimized]"
 
 

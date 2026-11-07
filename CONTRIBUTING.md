@@ -296,6 +296,11 @@ docs(readme): clarify BYOK cascade order
 4. If you touched exec, paths, or process management, note the platforms you
    tested on.
 
+**Docs:** user docs go in `content/docs/`. This repo carries no `docs/`,
+`output/` or `ops/` folder; maintainers' design notes live elsewhere, and
+`python scripts/check_public_tree.py --install-hook` makes a push refuse
+them.
+
 ---
 
 ## Reporting issues

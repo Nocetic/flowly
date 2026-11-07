@@ -3,7 +3,7 @@
 A subagent working for the owner is a thread whose conversation is
 ``subagent:<threadId>`` (``flowly.agent.subagent_threads``). Its turn is saved
 when the run ends; while it runs, the same live events an owner's turn has
-stream under that key and the run's id (docs/chat-wire-protocol.md §4.8):
+stream under that key and the run's id (flowly-internal/core/docs/chat-wire-protocol.md §4.8):
 
 * ``chat {state:"run_started"}`` once, with the task (``prompt``, the brief);
 * ``agent {stream:"assistant", data:{text}}`` — what the model said: token

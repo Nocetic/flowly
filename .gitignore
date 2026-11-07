@@ -8,18 +8,12 @@ build3/
 build-x64/
 .venv/
 .venv-x64/
-docs/*
-# Security engineering docs are companion to the tracked SECURITY.md
-# and should be visible to anyone cloning the repo. The other docs/
-# entries are local-only planning notes (intentionally excluded by
-# the docs/* glob above).
-!docs/security/
-!docs/cli-distribution.md
-!docs/memory-governance-architecture.md
-!docs/skill-self-improvement-architecture.md
-!docs/internal-gateway-rpc-architecture.md
-!docs/google-service-connections.md
-!docs/petdex-floating-pet.md
+# Internal notes live in the private Nocetic/flowly-internal repo, never
+# here: the public push refuses these (scripts/check_public_tree.py).
+/docs/
+/output/
+/ops/
+FLOWLETS_ROADMAP.md
 *.egg-info/
 *.egg
 *.pyc
@@ -48,13 +42,6 @@ amp
 
 # Compiled iMessage send helper (built per-platform by helpers/build.sh)
 flowly/channels/helpers/Flowly iMessage Helper.app/
-!docs/feature-rpc-architecture.md
-!docs/MCP_CONNECTIONS_IMPLEMENTATION.md
-!docs/mcp-ssh-management.md
-!docs/runtime.md
-# The chat wire contract — bot, relay, desktop and iOS all implement it, so
-# it has to be readable by anyone cloning any of them.
-!docs/chat-wire-protocol.md
 
 # Internal engineering notes (not shipped)
 STREAMING_ENGINEERING.md

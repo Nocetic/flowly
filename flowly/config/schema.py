@@ -1107,7 +1107,7 @@ class MediaConfig(BaseModel):
 
 
 class ActivityConfig(BaseModel):
-    """The owner-facing activity journal (``docs/engineering/activity-journal.md``).
+    """The owner-facing activity journal (``flowly-internal/core/docs/engineering/activity-journal.md``).
 
     Work is recorded either way; conversation never is. ``summaries`` decides
     whether the bot's own model also writes each task's title, outcome and

@@ -4844,7 +4844,7 @@ def _session_visibility():
     return visible
 
 
-# ── Activity: the bot's tasks (docs/engineering/activity-journal.md) ──────
+# ── Activity: the bot's tasks (flowly-internal/core/docs/engineering/activity-journal.md) ──────
 
 _activity_pruned = False
 
@@ -5334,7 +5334,7 @@ def subagents_watch(params: dict) -> dict:
     90 s), ``subagents.unwatch`` or a disconnect ends it. While bound, every
     turn of the thread streams to the caller as its own chat events under
     ``sessionKey`` (``subagent:<threadId>``) — on the relay inside
-    ``subagent.stream`` envelopes (docs/chat-wire-protocol.md §4.8).
+    ``subagent.stream`` envelopes (flowly-internal/core/docs/chat-wire-protocol.md §4.8).
 
     ``inflight`` is the running turn so far (``chat.inflight``'s entry: the
     task as ``prompt``, text, steps, tool progress), taken in the same step as
@@ -6218,7 +6218,7 @@ def system_capabilities() -> dict:
         # cut its list at ``limit`` and returned no way to the rest.
         "sessionsListVersion": 2,
         # 1: a subagent's running turn streams to whoever ``subagents.watch``es
-        # it (docs/chat-wire-protocol.md §4.8).
+        # it (flowly-internal/core/docs/chat-wire-protocol.md §4.8).
         "subagentStreamVersion": 1,
         # 1: ``objectives.changed`` is raised when the goals change
         # (``flowly/objectives/events.py``); a goals screen then reads again

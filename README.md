@@ -65,7 +65,7 @@ flowly service install --start    # launchd (macOS) / systemd (Linux) / Task Sch
 </tr>
 <tr>
   <td><b>A closed learning loop</b></td>
-  <td>Every fact you share becomes part of a governed <b>memory of your world</b> with a calibrated trust score — 👍/👎 to retune it, and a background consolidation pass merges duplicates and retires stale notes. Structured facts also land in a <b>knowledge graph</b>. Opt in and Flowly mines your recurring procedures to <b>write and refine its own skills</b>, every change snapshotted and reversible. → <a href="docs/memory-governance-architecture.md">memory</a> · <a href="docs/skill-self-improvement-architecture.md">skills</a></td>
+  <td>Every fact you share becomes part of a governed <b>memory of your world</b> with a calibrated trust score — 👍/👎 to retune it, and a background consolidation pass merges duplicates and retires stale notes. Structured facts also land in a <b>knowledge graph</b>. Opt in and Flowly mines your recurring procedures to <b>write and refine its own skills</b>, every change snapshotted and reversible. → <a href="flowly-internal/core/docs/memory-governance-architecture.md">memory</a> · <a href="flowly-internal/core/docs/skill-self-improvement-architecture.md">skills</a></td>
 </tr>
 <tr>
   <td><b>135 built-in skills</b></td>
@@ -156,7 +156,7 @@ Other command groups: `flowly channels · cron · plugins · skills · bundles �
   <img src="assets/architecture.png" alt="Flowly architecture: clients → gateway (running inside the sandbox) → your LLM provider" width="100%">
 </div>
 
-The gateway runs as a local daemon, and the **whole process runs inside the OS sandbox** (`sandbox-exec` on macOS, `bwrap` on Linux). Channels route through an in-process message bus; the TUI, desktop, and mobile apps connect as clients over one WebSocket protocol (`ws://127.0.0.1:18790`) — desktop and mobile can also reach it remotely via the Flowly Cloud relay. Config lives at `~/.flowly/config.json`, shared by every client. → [internal RPC protocol](docs/internal-gateway-rpc-architecture.md)
+The gateway runs as a local daemon, and the **whole process runs inside the OS sandbox** (`sandbox-exec` on macOS, `bwrap` on Linux). Channels route through an in-process message bus; the TUI, desktop, and mobile apps connect as clients over one WebSocket protocol (`ws://127.0.0.1:18790`) — desktop and mobile can also reach it remotely via the Flowly Cloud relay. Config lives at `~/.flowly/config.json`, shared by every client. → [internal RPC protocol](flowly-internal/core/docs/internal-gateway-rpc-architecture.md)
 
 ---
 
@@ -227,7 +227,6 @@ in **[CONTRIBUTING.md](CONTRIBUTING.md#development-setup)**.
 - [Open source vs. Desktop & Cloud](content/docs/using-flowly/desktop-vs-oss.md) — what's in this repo vs. the apps
 - [Security](SECURITY.md) — trust model + vulnerability reporting
 - [Contributing](CONTRIBUTING.md) — dev setup, project layout, PR process
-- **Engineering deep-dives:** [memory governance](docs/memory-governance-architecture.md) · [skill self-improvement](docs/skill-self-improvement-architecture.md) · [internal gateway RPC](docs/internal-gateway-rpc-architecture.md)
 
 ---
 

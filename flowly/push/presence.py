@@ -17,7 +17,7 @@ user is at that computer (or in a voice call there):
 Fail-safe in every direction: a report expires after its TTL, so a Desktop
 that quits, sleeps or loses its connection stops holding the phone back on its
 own; a Desktop that reports nothing (an older version, or no settings known
-yet) holds nothing back. See ``docs/engineering/notification-policy.md``.
+yet) holds nothing back. See ``flowly-internal/core/docs/engineering/notification-policy.md``.
 """
 
 from __future__ import annotations

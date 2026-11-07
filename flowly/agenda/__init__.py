@@ -7,5 +7,5 @@
 - :mod:`.service` — the runner wired into each gateway process.
 - :mod:`.timeparse`, :mod:`.prompts` — reading times, writing wake-up prompts.
 
-See ``docs/engineering/agent-goals.md``.
+See ``flowly-internal/core/docs/engineering/agent-goals.md``.
 """
