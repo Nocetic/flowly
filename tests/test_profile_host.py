@@ -1652,12 +1652,14 @@ async def test_a_named_agent_switched_to_another_provider_takes_a_model_it_serve
     assert switched["settings"]["model"] == active_provider.DEFAULT_MODELS["xai_oauth"]
 
     served["openai_codex"].add(active_provider.DEFAULT_MODELS["xai_oauth"])
-    kept = await host.configure({"name": "writer", "provider": "openai_codex"})
-    assert kept["settings"]["model"] == active_provider.DEFAULT_MODELS["xai_oauth"]
+    # Back on the provider it left: the model it chose there comes back
+    # (model_memory.py, 2026-11-07), even though the current one is served too.
+    back = await host.configure({"name": "writer", "provider": "openai_codex"})
+    assert back["settings"]["model"] == "gpt-5.5"
 
     usable.discard("anthropic")
     unset = await host.configure({"name": "writer", "provider": "anthropic"})
-    assert unset["settings"]["model"] == active_provider.DEFAULT_MODELS["xai_oauth"]
+    assert unset["settings"]["model"] == "gpt-5.5"
 
     chosen = await host.configure({"name": "writer", "provider": "xai_oauth", "model": "grok-4.6"})
     assert chosen["settings"]["model"] == "grok-4.6"

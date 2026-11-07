@@ -1565,10 +1565,22 @@ def update_profile_settings(
         config = _load_config_object(config_path)
         if bool(_profile_metadata(profile.path).get("localRuntime")):
             _set_profile_workspace(config, profile.path / "workspace")
+        # The model last chosen on each provider (model_memory.py): the old
+        # one is kept under the provider being left, a new one under the
+        # provider it runs on.
+        from flowly.integrations.model_memory import remember
+
+        previous_provider = str((config.get("providers") or {}).get("active") or "").strip() \
+            if isinstance(config.get("providers"), dict) else ""
+        previous_model = str(_profile_defaults(config).get("model") or "").strip()
+        if validated_provider is not None and validated_provider != previous_provider:
+            remember(config, previous_provider, previous_model)
         if validated_provider is not None:
             _set_profile_provider(config, validated_provider)
         if validated_model is not None:
             _set_profile_model(config, validated_model)
+            remember(config, validated_provider if validated_provider is not None else previous_provider,
+                     validated_model)
         if validated_effort is not None:
             _profile_defaults(config)["reasoningEffort"] = validated_effort
         if validated_tier is not None:

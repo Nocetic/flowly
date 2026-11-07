@@ -122,6 +122,10 @@ PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     "provider.list": 30_000,
     "provider.active": 30_000,
     "model.list": 60_000,
+    # The computer's favourite models (model_favorites.py): one list, read and
+    # starred through any agent.
+    "model.favorites": 30_000,
+    "model.favorite": 30_000,
     "sessions.list": 30_000,
     "activity.list": 30_000,
     "activity.get": 30_000,

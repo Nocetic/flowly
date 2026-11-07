@@ -2493,12 +2493,16 @@ async def model_list(params: dict) -> dict:
             raise FeatureRpcError("INVALID", f"unknown provider: {requested}")
     models = await fetch_models(provider_key, force_refresh=bool(params.get("forceRefresh")))
     from flowly.integrations.model_catalog import flowly_effort_cap
+    from flowly.integrations.model_favorites import favorites as _favorites, is_favorite
 
+    starred = _favorites()
     return {
         "provider": provider_key,
         "models": [
             {
                 "id": m.id,
+                # Starred on this computer (model.favorite).
+                "favorite": is_favorite(provider_key, m.id, starred),
                 "name": m.name,
                 "description": m.description,
                 "contextWindow": m.context_window,
@@ -2519,6 +2523,46 @@ async def model_list(params: dict) -> dict:
         # The highest effort the plan's credit runs at (free Flowly plan).
         "effortCap": flowly_effort_cap() if provider_key == "flowly" else None,
     }
+
+
+def model_favorites() -> dict:
+    """The computer's favourite models, in the order they were starred
+    (flowly/integrations/model_favorites.py): each with its provider's name,
+    whether this agent can use that provider now (``available``), and the
+    model's name when a catalogue read it. Every agent on the computer, and
+    every app, reads the same list."""
+    from flowly.integrations.model_catalog import cached_model
+    from flowly.integrations.model_favorites import favorites
+
+    providers = {row["key"]: row for row in provider_list()["providers"]}
+    out = []
+    for entry in favorites():
+        row = providers.get(entry["provider"], {})
+        known = cached_model(entry["provider"], entry["model"])
+        out.append({
+            "provider": entry["provider"],
+            "model": entry["model"],
+            "name": known.name if known is not None and known.name else entry["model"],
+            "providerName": row.get("name") or entry["provider"],
+            "available": bool(row.get("hasKey")),
+        })
+    return {"favorites": out}
+
+
+def model_favorite(params: dict) -> dict:
+    """Star (``on: true``) or unstar (``on: false``) ``model`` on
+    ``provider`` for the whole computer; returns the list as
+    ``model.favorites`` does. Idempotent: never a toggle."""
+    from flowly.integrations.model_favorites import FavoritesError, set_favorite
+
+    on = params.get("on")
+    if not isinstance(on, bool):
+        raise FeatureRpcError("INVALID", "on must be true or false")
+    try:
+        set_favorite(str(params.get("provider") or ""), str(params.get("model") or ""), on)
+    except FavoritesError as exc:
+        raise FeatureRpcError(exc.code, str(exc))
+    return model_favorites()
 
 
 def _effort_param(params: dict) -> str | None:
@@ -2578,9 +2622,24 @@ async def model_set(params: dict) -> dict:
         model = model.strip()
     effort = _effort_param(params)
     tier = _service_tier_param(params)
+    provider_param = params.get("provider")
+    if provider_param is not None and (not isinstance(provider_param, str) or not provider_param.strip()):
+        raise FeatureRpcError("INVALID", "provider must be a non-empty string")
     if model is None and effort is None and tier is None:
         raise FeatureRpcError("INVALID", "model, effort or serviceTier is required")
     from flowly.config.loader import load_config, save_config
+    if provider_param is not None:
+        # A favourite on another provider: move there first (its remembered
+        # model comes back), then take the model asked for, in one reload.
+        from flowly.integrations.active_provider import set_active_provider
+
+        try:
+            set_active_provider(provider_param.strip())
+        except ValueError as exc:
+            raise FeatureRpcError("INVALID", str(exc))
+        from flowly.integrations import model_catalog as _catalog
+
+        _catalog.flush_cache()
     from flowly.integrations.active_provider import resolve_active_provider
     from flowly.integrations.model_catalog import (
         effort_choice,
@@ -2618,11 +2677,21 @@ async def model_set(params: dict) -> dict:
     cfg.agents.defaults.model = target
     cfg.agents.defaults.reasoning_effort = effort
     cfg.agents.defaults.service_tier = tier
+    if model is not None and provider_key:
+        # Chosen on this provider: it comes back when the agent does
+        # (flowly/integrations/model_memory.py).
+        from flowly.integrations.model_memory import remember
+
+        holder = {"agents": {"defaults": {"modelsByProvider": dict(cfg.agents.defaults.models_by_provider)}}}
+        remember(holder, provider_key, target)
+        cfg.agents.defaults.models_by_provider = holder["agents"]["defaults"]["modelsByProvider"]
     save_config(cfg)
     result = {
         "ok": True, "model": target, "effort": effort, "effortReset": effort_reset,
         "serviceTier": tier, "serviceTierReset": tier_reset,
     }
+    if provider_param is not None:
+        result["provider"] = provider_key
     if await _live_provider_reload_succeeded():
         return {**result, "willRestart": False}
     return {**result, "willRestart": True}
@@ -6466,6 +6535,8 @@ _DISPATCH: dict[str, tuple] = {
     "flowlets.createFromTemplate": (flowlets_create_from_template, True, False),
     "model.list": (model_list, True, False),
     "model.set": (model_set, True, True),
+    "model.favorites": (model_favorites, False, False),
+    "model.favorite": (model_favorite, True, False),
     "assistants.list": (assistants_list_retired, False, False),
     "assistants.reload": (subagents_assistants_retired, True, False),
     "assistants.write": (agents_feature_retired, True, False),

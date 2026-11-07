@@ -637,6 +637,17 @@ def set_active_provider(key: str) -> str | None:
         raise ValueError(f"unknown provider key: {key}")
     from flowly.integrations.config_io import _atomic_write_json, _load_raw, _set_path
     raw = _load_raw()
+    # The provider the agent runs on now, before the switch: its model is
+    # remembered there (flowly/integrations/model_memory.py).
+    old_key = str(((raw.get("providers") or {}).get("active")) or "").strip()
+    if not old_key:
+        try:
+            from flowly.config.loader import load_config as _load
+
+            resolved = resolve_active_provider(_load())
+            old_key = resolved.key if resolved is not None else ""
+        except Exception:
+            old_key = ""
     _set_path(raw, "providers.active", key, merge=False)
 
     model_changed: str | None = None
@@ -657,11 +668,19 @@ def set_active_provider(key: str) -> str | None:
         current = str(
             ((raw.get("agents") or {}).get("defaults") or {}).get("model") or ""
         )
+        from flowly.integrations.model_memory import model_on_switch
+
+        # The model last chosen on the target provider comes back with it.
+        recalled = model_on_switch(raw, old_key, key, current)
         fallback = DEFAULT_MODELS.get(key)
+        if target_usable and recalled:
+            if recalled != current:
+                _set_path(raw, "agents.defaults.model", recalled, merge=False)
+                model_changed = recalled
         # No-op guard: if the current model IS the curated fallback, keep it
         # without rewriting (avoids a repeating "model → X" notification when
         # the catalogue doesn't list the curated alias verbatim).
-        if (
+        elif (
             target_usable
             and fallback
             and current.strip().lower() != fallback.lower()

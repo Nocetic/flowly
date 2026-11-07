@@ -186,6 +186,21 @@ def _model_for_provider(name: str, provider: str) -> str | None:
         return None
     host = load_config()
     model = read_profile_settings(name)["model"] or host.agents.defaults.model or ""
+    # The model this agent last chose on that provider comes back with it
+    # (model_memory.py), when the provider is set up and still serves it.
+    from flowly.integrations.model_memory import recall
+    from flowly.profile import describe_profile, _load_config_object
+
+    try:
+        recalled = recall(_load_config_object(describe_profile(name).path / "config.json"), provider)
+    except Exception:
+        recalled = None
+    if recalled:
+        try:
+            if _build_for(host, provider) is not None:
+                return recalled if recalled != model else None
+        except Exception:
+            pass
     fallback = DEFAULT_MODELS.get(provider)
     if not fallback or model.strip().lower() == fallback.lower() or model_fits_provider(model, provider):
         return None
