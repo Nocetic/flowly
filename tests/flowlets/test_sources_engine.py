@@ -67,8 +67,8 @@ def test_extract_json_skips_a_hallucinated_tool_call_preamble():
 
 def test_extract_json_prefers_the_candidate_matching_the_schema():
     # A preamble that IS well-formed JSON must not win over the real payload.
-    reply = '{"command":"date +%F"}\n{"title":"Ship it","who":"hakan"}'
-    assert _extract_json(reply, prefer_keys=["title", "who"]) == {"title": "Ship it", "who": "hakan"}
+    reply = '{"command":"date +%F"}\n{"title":"Ship it","who":"ozan"}'
+    assert _extract_json(reply, prefer_keys=["title", "who"]) == {"title": "Ship it", "who": "ozan"}
     # …and the hint also reaches into a list payload's rows.
     reply = '{"command":"date"}\n[{"title":"a"},{"title":"b"}]'
     assert _extract_json(reply, prefer_keys=["title"]) == [{"title": "a"}, {"title": "b"}]
@@ -117,7 +117,7 @@ async def test_agent_source_writes_list_and_broadcasts(store):
     async def broadcast(name, data):
         events.append((name, data))
 
-    runner = _Runner('[{"title":"fix bug","who":"hakan"},{"title":"add test","who":"claude"}]')
+    runner = _Runner('[{"title":"fix bug","who":"ozan"},{"title":"add test","who":"claude"}]')
     eng = SourceEngine(store, broadcast=broadcast, agent_runner=runner, tz=UTC)
     f = store.create("Repo", REPO)
     fid = f["id"]

@@ -4,8 +4,7 @@ The ChatGPT subscription (``openai_codex``) and xAI's Grok sign-in
 (``xai_oauth``) sign in with a device code: Core asks the provider for a code,
 the app shows it and opens the verification page, the person approves on any
 device, and Core waits for the tokens in the background. Nothing has to reach the machine the agent runs on, so it works
-the same on a Mac and on a cloud computer. Design: flowly-server
-``docs/cloud/design/provider-switching.md``.
+the same on a Mac and on a cloud computer.
 
 One sign-in per provider at a time: starting again cancels the one waiting.
 """

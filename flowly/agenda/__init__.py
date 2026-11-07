@@ -6,6 +6,4 @@
 - :mod:`.budget` — one daily budget shared by every agent on the machine.
 - :mod:`.service` — the runner wired into each gateway process.
 - :mod:`.timeparse`, :mod:`.prompts` — reading times, writing wake-up prompts.
-
-See ``flowly-internal/core/docs/engineering/agent-goals.md``.
 """

@@ -5051,7 +5051,7 @@ class GatewayServer:
         """The agent's reaction on the user's latest message (``react`` tool).
 
         To the conversation's own clients; a named agent's host is one of them
-        and carries it on to the Flowly server (chat-one-log.md §13).
+        and carries it on to the Flowly server.
         """
         payload = self._scoped_event({
             "type": "event",

@@ -109,7 +109,7 @@ def steer_running_turn(session_key: str, params: dict, command_status=None) -> d
     """A message sent while its conversation's reply is still running joins
     that reply as guidance (``run_steering``): it is in the conversation at
     once and the agent reads it at its next step, instead of a turn queued
-    behind the reply (Hakan, 2026-10-27; as Muse and Claude Code do).
+    behind the reply.
 
     Returns the ``chat.send`` acknowledgement, or None when no running reply
     takes it (none runs, it is ending, the message keeps its own turn, this
@@ -4844,7 +4844,7 @@ def _session_visibility():
     return visible
 
 
-# ── Activity: the bot's tasks (flowly-internal/core/docs/engineering/activity-journal.md) ──────
+# ── Activity: the bot's tasks ──────
 
 _activity_pruned = False
 
@@ -5334,7 +5334,7 @@ def subagents_watch(params: dict) -> dict:
     90 s), ``subagents.unwatch`` or a disconnect ends it. While bound, every
     turn of the thread streams to the caller as its own chat events under
     ``sessionKey`` (``subagent:<threadId>``) — on the relay inside
-    ``subagent.stream`` envelopes (flowly-internal/core/docs/chat-wire-protocol.md §4.8).
+    ``subagent.stream`` envelopes.
 
     ``inflight`` is the running turn so far (``chat.inflight``'s entry: the
     task as ``prompt``, text, steps, tool progress), taken in the same step as
@@ -6218,7 +6218,7 @@ def system_capabilities() -> dict:
         # cut its list at ``limit`` and returned no way to the rest.
         "sessionsListVersion": 2,
         # 1: a subagent's running turn streams to whoever ``subagents.watch``es
-        # it (flowly-internal/core/docs/chat-wire-protocol.md §4.8).
+        # it.
         "subagentStreamVersion": 1,
         # 1: ``objectives.changed`` is raised when the goals change
         # (``flowly/objectives/events.py``); a goals screen then reads again

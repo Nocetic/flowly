@@ -1,4 +1,4 @@
-"""The agent's reactions (chat-one-log.md §13): the ``react`` tool, the hub
+"""The agent's reactions: the ``react`` tool, the hub
 that carries it, and the ``chat.reaction`` event the Flowly server reads."""
 
 from __future__ import annotations

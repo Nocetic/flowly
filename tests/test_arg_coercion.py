@@ -22,8 +22,8 @@ def test_empty_list_passes_through():
 
 def test_macos_single_path_list_passes_through():
     """macOS happy path — one forward-slash path in a real list."""
-    result = coerce_str_list(["/Users/hakan/.flowly/screenshots/s.png"])
-    assert result == ["/Users/hakan/.flowly/screenshots/s.png"]
+    result = coerce_str_list(["/Users/ozan/.flowly/screenshots/s.png"])
+    assert result == ["/Users/ozan/.flowly/screenshots/s.png"]
 
 
 def test_macos_multiple_paths_list_passes_through():
@@ -34,9 +34,9 @@ def test_macos_multiple_paths_list_passes_through():
 
 def test_windows_path_in_real_list_passes_through():
     """If the model correctly emits a list, we leave it alone even on Windows."""
-    paths = ["C:\\Users\\Hakan\\a.png"]
+    paths = ["C:\\Users\\Ozan\\a.png"]
     result = coerce_str_list(paths)
-    assert result == ["C:\\Users\\Hakan\\a.png"]
+    assert result == ["C:\\Users\\Ozan\\a.png"]
 
 
 def test_list_with_non_string_items_stringified():
@@ -52,8 +52,8 @@ def test_stringified_json_array_simple():
 
 def test_stringified_json_array_properly_escaped_windows():
     """Backslashes already doubled → strict json.loads succeeds."""
-    result = coerce_str_list('["C:\\\\Users\\\\Hakan\\\\a.png"]')
-    assert result == ["C:\\Users\\Hakan\\a.png"]
+    result = coerce_str_list('["C:\\\\Users\\\\Ozan\\\\a.png"]')
+    assert result == ["C:\\Users\\Ozan\\a.png"]
 
 
 def test_stringified_json_array_raw_windows_backslashes():
@@ -62,9 +62,9 @@ def test_stringified_json_array_raw_windows_backslashes():
     Uses Python raw-string to reproduce exactly what arrives from the
     tool dispatcher after outer JSON decoding.
     """
-    bug = r'["C:\Users\Hakan\.flowly\screenshots\s.png"]'
+    bug = r'["C:\Users\Ozan\.flowly\screenshots\s.png"]'
     result = coerce_str_list(bug)
-    assert result == ["C:\\Users\\Hakan\\.flowly\\screenshots\\s.png"]
+    assert result == ["C:\\Users\\Ozan\\.flowly\\screenshots\\s.png"]
 
 
 def test_stringified_array_multiple_windows_paths():
@@ -76,9 +76,9 @@ def test_stringified_array_multiple_windows_paths():
     (rare — e.g. C:\\bin\\file.png) are a known residual edge case; downstream
     validation will flag them as missing files and the agent can retry.
     """
-    bug = r'["C:\Users\Hakan\a.png", "D:\Downloads\b.png"]'
+    bug = r'["C:\Users\Ozan\a.png", "D:\Downloads\b.png"]'
     result = coerce_str_list(bug)
-    assert result == ["C:\\Users\\Hakan\\a.png", "D:\\Downloads\\b.png"]
+    assert result == ["C:\\Users\\Ozan\\a.png", "D:\\Downloads\\b.png"]
 
 
 def test_bare_string_path_wrapped():

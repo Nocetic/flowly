@@ -67,12 +67,12 @@ def test_add_item_validates_enums(store):
 def test_fact_item_references_kg_triple(store):
     item = store.add_item(
         kind="fact",
-        text="Hakan works_at Nocetic Limited",
+        text="Ozan works_at Nocetic Limited",
         ref_kind="kg_triple",
-        ref_id="t_hakan_works_at_nocetic_ab12",
-        normalized_key="hakan|works_at",
+        ref_id="t_ozan_works_at_nocetic_ab12",
+        normalized_key="ozan|works_at",
     )
-    found = store.find_by_ref("kg_triple", "t_hakan_works_at_nocetic_ab12")
+    found = store.find_by_ref("kg_triple", "t_ozan_works_at_nocetic_ab12")
     assert [i.id for i in found] == [item.id]
 
 
@@ -196,13 +196,13 @@ def test_touch_used_sets_last_used(store):
 
 
 def test_find_by_key_filters_status(store):
-    a = store.add_item(kind="profile", text="email old", normalized_key="hakan|email")
-    b = store.add_item(kind="profile", text="email new", normalized_key="hakan|email")
+    a = store.add_item(kind="profile", text="email old", normalized_key="ozan|email")
+    b = store.add_item(kind="profile", text="email new", normalized_key="ozan|email")
     store.transition(a.id, STATUS_ACTIVE)
     # b stays candidate
-    actives = store.find_by_key("hakan|email", statuses={STATUS_ACTIVE})
+    actives = store.find_by_key("ozan|email", statuses={STATUS_ACTIVE})
     assert [i.id for i in actives] == [a.id]
-    allk = store.find_by_key("hakan|email")
+    allk = store.find_by_key("ozan|email")
     assert {i.id for i in allk} == {a.id, b.id}
 
 

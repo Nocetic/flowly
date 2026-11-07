@@ -11,8 +11,7 @@ outer process sets it before ``os.execve``; the inner process sees
 it set and returns from :func:`maybe_reexec_sandboxed` immediately,
 so the rest of ``main()`` runs once — inside the sandbox.
 
-The deny/allow lists mirror the TypeScript desktop policy in
-``flowly-desktop/src/main/local/sandbox/policy.ts``. The two lists
+The deny/allow lists mirror the Desktop app's own sandbox policy. The two lists
 are small enough to keep in sync by hand; a shared JSON manifest
 would cost more in coordination than it would save in lines.
 
@@ -148,8 +147,7 @@ def _reexec_macos(env: "os._Environ[str]") -> None:
 def _reexec_linux(env: "os._Environ[str]") -> None:
     """Linux re-exec under bubblewrap (bwrap) with a namespace-based sandbox.
 
-    The argv shape mirrors the TypeScript desktop launcher in
-    ``flowly-desktop/src/main/local/sandbox/linux.ts`` so a single
+    The argv shape mirrors the Desktop app's Linux sandbox launcher so a single
     SandboxPolicy intent — deny these paths, allow writes to these,
     inherit network — produces the same isolation on both spawn
     paths (Electron-driven and CLI-direct).

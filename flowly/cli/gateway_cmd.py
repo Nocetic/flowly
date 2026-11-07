@@ -1547,7 +1547,7 @@ def gateway(
     # The agent's agenda (flowly/agenda): follow-ups it plans for itself, the
     # goals it tracks, and the limits on writing first. Every runtime runs its
     # own, named agents included; the daily budget is shared through the
-    # canonical home. See flowly-internal/core/docs/engineering/agent-goals.md.
+    # canonical home.
     from flowly.agenda.service import AGENDA_GOAL_KEY, AGENDA_ITEM_KEY, AGENDA_SENDER, REVIEW_SESSION, AgendaService
     from flowly.agent.tools.follow_up import FollowUpTool
     from flowly.agent.tools.objective import ObjectiveTool
@@ -2116,7 +2116,7 @@ Respond to the user now:"""
     gateway_server._maintenance_backlog = lambda: bus.inbound_size
 
     # Profiles collaborate through this host's ProfileHost
-    # (flowly-internal/core/docs/gateway-profile-messaging.md). A direct run is bound to it by the
+    # A direct run is bound to it by the
     # gateway; a turn that arrives over the bus (relay, Flowly server: the
     # ``web`` channel) gets the same authority from the host when the agent
     # loop starts it, after the session lock. Background turns (system, cron,

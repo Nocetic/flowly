@@ -4,7 +4,7 @@ The agent looks at what is its own (profile, SOUL.md, its workspace skills,
 its routines, the names of its apps; memories only those the owner named),
 builds the recipe and sends it as a draft. The server keeps it and shows a
 card in this conversation; the owner reviews and publishes it there. The
-agent never publishes (flowly-server docs/cloud/design/agent-templates.md).
+agent never publishes.
 """
 from __future__ import annotations
 

@@ -19,7 +19,7 @@ Every piece of a run (a delta, a tool step, a tool's progress) gets the next
 ``seq`` of that run here, where it is recorded, and the transport sends it
 with the piece. The snapshot names the last piece it holds (``seq``), so a
 client that shows the snapshot adds only pieces with a higher ``seq`` and
-never shows one twice (flowly-internal/core/docs/chat-wire-protocol.md §8).
+never shows one twice.
 """
 
 from __future__ import annotations

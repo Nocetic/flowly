@@ -97,7 +97,7 @@ that holds `FLY_IMAGE_TOKEN`: it admits only `v*` tags and waits for a
 maintainer to approve each run. The release itself does not wait for the
 image. Once the image is pushed, the Flowly server moves every cloud computer
 to it on its own: canary first, sleeping homes at once, awake ones when they
-go to sleep (flowly-server `docs/cloud/engineering/cloud-auto-update.md`).
+go to sleep.
 
 By hand, existing homes move to a new image with the server's
 `server/scripts/roll-cloud-image.ts --image <ref> --version <core version>`:

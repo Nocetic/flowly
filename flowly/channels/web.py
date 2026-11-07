@@ -1703,7 +1703,7 @@ class WebChannel(BaseChannel):
         """The agent's reaction (``react`` tool) to the conversation's relay session.
 
         The Flowly server puts it on the user's newest message there and tells
-        the apps (chat-one-log.md §13); the relay passes it on as is.
+        the apps; the relay passes it on as is.
         """
         relay_id = self._relay_id_for(session_key)
         if not relay_id:

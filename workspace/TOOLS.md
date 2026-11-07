@@ -98,10 +98,10 @@ cron(action="add", name="reminder", message="Toplantı zamanı", schedule="at +3
 # Typed tool execution (no second LLM interpretation)
 cron(
   action="add",
-  name="call-hakan",
+  name="call-owner",
   schedule="at +1m",
   tool_name="voice_call",
-  tool_args={"action": "call", "to": "+905306067499", "script": "Hakan, kritik bir issue var."},
+  tool_args={"action": "call", "to": "+15555550123", "script": "Hi, there is a critical issue."},
   deliver=True
 )
 ```

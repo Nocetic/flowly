@@ -29,7 +29,7 @@ as described in `../README.md`. Run these commands from the Core worktree; set
 installation:
 
 ```sh
-screen_desktop=/Users/hakanoren/flowly-desktop/.codex-worktrees/remote-screen-desktop
+screen_desktop=/Users/alice/flowly-desktop/.codex-worktrees/remote-screen-desktop
 docker --context colima-flowly-screen build -t flowly-screen-latency-test:local tests/integration/screen/latency
 for fps in 30 60; do
   docker --context colima-flowly-screen run --rm --init \

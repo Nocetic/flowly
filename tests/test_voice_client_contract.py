@@ -37,13 +37,13 @@ def host(tmp_path, monkeypatch):
         def snapshot(self, params):
             validate_snapshot(params)
             served.append((runtime['profile'], 'snapshot', params))
-            return {'scope': {'profile': runtime['profile']}, 'sections': [{'kind': 'user', 'text': 'Hakan'}]}
+            return {'scope': {'profile': runtime['profile']}, 'sections': [{'kind': 'user', 'text': 'Ozan'}]}
 
     class Context:
         async def search(self, params):
             validate_context(params)
             served.append((runtime['profile'], 'recall', params))
-            return {'scope': {'profile': runtime['profile']}, 'facts': [{'text': 'Hakan'}]}
+            return {'scope': {'profile': runtime['profile']}, 'facts': [{'text': 'Ozan'}]}
 
     monkeypatch.setattr(feature_rpc, '_voice_snapshot_provider', lambda: Snapshot())
     monkeypatch.setattr(feature_rpc, '_voice_context_provider', lambda: Context())

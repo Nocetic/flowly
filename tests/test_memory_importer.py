@@ -39,7 +39,7 @@ class FakeExtractor:
 
 
 def test_parse_and_chunk_dump():
-    parsed = parse_dump("# Identity\n- Name is Hakan\n- Uses Flowly\n")
+    parsed = parse_dump("# Identity\n- Name is Ozan\n- Uses Flowly\n")
     assert parsed.rough_item_count == 2
     assert parsed.line_count == 3
 

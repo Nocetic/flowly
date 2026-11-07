@@ -126,8 +126,8 @@ def _seed_active(gov, text, key, ref_kind="inline", ref_id=None):
 
 
 def test_explicit_confident_newcomer_supersedes(gov):
-    loser = _seed_active(gov, "email old@x.com", "hakan:email")
-    new = Candidate(kind="profile", text="email new@x.com", normalized_key="hakan:email",
+    loser = _seed_active(gov, "email old@x.com", "ozan:email")
+    new = Candidate(kind="profile", text="email new@x.com", normalized_key="ozan:email",
                     confidence=0.0, is_explicit=True)
     svc = MemoryDreamerService(gov, _Delta(_rows(1)), _Scripted([[new]]),
                                injection_check=lambda t: False, calibrate=True)
@@ -135,14 +135,14 @@ def test_explicit_confident_newcomer_supersedes(gov):
     assert res.superseded == 1
     assert res.activated == 1
     assert gov.get_item(loser.id).status == STATUS_SUPERSEDED
-    winner = gov.find_by_key("hakan:email", statuses={STATUS_ACTIVE})[0]
+    winner = gov.find_by_key("ozan:email", statuses={STATUS_ACTIVE})[0]
     assert winner.text == "email new@x.com"
     assert winner.supersedes == loser.id
 
 
 def test_inferred_contradiction_does_not_supersede(gov):
-    loser = _seed_active(gov, "email old@x.com", "hakan:email")
-    new = Candidate(kind="profile", text="email guess@x.com", normalized_key="hakan:email",
+    loser = _seed_active(gov, "email old@x.com", "ozan:email")
+    new = Candidate(kind="profile", text="email guess@x.com", normalized_key="ozan:email",
                     confidence=0.99, is_explicit=False)  # inferred
     svc = MemoryDreamerService(gov, _Delta(_rows(1)), _Scripted([[new]]),
                                injection_check=lambda t: False, calibrate=True)
@@ -156,20 +156,20 @@ def test_supersede_mirrors_into_kg(gov, tmp_path):
     from flowly.memory.knowledge_graph import KnowledgeGraph
 
     kg = KnowledgeGraph(str(tmp_path / "kg.sqlite3"))
-    tid = kg.add_triple("Hakan", "email", "old@x.com", subject_type="person")
+    tid = kg.add_triple("Ozan", "email", "old@x.com", subject_type="person")
     # governance item backed by that triple, currently active
-    loser = _seed_active(gov, "Hakan email old@x.com", "hakan:email",
+    loser = _seed_active(gov, "Ozan email old@x.com", "ozan:email",
                          ref_kind="kg_triple", ref_id=tid)
     mirror = SqliteKGMirror(str(tmp_path / "kg.sqlite3"))
 
-    new = Candidate(kind="profile", text="Hakan email new@x.com", normalized_key="hakan:email",
+    new = Candidate(kind="profile", text="Ozan email new@x.com", normalized_key="ozan:email",
                     confidence=0.0, is_explicit=True)
     svc = MemoryDreamerService(gov, _Delta(_rows(1)), _Scripted([[new]]),
                                injection_check=lambda t: False, calibrate=True, kg_mirror=mirror)
     svc.run()
 
     # KG triple is now temporally closed (no current 'email=old@x.com').
-    facts = kg.query_entity("Hakan")
+    facts = kg.query_entity("Ozan")
     current_emails = [f for f in facts if f.get("predicate") == "email" and f.get("valid_to") is None]
     assert all("old@x.com" not in str(f.get("object", "")) for f in current_emails)
 

@@ -4,7 +4,6 @@ Every phone notification is a :class:`Notice` with a stable event key. This
 module sends each event at most once, adds the key to the payload so the relay
 can collapse repeats on the device (``eventKey``), and lets a request that can
 be answered elsewhere wait and be cancelled (:func:`schedule`, :func:`cancel`).
-See ``flowly-internal/core/docs/engineering/notification-policy.md``.
 
 Every title and body is cleaned and redacted here (:mod:`flowly.push.display`)
 whatever the sender did, and the owner's ``notifications.preview`` setting is

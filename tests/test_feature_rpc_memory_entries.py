@@ -79,6 +79,6 @@ def test_unclosed_sentinel_treated_as_freeform(workspace):
 
 
 def test_user_md_surfaced(workspace):
-    (workspace / "USER.md").write_text("Hakan, engineer.", encoding="utf-8")
+    (workspace / "USER.md").write_text("Ozan, engineer.", encoding="utf-8")
     out = feature_rpc.memory_entries()
-    assert out["user"] == "Hakan, engineer."
+    assert out["user"] == "Ozan, engineer."

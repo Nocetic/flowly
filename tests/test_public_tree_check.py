@@ -60,8 +60,8 @@ def test_the_upstream_agents_name_is_refused_in_any_file(repo):
 def test_only_pushes_to_the_open_repo_are_checked(repo):
     bad = commit(repo, {"docs/notes.md": "internal\n"})
     line = [f"refs/heads/main {bad} refs/heads/main {gate.ZERO}"]
-    assert gate.check_push(repo, "origin", "https://github.com/Nocetic/flowly-core.git", line) == []
-    assert gate.check_push(repo, "private", "git@github.com:Nocetic/flowly-internal.git", line) == []
+    assert gate.check_push(repo, "origin", "https://github.com/someone/flowly-fork.git", line) == []
+    assert gate.check_push(repo, "private", "git@github.com:someone/notes.git", line) == []
     for remote, url in (("public", "DISABLED"), ("x", "https://github.com/Nocetic/flowly.git"),
                         ("https://github.com/nocetic/flowly", "https://github.com/nocetic/flowly")):
         assert gate.check_push(repo, remote, url, line) == ["internal path: docs/notes.md"]

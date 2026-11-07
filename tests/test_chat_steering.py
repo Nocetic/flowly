@@ -428,7 +428,7 @@ def test_a_second_message_and_one_after_a_step_keep_no_half_text():
     inflight.finish("chat", "run")
 
 
-# ── A message sent while its conversation's reply runs (Hakan, 2026-10-27) ──
+# ── A message sent while its conversation's reply runs (Ozan, 2026-10-27) ──
 
 
 def _wired(monkeypatch, steer, receipt=lambda *_: None):

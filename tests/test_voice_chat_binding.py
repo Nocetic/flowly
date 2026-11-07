@@ -1,4 +1,4 @@
-"""A voice call belongs to the chat it starts in (flowly-internal/core/docs/chat-wire-protocol.md §7)."""
+"""A voice call belongs to the chat it starts in."""
 from __future__ import annotations
 
 import asyncio
@@ -511,7 +511,7 @@ async def test_a_named_agents_gateway_marks_the_user_row_and_refuses_a_bad_mark(
 
 
 def test_a_typed_turn_during_a_live_account_call_gets_the_call_even_as_the_host(manager, voice):
-    """Hakan, 2026-10-24 05:24: a typed turn over the Flowly server runs as the host,
+    """Ozan, 2026-10-24 05:24: a typed turn over the Flowly server runs as the host,
     the call is the account's; reading its ledger refused (SessionAccessError) and
     the turn went without the call."""
     from flowly.live_voice.authority import HOST_OWNER
@@ -530,7 +530,7 @@ def test_a_typed_turn_during_a_live_account_call_gets_the_call_even_as_the_host(
 
 
 def test_a_bound_calls_snapshot_has_this_chat_and_the_last_other_conversation_labelled_apart(manager, voice, tmp_path):
-    """Hakan: keep both. The bound chat first, then the owner's last other conversation."""
+    """Ozan: keep both. The bound chat first, then the owner's last other conversation."""
     from flowly.live_voice.memory_snapshot import VoiceMemorySnapshot
 
     workspace = tmp_path / 'workspace'

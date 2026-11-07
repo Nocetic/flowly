@@ -3,7 +3,7 @@
 A reaction can acknowledge a task without a word (👍, then keep working), or be
 the whole answer when nothing needs saying (❤️ after a thank-you). The user
 reacts to the agent's messages too; the server tells the agent with a bracketed
-note before their next message, or at once for 👎 / 🤔 (chat-one-log.md §13).
+note before their next message, or at once for 👎 / 🤔.
 """
 
 from __future__ import annotations

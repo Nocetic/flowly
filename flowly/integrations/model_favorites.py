@@ -1,7 +1,6 @@
 """Favourite models, one list per computer.
 
-Hakan asked (2026-11-07) for models to be starred and the stars to live in
-Core, so every app (Desktop, iOS, Android, through any of the computer's
+Starred models live in Core, so every app (Desktop, iOS, Android, through any of the computer's
 agents) reads the same list rather than each device keeping its own. Like the
 computer's sign-ins (``flowly/auth/shared_signin.py``) the list sits in the
 main agent's home, so every named agent on the computer shares it; a cloud

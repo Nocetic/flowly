@@ -3,7 +3,7 @@
 The agent asks for an API key or token by name; the person types it into a
 card in the chat; it is sealed to this agent's key on the way, saved in the
 agent's vault and handed to its commands as an environment variable. The model
-only ever sees names (flowly-server docs/cloud/design/secrets.md).
+only ever sees names.
 
 A request does not hold the turn: the agent says what it asked for and ends
 its reply; the conversation gets a turn of its own when the person saves,

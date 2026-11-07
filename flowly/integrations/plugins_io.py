@@ -1,8 +1,7 @@
 """CLI-side plugin discovery + enable/disable.
 
 Mirrors the desktop app's ``pluginsList`` / ``pluginEnable`` /
-``pluginDisable`` methods (see ``flowly-desktop/src/main/local/
-flowlyai-service.ts:2204+``) so the TUI's ``/plugins`` modal can manage
+``pluginDisable`` methods so the TUI's ``/plugins`` modal can manage
 plugins without a roundtrip to the gateway. Single source of truth:
 ``~/.flowly/config.json`` ``plugins.enabled`` / ``plugins.disabled``
 arrays — same fields the Python ``PluginManager`` reads at boot.

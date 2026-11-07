@@ -1,7 +1,7 @@
 """Ring the phone for a message a named agent wrote first.
 
 A named agent's runtime holds no device registrations (they live on the
-primary host; see ``flowly-internal/core/docs/engineering/profile-cron-push-2026-09-21.md``). When
+primary host). When
 its agenda delivers a message it only announces ``agenda.delivered`` with the
 wake-up's id. The primary host, observing the runtime, or Desktop, managing
 it, forwards that identity to ``profiles.agenda.notify``; this module reads

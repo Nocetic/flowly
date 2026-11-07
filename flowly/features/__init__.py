@@ -7,7 +7,7 @@ Usage:
         await spawn_verifier(...)
 
 Flags are read from ~/.flowly/features.json (local overrides) and can be
-set remotely by flowly-desktop when a user's plan is known. If no override
+set remotely by the Flowly apps when a user's plan is known. If no override
 exists, the registry default is used.
 """
 

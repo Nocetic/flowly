@@ -1,4 +1,4 @@
-"""Choosing an agent's provider from an app (flowly-server docs/cloud/design/provider-switching.md).
+"""Choosing an agent's provider from an app.
 
 Before: the new apps could not connect a provider at all. ``provider.set_key``
 took the key in the clear, which every call through the Flowly server would

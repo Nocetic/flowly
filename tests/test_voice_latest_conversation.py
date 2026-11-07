@@ -107,11 +107,11 @@ def test_the_snapshot_carries_it_after_memory_and_the_speaking_model_hears_the_t
     workspace = tmp_path / "workspace"
     (workspace / "memory").mkdir(parents=True)
     store = GovernanceStore(tmp_path / "memory_governance.sqlite3")
-    store.add_item(kind="profile", text="Name is Hakan", status="active")
-    store.add_item(kind="preference", text="Hakan is allergic to penicillin.", status="rejected")
+    store.add_item(kind="profile", text="Name is Ozan", status="active")
+    store.add_item(kind="preference", text="Ozan is allergic to penicillin.", status="rejected")
     (workspace / "memory" / "MEMORY.md").write_text("The studio is on the 3rd floor.\n")
     write_session(sessions, "web:abc", [
-        say("user", "Hakan is allergic to penicillin. Fix that, it is wrong."),
+        say("user", "Ozan is allergic to penicillin. Fix that, it is wrong."),
         say("assistant", "Fixed: you are not allergic. My key is sk-ant-api03-" + "a" * 40),
         say("user", "Thanks"),
     ], mtime=datetime(2026, 10, 4, 15, 14).timestamp(), metadata={"title": "Penicillin correction"})

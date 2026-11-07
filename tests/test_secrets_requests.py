@@ -1,5 +1,4 @@
-"""Secret requests, the agent's tools, the RPCs and a command's view of the vault
-(flowly-server docs/cloud/design/secrets.md)."""
+"""Secret requests, the agent's tools, the RPCs and a command's view of the vault."""
 
 from __future__ import annotations
 

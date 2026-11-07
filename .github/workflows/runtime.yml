@@ -14,7 +14,7 @@ name: runtime
 # (cloud/image/build-context.sh --ref) and pushes it to Fly's registry as
 # registry.fly.io/flowly-bots-image:<version>. The Flowly server watches this
 # repository's latest release and moves every cloud computer to that image on
-# its own (flowly-server docs/cloud/engineering/cloud-auto-update.md); until
+# its own; until
 # the image exists it waits, so the release does not wait for the image.
 #
 # The image job runs in the `cloud-image` environment: FLY_IMAGE_TOKEN (a

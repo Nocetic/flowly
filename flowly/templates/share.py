@@ -3,8 +3,7 @@
 The share button in an app's agent panel asks the agent itself, never the
 model: ``contents`` lists what a template of it would carry so the owner can
 choose, ``export`` builds the recipe of what was chosen. The server asks for
-the recipe and keeps it (flowly-server docs/cloud/design/agent-templates.md,
-"Paylaşım linki"); an app never supplies one.
+the recipe and keeps it; an app never supplies one.
 
 Memories never go from here: they go in only from the chat path, in the
 owner's own words (``template_draft``).

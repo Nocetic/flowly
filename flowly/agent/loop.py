@@ -2260,7 +2260,7 @@ class AgentLoop:
             logger.debug("[title] schedule failed", exc_info=True)
             # titling is best-effort; never disturb the turn
 
-    # ── Activity (flowly-internal/core/docs/engineering/activity-journal.md) ──────────────────
+    # ── Activity ──────────────────
 
     _ACTIVITY_OWNER_CHANNELS = frozenset({"web", "desktop", "ios", "android", "cli", "api", "voice"})
 
@@ -2883,8 +2883,8 @@ class AgentLoop:
         # owner publishes it from the card in the chat (flowly.templates).
         from flowly.agent.tools.templates import DraftTemplateTool
         self.tools.register(DraftTemplateTool(agent=self))
-        # React tool — one emoji on the user's latest message (chat-one-log.md
-        # §13). Carried by whichever surfaces registered with the reaction hub.
+        # React tool — one emoji on the user's latest message. Carried by
+        # whichever surfaces registered with the reaction hub.
         from flowly.agent.tools.react import ReactTool
         self.tools.register(ReactTool())
         from flowly.agent.tools.google_connection import GoogleConnectionTool
@@ -9048,7 +9048,7 @@ class AgentLoop:
                     # normally arrives mid-turn), and the run would never
                     # settle — the chat would sit on "replying" forever. The
                     # transcript divider comes from the compaction event
-                    # instead; see flowly-internal/core/docs/chat-wire-protocol.md §4.2.
+                    # instead.
                     saved = result.get("tokens_before", 0) - result.get("tokens_after", 0)
                     return OutboundMessage(
                         channel=msg.channel, chat_id=msg.chat_id,
@@ -9912,7 +9912,7 @@ class AgentLoop:
                 #
                 # No transcript separator is published here. The boundary row
                 # is written by whichever transport persists the conversation,
-                # keyed off this event — see flowly-internal/core/docs/chat-wire-protocol.md §4.2.
+                # keyed off this event.
                 # Publishing it as a reply meant every consumer of terminals
                 # had to recognise a magic string to avoid settling a turn that
                 # was still streaming.

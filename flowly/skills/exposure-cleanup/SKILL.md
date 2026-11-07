@@ -80,7 +80,7 @@ The helper refuses explicit `--kind ccpa` or `--kind gdpr` when the subject resi
 Validate the skill after edits:
 
 ```bash
-python3 /Users/hakanoren/.codex/skills/.system/skill-creator/scripts/quick_validate.py flowly/skills/exposure-cleanup
+python3 <skill-creator>/scripts/quick_validate.py flowly/skills/exposure-cleanup
 python3 -m py_compile flowly/skills/exposure-cleanup/scripts/exposure_cleanup.py
 python3 flowly/skills/exposure-cleanup/scripts/exposure_cleanup.py doctor
 ```

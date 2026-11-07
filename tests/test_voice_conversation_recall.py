@@ -109,11 +109,11 @@ async def test_recall_returns_them_with_memory_and_governance_still_applies(home
     (workspace / "memory").mkdir(parents=True)
     store = GovernanceStore(root / "memory_governance.sqlite3")
     store.add_item(kind="preference", text="Prefers the window seat on trains.", status="active")
-    store.add_item(kind="preference", text="Hakan is allergic to penicillin.", status="rejected")
+    store.add_item(kind="preference", text="Ozan is allergic to penicillin.", status="rejected")
     conversation("telegram:1", [say("user", "Book the train to İzmir, window seat.", "2026-10-01T10:00:00"),
                                 say("assistant", "Booked the 9:40 train, seat 12A.", "2026-10-01T10:00:05")],
                  metadata={"title": "Trip"})
-    conversation("web:2", [say("user", "Hakan is allergic to penicillin. On the train too.", 1_002)])
+    conversation("web:2", [say("user", "Ozan is allergic to penicillin. On the train too.", 1_002)])
     reader = VoiceContext(workspace, state_db=lambda name: root / name, profile=lambda: ("default", "bot-1"),
                           conversations=lambda: (root / "session_index.sqlite", sessions))
 

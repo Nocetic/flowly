@@ -143,7 +143,7 @@ async def test_a_screen_the_person_already_holds_continues_on_the_hand_back(scre
 
 
 async def test_later_is_not_a_new_step_and_the_turn_is_told_a_step_waits(screen_gateway, surfaces):
-    """Hakan, 2026-10-20: "ok thanks, I'll look in a bit" produced a second card."""
+    """Ozan, 2026-10-20: "ok thanks, I'll look in a bit" produced a second card."""
     from flowly.agent.loop import screen_step_waiting_guidance
 
     gateway, _, browser = screen_gateway
@@ -176,7 +176,7 @@ async def test_a_different_step_supersedes_the_one_waiting_and_both_are_on_recor
 
 
 async def test_the_agent_withdraws_a_step_the_person_gave_up_on(screen_gateway, surfaces):
-    """Hakan: "I won't sign in, I give up, remove the card" must not need the screen."""
+    """Ozan: "I won't sign in, I give up, remove the card" must not need the screen."""
     gateway, _, browser = screen_gateway
     result = await hand_over(gateway, surfaces, "Sign in to X")
     async with host_screen_run_scope(gateway, "desktop:chat", "run-tr"):

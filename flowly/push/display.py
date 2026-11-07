@@ -15,8 +15,6 @@ title and body goes through :func:`safe_text` first:
    matched.
 3. Whitespace is collapsed to one line (a command's line breaks become ``↵``)
    and the result is bounded.
-
-See ``flowly-internal/core/docs/engineering/notification-policy.md``.
 """
 
 from __future__ import annotations

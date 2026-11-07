@@ -329,7 +329,7 @@ def test_lm_studio_loads_a_model_with_the_context_the_agent_needs():
 
 
 def test_a_model_held_with_too_little_context_is_loaded_again_with_enough():
-    """The case Hakan hit: LM Studio held gemma-4-e2b at 8192 tokens."""
+    """The case Ozan hit: LM Studio held gemma-4-e2b at 8192 tokens."""
     app = _LMStudio(_lms_entry(contexts=(8192,)))
 
     async def go():

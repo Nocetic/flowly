@@ -19,8 +19,6 @@ runtime). Every 30 seconds it looks at the due wake-ups, one at a time:
 Once a day, after the review time, the agent reviews its goals and the
 owner's recent conversations in an isolated session and plans the day's
 follow-ups with its tools. It cannot write to the owner from there.
-
-See ``flowly-internal/core/docs/engineering/agent-goals.md``.
 """
 
 from __future__ import annotations

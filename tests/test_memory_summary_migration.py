@@ -45,9 +45,9 @@ def test_render_only_active_items(gov):
 
 
 def test_render_groups_and_kg(gov):
-    p = gov.add_item(kind="profile", text="name is Hakan")
+    p = gov.add_item(kind="profile", text="name is Ozan")
     gov.transition(p.id, STATUS_ACTIVE)
-    block = render_generated_block(gov.list_items(), kg_summary="- Hakan (person): email=a@b.com")
+    block = render_generated_block(gov.list_items(), kg_summary="- Ozan (person): email=a@b.com")
     assert "## Profile" in block
     assert "## Knowledge Graph" in block
     assert "email=a@b.com" in block
@@ -173,11 +173,11 @@ def test_migrate_dedups_internal_duplicates(gov, tmp_path):
 def test_migrate_skips_kg_covered_entries(gov, tmp_path):
     ms = MemoryStore(tmp_path / "ws")
     ms.write_long_term(
-        "<!-- 2026-06-01 -->\nmy email is hakan@nocetic.com\n"
+        "<!-- 2026-06-01 -->\nmy email is ozan@example.com\n"
         "<!-- 2026-06-02 -->\nprefers tabs over spaces\n"
     )
     # Simulate the email already living in the KG.
-    tokens = {"hakan@nocetic.com"}
+    tokens = {"ozan@example.com"}
     res = migrate_memory_md(gov, ms, kg_tokens=tokens)
     assert res.imported == 1
     assert res.kg_skipped == 1
@@ -197,13 +197,13 @@ def test_regenerate_memory_md_preserves_manual(gov, tmp_path):
     ms.write_long_term("# my notes\n\nremember milk\n")
     a = gov.add_item(kind="preference", text="dark mode")
     gov.transition(a.id, STATUS_ACTIVE)
-    out = regenerate_memory_md(gov, ms, kg_summary="- Hakan (person): email=a@b.com")
+    out = regenerate_memory_md(gov, ms, kg_summary="- Ozan (person): email=a@b.com")
     assert "remember milk" in out          # manual preserved
     assert "dark mode" in out              # active item rendered
     assert "email=a@b.com" in out          # KG summary included
     assert ms.read_long_term() == out      # written to disk
     # idempotent regen keeps a single block
-    out2 = regenerate_memory_md(gov, ms, kg_summary="- Hakan (person): email=a@b.com")
+    out2 = regenerate_memory_md(gov, ms, kg_summary="- Ozan (person): email=a@b.com")
     assert out2.count(SENTINEL_START) == 1
 
 
@@ -246,10 +246,10 @@ def test_kg_value_tokens_reads_real_kg(tmp_path):
     from flowly.memory.knowledge_graph import KnowledgeGraph
 
     kg = KnowledgeGraph(str(tmp_path / "kg.sqlite3"))
-    kg.add_triple("Hakan Ören", "email", "hakan@nocetic.com", subject_type="person")
-    kg.add_triple("Hakan Ören", "works_at", "Nocetic Limited",
+    kg.add_triple("Ozan Yılmaz", "email", "ozan@example.com", subject_type="person")
+    kg.add_triple("Ozan Yılmaz", "works_at", "Nocetic Limited",
                   subject_type="person", object_type="company")
     tokens = kg_value_tokens(kg)
-    assert "hakan@nocetic.com" in tokens
+    assert "ozan@example.com" in tokens
     # entity object normalized (underscores → spaces)
     assert any("nocetic" in t for t in tokens)

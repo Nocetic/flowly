@@ -95,7 +95,7 @@ def test_apply_supersede_redundant_freeform(gov):
 
 
 def test_apply_merge_into_survivor_with_kg_mirror(gov):
-    survivor = _active(gov, kind="fact", text="Hakan email a@b.com",
+    survivor = _active(gov, kind="fact", text="Ozan email a@b.com",
                        ref_kind="kg_triple", ref_id="t_keep")
     loser = _active(gov, kind="fact", text="a@b.com email a@b.com",
                     ref_kind="kg_triple", ref_id="t_drop")
@@ -159,10 +159,10 @@ def test_run_applies_and_refreshes_memory_md(gov, tmp_path):
 
 
 # -- whose memory it is ------------------------------------------------------
-# Memories name the owner both ways ("User prefers Turkish." / "Hakan wants
+# Memories name the owner both ways ("User prefers Turkish." / "Ozan wants
 # answers in Turkish."); the proposer must be told they are one person.
 
-OWNER_MD = "# User Profile — Hakan\n\n- **Name:** Hakan\n- **Language:** Turkish\n"
+OWNER_MD = "# User Profile — Ozan\n\n- **Name:** Ozan\n- **Language:** Turkish\n"
 
 
 def test_the_proposer_is_told_whose_memory_it_is(gov, tmp_path):
@@ -195,7 +195,7 @@ async def test_the_agents_consolidate_tool_sends_the_owner_too(gov, tmp_path):
     workspace = tmp_path / "ws"
     store = MemoryStore(workspace)
     (workspace / "USER.md").write_text(OWNER_MD, encoding="utf-8")
-    _active(gov, kind="preference", text="Hakan wants answers in Turkish.")
+    _active(gov, kind="preference", text="Ozan wants answers in Turkish.")
     prompts: list[str] = []
 
     class Provider:
@@ -209,4 +209,4 @@ async def test_the_agents_consolidate_tool_sends_the_owner_too(gov, tmp_path):
     )
     await tool.execute(dry_run=True)
 
-    assert prompts and "**Name:** Hakan" in prompts[0]
+    assert prompts and "**Name:** Ozan" in prompts[0]

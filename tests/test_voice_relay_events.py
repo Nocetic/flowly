@@ -289,7 +289,7 @@ async def test_a_call_starting_with_several_reads_at_once_gets_all_of_them(admis
 
     class Snapshot:
         def snapshot(self, params):
-            return {'scope': {'profile': 'default', 'botId': 'bot'}, 'sections': [{'kind': 'user', 'text': 'Hakan'}]}
+            return {'scope': {'profile': 'default', 'botId': 'bot'}, 'sections': [{'kind': 'user', 'text': 'Ozan'}]}
 
     monkeypatch.setattr(feature_rpc, '_voice_snapshot_provider', lambda: Snapshot())
     original = feature_rpc.resolve_voice_access
@@ -316,4 +316,4 @@ async def test_a_call_starting_with_several_reads_at_once_gets_all_of_them(admis
     replies = {frame['id']: frame for frame in socket.sent if frame.get('id') in {'memory', 'tasks'}}
     assert 'result' in replies['tasks'], replies['tasks']
     assert 'result' in replies['memory'], replies['memory']
-    assert replies['memory']['result']['sections'][0]['text'] == 'Hakan'
+    assert replies['memory']['result']['sections'][0]['text'] == 'Ozan'

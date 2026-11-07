@@ -3,7 +3,7 @@
 The ``react`` tool hands a reaction here; the surfaces that draw chats
 (the Flowly server and relay through the web channel, the local gateway's
 clients) register to carry it as a ``chat.reaction`` event. The server puts
-it on the user's newest message in that conversation (chat-one-log.md §13).
+it on the user's newest message in that conversation.
 """
 
 from __future__ import annotations

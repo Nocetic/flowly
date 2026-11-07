@@ -1,4 +1,4 @@
-"""Per-machine identifier — SHARED with flowly-desktop.
+"""Per-machine identifier — SHARED with Flowly Desktop.
 
 Why this matters
 ----------------
@@ -140,7 +140,7 @@ def _hardware_fingerprint_fallback() -> str:
 
 @lru_cache(maxsize=1)
 def machine_id() -> str:
-    """Return the machine identifier, sharing with flowly-desktop when possible.
+    """Return the machine identifier, sharing with Flowly Desktop when possible.
 
     Priority (default home):
       1. Read the desktop's ``.machine-id`` file → use raw UUID

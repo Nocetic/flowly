@@ -114,7 +114,7 @@ def test_starting_to_track_a_goal_is_work_planning_a_check_in_is_talking():
 def test_memory_work_is_not_a_step_either():
     messages = [
         {"role": "assistant", "content": "", "tool_calls": [_call("m", "memory_search"), _call("w", "web_search")]},
-        {"role": "tool", "tool_call_id": "m", "name": "memory_search", "content": "Hakan prefers short answers"},
+        {"role": "tool", "tool_call_id": "m", "name": "memory_search", "content": "Ozan prefers short answers"},
         {"role": "tool", "tool_call_id": "w", "name": "web_search", "content": "results"},
     ]
     shown = project_tool_messages_for_ui(messages)

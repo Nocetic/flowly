@@ -73,12 +73,12 @@ async def test_registration_sends_the_token_name_and_hosting_and_returns_the_sec
 
     monkeypatch.setattr(home_registration, "hosting", lambda: "mac")
     async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as client:
-        result = await register_home("id-token", server_url=URL, name="Hakan Mac", host_id="old", client=client)
+        result = await register_home("id-token", server_url=URL, name="Ozan Mac", host_id="old", client=client)
     assert result == HomeRegistration(agent_host_id="h1", agent_secret="s" * 43, created=True)
     assert seen == {
         "url": "https://cloud.useflowlyapp.com/v1/homes/register",
         "auth": "Bearer id-token",
-        "body": {"name": "Hakan Mac", "hosting": "mac", "hostId": "old"},
+        "body": {"name": "Ozan Mac", "hosting": "mac", "hostId": "old"},
     }
 
 

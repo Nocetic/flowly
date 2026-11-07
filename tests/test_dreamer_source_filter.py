@@ -28,7 +28,7 @@ def _make_index(tmp_path):
         ("cron:job_42", "user", "run the daily report", 3.0),
         ("subagent:run_9", "user", "internal subtask prompt", 4.0),
         ("system:announce", "assistant", "background announce", 5.0),
-        ("web:abc", "user", "my name is Hakan", 6.0),
+        ("web:abc", "user", "my name is Ozan", 6.0),
         ("heartbeat:tick.full", "user", "mirror twin noise", 7.0),
     ]
     conn.executemany(

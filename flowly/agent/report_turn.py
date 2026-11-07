@@ -11,7 +11,7 @@ live tool steps, one final, Stop.
 This module holds the small contract those runners and the agent share, so
 neither has to import the other.
 
-Wire (flowly-internal/core/docs/chat-wire-protocol.md):
+Wire:
 
 * ``{"event": "chat", "data": {"state": "run_started", "runId", "sessionKey",
   "turnOrigin": "subagent", "hiddenPrompt": true, "steerable": false}}`` once

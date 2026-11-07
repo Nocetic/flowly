@@ -65,7 +65,7 @@ _OWNER_PROFILE_CHARS = 1200
 def owner_profile(workspace: Path | str | None) -> str:
     """Who the memory belongs to, from the workspace's USER.md ("" if none).
 
-    Memories name the owner both ways ("User prefers Turkish." and "Hakan
+    Memories name the owner both ways ("User prefers Turkish." and "Ozan
     wants answers in Turkish."). Not knowing they are one person, the
     proposer kept both: 2 of 10 such duplicates merged over five runs with
     a cheap model, 10 of 10 once it was told who the owner is.

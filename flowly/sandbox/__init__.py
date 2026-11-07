@@ -1,7 +1,6 @@
 """Flowly CLI-side sandbox wrapping.
 
-The Electron desktop wraps the agent process at spawn time (see
-``flowly-desktop/src/main/local/sandbox/``). When a user runs the
+The Electron desktop wraps the agent process at spawn time. When a user runs the
 CLI directly (``flowly gateway``, ``uv run flowly``, etc.) there is
 no Electron in front to wrap, so the CLI wraps itself by re-execing
 under the platform sandbox primitive.

@@ -1,7 +1,6 @@
 """PluginsModal — list installed plugins, toggle enabled, see errors.
 
-Mirrors desktop's plugin tab (``flowly-desktop/src/main/local/flowlyai-
-service.ts:2204+`` ``pluginsList`` + the renderer UI). One row per
+Mirrors the Desktop app's plugin tab. One row per
 discovered plugin (bundled + user), colour-coded by status, with
 arrow-key navigation and a single-key toggle.
 

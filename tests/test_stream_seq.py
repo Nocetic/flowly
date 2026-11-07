@@ -1,4 +1,4 @@
-"""Every piece of a run goes on the wire with its ``seq`` (flowly-internal/core/docs/chat-wire-protocol.md §8).
+"""Every piece of a run goes on the wire with its ``seq``.
 
 A client shows the ``chat.inflight`` snapshot, then adds only pieces with a
 higher ``seq``: none twice (the Android "every chunk twice" class of bug),

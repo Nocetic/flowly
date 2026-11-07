@@ -2,7 +2,7 @@
 
 Sending a message to a bot once answered with
 
-    [Errno 1] Operation not permitted: '/Users/hakanoren/.flowly/config.json'
+    [Errno 1] Operation not permitted: '/Users/alice/.flowly/config.json'
 
 which is an errno and somebody's home directory, in place of anything they
 could act on. Worse, the log recorded the same sentence and no traceback — so

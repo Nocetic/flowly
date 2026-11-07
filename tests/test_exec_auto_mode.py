@@ -133,7 +133,7 @@ def test_a_link_out_of_the_folder_asks(folder: Path, tmp_path: Path) -> None:
 def home(tmp_path: Path, monkeypatch) -> Path:
     """A home with notes, an Obsidian vault in iCloud and an SSH key."""
     home = tmp_path / "home"
-    vault = home / "Library" / "Mobile Documents" / "iCloud~md~obsidian" / "Documents" / "Hakan"
+    vault = home / "Library" / "Mobile Documents" / "iCloud~md~obsidian" / "Documents" / "Ozan"
     vault.mkdir(parents=True)
     (vault / "Flowly.md").write_text("plan\n", encoding="utf-8")
     (home / "notes").mkdir()
@@ -148,8 +148,8 @@ def home(tmp_path: Path, monkeypatch) -> Path:
 # What the agent ran on 2026-10-31 and was asked about every time, though
 # read_file reads the same files unasked.
 HOME_READS = [
-    'ls -la "$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Hakan/" | head -40',
-    'cd "$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Hakan" && ls && cat Flowly.md',
+    'ls -la "$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Ozan/" | head -40',
+    'cd "$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Ozan" && ls && cat Flowly.md',
     "cat ~/notes/x.md 2>/dev/null",
     "sed -n '1,40p' ~/notes/x.md",
     'find ~/notes -maxdepth 2 -iname "*.md"',

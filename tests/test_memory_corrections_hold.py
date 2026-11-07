@@ -70,7 +70,7 @@ def triple_is_current(state, triple_id):
 
 
 async def add(tools, predicate="allergic_to", obj="penicillin"):
-    return await tools.execute("knowledge_graph", {"action": "add", "subject": "Hakan", "predicate": predicate,
+    return await tools.execute("knowledge_graph", {"action": "add", "subject": "Ozan", "predicate": predicate,
                                                   "object": obj, "subject_type": "person"})
 
 
@@ -79,9 +79,9 @@ async def test_an_invalidated_fact_stops_being_memory_everywhere(agent):
     await add(tools)
     [fact] = facade.gov.list_items(status=STATUS_ACTIVE)
     facade.refresh()
-    assert "Hakan allergic to penicillin" in memory_md(workspace)
+    assert "Ozan allergic to penicillin" in memory_md(workspace)
 
-    result = await tools.execute("knowledge_graph", {"action": "invalidate", "subject": "Hakan",
+    result = await tools.execute("knowledge_graph", {"action": "invalidate", "subject": "Ozan",
                                                     "predicate": "allergic_to", "object": "penicillin"})
     assert fact.ref_id in result
     await add(tools, "not_allergic_to")
@@ -89,8 +89,8 @@ async def test_an_invalidated_fact_stops_being_memory_everywhere(agent):
 
     assert facade.gov.get_item(fact.id).status == STATUS_STALE
     text = memory_md(workspace)
-    assert "Hakan not allergic to penicillin" in text
-    assert "Hakan allergic to penicillin" not in text
+    assert "Ozan not allergic to penicillin" in text
+    assert "Ozan allergic to penicillin" not in text
     assert not re.search(r"(?<!not_)allergic_to → penicillin", text)  # nor the graph
 
     # Undo brings the fact and its triple back together.
@@ -101,9 +101,9 @@ async def test_an_invalidated_fact_stops_being_memory_everywhere(agent):
 async def test_an_invalidate_that_closed_nothing_retires_nothing(agent):
     facade, tools, _, _, _ = agent
     await add(tools)
-    await tools.execute("knowledge_graph", {"action": "invalidate", "subject": "Hakan",
+    await tools.execute("knowledge_graph", {"action": "invalidate", "subject": "Ozan",
                                            "predicate": "allergic_to", "object": "aspirin"})
-    assert [i.text for i in facade.gov.list_items(status=STATUS_ACTIVE)] == ["Hakan allergic to penicillin"]
+    assert [i.text for i in facade.gov.list_items(status=STATUS_ACTIVE)] == ["Ozan allergic to penicillin"]
 
 
 async def test_a_rejected_fact_stops_being_current_in_the_graph(agent):
@@ -119,8 +119,8 @@ async def test_a_rejected_fact_stops_being_current_in_the_graph(agent):
 def test_a_fact_consolidation_finds_outdated_is_closed_in_the_graph(agent):
     facade, _, _, state, _ = agent
     graph = KnowledgeGraph(str(state / "knowledge_graph.sqlite3"))
-    triple = graph.add_triple("Hakan", "lives_in", "Ankara")
-    fact = facade.ingest_kg_fact("Hakan", "lives_in", "Ankara", triple)
+    triple = graph.add_triple("Ozan", "lives_in", "Ankara")
+    fact = facade.ingest_kg_fact("Ozan", "lives_in", "Ankara", triple)
     apply_operations(facade.gov, [ConsolidateOp(op=OP_STALE, item_id=fact.id, reason="moved")],
                      kg_mirror=facade.kg_mirror)
     assert facade.gov.get_item(fact.id).status == STATUS_STALE
@@ -132,16 +132,16 @@ def test_facts_and_triples_written_out_of_step_are_repaired(agent):
     graph = KnowledgeGraph(str(state / "knowledge_graph.sqlite3"))
     # What the owner's memory held: an invalidated fact still active, a
     # rejected one still current, and two items that must be left alone.
-    closed = graph.add_triple("Hakan", "allergic_to", "penicillin")
-    stale_fact = facade.ingest_kg_fact("Hakan", "allergic_to", "penicillin", closed)
-    graph.invalidate("Hakan", "allergic_to", "penicillin")
-    rejected_triple = graph.add_triple("Hakan", "loves", "dark mode")
-    rejected = facade.ingest_kg_fact("Hakan", "loves", "dark mode", rejected_triple)
+    closed = graph.add_triple("Ozan", "allergic_to", "penicillin")
+    stale_fact = facade.ingest_kg_fact("Ozan", "allergic_to", "penicillin", closed)
+    graph.invalidate("Ozan", "allergic_to", "penicillin")
+    rejected_triple = graph.add_triple("Ozan", "loves", "dark mode")
+    rejected = facade.ingest_kg_fact("Ozan", "loves", "dark mode", rejected_triple)
     facade.gov.transition(rejected.id, STATUS_REJECTED, actor="user", reason="panel without mirror")
-    shared = graph.add_triple("Hakan", "uses", "Ghostty")
-    old_copy = facade.ingest_kg_fact("Hakan", "uses", "Ghostty", shared)
+    shared = graph.add_triple("Ozan", "uses", "Ghostty")
+    old_copy = facade.ingest_kg_fact("Ozan", "uses", "Ghostty", shared)
     facade.gov.transition(old_copy.id, STATUS_SUPERSEDED, actor="system", reason="test")
-    facade.gov.add_item(kind="fact", text="Hakan uses Ghostty", status=STATUS_ACTIVE,
+    facade.gov.add_item(kind="fact", text="Ozan uses Ghostty", status=STATUS_ACTIVE,
                         ref_kind="kg_triple", ref_id=shared)
     missing = facade.gov.add_item(kind="fact", text="Gone from the graph", status=STATUS_ACTIVE,
                                   ref_kind="kg_triple", ref_id="t_missing")
@@ -159,7 +159,7 @@ def test_an_unreadable_graph_repairs_nothing(tmp_path):
     state.mkdir()
     (state / "knowledge_graph.sqlite3").write_text("not a database")
     facade = open_memory_governance(state, tmp_path / "workspace")
-    item = facade.gov.add_item(kind="fact", text="Hakan uses Codex", status=STATUS_ACTIVE,
+    item = facade.gov.add_item(kind="fact", text="Ozan uses Codex", status=STATUS_ACTIVE,
                                ref_kind="kg_triple", ref_id="t_1")
     assert facade.reconcile_kg_triples() == {"staled": 0, "closed": 0}
     assert facade.gov.get_item(item.id).status == STATUS_ACTIVE
@@ -189,22 +189,22 @@ async def test_a_memory_note_is_stated_once(agent):
 
 
 def test_the_prompt_leaves_out_a_note_that_is_no_longer_memory():
-    md = (f"<!-- 2026-10-04 15:14 -->\nHakan is allergic to penicillin.\n\nThe studio is on the 3rd floor.\n\n"
-          f"<!-- 2026-10-04 15:15 -->\nCodex\n\nHakan uses Codex for coding.\n\n"
-          f"{SENTINEL_START}\n- Hakan is allergic to penicillin.\n{SENTINEL_END}\n")
-    states = [("rejected", "Hakan is allergic to penicillin."), ("stale", "Codex"),
+    md = (f"<!-- 2026-10-04 15:14 -->\nOzan is allergic to penicillin.\n\nThe studio is on the 3rd floor.\n\n"
+          f"<!-- 2026-10-04 15:15 -->\nCodex\n\nOzan uses Codex for coding.\n\n"
+          f"{SENTINEL_START}\n- Ozan is allergic to penicillin.\n{SENTINEL_END}\n")
+    states = [("rejected", "Ozan is allergic to penicillin."), ("stale", "Codex"),
               ("active", "The studio is on the 3rd floor.")]
     shown = withhold_retired_notes(md, states)
-    assert "studio" in shown and "Hakan uses Codex for coding." in shown
+    assert "studio" in shown and "Ozan uses Codex for coding." in shown
     # The whole short note goes; a longer note that mentions it stays.
     assert "\nCodex\n" not in shown
     assert shown.count("allergic") == 1  # only the generated block, untouched
     # Nothing retired, nothing changed.
     assert withhold_retired_notes(md, [("active", "x")]) == md
     # The same text still active elsewhere is not withheld.
-    assert "allergic" in withhold_retired_notes("Hakan is allergic to penicillin.",
-                                                 [("rejected", "Hakan is allergic to penicillin."),
-                                                  ("active", "Hakan is allergic to penicillin.")])
+    assert "allergic" in withhold_retired_notes("Ozan is allergic to penicillin.",
+                                                 [("rejected", "Ozan is allergic to penicillin."),
+                                                  ("active", "Ozan is allergic to penicillin.")])
 
 
 def test_an_unreadable_governance_index_reports_none(tmp_path):
@@ -220,12 +220,12 @@ def test_the_chat_prompt_states_memory_once_and_without_retired_notes(agent, mon
     facade, _, workspace, state, _ = agent
     monkeypatch.setattr("flowly.config.loader.get_data_dir", lambda: state)
     graph = KnowledgeGraph(str(state / "knowledge_graph.sqlite3"))
-    facade.ingest_kg_fact("Hakan", "works_at", "Nocetic", graph.add_triple("Hakan", "works_at", "Nocetic"))
-    retired = facade.ingest_append("Hakan is allergic to penicillin.")
+    facade.ingest_kg_fact("Ozan", "works_at", "Nocetic", graph.add_triple("Ozan", "works_at", "Nocetic"))
+    retired = facade.ingest_append("Ozan is allergic to penicillin.")
     facade.reject(retired.id)
     note = workspace / "memory" / "MEMORY.md"
     note.parent.mkdir(parents=True, exist_ok=True)
-    note.write_text("<!-- 2026-10-04 15:14 -->\nHakan is allergic to penicillin.\n\nThe studio is on the 3rd floor.\n")
+    note.write_text("<!-- 2026-10-04 15:14 -->\nOzan is allergic to penicillin.\n\nThe studio is on the 3rd floor.\n")
     facade.refresh()
 
     block = ContextBuilder(workspace)._compute_memory_block(memory_search_enabled=True)
@@ -261,7 +261,7 @@ def test_a_decision_in_the_memory_panel_reaches_the_prompt_at_once(tmp_path, mon
     monkeypatch.setattr(feature_rpc, "state_db", lambda name: home / name)
     graph = KnowledgeGraph(str(home / "knowledge_graph.sqlite3"))
     facade = open_memory_governance(home, workspace)
-    fact = facade.ingest_kg_fact("Hakan", "loves", "dark mode", graph.add_triple("Hakan", "loves", "dark mode"))
+    fact = facade.ingest_kg_fact("Ozan", "loves", "dark mode", graph.add_triple("Ozan", "loves", "dark mode"))
     facade.refresh()
     assert "dark mode" in (workspace / "memory" / "MEMORY.md").read_text()
 

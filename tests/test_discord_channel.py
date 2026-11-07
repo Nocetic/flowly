@@ -62,7 +62,7 @@ def _payload(
         "id": "M1",
         "channel_id": "CH1",
         "content": content,
-        "author": {"id": "U1", "username": "hakan", "global_name": "Hakan"},
+        "author": {"id": "U1", "username": "ozan", "global_name": "Ozan"},
         "mentions": mentions or [],
     }
     if guild_id:
@@ -134,8 +134,8 @@ def test_dms_bypass_group_policy():
 def test_guild_message_is_labeled_with_sender_name():
     channel, handled = _make_channel("open")
     _feed(channel, _payload("raporu attım"))
-    assert handled[0]["content"] == "[Hakan]: raporu attım"
-    assert handled[0]["metadata"]["sender_name"] == "Hakan"
+    assert handled[0]["content"] == "[Ozan]: raporu attım"
+    assert handled[0]["metadata"]["sender_name"] == "Ozan"
 
 
 def test_guild_nick_wins_over_global_name():
@@ -159,7 +159,7 @@ def test_bot_mention_is_stripped_and_others_humanized():
             mentions=[_bot_mention(), {"id": "U2", "username": "ayse", "global_name": "Ayşe"}],
         ),
     )
-    assert handled[0]["content"] == "[Hakan]: @Ayşe ile konuş"
+    assert handled[0]["content"] == "[Ozan]: @Ayşe ile konuş"
 
 
 # ── passive channel context (Faz B / observe path) ──────────────────
@@ -173,7 +173,7 @@ def test_unanswered_guild_message_is_observed():
     assert kw["metadata"]["group_observe"] is True
     # Bare text (no [name] prefix) + sender name in metadata for the loop.
     assert kw["content"] == "günaydın ekip"
-    assert kw["metadata"]["sender_name"] == "Hakan"
+    assert kw["metadata"]["sender_name"] == "Ozan"
 
 
 def test_group_context_off_drops_unanswered_guild_messages():

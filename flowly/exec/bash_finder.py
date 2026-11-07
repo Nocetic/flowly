@@ -12,14 +12,14 @@ correctly lists files.
 
 The standard solution is to require bash on every platform (Windows
 users install Git for Windows, which ships Git Bash at a standard
-path). Flowly goes further: flowly-desktop's Windows installer bundles
+path). Flowly goes further: Flowly Desktop's Windows installer bundles
 a portable MinGit (≈35 MB) and injects its bash path via the
 `FLOWLY_BASH_PATH` environment variable, so end-users get Mac-parity
 shell semantics out of the box without any manual install.
 
 Resolution order (Windows only)
 ───────────────────────────────
-  1. `FLOWLY_BASH_PATH` — set by flowly-desktop for bundled MinGit. Highest
+  1. `FLOWLY_BASH_PATH` — set by Flowly Desktop for bundled MinGit. Highest
      priority so the version we ship always wins.
   2. Standard Git for Windows install paths (Program Files, LOCALAPPDATA).
      Catches dev machines and users who already installed Git manually.
@@ -64,7 +64,7 @@ def find_bash() -> str | None:
         _BASH_CACHE = None
         return None
 
-    # 1. Env var injected by flowly-desktop for the bundled MinGit.
+    # 1. Env var injected by Flowly Desktop for the bundled MinGit.
     env_path = os.environ.get("FLOWLY_BASH_PATH")
     if env_path and os.path.isfile(env_path):
         logger.info(f"[bash_finder] Using bundled bash: {env_path}")

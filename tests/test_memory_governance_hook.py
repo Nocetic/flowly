@@ -90,11 +90,11 @@ async def test_subagent_registry_also_fires_governance_hook(tmp_path):
 async def test_kg_add_flows_and_supersedes(tmp_path):
     reg, gov, mg, ws = _make(tmp_path)
     await reg.execute("knowledge_graph", {
-        "action": "add", "subject": "Hakan", "predicate": "email",
+        "action": "add", "subject": "Ozan", "predicate": "email",
         "object": "old@x.com", "subject_type": "person",
     })
     await reg.execute("knowledge_graph", {
-        "action": "add", "subject": "Hakan", "predicate": "email",
+        "action": "add", "subject": "Ozan", "predicate": "email",
         "object": "new@x.com", "subject_type": "person",
     })
     facts = [i for i in gov.list_items() if i.kind == "fact"]

@@ -2,8 +2,8 @@
 """What may reach the open repo (Nocetic/flowly), checked before it does.
 
 The open repo gets code, tests and the user docs in ``content/docs``. Design
-notes, research, marketing drafts and operations live in the private
-``Nocetic/flowly-internal`` repo. This refuses a push to the open repo when
+notes, research, marketing drafts and operations live in the maintainers'
+private notes repo. This refuses a push to the open repo when
 the commit pushed carries one of those paths or the upstream agent's name,
 and when it pushes anything but ``main`` or a tag.
 
@@ -91,7 +91,7 @@ def _report(found: list[str]) -> int:
         print(f"  - {item}", file=sys.stderr)
     if len(found) > 40:
         print(f"  … and {len(found) - 40} more", file=sys.stderr)
-    print("Internal notes belong in Nocetic/flowly-internal.", file=sys.stderr)
+    print("Internal notes belong in the maintainers' private notes repo.", file=sys.stderr)
     return 1
 
 

@@ -1,4 +1,4 @@
-"""The secrets vault, its envelope, names and redaction (flowly-server docs/cloud/design/secrets.md)."""
+"""The secrets vault, its envelope, names and redaction."""
 
 from __future__ import annotations
 

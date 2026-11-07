@@ -46,11 +46,11 @@ def test_injection_flagged_append_never_auto_activates(facade):
 
 def test_kg_fact_user_channel_activates_and_supersedes(facade):
     first = facade.ingest_kg_fact(
-        "Hakan", "email", "old@x.com", "t_1", source_session="cli:tui-1"
+        "Ozan", "email", "old@x.com", "t_1", source_session="cli:tui-1"
     )
     assert first.status == STATUS_ACTIVE
     second = facade.ingest_kg_fact(
-        "Hakan", "email", "new@x.com", "t_2", source_session="cli:tui-1"
+        "Ozan", "email", "new@x.com", "t_2", source_session="cli:tui-1"
     )
     assert second.status == STATUS_ACTIVE
     assert facade.gov.get_item(first.id).status != STATUS_ACTIVE  # old superseded
@@ -58,13 +58,13 @@ def test_kg_fact_user_channel_activates_and_supersedes(facade):
 
 def test_kg_fact_automation_reviews_and_does_not_evict_active(facade):
     good = facade.ingest_kg_fact(
-        "Hakan", "role", "founder", "t_1", source_session="cli:tui-1"
+        "Ozan", "role", "founder", "t_1", source_session="cli:tui-1"
     )
     assert good.status == STATUS_ACTIVE
     # An autonomous run proposes a conflicting value — it must NOT silently evict
     # the known active fact; it parks in review.
     auto = facade.ingest_kg_fact(
-        "Hakan", "role", "intern", "t_2", source_session="cron:job_9",
+        "Ozan", "role", "intern", "t_2", source_session="cron:job_9",
         auto_activate=False,
     )
     assert auto.status == STATUS_NEEDS_REVIEW

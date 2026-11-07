@@ -152,9 +152,9 @@ def test_duplicate_across_runs_bumps_not_duplicates(gov):
 
 def test_contradiction_routes_newcomer_to_review(gov):
     old = Candidate(kind="profile", text="email old@x.com",
-                    normalized_key="hakan:email", confidence=0.9)
+                    normalized_key="ozan:email", confidence=0.9)
     new = Candidate(kind="profile", text="email new@x.com",
-                    normalized_key="hakan:email", confidence=0.9)
+                    normalized_key="ozan:email", confidence=0.9)
     svc = _svc(gov, _msgs(4), [[old], [new]], injection_check=lambda t: False)
     svc.run()  # old becomes active
     svc.delta_source.rows.append(
@@ -163,7 +163,7 @@ def test_contradiction_routes_newcomer_to_review(gov):
     res2 = svc.run()
     assert res2.conflicts == 1
     assert res2.needs_review == 1  # newcomer parked, P3 will arbitrate
-    assert gov.get_item(gov.find_by_key("hakan:email", statuses={STATUS_ACTIVE})[0].id).text == "email old@x.com"
+    assert gov.get_item(gov.find_by_key("ozan:email", statuses={STATUS_ACTIVE})[0].id).text == "email old@x.com"
 
 
 # -- watermark resume -------------------------------------------------------

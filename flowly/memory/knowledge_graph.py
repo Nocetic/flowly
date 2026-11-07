@@ -9,8 +9,8 @@ SQLite-backed store with:
 
 Usage:
     kg = KnowledgeGraph("/path/to/knowledge_graph.sqlite3")
-    kg.add_triple("Hakan Ören", "works_at", "Nocetic Limited", subject_type="person", object_type="company")
-    kg.query_entity("Hakan")  # resolves via alias/fuzzy to "Hakan Ören"
+    kg.add_triple("Ozan Yılmaz", "works_at", "Acme Ltd", subject_type="person", object_type="company")
+    kg.query_entity("Ozan")  # resolves via alias/fuzzy to "Ozan Yılmaz"
 """
 
 import hashlib

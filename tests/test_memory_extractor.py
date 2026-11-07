@@ -208,14 +208,14 @@ def test_dreamer_with_live_extractor_commits(tmp_path):
             if self.calls == 1:
                 return [
                     MessageRow(id=1, session_key="cli:x", role="user",
-                               content="My name is Hakan and I guess I like dark mode", timestamp=0.0),
+                               content="My name is Ozan and I guess I like dark mode", timestamp=0.0),
                     MessageRow(id=2, session_key="cli:x", role="assistant",
-                               content="Got it, Hakan.", timestamp=1.0),
+                               content="Got it, Ozan.", timestamp=1.0),
                 ]
             return []
 
     provider = _FakeProvider([
-        '[{"kind":"profile","text":"Name is Hakan","normalized_key":"profile:name",'
+        '[{"kind":"profile","text":"Name is Ozan","normalized_key":"profile:name",'
         '"privacy_level":"normal","is_explicit":true,"confidence":0.95},'
         '{"kind":"preference","text":"Might prefer dark mode","normalized_key":"pref:theme",'
         '"privacy_level":"normal","is_explicit":false,"confidence":0.5}]'
@@ -234,7 +234,7 @@ def test_dreamer_with_live_extractor_commits(tmp_path):
     active = gov.list_items(status=STATUS_ACTIVE)
     review = gov.list_items(status=STATUS_NEEDS_REVIEW)
     # explicit profile fact auto-activated; inferred preference parked for review.
-    assert any(i.text == "Name is Hakan" and i.kind == "profile" for i in active)
+    assert any(i.text == "Name is Ozan" and i.kind == "profile" for i in active)
     assert any(i.kind == "preference" for i in review)
     gov.close()
 
@@ -351,7 +351,7 @@ def test_dreamer_dedups_and_supersedes_via_known_memory(tmp_path):
 def test_render_profile():
     assert _render_profile("") == "(no profile on file)"
     assert _render_profile("   ") == "(no profile on file)"
-    assert _render_profile("# Profile\n- Name: Hakan") == "# Profile\n- Name: Hakan"
+    assert _render_profile("# Profile\n- Name: Ozan") == "# Profile\n- Name: Ozan"
     assert len(_render_profile("x" * 9000, max_chars=100)) == 100
 
 
@@ -359,23 +359,23 @@ def test_profile_injected_into_prompt():
     ex = SubagentExtractor(provider=object(), model="m")
     prompt = ex._build_prompt(
         [MessageRow(id=1, session_key="web:x", role="user", content="hi", timestamp=0.0)],
-        profile="# User Profile\n- **Name:** Hakan",
+        profile="# User Profile\n- **Name:** Ozan",
     )
     assert "USER PROFILE" in prompt
-    assert "**Name:** Hakan" in prompt
+    assert "**Name:** Ozan" in prompt
 
 
 def test_read_user_profile(tmp_path):
     from flowly.memory.dreamer import read_user_profile
 
     assert read_user_profile(tmp_path) == ""        # no USER.md → empty
-    (tmp_path / "USER.md").write_text("- Name: Hakan", encoding="utf-8")
-    assert "Hakan" in read_user_profile(tmp_path)
+    (tmp_path / "USER.md").write_text("- Name: Ozan", encoding="utf-8")
+    assert "Ozan" in read_user_profile(tmp_path)
 
 
 def test_dreamer_skips_facts_already_in_profile(tmp_path):
     """The user's USER.md profile is injected so the dreamer doesn't re-propose
-    facts already on file. Regression for: the name "Hakan" landed back in the
+    facts already on file. Regression for: the name "Ozan" landed back in the
     review queue even though it was already in USER.md."""
     from flowly.memory.dreamer import (
         MemoryDreamerService,
@@ -386,7 +386,7 @@ def test_dreamer_skips_facts_already_in_profile(tmp_path):
 
     ws = tmp_path / "workspace"
     ws.mkdir()
-    (ws / "USER.md").write_text("# User Profile — Hakan\n- **Name:** Hakan\n", encoding="utf-8")
+    (ws / "USER.md").write_text("# User Profile — Ozan\n- **Name:** Ozan\n", encoding="utf-8")
 
     gov = GovernanceStore(str(tmp_path / "gov.sqlite3"))
 
@@ -396,11 +396,11 @@ def test_dreamer_skips_facts_already_in_profile(tmp_path):
 
         async def chat_stream(self, messages, **kwargs):
             self.seen_prompt = messages[0]["content"]
-            if "**Name:** Hakan" in self.seen_prompt:
+            if "**Name:** Ozan" in self.seen_prompt:
                 yield _Delta("[]")  # name already on file → nothing new
             else:  # regression path: without injection the model "learns" it again
                 yield _Delta(
-                    '[{"kind":"profile","text":"Name is Hakan",'
+                    '[{"kind":"profile","text":"Name is Ozan",'
                     '"normalized_key":"profile:name","is_explicit":false,"confidence":0.6}]'
                 )
 
@@ -414,7 +414,7 @@ def test_dreamer_skips_facts_already_in_profile(tmp_path):
             self.n += 1
             if self.n == 1:
                 return [MessageRow(id=1, session_key="web:x", role="user",
-                                   content="selam ben hakan", timestamp=0.0)]
+                                   content="selam ben ozan", timestamp=0.0)]
             return []
 
     async def main():
@@ -427,7 +427,7 @@ def test_dreamer_skips_facts_already_in_profile(tmp_path):
         return await asyncio.to_thread(svc.run, max_messages=50)
 
     res = asyncio.run(main())
-    assert "**Name:** Hakan" in provider.seen_prompt   # profile reached the prompt
+    assert "**Name:** Ozan" in provider.seen_prompt   # profile reached the prompt
     assert res.candidates == 0                          # nothing re-proposed
     gov.close()
 
@@ -476,8 +476,8 @@ def test_memory_dream_rpc_end_to_end(tmp_path, monkeypatch):
         "CREATE TABLE messages (id INTEGER PRIMARY KEY, session_key TEXT, "
         "role TEXT, content TEXT, timestamp REAL)"
     )
-    conn.execute("INSERT INTO messages VALUES (1,'cli:x','user','My name is Hakan',0.0)")
-    conn.execute("INSERT INTO messages VALUES (2,'cli:x','assistant','Hi Hakan',1.0)")
+    conn.execute("INSERT INTO messages VALUES (1,'cli:x','user','My name is Ozan',0.0)")
+    conn.execute("INSERT INTO messages VALUES (2,'cli:x','assistant','Hi Ozan',1.0)")
     conn.commit()
     conn.close()
 
@@ -494,7 +494,7 @@ def test_memory_dream_rpc_end_to_end(tmp_path, monkeypatch):
         lambda cfg: object(),
     )
     provider = _FakeProvider([
-        '[{"kind":"profile","text":"Name is Hakan","normalized_key":"profile:name",'
+        '[{"kind":"profile","text":"Name is Ozan","normalized_key":"profile:name",'
         '"privacy_level":"normal","is_explicit":true,"confidence":0.95}]'
     ])
     monkeypatch.setattr(
@@ -510,7 +510,7 @@ def test_memory_dream_rpc_end_to_end(tmp_path, monkeypatch):
 
     gov = GovernanceStore(str(tmp_path / "memory_governance.sqlite3"))
     active = gov.list_items(status=STATUS_ACTIVE)
-    assert any(i.text == "Name is Hakan" for i in active)
+    assert any(i.text == "Name is Ozan" for i in active)
     gov.close()
 
     # A second pass has nothing new past the watermark → cheap no-op.

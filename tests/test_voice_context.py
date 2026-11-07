@@ -28,9 +28,9 @@ def context(tmp_path):
 @pytest.mark.asyncio
 async def test_recall_has_scoped_provenance_and_revisions(context):
     reader, workspace, store, _ = context
-    item = store.add_item(kind='preference', text='Hakan prefers Turkish.', status='active',
+    item = store.add_item(kind='preference', text='Ozan prefers Turkish.', status='active',
                           source_session='desktop:work-1', source_message_ids=['msg-1'])
-    (workspace / 'USER.md').write_text('Hakan builds Flowly.')
+    (workspace / 'USER.md').write_text('Ozan builds Flowly.')
     result = await reader.search({})
     fact = next(f for f in result['facts'] if 'prefers' in f['text'])
     assert fact['sourceRef'].endswith(item.id)
@@ -49,11 +49,11 @@ async def test_privacy_and_lifecycle_apply_to_graph_and_manual_mirrors(context, 
     graph = KnowledgeGraph(str(tmp_path / 'knowledge_graph.sqlite3'))
     for status, privacy, marker in [('active', 'secret', 'secret-plan'), ('active', 'sensitive', 'private-plan'),
                                      ('superseded', 'normal', 'old-plan'), ('needs_review', 'normal', 'unconfirmed-plan')]:
-        triple = graph.add_triple('Hakan', 'plans', marker)
-        store.add_item(kind='fact', text=f'Hakan plans {marker}', ref_kind='kg_triple', ref_id=triple,
+        triple = graph.add_triple('Ozan', 'plans', marker)
+        store.add_item(kind='fact', text=f'Ozan plans {marker}', ref_kind='kg_triple', ref_id=triple,
                        status=status, privacy_level=privacy)
     graph.add_triple('Flowly', 'uses', 'ElevenLabs')
-    (workspace / 'memory/MEMORY.md').write_text('Copied note: Hakan plans secret-plan')
+    (workspace / 'memory/MEMORY.md').write_text('Copied note: Ozan plans secret-plan')
     result = await reader.search({})
     text = json.dumps(result)
     assert 'secret-plan' not in text and 'private-plan' not in text and 'old-plan' not in text and 'unconfirmed-plan' not in text
@@ -90,7 +90,7 @@ async def test_corrupt_governance_does_not_turn_into_unfiltered_recall(context, 
 @pytest.mark.asyncio
 async def test_index_failure_keeps_available_sources_and_reports_partial(context):
     reader, workspace, _, index = context
-    (workspace / 'USER.md').write_text('Hakan speaks Turkish.')
+    (workspace / 'USER.md').write_text('Ozan speaks Turkish.')
     index.search.side_effect = RuntimeError('token=do-not-export-in-errors')
     result = await reader.search({'query': 'Turkish'})
     assert result['partial']
@@ -131,8 +131,8 @@ async def test_memory_search_matches_count_even_without_the_query_words(context)
     """Recall uses the agent's own memory search; a semantic match that does
     not repeat the query's words is still a match, as in the agent's chat."""
     reader, workspace, _, index = context
-    (workspace / 'memory/2026-10-01.md').write_text('Hakan drinks an Americano every morning.')
-    index.search.return_value = [SimpleNamespace(path='memory/2026-10-01.md', snippet='Hakan drinks an Americano every morning.',
+    (workspace / 'memory/2026-10-01.md').write_text('Ozan drinks an Americano every morning.')
+    index.search.return_value = [SimpleNamespace(path='memory/2026-10-01.md', snippet='Ozan drinks an Americano every morning.',
                                                  start_line=1, end_line=1)]
     result = await reader.search({'query': 'kahve alışkanlığı'})
     assert any('Americano' in fact['text'] for fact in result['facts'])

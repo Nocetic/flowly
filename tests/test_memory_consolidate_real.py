@@ -5,7 +5,7 @@ Live model, skipped by default. Run against a real Flowly home:
     FLOWLY_REAL_LLM_HOME=~/.flowly pytest -m real_llm tests/test_memory_consolidate_real.py
 
 Memories call the owner "User" in one note and by name in the next ("User
-prefers replies in Turkish." / "Hakan wants the agent to answer in
+prefers replies in Turkish." / "Ozan wants the agent to answer in
 Turkish."). The proposer did not know they were one person: with the active
 cheap model (deepseek-v4.1-flash, 2026-10-28) 2 of 10 such duplicates merged
 over five runs; told who the owner is, 10 of 10, and no related-but-different
@@ -26,10 +26,10 @@ from flowly.memory.governance import GovernanceStore
 
 pytestmark = pytest.mark.real_llm
 
-OWNER_MD = "# User Profile — Hakan\n\n- **Name:** Hakan\n- **Language:** Turkish (casual tone)\n"
+OWNER_MD = "# User Profile — Ozan\n\n- **Name:** Ozan\n- **Language:** Turkish (casual tone)\n"
 DUPLICATES = [
-    ("User prefers replies in Turkish.", "Hakan wants the agent to answer in Turkish."),
-    ("User's birthday is March 3.", "Hakan was born on 3 March."),
+    ("User prefers replies in Turkish.", "Ozan wants the agent to answer in Turkish."),
+    ("User's birthday is March 3.", "Ozan was born on 3 March."),
 ]
 DISTINCT = [
     "User drinks coffee without sugar.",

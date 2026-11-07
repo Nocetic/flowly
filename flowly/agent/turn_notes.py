@@ -1,5 +1,5 @@
 """Notes the Flowly app adds to a turn: what the agent should know that the
-person did not say (``chat.send`` ``notes``; flowly-server chat-one-log.md §13).
+person did not say (``chat.send`` ``notes``).
 
 The person's reaction on one of the agent's messages is the first: "the user
 reacted 👍 to your message …". It used to be glued in front of the person's

@@ -20,9 +20,9 @@ def voice_memory(tmp_path, register=True):
 
 def test_saves_through_the_agents_memory_tool_and_refuses_duplicates(tmp_path):
     memory = voice_memory(tmp_path)
-    assert asyncio.run(memory.append({'content': 'Hakan prefers Turkish replies.'})) == {'status': 'saved'}
-    assert 'Hakan prefers Turkish replies.' in (tmp_path / 'memory' / 'MEMORY.md').read_text()
-    assert asyncio.run(memory.append({'content': 'hakan prefers turkish replies.'}))['status'] == 'duplicate'
+    assert asyncio.run(memory.append({'content': 'Ozan prefers Turkish replies.'})) == {'status': 'saved'}
+    assert 'Ozan prefers Turkish replies.' in (tmp_path / 'memory' / 'MEMORY.md').read_text()
+    assert asyncio.run(memory.append({'content': 'ozan prefers turkish replies.'}))['status'] == 'duplicate'
 
 
 def test_reports_an_agent_without_the_tool_as_unavailable(tmp_path):

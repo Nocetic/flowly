@@ -1,7 +1,7 @@
 """Feature flag registry and store.
 
 Two sources of truth (highest priority wins):
-  1. Remote overrides — set by flowly-desktop/flowly-app based on user plan
+  1. Remote overrides — set by the Flowly apps based on user plan
   2. Local overrides  — ~/.flowly/features.json, user can edit manually
   3. Registry default — hardcoded below
 

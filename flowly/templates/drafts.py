@@ -3,8 +3,7 @@
 The gateway registers how the event is carried (``flowly.cli.gateway_cmd``):
 to the Flowly server for the main agent, to the agent host for a named one
 (which passes it on under the agent's profile). The server keeps the draft
-and puts a card in the conversation; the owner publishes it there
-(flowly-server PROTOCOL B6d).
+and puts a card in the conversation; the owner publishes it there.
 """
 from __future__ import annotations
 

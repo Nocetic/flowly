@@ -108,7 +108,7 @@ def test_reconcile_preserves_valid_paid_model(tmp_path: Path, monkeypatch) -> No
 def test_reconcile_never_rewrites_a_user_choice_absent_from_stale_catalog(
     tmp_path: Path, monkeypatch,
 ) -> None:
-    """The Hakan bug: a freshly released model the user picked is missing from
+    """The Ozan bug: a freshly released model the user picked is missing from
     yesterday's cached catalog — reconcile must NOT snap it back to the
     backend default on every restart. Only legacy schema defaults migrate."""
     monkeypatch.setenv("FLOWLY_HOME", str(tmp_path))

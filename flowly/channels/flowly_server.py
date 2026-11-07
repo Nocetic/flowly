@@ -79,7 +79,7 @@ _PROFILE_DELIVERY_SESSION = re.compile(r"^srv-p:([A-Za-z0-9._-]{1,64}):([A-Za-z0
 #: Roster and connection events stay on the ``profiles.rpc`` path.
 PROFILE_CHAT_EVENTS = frozenset({
     "chat", "agent", "compaction", "goal.updated", "queue",
-    # The agent's reaction on the person's message (server A8, chat-one-log.md §13).
+    # The agent's reaction on the person's message.
     "chat.reaction",
     "exec.approval.requested", "exec.approval.closed",
     "agent.clarify.requested", "agent.clarify.closed",
@@ -357,8 +357,8 @@ class FlowlyServerChannel(WebChannel):
     async def report_profile_home_message(self, profile: str, message_id: str, text: str, files: int) -> None:
         """A person's message in a named agent's one chat that did not come
         through the server (Desktop, a direct gateway app), told to it on the
-        agent's delivery session as the person's own entry (server
-        chat-one-log.md §10.9). The server keeps it once; a message it
+        agent's delivery session as the person's own entry. The server
+        keeps it once; a message it
         delivered itself is in its log already and stays as it is."""
         from flowly.agent_home import HOME_SESSION
 

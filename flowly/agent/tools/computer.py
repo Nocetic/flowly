@@ -376,8 +376,7 @@ class ComputerTool(Tool):
     #
     # Tier 0: native Swift helper bundled inside Flowly Desktop. Owns
     # the Apple-native automation surface (AX, CGEvent, NSWorkspace,
-    # ScreenCaptureKit) on macOS 14+. Source: flowly-desktop/native/
-    # macos-helper/. On non-macOS hosts and on macOS < 14 the helper
+    # ScreenCaptureKit) on macOS 14+, built with the Desktop app. On non-macOS hosts and on macOS < 14 the helper
     # is unavailable; tier returns None and dispatch falls through.
     #
     # Tier 1: Electron HTTP /input — legacy cliclick/osascript path.

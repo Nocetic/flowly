@@ -140,7 +140,7 @@ def test_recall_marks_used_and_carries_provenance(gov):
 
 
 def test_recall_includes_kg_summary(gov):
-    mg = MemoryGovernance(gov, kg_summary_fn=lambda: "- Hakan (person): email=a@b.com")
+    mg = MemoryGovernance(gov, kg_summary_fn=lambda: "- Ozan (person): email=a@b.com")
     out = mg.recall()
     assert "email=a@b.com" in out["kg_summary"]
 
@@ -193,12 +193,12 @@ def test_ingest_kg_fact_creates_and_supersedes(gov, tmp_path):
     ms = MemoryStore(tmp_path / "ws")
     mirror = FakeMirror()
     mg = MemoryGovernance(gov, memory_store=ms, kg_mirror=mirror)
-    f1 = mg.ingest_kg_fact("Hakan", "email", "old@x.com", "t_old")
+    f1 = mg.ingest_kg_fact("Ozan", "email", "old@x.com", "t_old")
     assert f1.status == STATUS_ACTIVE
     # same exact triple again → dedup
-    assert mg.ingest_kg_fact("Hakan", "email", "old@x.com", "t_old") is None
+    assert mg.ingest_kg_fact("Ozan", "email", "old@x.com", "t_old") is None
     # new email on same subject+predicate → supersede the old fact + close its triple
-    f2 = mg.ingest_kg_fact("Hakan", "email", "new@x.com", "t_new")
+    f2 = mg.ingest_kg_fact("Ozan", "email", "new@x.com", "t_new")
     assert f2.status == STATUS_ACTIVE
     assert gov.find_by_ref("kg_triple", "t_old")[0].status == STATUS_SUPERSEDED
     assert "t_old" in mirror.superseded
@@ -215,7 +215,7 @@ def test_dirty_tracking(gov, tmp_path):
     assert mg.is_dirty() is True
     mg.clear_dirty()
     assert mg.is_dirty() is False
-    mg.ingest_kg_fact("Hakan", "role", "CEO", "t_role")  # kg ingest marks dirty too
+    mg.ingest_kg_fact("Ozan", "role", "CEO", "t_role")  # kg ingest marks dirty too
     assert mg.is_dirty() is True
 
 
