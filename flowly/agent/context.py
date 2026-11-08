@@ -1904,15 +1904,29 @@ Skills with available="false" need dependencies — try installing with apt/brew
                 f"Archive: `{workspace_path}/memory/` (daily notes, past conversations).",
             ])
         else:
+            # With memory_append the agent never writes memory files itself, so
+            # it needs no filename (an `exec date` hint sent models to the shell).
             date_hint = (
                 " (run `exec date +%F` if you need today's filename)"
-                if has_tool("exec") else ""
+                if has_tool("exec") and not has_tool("memory_append") else ""
             )
             memory_lines.extend([
                 f"Persistent memory: `{workspace_path}/memory/MEMORY.md` (curated facts).",
                 f"Daily notes: `{workspace_path}/memory/YYYY-MM-DD.md`{date_hint}.",
             ])
-        if has_tool("memory_append") or has_tool("write_file"):
+        if has_tool("memory_append"):
+            # Named, not described: told to "append it to MEMORY.md", a model
+            # on a fresh home ran `mkdir -p .../memory` through exec and asked
+            # the owner to approve it (2026-11-08). memory_append needs no
+            # approval, keeps duplicates out and feeds the memory governance.
+            memory_lines.append(
+                "**Write immediately** — the moment you learn a fact (name, job, "
+                "preference, email), call `memory_append` with it. Do not wait. "
+                "1-3 lines per fact, never delete. Never write memory files "
+                "with `exec`, `write_file` or `edit_file`: the memory folder "
+                "already exists and `memory_append` is the only writer."
+            )
+        elif has_tool("write_file"):
             memory_lines.append(
                 "**Write immediately** — the moment you learn a fact (name, job, "
                 "preference, email), append it to MEMORY.md. Do not wait. "
