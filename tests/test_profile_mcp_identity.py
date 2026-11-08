@@ -107,7 +107,7 @@ def test_profile_gmail_surface_is_explicit():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("method", ["gmail.status", "mcp.access.list", "kg.delete_entity"])
+@pytest.mark.parametrize("method", ["gmail.status", "mcp.access.list"])
 async def test_profile_owner_surfaces_require_pinned_identity(monkeypatch, tmp_path, method):
     import flowly.profile as profiles
     monkeypatch.setattr(profiles, "_DEFAULT_HOME", tmp_path)

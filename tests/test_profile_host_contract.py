@@ -42,8 +42,8 @@ def test_mobile_profile_rpc_surface_is_bot_scoped() -> None:
         assert method in PROFILE_RPC_TIMEOUTS
 
     for forbidden in (
-        "config.get",
-        "config.set",
+        # config.get / config.set are allowed, but only for the settings
+        # page's fields (test_profile_host_parity.py).
         "connections.secret.get",
         "mcp.install",
         "skills.update",

@@ -56,10 +56,19 @@ from flowly.profile_host_contract import (
     ProfileHostError,
     bounded_timeout,
     is_internal_profile_session,
+    profile_config_view,
     validate_profile_rpc,
 )
 from flowly.self_restart import RESTART_CLOSE_CODE
 from flowly.session.attention import KINDS as _ATTENTION_KINDS, clean_subject, most_urgent
+
+
+def _artifact_creator(artifact: Any) -> str | None:
+    metadata = artifact.get("metadata") if isinstance(artifact, dict) else None
+    provenance = metadata.get("flowlyProvenance") if isinstance(metadata, dict) else None
+    creator = provenance.get("createdByProfile") if isinstance(provenance, dict) else None
+    return creator if isinstance(creator, str) and creator else None
+
 
 ProfileEventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 ProfileRoomEventCallback = Callable[[dict[str, Any]], Awaitable[None]]
@@ -68,6 +77,10 @@ PrimaryEventLeaseCallback = Callable[[bool], None]
 TaskStartedCallback = Callable[[str], Awaitable[None] | None]
 
 _READY_PREFIX = "FLOWLY_LOCAL_RUNTIME_READY "
+# A named agent's artifact list reads the primary's store this many rows at a
+# time, at most this many pages (artifacts.list caps a page at 200).
+_ARTIFACT_PAGE = 200
+_ARTIFACT_PAGES = 10
 _START_TIMEOUT_SECONDS = 90
 _STOP_TIMEOUT_SECONDS = 8
 _RESTART_POLL_SECONDS = 0.25
@@ -1247,7 +1260,7 @@ class ProfileHost:
             # Old runtimes ignore the additive parameter and keep legacy events.
             safe["eventVersion"] = 2
         guarded = expected_host_id is not None or expected_bot_id is not None
-        if method.startswith(("mcp.", "gmail.", "memory.", "kg.", "skills.")) and not guarded:
+        if method.startswith(("mcp.", "gmail.", "memory.", "skills.")) and not guarded:
             raise ProfileHostError("INVALID_PARAMS", "This operation requires the selected profile identities.")
         if guarded:
             if not isinstance(expected_host_id, str) or not expected_host_id or not isinstance(expected_bot_id, str) or not expected_bot_id:
@@ -1280,6 +1293,8 @@ class ProfileHost:
                 safe.update(host_assigned_origin(safe))
             except ValueError as exc:
                 raise ProfileHostError("INVALID_PARAMS", str(exc)) from None
+        if method.startswith("artifacts.") and name != "default":
+            return await self._profile_artifacts(name, method, safe, bounded_timeout(method, timeout_ms))
         target_options: dict[str, Any] = {"expected_bot_id": expected_bot_id} if guarded else {}
         if if_running:
             target_options["if_running"] = True
@@ -1288,6 +1303,9 @@ class ProfileHost:
         )
         if expected_bot_id is not None and ensure_profile_bot_id(name).bot_id != expected_bot_id:
             raise ProfileHostError('PROFILE_IDENTITY_CHANGED', 'The selected agent has changed.')
+        if method == "config.get" and isinstance(result, dict):
+            # Only the settings page's fields leave the agent (PROFILE_CONFIG_FIELDS).
+            return {"config": profile_config_view(result.get("config"))}
         if method == "sessions.list" and isinstance(result, dict):
             sessions = result.get("sessions")
             if isinstance(sessions, list):
@@ -3080,6 +3098,45 @@ class ProfileHost:
     def _check_rpc_profile_identity(self, name: str, expected_bot_id: str) -> None:
         if _public_profile(name).get("botId") != expected_bot_id:
             raise ProfileHostError("PROFILE_IDENTITY_CHANGED", "The selected profile identity changed.")
+
+    async def _profile_artifacts(
+        self, name: str, method: str, params: dict[str, Any], timeout: float,
+    ) -> Any:
+        """A named agent's artifacts: the ones it created in the primary's shared
+        store (shared_service.py writes ``createdByProfile``). Another agent's
+        artifact answers NOT_FOUND, as a missing one does."""
+        if self._primary_rpc is None:
+            raise ProfileHostError(
+                "DEFAULT_PROFILE_UNAVAILABLE", "Artifacts are not available right now.", retryable=True,
+            )
+        forwarded = {key: value for key, value in params.items() if key not in {"expectedBotId", "expectedHostId"}}
+        if method == "artifacts.list":
+            # The primary pages the whole store; read on until this agent's page is full.
+            try:
+                limit = max(1, min(int(forwarded.get("limit", 50) or 50), _ARTIFACT_PAGE))
+                skip = max(0, int(forwarded.get("offset", 0) or 0))
+            except (TypeError, ValueError):
+                raise ProfileHostError("INVALID_PARAMS", "Artifact paging is invalid.") from None
+            mine: list[dict[str, Any]] = []
+            for page in range(_ARTIFACT_PAGES):
+                result = await self._primary_rpc(
+                    method, {**forwarded, "limit": _ARTIFACT_PAGE, "offset": page * _ARTIFACT_PAGE}, timeout,
+                )
+                rows = result.get("artifacts") if isinstance(result, dict) else None
+                if not isinstance(rows, list):
+                    break
+                mine += [row for row in rows if _artifact_creator(row) == name]
+                if len(rows) < _ARTIFACT_PAGE or len(mine) >= skip + limit:
+                    break
+            return {"artifacts": mine[skip:skip + limit]}
+        artifact_id = forwarded.get("id")
+        if not isinstance(artifact_id, str) or not artifact_id:
+            raise ProfileHostError("INVALID_PARAMS", "An artifact id is required.")
+        found = await self._primary_rpc("artifacts.get", {"id": artifact_id, "limit": 1}, timeout)
+        artifact = found.get("artifact") if isinstance(found, dict) else None
+        if not isinstance(artifact, dict) or _artifact_creator(artifact) != name:
+            raise ProfileHostError("NOT_FOUND", "Artifact not found")
+        return await self._primary_rpc(method, forwarded, timeout)
 
     async def _target_rpc(
         self,

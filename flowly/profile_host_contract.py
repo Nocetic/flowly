@@ -6,6 +6,8 @@ import base64
 import binascii
 import ipaddress
 import json
+import re
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -84,6 +86,33 @@ PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     # one entity. Each runs on the named agent's own knowledge_graph.sqlite3.
     "kg.graph": 30_000,
     "kg.delete_entity": 30_000,
+    # What the owner sees of the main agent, they see of a named one: each of
+    # these reads or changes the named agent's own home (media.sqlite, its
+    # audit and gateway log, its tool routing).
+    "media.library.list": 30_000,
+    "media.library.stats": 30_000,
+    "media.library.star": 30_000,
+    "media.library.delete": 30_000,
+    "audit.list": 30_000,
+    "audit.stats": 30_000,
+    "audit.clear": 30_000,
+    "logs.events": 30_000,
+    "tools.semantic.status": 30_000,
+    "tools.semantic.enable": 60_000,
+    "tools.semantic.disable": 60_000,
+    # Its settings page: only PROFILE_CONFIG_FIELDS, never the whole
+    # config.json (provider keys live there).
+    "config.get": 30_000,
+    "config.set": 30_000,
+    # Artifacts are a primary-owned shared service (shared_service.py): a
+    # named agent's are the ones it created, read and changed in the
+    # primary's store (ProfileHost.rpc).
+    "artifacts.list": 30_000,
+    "artifacts.get": 30_000,
+    "artifacts.versions": 30_000,
+    "artifacts.pin": 30_000,
+    "artifacts.update": 30_000,
+    "artifacts.delete": 30_000,
     "mcp.capabilities": 30_000,
     "mcp.connections.list": 30_000,
     "mcp.connections.action": 60_000,
@@ -490,6 +519,74 @@ def _validate_skills_request(method: str, value: dict[str, Any]) -> dict[str, An
     return {"source": source, "restart": False}
 
 
+# A named agent's settings page (Desktop's agent-config.ts): what it shows,
+# and which of those it changes, each with the values it may take. The
+# rest of config.json never leaves the agent's machine through the host.
+_COMMIT_MODES = frozenset({"selective", "manual", "aggressive"})
+PROFILE_CONFIG_FIELDS: dict[tuple[str, ...], Callable[[Any], bool] | None] = {
+    ("notifications", "preview"): lambda value: value in ("full", "minimal"),
+    ("agents", "defaults", "memoryDreaming", "enabled"): lambda value: isinstance(value, bool),
+    ("agents", "defaults", "memoryDreaming", "autoConsolidate"): lambda value: isinstance(value, bool),
+    ("agents", "defaults", "memoryDreaming", "commitMode"): lambda value: value in _COMMIT_MODES,
+    ("agents", "defaults", "skillImprovement", "enabled"): lambda value: isinstance(value, bool),
+    ("tools", "artifact", "enabled"): lambda value: isinstance(value, bool),
+    # Shown, not changed from here.
+    ("agents", "defaults", "persona"): None,
+    ("agents", "defaults", "llmTimeoutSeconds"): None,
+}
+
+
+def _snake(key: str) -> str:
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", key).lower()
+
+
+def profile_config_view(config: Any) -> dict[str, Any]:
+    """The named agent's settings, as config.get answers them: only
+    PROFILE_CONFIG_FIELDS (camelCase; a snake_case key on disk is read too)."""
+    view: dict[str, Any] = {}
+    for path in PROFILE_CONFIG_FIELDS:
+        node: Any = config
+        for key in path:
+            if not isinstance(node, dict):
+                node = None
+                break
+            node = node.get(key, node.get(_snake(key)))
+        if node is None or isinstance(node, (dict, list)):
+            continue
+        target = view
+        for key in path[:-1]:
+            target = target.setdefault(key, {})
+        target[path[-1]] = node
+    return view
+
+
+def _config_leaves(value: dict[str, Any], prefix: tuple[str, ...] = ()) -> list[tuple[tuple[str, ...], Any]]:
+    leaves: list[tuple[tuple[str, ...], Any]] = []
+    for key, item in value.items():
+        path = (*prefix, key)
+        if isinstance(item, dict) and item:
+            leaves.extend(_config_leaves(item, path))
+        else:
+            leaves.append((path, item))
+    return leaves
+
+
+def _validate_config_request(method: str, value: dict[str, Any]) -> dict[str, Any]:
+    if method == "config.get":
+        return {}
+    patch = value.get("config")
+    restart = value.get("restart", False)
+    if not isinstance(patch, dict) or not patch or set(value) - {"config", "restart"} or not isinstance(restart, bool):
+        raise ProfileHostError("INVALID_PARAMS", "A named agent's settings change is invalid.")
+    for path, item in _config_leaves(patch):
+        check = PROFILE_CONFIG_FIELDS.get(path)
+        if check is None or not check(item):
+            raise ProfileHostError(
+                "INVALID_PARAMS", "This setting cannot be changed for a named agent from here."
+            )
+    return {"config": patch, "restart": restart}
+
+
 def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]:
     if not isinstance(method, str) or method not in PROFILE_RPC_TIMEOUTS:
         raise ProfileHostError(
@@ -509,6 +606,8 @@ def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]
     if size > MAX_REQUEST_BYTES:
         raise ProfileHostError("REQUEST_TOO_LARGE", "Profile request is too large.")
     value = _validate_access_policy(method, value)
+    if method in {"config.get", "config.set"}:
+        value = _validate_config_request(method, value)
     if method.startswith("skills."):
         value = _validate_skills_request(method, value)
     if method.startswith("agent.home."):

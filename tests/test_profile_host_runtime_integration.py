@@ -398,7 +398,7 @@ async def test_authenticated_gateway_exposes_profile_lifecycle_and_proxy_rpc(
 
                 capabilities = await rpc("profiles.capabilities")
                 assert "profiles.rpc" in capabilities["methods"]
-                assert "config.get" not in capabilities["profileRpcMethods"]
+                assert "connections.secret.get" not in capabilities["profileRpcMethods"]
                 assert "tools.access.get" in capabilities["profileRpcMethods"]
                 assert "tools.access.set" in capabilities["profileRpcMethods"]
                 assert "exec.policy.set" in capabilities["profileRpcMethods"]
@@ -450,6 +450,15 @@ async def test_authenticated_gateway_exposes_profile_lifecycle_and_proxy_rpc(
                     "params": {},
                 })
                 assert sessions == {"sessions": []}
+                # Its settings page, end to end: the fields, never the provider key.
+                settings = await rpc("profiles.rpc", {
+                    "name": "writer",
+                    "method": "config.get",
+                    "params": {},
+                })
+                assert set(settings) == {"config"}
+                assert "providers" not in settings["config"]
+                assert "test-key" not in json.dumps(settings)
                 history = await rpc("profiles.rpc", {
                     "name": "writer",
                     "method": "chat.history",
