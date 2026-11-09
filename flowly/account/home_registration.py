@@ -99,8 +99,10 @@ async def register_home(
                             adopted=bool(data.get("adopted")))
 
 
-def wire_flowly_server(registration: HomeRegistration, server_url: str) -> None:
-    """Turn ``channels.flowlyServer`` on with this registration.
+def wire_flowly_server(
+    registration: HomeRegistration, server_url: str, *, owner_uid: str = "", owner_email: str = "",
+) -> None:
+    """Turn ``channels.flowlyServer`` on with this registration, made by ``owner_uid``.
 
     The relay settings stay as they are: while this channel is on the relay is
     not used, and ``unwire_flowly_server`` returns to it.
@@ -111,8 +113,70 @@ def wire_flowly_server(registration: HomeRegistration, server_url: str) -> None:
     channel.server_url = server_url
     channel.agent_secret = registration.agent_secret
     channel.agent_host_id = registration.agent_host_id
+    channel.owner_uid = owner_uid
+    channel.owner_email = owner_email or ""
     save_config(config)
     audit_log.info("home.wired", host=registration.agent_host_id)
+
+
+# ── Which account this agent belongs to ─────────────────────────────────────
+
+
+class HomeLinkedElsewhere(RuntimeError):
+    """A sign-in as another account while this agent is linked to its owner's."""
+
+    def __init__(self, owner_email: str):
+        self.owner_email = owner_email
+        super().__init__(f"linked to another Flowly account ({owner_email or 'unknown'})")
+
+
+@dataclass(frozen=True)
+class LinkState:
+    #: The apps of ``owner_uid`` reach this agent through the Flowly server.
+    linked: bool
+    host_id: str
+    owner_uid: str
+    #: Masked (``h***@example.com``): enough to recognise, not to read off a screen.
+    owner_email: str
+
+
+def mask_email(email: str | None) -> str:
+    """``hakan@example.com`` → ``h***@example.com``."""
+    if not email or "@" not in email:
+        return ""
+    name, _, domain = email.partition("@")
+    return f"{name[:1]}***@{domain}"
+
+
+def link_state() -> LinkState:
+    """Whether this agent is linked, and to whom.
+
+    A link made before the owner was kept names none; Desktop always signed in
+    and connected as one account, so the account in the keychain is its owner.
+    """
+    channel = load_config().channels.flowly_server
+    linked = bool(channel.enabled and channel.agent_secret and channel.agent_host_id)
+    owner_uid, owner_email = channel.owner_uid, channel.owner_email
+    if linked and not owner_uid:
+        from flowly.account.auth import load_account_sync
+
+        signed_in = load_account_sync()
+        if signed_in is not None:
+            owner_uid, owner_email = signed_in.user_id or "", signed_in.email or ""
+    return LinkState(linked=linked, host_id=channel.agent_host_id, owner_uid=owner_uid or "",
+                     owner_email=mask_email(owner_email))
+
+
+def assert_may_sign_in(user_id: str) -> None:
+    """Refuse a sign-in as anyone but the owner while the agent is linked.
+
+    Otherwise one account's apps would reach the agent while another's credits
+    paid for it, and its memory would answer the second person.
+    """
+    state = link_state()
+    if state.linked and state.owner_uid and user_id and state.owner_uid != user_id:
+        audit_log.info("home.signin.refused", host=state.host_id)
+        raise HomeLinkedElsewhere(state.owner_email)
 
 
 def unwire_flowly_server() -> bool:

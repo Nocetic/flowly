@@ -206,6 +206,7 @@ async def run_login_flow(
     if on_status: on_status("fetching profile")
     profile = await lookup_account(tokens.id_token)
     account = _account_from(tokens, profile, device_id)
+    _refuse_another_owner(account)
     save_account(account)
     audit_log.info("login.flow.success",
                    user_id=account.user_id,
@@ -213,6 +214,13 @@ async def run_login_flow(
                    storage=storage_status().detail)
     if on_status: on_status("done")
     return account
+
+
+def _refuse_another_owner(account: Account) -> None:
+    """Nothing is saved for an account other than the one the agent is linked to."""
+    from flowly.account.home_registration import assert_may_sign_in
+
+    assert_may_sign_in(account.user_id)
 
 
 def _account_from(tokens: TokenBundle, profile: dict[str, Any], device_id: str) -> Account:
@@ -242,6 +250,7 @@ async def sign_in_with_handoff(custom_token: str) -> Account:
     tokens = await sign_in_with_custom_token(custom_token)
     profile = await lookup_account(tokens.id_token)
     account = _account_from(tokens, profile, "desktop-handoff")
+    _refuse_another_owner(account)
     save_account(account)
     audit_log.info("login.handoff.success",
                    user_id=tokens.user_id,

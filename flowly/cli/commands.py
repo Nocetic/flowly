@@ -41,6 +41,13 @@ def version_callback(value: bool):
         raise typer.Exit()
 
 
+def _configured_port() -> int:
+    """This agent's gateway port: another user of this computer may hold the default."""
+    from flowly.integrations.gateway_autostart import _configured_port as configured
+
+    return configured()
+
+
 @app.callback(invoke_without_command=True)
 def main(
     ctx: typer.Context,
@@ -48,7 +55,7 @@ def main(
         None, "--version", "-v", callback=version_callback, is_eager=True
     ),
     host: str = typer.Option("127.0.0.1", "--host", help="Gateway host"),
-    port: int = typer.Option(18790, "--port", "-P", help="Gateway port"),
+    port: int = typer.Option(0, "--port", "-P", help="Gateway port (default: config.gateway.port)."),
     session: str = typer.Option(
         "", "--session", "-s",
         help="Open a specific session key (default: start a fresh session)",
@@ -101,7 +108,7 @@ def main(
     # values rather than OptionInfo defaults.
     from flowly.tui.entry import run_tui
     run_tui(
-        host=host, port=port, session=session, new=new, resume=resume, theme=theme
+        host=host, port=port or _configured_port(), session=session, new=new, resume=resume, theme=theme
     )
 
 

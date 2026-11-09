@@ -385,6 +385,33 @@ def _run_cli(*args: str) -> int:
     return subprocess.run([sys.executable, "-m", "flowly", *args]).returncode
 
 
+def persist_gateway_port(port: int) -> None:
+    """Keep ``port`` as this agent's gateway port (``config.gateway.port``)."""
+    from flowly.config.loader import load_config, save_config
+
+    config = load_config()
+    config.gateway.port = port
+    save_config(config)
+
+
+def _leave_another_users_port(port: int) -> int:
+    """A free port, kept for next time, when another user of this computer holds ``port``.
+
+    Ports are per computer: with two people signed in, the first agent holds
+    18790 and the second could never start. Only another user's listener moves
+    this agent; one of this user's own goes through ``take_over_port``.
+    """
+    from flowly.integrations.port_owner import move_off_another_users_port
+
+    moved = move_off_another_users_port(port, persist_gateway_port)
+    if moved != port:
+        console.print(
+            f"[yellow]Port {port} is used by another user of this computer;[/] "
+            f"this agent uses port {moved} from now on."
+        )
+    return moved
+
+
 def take_over_port(port: int) -> bool:
     """Offer to stop the installed gateway service that holds *port*.
 
@@ -648,6 +675,8 @@ def gateway(
     # `flowly gateway` became invisible to the desktop dashboard even though
     # it was perfectly healthy. One source of truth ends that split.
     port = port if local_runtime else resolve_gateway_port(port, config)
+    if not local_runtime:
+        port = _leave_another_users_port(port)
 
     # If the installed background service holds this port, offer to take it
     # over for this session (and restore it on exit). This is the entire

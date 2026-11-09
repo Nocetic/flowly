@@ -20,6 +20,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Label, Static
 
 from flowly.account.auth import Account, LoginTimeout, run_login_flow
+from flowly.account.home_registration import HomeLinkedElsewhere
 from flowly.account.firebase_rest import FirebaseAuthError
 
 
@@ -199,6 +200,12 @@ class LoginPanel(Vertical):
                 on_code=self._show_code,
                 on_status=self._set_status,
             )
+        except HomeLinkedElsewhere as linked:
+            self._set_status(
+                f"this agent is linked to another Flowly account ({linked.owner_email or 'unknown'}); "
+                "its owner runs `flowly server disconnect` to let it go", "error")
+            self._set_step("step-auth", "error", "Linked to another account")
+            return
         except LoginTimeout:
             self._set_status("code expired — close and try again", "error")
             self._set_step("step-auth", "error", "Authorization timed out")

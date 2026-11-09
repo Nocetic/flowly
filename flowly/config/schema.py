@@ -164,6 +164,10 @@ class FlowlyServerChannelConfig(BaseModel):
     server_url: str = "wss://cloud.useflowlyapp.com/v1/agent"
     agent_secret: str = ""    # this agent's own secret; the server keeps only its SHA-256
     agent_host_id: str = ""   # users/{uid}/servers/{id} document id
+    # The account the entry was made with: its apps reach this agent and its
+    # credits are the ones spent. Empty for a link made before it was kept.
+    owner_uid: str = ""
+    owner_email: str = ""
 
     def connection_settings(self, environ=None) -> tuple[str, str, str]:
         """``(server_url, agent_secret, agent_host_id)``: config first, then the environment."""

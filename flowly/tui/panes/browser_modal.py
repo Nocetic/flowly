@@ -299,8 +299,10 @@ class BrowserPanel(Vertical):
     async def _refresh_extension_status(self) -> None:
         import httpx
         try:
+            from flowly.integrations.gateway_autostart import _configured_port
+
             async with httpx.AsyncClient(timeout=2.0) as c:
-                r = await c.get("http://127.0.0.1:18790/api/extension/status")
+                r = await c.get(f"http://127.0.0.1:{_configured_port()}/api/extension/status")
             if r.status_code == 200:
                 self._update_gateway("[green]●[/] Gateway reachable")
                 data = r.json()

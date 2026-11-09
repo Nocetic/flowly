@@ -37,9 +37,11 @@ def _apply_changes_to_running_gateway(what: str) -> None:
 
     async def _check_running() -> bool:
         import socket
+
+        from flowly.integrations.gateway_autostart import _configured_port
         try:
             await asyncio.to_thread(
-                lambda: socket.create_connection(("127.0.0.1", 18790), timeout=0.5).close()
+                lambda: socket.create_connection(("127.0.0.1", _configured_port()), timeout=0.5).close()
             )
             return True
         except OSError:

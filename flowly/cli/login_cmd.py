@@ -357,6 +357,20 @@ def _login_with_account_key(key: str) -> None:
         raise typer.Exit(code=4)
 
 
+#: ``flowly login`` refused: the agent is linked to another account (Desktop reads this code).
+EXIT_LINKED_ELSEWHERE = 5
+
+
+def _refuse_linked_elsewhere(owner_email: str) -> None:
+    """Say which account holds the agent and how its owner lets it go, then exit 5."""
+    console.print(
+        f"[red]✗ This agent is linked to another Flowly account ({owner_email or 'unknown'}).[/]\n"
+        "  Its apps reach it and its credits pay for it, so it cannot sign in as you.\n"
+        "  To move it, sign in as that account and run: [bold]flowly server disconnect[/bold]"
+    )
+    raise typer.Exit(code=EXIT_LINKED_ELSEWHERE)
+
+
 def _login_with_handoff(token: str) -> None:
     """Sign in with a token Flowly Desktop handed over on stdin, then issue the
     account key — no browser, no relay. Desktop runs this for the agent it
@@ -366,9 +380,12 @@ def _login_with_handoff(token: str) -> None:
     4 the running gateway could not take the new key.
     """
     from flowly.account.auth import sign_in_with_handoff
+    from flowly.account.home_registration import HomeLinkedElsewhere
 
     try:
         account = asyncio.run(sign_in_with_handoff(token))
+    except HomeLinkedElsewhere as linked:
+        _refuse_linked_elsewhere(linked.owner_email)
     except Exception as exc:  # noqa: BLE001
         console.print(f"[red]✗ Sign-in with the handed-over token failed:[/] {exc}")
         raise typer.Exit(code=1)
@@ -493,6 +510,7 @@ def login(
         load_account_sync,
         run_login_flow,
     )
+    from flowly.account.home_registration import HomeLinkedElsewhere
 
     # ── Path: --key (use a key you already have — no browser, no relay) ──
     # Programmatic / Desktop path: a key was provided, just store it.
@@ -788,6 +806,8 @@ def login(
             account = asyncio.run(
                 run_login_flow(on_code=_on_code, on_status=_on_status)
             )
+    except HomeLinkedElsewhere as linked:
+        _refuse_linked_elsewhere(linked.owner_email)
     except LoginTimeout:
         console.print(
             "[red]✗ Authorization timed out.[/] "

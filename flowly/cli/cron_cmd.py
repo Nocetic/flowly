@@ -260,9 +260,13 @@ def cron_run(
         "-f",
         help="Run paused/completed jobs without reactivating their schedule",
     ),
-    port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
+    port: int = typer.Option(0, "--port", "-p", help="Gateway port (default: config.gateway.port)."),
 ):
     """Run one manual attempt without changing the schedule lifecycle."""
+    if not port:
+        from flowly.integrations.gateway_autostart import _configured_port
+
+        port = _configured_port()
     import json
     import urllib.request
     import urllib.error

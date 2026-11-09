@@ -308,9 +308,19 @@ def _kill_gateway_on_port(port: int, wait: float = 2.0) -> bool:
     return False
 
 
+def _configured_gateway_port() -> int:
+    """``config.gateway.port``: what a service without ``--port`` binds."""
+    try:
+        from flowly.config.loader import load_config
+
+        return int(load_config().gateway.port or 18790)
+    except Exception:
+        return 18790
+
+
 def _extract_port_from_plist(plist_path: Path) -> int:
     if not plist_path.exists():
-        return 18790
+        return _configured_gateway_port()
     try:
         raw = plist_path.read_bytes()
         data = plistlib.loads(raw)
@@ -321,24 +331,24 @@ def _extract_port_from_plist(plist_path: Path) -> int:
                 return int(args[idx + 1])
     except Exception:
         pass
-    return 18790
+    return _configured_gateway_port()
 
 
 def _extract_port_from_unit(unit_path: Path) -> int:
     if not unit_path.exists():
-        return 18790
+        return _configured_gateway_port()
     try:
         content = unit_path.read_text(encoding="utf-8")
     except Exception:
-        return 18790
+        return _configured_gateway_port()
     marker = "--port"
     if marker not in content:
-        return 18790
+        return _configured_gateway_port()
     try:
         after = content.split(marker, 1)[1].strip()
         return int(after.split()[0])
     except Exception:
-        return 18790
+        return _configured_gateway_port()
 
 
 def _extract_port_from_win_xml(xml_path: Path) -> int:
@@ -361,7 +371,7 @@ def _extract_port_from_win_xml(xml_path: Path) -> int:
         if "--port" in content:
             break
     match = re.search(r"--port\s+[\"']?(\d+)", content)
-    return int(match.group(1)) if match else 18790
+    return int(match.group(1)) if match else _configured_gateway_port()
 
 
 class _LaunchctlCommandError(RuntimeError):
@@ -826,7 +836,7 @@ def _ensure_linger_linux() -> None:
 @service_app.command("install")
 def service_install(
     label: str = typer.Option(DEFAULT_SERVICE_LABEL, "--label", help="Service label"),
-    port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
+    port: int = typer.Option(0, "--port", "-p", help="Gateway port baked into the service. Omit to follow config.gateway.port (default 18790)."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable gateway verbose mode"),
     start: bool = typer.Option(True, "--start/--no-start", help="Start service after install"),
     force: bool = typer.Option(False, "--force", "-f", help="(No longer required — install is idempotent and reinstalls cleanly. Kept for back-compat.)"),
@@ -870,7 +880,14 @@ def service_install(
     # `flowly gateway` command is separate from `service install`, so the flags
     # must live on the unit, not just an interactive invocation. Persist them
     # too, so a manual restart matches.
-    gateway_args = ["gateway", "--port", str(port)]
+    # Without --port the service follows config.gateway.port on every start,
+    # so the port this agent settled on (another user of this computer may
+    # hold the default) is one value that every reader agrees on.
+    gateway_args = ["gateway", "--port", str(port)] if port else ["gateway"]
+    if not port:
+        from flowly.cli.gateway_cmd import _leave_another_users_port
+
+        port = _leave_another_users_port(_configured_gateway_port())
 
     # Resolve host + token the SAME way `flowly gateway` does. A background
     # service can't print an auto-generated token on first bind where you'd
@@ -1254,7 +1271,7 @@ def service_start(
     elif system == "windows" and win_xml:
         _port = _extract_port_from_win_xml(win_xml)
     else:
-        _port = 18790
+        _port = _configured_gateway_port()
 
     # Don't launch a second gateway: if the port is already held, say so and
     # stop. This is exactly the "multiple gateways / port in use" trap.
@@ -1367,7 +1384,7 @@ def service_stop(
     system = platform.system().lower()
 
     # Determine the port so we can force-kill if needed
-    port = 18790
+    port = _configured_gateway_port()
     if system == "darwin" and mac_plist:
         port = _extract_port_from_plist(mac_plist)
     elif system == "linux" and linux_unit:
