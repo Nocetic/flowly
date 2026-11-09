@@ -99,6 +99,38 @@ async def register_home(
                             adopted=bool(data.get("adopted")))
 
 
+RELEASE_PATH = "/v1/homes/release"
+
+
+async def release_home(
+    server_url: str, host_id: str, secret: str, *, client: httpx.AsyncClient | None = None,
+) -> None:
+    """Tell the server this machine lets go of its home (D53): the owner's apps drop it.
+
+    Proven like the agent's socket: its secret and host id. The document and
+    its conversations stay on the server; ``server connect`` brings it back.
+    """
+    own = client is None
+    client = client or httpx.AsyncClient(timeout=20.0)
+    try:
+        response = await client.post(
+            http_origin(server_url) + RELEASE_PATH,
+            headers={"Authorization": f"Bearer {secret}", "X-Flowly-Agent-Host": host_id},
+        )
+    except httpx.HTTPError as error:
+        raise HomeRegistrationError("UNREACHABLE", str(error)) from error
+    finally:
+        if own:
+            await client.aclose()
+    if response.status_code != 200:
+        try:
+            code = str(response.json().get("error") or "")
+        except ValueError:
+            code = ""
+        raise HomeRegistrationError(code or f"HTTP_{response.status_code}")
+    audit_log.info("home.released", host=host_id)
+
+
 def wire_flowly_server(
     registration: HomeRegistration, server_url: str, *, owner_uid: str = "", owner_email: str = "",
 ) -> None:
@@ -190,3 +222,33 @@ def unwire_flowly_server() -> bool:
     save_config(config)
     audit_log.info("home.unwired", host=channel.agent_host_id)
     return True
+
+
+async def link_this_machine(
+    account, *, server_url: str = "", name: str = "", host_id: str = "", adopt: bool = True,
+) -> HomeRegistration:
+    """Register this machine with the Flowly server as ``account`` and wire the channel.
+
+    The one way an agent becomes reachable from the Flowly apps, for
+    ``flowly server connect`` and ``flowly login`` alike. The entry this
+    machine already has is asked for only when it is this account's (another
+    account only ever got NOT_FOUND for it); else the one named, else (with
+    ``adopt``) its relay-era entry found by fingerprint, so its conversations
+    carry over, else a new one. Raises ``HomeLinkedElsewhere`` while the agent
+    is linked to another account, and ``HomeRegistrationError`` when the
+    server refuses.
+    """
+    from flowly.account.fingerprint import machine_id, machine_name
+
+    user_id = getattr(account, "user_id", "") or ""
+    assert_may_sign_in(user_id)
+    channel = load_config().channels.flowly_server
+    url = server_url or channel.server_url
+    own_entry = channel.agent_host_id if channel.owner_uid in ("", user_id) else ""
+    target = own_entry or host_id or None
+    registration = await register_home(
+        account.id_token, server_url=url, name=name or machine_name(), host_id=target,
+        adopt_machine_id=machine_id() if adopt and not target else None,
+    )
+    wire_flowly_server(registration, url, owner_uid=user_id, owner_email=getattr(account, "email", "") or "")
+    return registration

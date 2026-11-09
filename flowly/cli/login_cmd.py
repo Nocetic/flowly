@@ -90,8 +90,6 @@ async def _apply_repair(account, *, dry_run: bool) -> _RepairResult:
     same guard the TUI login modal enforces.
     """
     from flowly.account import audit_log
-    from flowly.account.relay_config import wire_relay_credentials
-    from flowly.account.server import register_machine
 
     result = _RepairResult()
     # The Flowly server channel replaces the relay: never register or wire
@@ -107,13 +105,7 @@ async def _apply_repair(account, *, dry_run: bool) -> _RepairResult:
         if server_channel:
             plan.append("would not touch the relay — the Flowly server channel replaces it")
         else:
-            plan.append(
-                "would POST /api/servers (idempotent on machineId)"
-            )
-            if not relay.healthy:
-                plan.append(f"would re-wire channels.web ({relay.reason})")
-            else:
-                plan.append("relay config already healthy — no-op")
+            plan.append("would link this machine to the Flowly server (POST /v1/homes/register), adopting its relay-era entry")
         if not is_active:
             plan.append("would set providers.active = 'flowly' (was empty)")
         else:
@@ -140,23 +132,18 @@ async def _apply_repair(account, *, dry_run: bool) -> _RepairResult:
         )
         return result
 
-    # 1. Register-or-reuse the machine in Firestore.
-    srv = await register_machine(account.id_token)
-    account.server_id = srv.server_id
-    account.server_name = srv.name
-    account.gateway_auth_token = srv.gateway_auth_token
+    # Reachable from the Flowly apps: linked to the Flowly server as this
+    # account (the relay is retired; 2026-11-09). Its relay-era entry is
+    # adopted, so the conversations it had there carry over.
+    from flowly.account.home_registration import link_this_machine
 
-    from flowly.account.auth import save_account
-    save_account(account)
-
-    # 2. Wire relay credentials into ``channels.web``.
-    change = wire_relay_credentials(srv)
+    registration = await link_this_machine(account, adopt=True)
     result.relay_wired = True
-    result.relay_changed = change.changed
-    result.needs_gateway_restart = change.needs_gateway_restart
-    result.server_id = srv.server_id
-    result.server_name = srv.name
-    result.server_existing = srv.existing
+    result.relay_changed = True
+    result.needs_gateway_restart = True
+    result.server_id = registration.agent_host_id
+    result.server_name = getattr(account, "machine_name", "") or registration.agent_host_id
+    result.server_existing = not registration.created
 
     # 3. Auto-promote Flowly to default provider ONLY when nothing is
     #    set. Same guard as ``flowly/tui/panes/login_modal.py`` so a
@@ -168,9 +155,9 @@ async def _apply_repair(account, *, dry_run: bool) -> _RepairResult:
 
     audit_log.info(
         "cli.login.repair_applied",
-        server_id=srv.server_id,
-        server_existing=srv.existing,
-        relay_changed=change.changed,
+        server_id=registration.agent_host_id,
+        server_existing=not registration.created,
+        relay_changed=True,
         provider_promoted=result.provider_promoted,
         previous_active_provider=slug,
     )
@@ -206,21 +193,11 @@ def _print_repair_summary(result: _RepairResult, *, header: str) -> None:
     console.print()
     console.print(f"  [green]✓[/] {header}")
     if result.relay_wired:
-        if result.relay_changed:
-            verb = "registered" if not result.server_existing else "reused"
-            console.print(
-                f"  [green]✓[/] Server {verb} → "
-                f"[cyan]{result.server_name}[/]"
-            )
-            console.print(
-                "  [green]✓[/] Relay config wired → "
-                "[dim]wss://relay.useflowlyapp.com/relay[/]"
-            )
-        else:
-            console.print(
-                f"  [dim]·[/] Relay config already healthy "
-                f"([cyan]{result.server_name}[/]) — no change"
-            )
+        verb = "linked" if not result.server_existing else "linked again"
+        console.print(
+            f"  [green]✓[/] This machine is {verb} to the Flowly server "
+            f"[dim](agent host {result.server_id})[/] — reachable from the Flowly apps"
+        )
     if result.provider_promoted:
         console.print(
             f"  [green]✓[/] Provider set → [b]{result.provider_promoted_to}[/] "
@@ -259,7 +236,7 @@ def _apply_runtime_changes(
         return True
     if result.status == "gateway_restarted":
         console.print(
-            f"  [green]✓[/] Gateway restarted with the new relay config "
+            f"  [green]✓[/] Gateway restarted with the new connection "
             f"[dim]({result.detail})[/]"
         )
         return True
@@ -478,9 +455,10 @@ def login(
              "app) — sets the flowly provider with no server record and no relay.",
     ),
     relay_opt: Optional[bool] = typer.Option(
-        None, "--relay/--no-relay",
-        help="Skip the interactive prompt and force remote/phone reach (a server "
-             "registration + relay) ON or OFF. Default: ask interactively.",
+        None, "--apps/--no-apps", "--relay/--no-relay",
+        help="Skip the interactive prompt: link this agent to the Flowly server so the "
+             "Flowly apps reach it (ON) or not (OFF). Default: ask interactively; "
+             "scripts link. --relay/--no-relay are the old names.",
     ),
     token_stdin: bool = typer.Option(
         False, "--token-stdin",
@@ -568,19 +546,14 @@ def login(
             key_change = _provision_account_key(account)
             relay = _check_relay_state()
             is_active, _ = _check_provider_state()
-            # Repair cannot fix the Flowly server channel (the machine's
-            # settings provide it), so only the provider counts there.
-            reach_ok = relay.healthy or relay.via == "flowlyServer"
+            # Reach means the Flowly server channel: the relay is retired, so a
+            # healthy relay alone is linked to the Flowly server here.
+            reach_ok = relay.via == "flowlyServer"
             repair_relay_or_provider = not (reach_ok and is_active)
             if not repair_relay_or_provider and not key_change.changed:
                 if relay.via == "flowlyServer":
                     console.print("[green]✓[/] Nothing to repair — the provider is already healthy.")
                     _print_server_channel(relay)
-                else:
-                    console.print(
-                        "[green]✓[/] Nothing to repair — relay config and "
-                        "provider are already healthy."
-                    )
                 audit_log.info("cli.login.repair_skipped_healthy",
                                server_id=relay.server_id)
                 raise typer.Exit(code=3)
@@ -664,13 +637,14 @@ def login(
         # server channel there is no relay to offer.
         if relay.via == "flowlyServer":
             _print_server_channel(relay)
-        elif not relay.healthy:
+        else:
+            # Not on the Flowly server (no link, or only the retired relay): offer it.
             want_relay = relay_opt
             if want_relay is None and sys.stdin.isatty():
                 console.print()
                 want_relay = typer.confirm(
-                    "  Make this bot reachable remotely (phone / Flowly relay)? "
-                    "This registers a server",
+                    "  Reach this agent from the Flowly apps (Desktop, phone)? "
+                    "This links it to your Flowly account",
                     default=False,
                 )
             if want_relay:
@@ -688,8 +662,8 @@ def login(
                             security_sensitive=key_change.replaced_stale,
                         )
                     console.print(
-                        f"  [yellow]⚠ Relay registration failed:[/] {exc}\n"
-                        f"  Re-run [cyan]flowly login --repair[/] when ready."
+                        f"  [yellow]⚠ Linking to the Flowly server failed:[/] {exc}\n"
+                        f"  Run [cyan]flowly server connect[/] when ready."
                     )
                     audit_log.error("cli.login.relay_optin_failed", error=str(exc))
                     raise typer.Exit(code=2 if runtime_ok else 4)
@@ -846,8 +820,8 @@ def login(
         if sys.stdin.isatty():
             console.print()
             want_relay = typer.confirm(
-                "  Make this bot reachable remotely (phone / Flowly relay)? "
-                "This registers a server",
+                "  Reach this agent from the Flowly apps (Desktop, phone)? "
+                "This links it to your Flowly account",
                 default=False,
             )
         else:
@@ -871,8 +845,8 @@ def login(
                 security_sensitive=key_change.replaced_stale,
             )
             console.print(
-                f"  [yellow]⚠ Signed in, but relay registration failed:[/] {exc}\n"
-                f"  Re-run [cyan]flowly login --repair[/] when ready."
+                f"  [yellow]⚠ Signed in, but linking to the Flowly server failed:[/] {exc}\n"
+                f"  Run [cyan]flowly server connect[/] when ready."
             )
             audit_log.error("cli.login.full_flow_post_register_failed", error=str(exc))
             raise typer.Exit(code=2 if runtime_ok else 4)

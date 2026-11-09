@@ -22,60 +22,55 @@ def server_connect(
 ):
     """Register this machine with the Flowly server and use it instead of the relay."""
     from flowly.account.auth import load_account_refreshing
-    from flowly.account.fingerprint import machine_id, machine_name
-    from flowly.account.home_registration import (
-        HomeLinkedElsewhere,
-        HomeRegistrationError,
-        assert_may_sign_in,
-        register_home,
-        wire_flowly_server,
-    )
+    from flowly.account.home_registration import HomeLinkedElsewhere, HomeRegistrationError, link_this_machine
     from flowly.cli.login_cmd import _refuse_linked_elsewhere
-    from flowly.config.loader import load_config
 
     account = asyncio.run(load_account_refreshing())
     if account is None:
         console.print("[red]Not signed in.[/] Run [bold]flowly login[/] first.")
         raise typer.Exit(1)
-    user_id = getattr(account, "user_id", "") or ""
     try:
-        assert_may_sign_in(user_id)
+        registration = asyncio.run(link_this_machine(account, server_url=url, name=name, host_id=host_id, adopt=adopt))
     except HomeLinkedElsewhere as linked:
         _refuse_linked_elsewhere(linked.owner_email)
-    channel = load_config().channels.flowly_server
-    server_url = url or channel.server_url
-    # The home this machine already has (the server entry is its owner's: another
-    # account asking for it only ever got NOT_FOUND), else the entry named, else
-    # (asked for) its relay-era entry found by fingerprint, else a new one.
-    own_entry = channel.agent_host_id if channel.owner_uid in ("", user_id) else ""
-    target = own_entry or host_id or None
-    try:
-        registration = asyncio.run(register_home(
-            account.id_token, server_url=server_url, name=name or machine_name(), host_id=target,
-            adopt_machine_id=machine_id() if adopt and not target else None,
-        ))
     except HomeRegistrationError as error:
         console.print(f"[red]The Flowly server refused:[/] {error.code}")
         raise typer.Exit(1)
-    wire_flowly_server(registration, server_url, owner_uid=user_id, owner_email=getattr(account, "email", "") or "")
     state = "registered" if registration.created else "re-registered"
     console.print(f"[green]✓[/] This machine is {state} as agent host [bold]{registration.agent_host_id}[/].")
     if registration.adopted:
         console.print("  Its relay-era conversations carry over to the new apps.")
-    elif adopt and not target:
+    elif adopt and registration.created:
         console.print("  [yellow]⚠ No relay-era entry of this machine was found; this is a new home with no past conversations.[/]")
     console.print("  Restart the gateway to connect: [bold]flowly service restart[/] (or restart Flowly Desktop).")
 
 
 @server_app.command("disconnect")
 def server_disconnect():
-    """Stop using the Flowly server; the relay (if set up) takes over again."""
-    from flowly.account.home_registration import unwire_flowly_server
+    """Unlink this agent from its Flowly account: the account's apps no longer reach it.
 
-    if unwire_flowly_server():
-        console.print("[green]✓[/] The Flowly server channel is off. Restart the gateway to apply.")
+    The agent keeps running (terminal, Telegram, schedules) with its memory on
+    this machine, and another account may link it next (D53).
+    """
+    from flowly.account import home_registration as homes
+    from flowly.config.loader import load_config
+
+    state = homes.link_state()
+    channel = load_config().channels.flowly_server
+    if state.linked:
+        server_url, secret, host_id = channel.connection_settings()
+        try:
+            asyncio.run(homes.release_home(server_url, host_id, secret))
+        except homes.HomeRegistrationError as error:
+            console.print(
+                f"[yellow]⚠ The Flowly server could not be told ({error.code}):[/] this computer may still "
+                "show as offline in the account's apps until it is removed there."
+            )
+    if homes.unwire_flowly_server():
+        owner = f" removed from {state.owner_email}" if state.owner_email else " unlinked"
+        console.print(f"[green]✓[/] This computer is{owner}. Restart the gateway to apply.")
     else:
-        console.print("The Flowly server channel was already off.")
+        console.print("This computer was not linked to a Flowly account.")
 
 
 @server_app.command("status")

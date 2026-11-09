@@ -195,3 +195,54 @@ def test_after_unlinking_another_account_gets_a_home_of_its_own(monkeypatch):
     assert result.exit_code == 0, result.output
     assert calls == [None]
     assert link_state().owner_uid == "uid-b"
+
+
+def test_disconnecting_lets_the_server_drop_this_machine_from_the_owners_apps(monkeypatch):
+    # Before 2026-11-09 it only switched the channel off here: the Mac stayed
+    # in the owner's apps, offline, forever.
+    from flowly.cli import server_cmd
+
+    _link()
+    released = []
+
+    async def release(server_url, host_id, secret, **_):
+        released.append((server_url, host_id, secret))
+
+    monkeypatch.setattr("flowly.account.home_registration.release_home", release)
+    result = CliRunner().invoke(server_cmd.server_app, ["disconnect"])
+    assert result.exit_code == 0, result.output
+    assert released == [(URL, "h-a", "secret-a")]
+    assert link_state().linked is False
+    assert "removed from h***@example.com" in result.output
+
+
+def test_disconnecting_still_unlinks_when_the_server_cannot_be_told(monkeypatch):
+    from flowly.account.home_registration import HomeRegistrationError
+    from flowly.cli import server_cmd
+
+    _link()
+
+    async def unreachable(*args, **kwargs):
+        raise HomeRegistrationError("HTTP_503")
+
+    monkeypatch.setattr("flowly.account.home_registration.release_home", unreachable)
+    result = CliRunner().invoke(server_cmd.server_app, ["disconnect"])
+    assert result.exit_code == 0, result.output
+    assert link_state().linked is False
+    assert "HTTP_503" in result.output
+
+
+async def test_release_proves_itself_with_the_agent_secret():
+    import httpx
+
+    from flowly.account.home_registration import release_home
+
+    seen = {}
+
+    def answer(request):
+        seen.update(url=str(request.url), auth=request.headers["authorization"], host=request.headers["x-flowly-agent-host"])
+        return httpx.Response(200, json={"released": True})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as client:
+        await release_home(URL, "h-a", "secret-a", client=client)
+    assert seen == {"url": "https://cloud.useflowlyapp.com/v1/homes/release", "auth": "Bearer secret-a", "host": "h-a"}
