@@ -263,6 +263,19 @@ class ChatCommandStore:
         except (ValueError, TypeError):
             raise SessionAccessError() from None
 
+    def withdraw(self, session_key: str, run_id: str) -> None:
+        """A command accepted here and never run, forgotten: the same identity is a new command again.
+
+        For a message refused before its turn (its files could not be kept):
+        its sender delivers it again, and that must run, not replay a refusal.
+        """
+        with self._lock, self._db:
+            self._db.execute(
+                """DELETE FROM chat_commands
+                   WHERE run_id = ? AND session_key = ? AND owner_id = ? AND status = 'accepted'""",
+                (run_id, session_key, self.owner_id),
+            )
+
     def settle(self, session_key: str, run_id: str, status: str) -> None:
         if status not in _TERMINAL | {"running"}:
             raise ValueError("Invalid command status")

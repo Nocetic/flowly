@@ -39,6 +39,7 @@ from flowly.live_voice.events import EventAccess, current_event_access
 from flowly.live_voice.relay_events import RelayOutbound, RelayRecipients
 from flowly.live_voice.relay_transport import CAPABILITY as RELAY_VOICE_CAPABILITY
 from flowly.live_voice.relay_transport import RelayBrowserVerifier, RelayMessage, RelayPrincipal
+from flowly.media.kept_files import KeptFileError
 from flowly.profile import get_flowly_home
 from flowly.profile_host_contract import (
     ProfileHostError,
@@ -1044,6 +1045,11 @@ class WebChannel(BaseChannel):
         if self._ws:
             await self._ws.close()
             self._ws = None
+
+    async def _keep_server_files(self, attachments: list, media_dir: Path, session_id: str
+                                 ) -> tuple[list, list[str | None] | None]:
+        """Files a server asks this computer to keep (``FlowlyServerChannel``, server A11); the relay asks none."""
+        return attachments, None
 
     async def _media_attachments(self, msg: OutboundMessage) -> tuple[list[dict[str, Any]], set[str]]:
         """Describe this turn's media and files as Attachment V2, by media id,
@@ -2506,6 +2512,7 @@ class WebChannel(BaseChannel):
 
             # Save attachments to disk
             media: list[str] = []
+            kept_files: list[str | None] | None = None
             attachments = params.get("attachments") or []
             try:
                 message_text = append_browser_annotation_context(message_text, attachments)
@@ -2516,7 +2523,17 @@ class WebChannel(BaseChannel):
                     source = self.chat_commands.control_scope(run_id)
                     access = EventAccess(scopes=(source,)) if source is not None else EventAccess(blocked=True)
                     with event_access_scope(access):
+                        attachments, kept_files = await self._keep_server_files(attachments, media_dir, session_id)
                         media = _save_attachments(attachments, media_dir)
+            except KeptFileError:
+                # Never run without its files: refused before its turn, and new again when it comes back.
+                self.chat_commands.withdraw(session_key, run_id)
+                await ws.send(json.dumps({
+                    'type': 'rpc', 'id': rpc_id, 'sessionId': session_id,
+                    'error': {'code': 'FILE_NOT_KEPT', 'retryable': True,
+                              'message': 'A file in this message could not be taken onto your computer yet.'},
+                }))
+                return
             except Exception:
                 self.chat_commands.settle(session_key, run_id, 'error')
                 logger.exception('Could not prepare attachments for chat run {}', run_id)
@@ -2575,7 +2592,8 @@ class WebChannel(BaseChannel):
                 "type": "rpc",
                 "id": rpc_id,
                 "sessionId": session_id,
-                "result": {"runId": run_id},
+                # The files taken onto this computer (D54), by media id: the server's copies may go.
+                "result": {"runId": run_id, **({"files": kept_files} if kept_files is not None else {})},
             }
             await ws.send(json.dumps(ack))
 

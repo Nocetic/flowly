@@ -55,6 +55,11 @@ VOICE_AUTHORITY_FEATURE = "voice-authority-v1"
 #: lets its owner turn that off only with a Core that says this.
 CHAT_HISTORY_FEATURE = "chat-history-v1"
 
+#: This Core keeps every file the server marks ``keep`` before the turn, or
+#: refuses the message (``FILE_NOT_KEPT``, retryable; flowly/media/kept_files.py):
+#: a home that keeps no chats on the server sends it uploaded files that way.
+CHAT_FILES_FEATURE = "chat-files-v1"
+
 #: While backing off, look at the clocks this often for a resume.
 RESUME_TICK_SECONDS = 0.5
 #: The wall clock ran this much further than the monotonic one within a tick:
@@ -525,7 +530,7 @@ class FlowlyServerChannel(WebChannel):
         return url, {"additional_headers": {
             "Authorization": f"Bearer {secret}",
             "X-Flowly-Agent-Host": host,
-            "X-Flowly-Agent-Features": f"{VOICE_AUTHORITY_FEATURE},{CHAT_HISTORY_FEATURE}",
+            "X-Flowly-Agent-Features": f"{VOICE_AUTHORITY_FEATURE},{CHAT_HISTORY_FEATURE},{CHAT_FILES_FEATURE}",
         }}, None
 
     def _on_connected(self, ws) -> None:
@@ -604,6 +609,20 @@ class FlowlyServerChannel(WebChannel):
         """Wait for background power RPCs (tests, shutdown)."""
         while self._power_tasks:
             await asyncio.gather(*tuple(self._power_tasks), return_exceptions=True)
+
+    async def _keep_server_files(self, attachments: list, media_dir: Path, session_id: str
+                                 ) -> tuple[list, list[str | None] | None]:
+        """A home that keeps no chats on the server keeps their files here (server A11, ``kept_files``).
+
+        Only the server's own delivery asks (a ``srv-`` session): an app's word
+        never has this computer fetch anything.
+        """
+        from flowly.media.kept_files import KEEP_KEY, keep_files
+
+        if not (isinstance(session_id, str) and session_id.startswith("srv-")):
+            return [{k: v for k, v in att.items() if k != KEEP_KEY} if isinstance(att, dict) else att
+                    for att in attachments], None
+        return await keep_files(attachments, media_dir)
 
     @staticmethod
     def _reply(msg: dict, body: dict) -> str:

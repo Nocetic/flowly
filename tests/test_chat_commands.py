@@ -119,3 +119,22 @@ def test_goal_binding_rejects_wrong_session_and_unobserved_completion(tmp_path):
         assert store.lookup('session', 'run')['goalBinding']['state'] == 'unknown'
     finally:
         store.close()
+
+
+def test_a_command_refused_before_it_ran_is_new_again_and_nothing_else_is_withdrawn(tmp_path):
+    store = ChatCommandStore(tmp_path / "commands.sqlite3")
+    assert store.accept("web:one", "command-1", {"message": "look"})[0]
+    store.withdraw("web:one", "command-1")
+    assert store.accept("web:one", "command-1", {"message": "look"})[0], "it comes again and runs"
+    # A command that ran, or another session's, is never forgotten.
+    store.settle("web:one", "command-1", "running")
+    store.withdraw("web:one", "command-1")
+    assert store.lookup("web:one", "command-1")["status"] == "running"
+    store.accept("web:two", "command-2", {"message": "other"})
+    store.withdraw("web:one", "command-2")
+    assert store.lookup("web:two", "command-2") is not None
+    other = ChatCommandStore(tmp_path / "commands.sqlite3", owner_id="another-process")
+    other.withdraw("web:two", "command-2")
+    assert store.lookup("web:two", "command-2") is not None, "only the process that accepted it"
+    store.close()
+    other.close()
