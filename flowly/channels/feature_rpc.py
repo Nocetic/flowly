@@ -4688,6 +4688,12 @@ def _session_row(p, st, waiting: dict) -> dict | None:
         if isinstance(raw_completion_id, str) and raw_completion_id.strip()
         else None
     )
+    # Its last words, as its row shows them: kept in the header on every save,
+    # else read from the end of a file saved before that (flowly/session/preview.py).
+    from flowly.session.preview import tail_preview
+
+    kept = metadata.get("last_message")
+    preview = kept if isinstance(kept, dict) and isinstance(kept.get("text"), str) else tail_preview(p)
     raw_completed_at = metadata.get("last_assistant_at")
     last_assistant_at = (
         raw_completed_at
@@ -4712,6 +4718,8 @@ def _session_row(p, st, waiting: dict) -> dict | None:
         "updatedAt": modified_ms,
         "lastAssistantRunId": last_assistant_run_id,
         "lastAssistantAt": last_assistant_at,
+        "lastMessage": preview["text"] if preview else None,
+        "lastMessageRole": preview["role"] if preview else None,
         # True while a turn for this session is in flight — drives the
         # client's "running" shimmer. Old clients ignore the field.
         "running": _inflight_get(key) is not None,

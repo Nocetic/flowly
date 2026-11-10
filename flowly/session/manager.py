@@ -1825,6 +1825,14 @@ class SessionManager:
             )
 
         session.ensure_event_identities()
+        # Its last words, for its row in a list (sessions.list reads the header alone).
+        from flowly.session.preview import last_message_preview
+
+        preview = last_message_preview([*session.messages, *(extra_messages or [])])
+        if preview:
+            session.metadata["last_message"] = preview
+        else:
+            session.metadata.pop("last_message", None)
         if not session.metadata.get("_pending_archive_transaction") and not (_reserve_work and canonical is None):
             self._withdraw_removed_active_events(session)
         path = self._get_session_path(session.key)
