@@ -2576,28 +2576,39 @@ class GatewayServer:
     async def _ws_rpc_sessions_delete(
         self, ws: web.WebSocketResponse, rpc_id: str, params: dict
     ) -> None:
-        if "key" in params and "sessionKey" in params and params["key"] != params["sessionKey"]:
-            await self._ws_rpc_error(ws, rpc_id, "INVALID_PARAMS", "Conversation targets do not match.")
+        try:
+            result = await self.sessions_delete_result(params)
+        except feature_rpc.FeatureRpcError as exc:
+            await self._ws_rpc_error(ws, rpc_id, exc.code, exc.message)
             return
+        await self._ws_rpc_reply(ws, rpc_id, result)
+
+    async def sessions_delete_result(self, params: dict, *, remote: bool = False) -> dict:
+        """A conversation deleted, as ``sessions.delete`` answers it.
+
+        The one deletion for every transport: this gateway's own clients, and
+        the Flowly server for a chat the agent keeps itself (a home that keeps
+        no chats on the server, server PROTOCOL A11), where ``remote`` allows
+        only the apps' own conversations. Raises ``FeatureRpcError``.
+        """
+        if "key" in params and "sessionKey" in params and params["key"] != params["sessionKey"]:
+            raise feature_rpc.FeatureRpcError("INVALID_PARAMS", "Conversation targets do not match.")
         session_key = params.get("sessionKey") or params.get("key", "")
         from flowly.agent_home import is_agent_home
         if is_agent_home(session_key):
-            await self._ws_rpc_error(ws, rpc_id, "PERSISTENT_CONVERSATION", "Compact this agent's context instead of deleting its conversation.")
-            return
-        if not session_key or not self.sessions:
-            await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "sessionKey is required")
-            return
+            raise feature_rpc.FeatureRpcError("PERSISTENT_CONVERSATION", "Compact this agent's context instead of deleting its conversation.")
+        if not isinstance(session_key, str) or not session_key or not self.sessions:
+            raise feature_rpc.FeatureRpcError("INVALID_REQUEST", "sessionKey is required")
+        if remote:
+            from flowly.profile_host_contract import REMOTE_SESSION_PREFIXES
+
+            if not session_key.startswith(REMOTE_SESSION_PREFIXES):
+                raise feature_rpc.FeatureRpcError("INVALID_REQUEST", "Only an app's own conversation is deleted from afar.")
 
         from flowly.agent import inflight
 
         if inflight.get(session_key) is not None:
-            await self._ws_rpc_error(
-                ws,
-                rpc_id,
-                "SESSION_BUSY",
-                "Finish or stop the active turn before deleting this session.",
-            )
-            return
+            raise feature_rpc.FeatureRpcError("SESSION_BUSY", "Finish or stop the active turn before deleting this session.")
 
         delete_callback = getattr(self, "on_session_delete", None)
         if delete_callback is not None:
@@ -2608,13 +2619,8 @@ class GatewayServer:
             except SessionBusyError:
                 # A chat may arrive after the fast check above. The owning
                 # agent rechecks at the turn-lock boundary, closing that race.
-                await self._ws_rpc_error(
-                    ws,
-                    rpc_id,
-                    "SESSION_BUSY",
-                    "Finish or stop the active turn before deleting this session.",
-                )
-                return
+                raise feature_rpc.FeatureRpcError(
+                    "SESSION_BUSY", "Finish or stop the active turn before deleting this session.") from None
         else:
             deleted = self.sessions.delete(session_key)
         # Drop the per-session cwd pin too — otherwise a future session
@@ -2623,7 +2629,7 @@ class GatewayServer:
         from flowly.runtime_cwd import clear_session_cwd
 
         clear_session_cwd(session_key)
-        await self._ws_rpc_reply(ws, rpc_id, {"deleted": deleted, "sessionKey": session_key})
+        return {"deleted": deleted, "sessionKey": session_key}
 
     async def _ws_rpc_sessions_model_get(
         self, ws: web.WebSocketResponse, rpc_id: str, params: dict

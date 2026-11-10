@@ -284,7 +284,37 @@ class FlowlyServerChannel(WebChannel):
         if method == "chat.react":
             await self._main_chat_react(ws, msg)
             return
+        if method == "sessions.delete":
+            await self._main_sessions_delete(ws, msg)
+            return
         await super()._dispatch_rpc(ws, msg)
+
+    async def _main_sessions_delete(self, ws, msg: dict) -> None:
+        """One of the main agent's app chats deleted here, asked through the server (server PROTOCOL A11).
+
+        The apps of a home that keeps no chats on the server delete them on
+        this machine, as a direct gateway's do: before, this channel did not
+        know the method and every delete from a phone failed.
+        """
+        from flowly.channels.feature_rpc import FeatureRpcError
+
+        rpc_id = msg.get("id", "")
+        session_id = msg.get("sessionId", "")
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+
+        async def reply(body: dict[str, Any]) -> None:
+            await ws.send(json.dumps({"type": "rpc", "id": rpc_id, "sessionId": session_id, **body}))
+
+        gateway = self._screen_gateway
+        if gateway is None or not hasattr(gateway, "sessions_delete_result"):
+            await reply({"error": {"code": "UNAVAILABLE", "message": "This agent cannot delete chats here.", "retryable": True}})
+            return
+        try:
+            result = await gateway.sessions_delete_result(params, remote=True)
+        except FeatureRpcError as exc:
+            await reply({"error": {"code": exc.code, "message": exc.message, "retryable": exc.code == "SESSION_BUSY"}})
+            return
+        await reply({"result": result})
 
     async def _main_chat_react(self, ws, msg: dict) -> None:
         """The person's reaction on one of the main agent's messages, kept here (server PROTOCOL A11)."""
