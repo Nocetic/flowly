@@ -128,3 +128,12 @@ async def test_a_named_agents_history_still_goes_to_that_agent(home):
     await channel._handle_relay_message(socket, {"type": "rpc", "id": "n1", "method": "chat.history",
                                                  "params": {"sessionKey": "agent:home", "profile": "tsuki"}})
     assert called == ["tsuki"]
+
+
+def test_core_tells_the_server_it_reads_the_main_agents_conversations_itself():
+    from flowly.channels.flowly_server import CHAT_HISTORY_FEATURE
+
+    channel, _ = _channel(None)
+    _, kwargs, _ = channel._relay_connection()
+    features = kwargs["additional_headers"]["X-Flowly-Agent-Features"].split(",")
+    assert CHAT_HISTORY_FEATURE == "chat-history-v1" and CHAT_HISTORY_FEATURE in features

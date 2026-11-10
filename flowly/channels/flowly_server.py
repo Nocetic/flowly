@@ -50,6 +50,11 @@ PASSIVE_METHODS = frozenset({
 #: does not ask, because after it Core drops a client's unwrapped frames.
 VOICE_AUTHORITY_FEATURE = "voice-authority-v1"
 
+#: This Core answers the main agent's ``chat.history`` itself (``_main_chat_history``):
+#: a home may then keep no chats on the server (server PROTOCOL A11). A server
+#: lets its owner turn that off only with a Core that says this.
+CHAT_HISTORY_FEATURE = "chat-history-v1"
+
 #: While backing off, look at the clocks this often for a resume.
 RESUME_TICK_SECONDS = 0.5
 #: The wall clock ran this much further than the monotonic one within a tick:
@@ -493,7 +498,7 @@ class FlowlyServerChannel(WebChannel):
         return url, {"additional_headers": {
             "Authorization": f"Bearer {secret}",
             "X-Flowly-Agent-Host": host,
-            "X-Flowly-Agent-Features": VOICE_AUTHORITY_FEATURE,
+            "X-Flowly-Agent-Features": f"{VOICE_AUTHORITY_FEATURE},{CHAT_HISTORY_FEATURE}",
         }}, None
 
     def _on_connected(self, ws) -> None:

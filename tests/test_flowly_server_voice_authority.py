@@ -49,7 +49,8 @@ def _enabled_channel():
 def test_core_asks_the_server_for_voice_identity():
     channel = FlowlyServerChannel(_config(), MessageBus())
     _, kwargs, _ = channel._relay_connection()
-    assert kwargs["additional_headers"]["X-Flowly-Agent-Features"] == VOICE_AUTHORITY_FEATURE == "voice-authority-v1"
+    assert VOICE_AUTHORITY_FEATURE == "voice-authority-v1"
+    assert VOICE_AUTHORITY_FEATURE in kwargs["additional_headers"]["X-Flowly-Agent-Features"].split(",")
 
 
 def test_after_the_handshake_the_servers_own_calls_stay_accepted_and_a_clients_plain_rpc_does_not():
@@ -194,6 +195,6 @@ async def test_real_server_connection_negotiates_and_runs_account_and_server_cal
             channel._running = False
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-    assert headers.get("x-flowly-agent-features") == "voice-authority-v1"
+    assert "voice-authority-v1" in headers.get("x-flowly-agent-features", "").split(",")
     assert owners == [("voice.list", RequestOwner("account-1"))]
     channel.chat_commands.close()
