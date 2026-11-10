@@ -267,7 +267,47 @@ class FlowlyServerChannel(WebChannel):
                 and profile not in (None, "", "default"):
             await self._dispatch_profile_chat(ws, msg, profile)
             return
+        if method == "chat.history":
+            await self._main_chat_history(ws, msg)
+            return
         await super()._dispatch_rpc(ws, msg)
+
+    async def _main_chat_history(self, ws, msg: dict) -> None:
+        """The main agent's conversation as this machine keeps it (chat-storage-choice.md).
+
+        The server reads a home's chats from here when it keeps none of them
+        itself; it reads its own otherwise and never asks. Answered as the
+        gateway answers its own clients, from its session manager (the relay
+        answered nothing: its apps read Firestore).
+        """
+        from flowly.channels.feature_rpc import FeatureRpcError
+        from flowly.session.history_page import HistoryPageError
+
+        rpc_id = msg.get("id", "")
+        session_id = msg.get("sessionId", "")
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+
+        async def reply(body: dict[str, Any]) -> None:
+            await ws.send(json.dumps({"type": "rpc", "id": rpc_id, "sessionId": session_id, **body}))
+
+        gateway = self._screen_gateway
+        if gateway is None or not hasattr(gateway, "chat_history_result"):
+            await reply({"error": {"code": "UNAVAILABLE", "message": "This agent cannot read its conversations here.",
+                                   "retryable": True}})
+            return
+        try:
+            result = gateway.chat_history_result(params)
+        except FeatureRpcError as exc:
+            await reply({"error": {"code": exc.code, "message": exc.message, "retryable": False}})
+            return
+        except HistoryPageError as exc:
+            await reply({"error": {"code": exc.code, "message": str(exc), "retryable": False}})
+            return
+        except Exception as exc:  # noqa: BLE001 - the app is told, never left waiting
+            logger.error("[FlowlyServer] chat.history failed ({})", type(exc).__name__)
+            await reply({"error": {"code": "INTERNAL", "message": "This conversation could not be read.", "retryable": True}})
+            return
+        await reply({"result": _with_exact_times(result)})
 
     async def _dispatch_profile_chat(self, ws, msg: dict, profile: Any) -> None:
         """A named agent's chat call from the server: run it in that agent.

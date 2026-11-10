@@ -2681,28 +2681,42 @@ class GatewayServer:
     async def _ws_rpc_chat_history(
         self, ws: web.WebSocketResponse, rpc_id: str, params: dict
     ) -> None:
+        from flowly.session.history_page import HistoryPageError
+
+        try:
+            result = self.chat_history_result(params)
+        except feature_rpc.FeatureRpcError as exc:
+            await self._ws_rpc_error(ws, rpc_id, exc.code, exc.message)
+            return
+        except HistoryPageError as exc:
+            await self._ws_rpc_error(ws, rpc_id, exc.code, str(exc))
+            return
+        await self._ws_rpc_reply(ws, rpc_id, result)
+
+    def chat_history_result(self, params: dict) -> dict:
+        """A conversation's history as ``chat.history`` answers it, a page at a time.
+
+        The one reading of a conversation for every transport: this gateway's
+        own clients, and the Flowly server for a home that keeps no chats of
+        its own (``FlowlyServerChannel``, chat-storage-choice.md). Read from
+        this gateway's own session manager, so a page's cursor holds on the
+        next page (rows saved before they had identities get theirs when a
+        session is loaded). Raises ``FeatureRpcError`` / ``HistoryPageError``.
+        """
         session_key = params.get("sessionKey", "")
         if not session_key or not self.sessions:
-            await self._ws_rpc_reply(ws, rpc_id, {"sessionKey": session_key, "messages": []})
-            return
+            return {"sessionKey": session_key, "messages": []}
 
-        from flowly.session.history_page import HistoryPageError, history_page
+        from flowly.session.history_page import history_page
         from flowly.session.history_rows import history_row, project_rows
         from flowly.session.keys import is_subagent_thread
 
         if is_subagent_thread(session_key):
             # A subagent's conversation lives in its own store and is only
             # read here: nothing is created or cached for it.
-            try:
-                rows, _thread = feature_rpc.subagent_thread_rows(session_key)
-                rows, page_info = history_page(rows, session_key, params)
-            except feature_rpc.FeatureRpcError as exc:
-                await self._ws_rpc_error(ws, rpc_id, exc.code, exc.message)
-                return
-            except HistoryPageError as exc:
-                await self._ws_rpc_error(ws, rpc_id, exc.code, str(exc))
-                return
-            await self._ws_rpc_reply(ws, rpc_id, {
+            rows, _thread = feature_rpc.subagent_thread_rows(session_key)
+            rows, page_info = history_page(rows, session_key, params)
+            return {
                 "sessionKey": session_key,
                 "sessionId": session_key,
                 "messages": project_rows([history_row(m) for m in rows]),
@@ -2710,8 +2724,7 @@ class GatewayServer:
                 "modelOverride": None,
                 "readOnly": True,
                 **page_info,
-            })
-            return
+            }
 
         session = self.sessions.get_or_create(session_key)
         # Return full messages (not just role/content) for richer UI rendering.
@@ -2726,11 +2739,7 @@ class GatewayServer:
         # latter is the compacted LLM working context (just [summary]+recent
         # after a /compact), which would drop the early turns from the chat UI.
         source_messages = self.sessions.get_full_messages(session_key)
-        try:
-            source_messages, page_info = history_page(source_messages, session_key, params)
-        except HistoryPageError as exc:
-            await self._ws_rpc_error(ws, rpc_id, exc.code, str(exc))
-            return
+        source_messages, page_info = history_page(source_messages, session_key, params)
 
         # Reconstruct attachment previews from the media paths saved on the
         # turn. Images get a small base64 JPEG thumbnail (not the full original
@@ -2745,19 +2754,14 @@ class GatewayServer:
         # deferred-call wrappers here so a reopened Desktop/iOS conversation
         # renders the same effective tool identity it showed while streaming.
         messages = project_rows([history_row(m, attachments=attachments) for m in source_messages])
-
-        await self._ws_rpc_reply(
-            ws,
-            rpc_id,
-            {
-                "sessionKey": session_key,
-                "sessionId": session_key,
-                "messages": messages,
-                "thinkingLevel": session.metadata.get("thinkingLevel"),
-                "modelOverride": session.metadata.get("model_override"),
-                **page_info,
-            },
-        )
+        return {
+            "sessionKey": session_key,
+            "sessionId": session_key,
+            "messages": messages,
+            "thinkingLevel": session.metadata.get("thinkingLevel"),
+            "modelOverride": session.metadata.get("model_override"),
+            **page_info,
+        }
 
     # --- RPC: chat.send ---
 
