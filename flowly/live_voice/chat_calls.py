@@ -193,6 +193,8 @@ def with_chat_calls(rows: list[dict], sessions: Any, chat_file_exists: Any) -> l
       started in a new chat, before anything is written into it) is listed
       at once, where its call is; it comes back no other way. A chat deleted
       while its call runs is the only one it could bring back.
+    - A call that belongs to a chat is not listed on its own: it is shown in
+      that chat (as the call library, ``voice.list``, leaves it out).
     """
     chats_without_words = [row for row in rows if str(row.get("key", "")).startswith("web:") and not row.get("lastMessage")]
     voice_rows = [row for row in rows if row.get("kind") == "voice"]
@@ -226,5 +228,7 @@ def with_chat_calls(rows: list[dict], sessions: Any, chat_file_exists: Any) -> l
                     "lastMessage": fallback_text(0, live=True), "lastMessageRole": "assistant",
                     "running": False, "modelOverride": None,
                 })
+        if isinstance(chat, str):
+            continue
         out.append(row)
     return out

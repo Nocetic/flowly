@@ -113,6 +113,8 @@ def test_the_list_names_a_chat_by_its_call_and_lists_one_whose_call_runs_before_
     rows = {row["key"]: row for row in sessions_list({"limit": 50})["sessions"]}
     assert rows["web:new-chat"]["lastMessage"] == "🎙 Voice chat"
     assert rows["web:new-chat"]["title"] is None
+    # The call itself is not listed apart from its chat (the call library leaves it out too).
+    assert not any(row.get("kind") == "voice" for row in sessions_list({"limit": 50})["sessions"])
     # An ended call of a chat that has no session (deleted) never brings it back.
     call(manager, "call-3", chat="web:gone")
     assert "web:gone" not in {row["key"] for row in sessions_list({"limit": 50})["sessions"]}
