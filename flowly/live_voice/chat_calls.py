@@ -16,10 +16,24 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from flowly.live_voice.authority import request_owner_scope
 from flowly.live_voice.chat_binding import call_record
 from flowly.live_voice.sessions import session_key as voice_session_key
 
 ROW_KIND = "voice_call"
+
+
+def _as_the_chat() -> Any:
+    """Read a chat's calls as the chat, not as the request.
+
+    A call's ledger is its owner's (an account's, for a call an app started):
+    a request in another scope (the host's, as every app request through the
+    Flowly server is) does not see it, and the chat showed none of its calls
+    (2026-11-10). Its card belongs to the chat (the server keeps it as the
+    chat's row, and its record is sent as the chat's, ``chat_binding``), so it
+    is read in the trusted in-process scope, for this chat's bound calls only.
+    """
+    return request_owner_scope(None)
 
 
 def fallback_text(duration_ms: int, *, live: bool = False) -> str:
@@ -70,11 +84,19 @@ def chat_calls(sessions: Any, chat: str, *, now: datetime | None = None, listed:
     ``listed``: the sessions' list already read (``list_sessions``), for many chats at once.
     """
     rows: list[dict] = []
-    if listed is None:
-        try:
-            listed = sessions.list_sessions()
-        except Exception:  # noqa: BLE001 - a chat reads without its calls rather than not at all
-            return rows
+    with _as_the_chat():
+        if listed is None:
+            try:
+                listed = sessions.list_sessions()
+            except Exception:  # noqa: BLE001 - a chat reads without its calls rather than not at all
+                return rows
+        rows = _calls_of(sessions, chat, listed, now)
+    rows.sort(key=lambda row: _seconds(row.get("timestamp")) or 0.0)
+    return rows
+
+
+def _calls_of(sessions: Any, chat: str, listed: list[dict], now: datetime | None) -> list[dict]:
+    rows: list[dict] = []
     for info in listed:
         if info.get("kind") != "voice" or info.get("voiceChatSessionKey") != chat:
             continue
@@ -94,7 +116,6 @@ def chat_calls(sessions: Any, chat: str, *, now: datetime | None = None, listed:
         row = _row(record) if record else None
         if row is not None:
             rows.append(row)
-    rows.sort(key=lambda row: _seconds(row.get("timestamp")) or 0.0)
     return rows
 
 
@@ -156,79 +177,81 @@ def forget_chat_calls(sessions: Any, chat: str) -> int:
     """A deleted chat's calls go with it (as the server deletes a stored chat's call rows).
 
     Each ended call is deleted the way the voice library deletes one (its
-    tombstone, ``VoiceSessions.delete``); a call still running stays until it
-    ends. Returns how many went.
+    tombstone, ``VoiceSessions.delete``), as its own owner; a call still
+    running stays until it ends. Read as the chat (``_as_the_chat``): a
+    delete asked through the Flowly server runs in the host's scope, where an
+    account's call is not seen. Returns how many went.
     """
     from flowly.live_voice.sessions import VoiceError, VoiceSessions
 
     gone = 0
-    try:
-        listed = sessions.list_sessions()
-    except Exception:  # noqa: BLE001
-        return gone
-    for info in listed:
-        if info.get("kind") != "voice" or info.get("voiceChatSessionKey") != chat:
-            continue
-        call_id = info.get("voiceConversationId")
-        if not isinstance(call_id, str) or not call_id:
-            continue
-        store = VoiceSessions(sessions)
-        # Deleted as its own owner (the host's, or the account's that started it).
-        owner = info.get("voiceOwner")
-        store._owner = owner if isinstance(owner, dict) else {"kind": "host"}
+    with _as_the_chat():
         try:
-            if store.delete({"conversationId": call_id}).get("deleted") is not False:
-                gone += 1
-        except VoiceError:
-            continue
+            listed = sessions.list_sessions()
+        except Exception:  # noqa: BLE001
+            return gone
+        for info in listed:
+            if info.get("kind") != "voice" or info.get("voiceChatSessionKey") != chat:
+                continue
+            call_id = info.get("voiceConversationId")
+            if not isinstance(call_id, str) or not call_id:
+                continue
+            store = VoiceSessions(sessions)
+            owner = info.get("voiceOwner")
+            store._owner = owner if isinstance(owner, dict) else {"kind": "host"}
+            try:
+                if store.delete({"conversationId": call_id}).get("deleted") is not False:
+                    gone += 1
+            except VoiceError:
+                continue
     return gone
 
 
-
-def with_chat_calls(rows: list[dict], sessions: Any, chat_file_exists: Any) -> list[dict]:
+def with_chat_calls(rows: list[dict], sessions: Any, chat_file_exists: Any, *, first_page: bool = True) -> list[dict]:
     """A list page (``sessions.list`` rows) with what its chats' calls say.
 
     - A chat with no words of its own says its newest call ("🎙 Voice chat · 0:57").
     - A chat whose call is running now and that has no session yet (a call
       started in a new chat, before anything is written into it) is listed
-      at once, where its call is; it comes back no other way. A chat deleted
-      while its call runs is the only one it could bring back.
+      at once, at the top of the first page: it comes back no other way. A
+      chat deleted while its call runs is the only one it could bring back.
     - A call that belongs to a chat is not listed on its own: it is shown in
       that chat (as the call library, ``voice.list``, leaves it out).
+
+    Calls are read as their chats (``_as_the_chat``), whoever asks for the list.
     """
-    chats_without_words = [row for row in rows if str(row.get("key", "")).startswith("web:") and not row.get("lastMessage")]
-    voice_rows = [row for row in rows if row.get("kind") == "voice"]
-    if not chats_without_words and not voice_rows:
-        return rows
-    try:
-        listed = sessions.list_sessions()
-    except Exception:  # noqa: BLE001
-        return rows
+    with _as_the_chat():
+        try:
+            listed = sessions.list_sessions()
+        except Exception:  # noqa: BLE001
+            return rows
     bound = {info.get("voiceConversationId"): info.get("voiceChatSessionKey") for info in listed
              if info.get("kind") == "voice" and isinstance(info.get("voiceChatSessionKey"), str)}
-    chats = {chat for chat in bound.values()}
-    for row in chats_without_words:
-        if row["key"] in chats:
+    if not bound:
+        return rows
+    chats = set(bound.values())
+    for row in rows:
+        if str(row.get("key", "")).startswith("web:") and not row.get("lastMessage") and row["key"] in chats:
             line = preview(sessions, row["key"], listed=listed)
             if line:
                 row["lastMessage"], row["lastMessageRole"] = line["text"], line["role"]
     keys = {row.get("key") for row in rows}
-    out: list[dict] = []
-    for row in rows:
-        chat = bound.get(row.get("voiceConversationId")) if row.get("kind") == "voice" else None
-        if isinstance(chat, str) and chat not in keys and not chat_file_exists(chat):
-            calls = chat_calls(sessions, chat, listed=listed)
-            if any(call["voiceCall"]["phase"] == "live" for call in calls):
+    running: list[dict] = []
+    if first_page:
+        for chat in sorted(chats):
+            if not chat.startswith("web:") or chat in keys or chat_file_exists(chat):
+                continue
+            if any(call["voiceCall"]["phase"] == "live" for call in chat_calls(sessions, chat, listed=listed)):
                 keys.add(chat)
-                out.append({
-                    "key": chat, "fileName": None, "sizeBytes": 0, "modifiedAt": row.get("modifiedAt"),
+                running.append({
+                    "key": chat, "fileName": None, "sizeBytes": 0, "modifiedAt": None,
                     "channel": "web", "chatId": chat.split(":", 1)[1], "title": None,
-                    "displayName": chat.split(":", 1)[1], "updatedAt": row.get("updatedAt"),
+                    "displayName": chat.split(":", 1)[1], "updatedAt": None,
                     "lastAssistantRunId": None, "lastAssistantAt": None,
                     "lastMessage": fallback_text(0, live=True), "lastMessageRole": "assistant",
                     "running": False, "modelOverride": None,
                 })
-        if isinstance(chat, str):
-            continue
-        out.append(row)
-    return out
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    for row in running:
+        row["modifiedAt"] = row["updatedAt"] = now_ms
+    return running + [row for row in rows if not (row.get("kind") == "voice" and row.get("voiceConversationId") in bound)]

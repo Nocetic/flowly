@@ -147,3 +147,26 @@ async def test_deleting_a_chat_through_the_agent_deletes_its_calls(home, manager
     finally:
         loop.stop()
     assert SessionManager(home / "workspace").read("desktop:voice:call-1") is None
+
+
+def test_an_apps_call_is_its_chats_whoever_asks(home, manager):
+    """A call an app started is its account's; every request through the Flowly
+    server is the host's. The chat showed none of its calls (2026-11-10)."""
+    from flowly.live_voice.authority import HOST_OWNER, RequestOwner, request_owner_scope
+
+    account = VoiceSessions(manager).for_owner(RequestOwner(uid="account-1"))
+    account.open({"conversationId": "call-9", "connectionId": "call-9-c", "language": "tr"},
+                 profile="default", bot_id="agent-1", chat="web:app-chat")
+    account.append({"conversationId": "call-9", "connectionId": "call-9-c", "messageId": "m1", "ordinal": 1,
+                    "role": "user", "text": "hello"})
+    account.end({"conversationId": "call-9", "connectionId": "call-9-c"})
+    session = manager.get_or_create("web:app-chat")
+    session.add_message("user", "[Voice call …]", kind="voice_call_context", voiceCallId="call-9", _display_hidden=True)
+    manager.save(session)
+    with request_owner_scope(HOST_OWNER):
+        rows = GatewayServer(sessions=manager).chat_history_result({"sessionKey": "web:app-chat"})["messages"]
+        assert [row["id"] for row in rows] == ["voice-call-call-9"]
+        listed = {row["key"]: row for row in sessions_list({"limit": 50})["sessions"]}
+        assert listed["web:app-chat"]["lastMessage"].startswith("🎙 Voice chat · ")
+        assert forget_chat_calls(manager, "web:app-chat") == 1
+    assert manager.read("desktop:voice:call-9") is None
