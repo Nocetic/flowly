@@ -2782,7 +2782,9 @@ class GatewayServer:
         # older client's read) keeps its rows' ``id`` as they were, where an
         # ``id`` is the sender's own word for its message (iOS matches its
         # bubble to the stored row by it, 2026-11-10).
-        identities = {id(m): identity for m, identity in zip(source_messages, row_identities(source_messages))}
+        full_messages = source_messages
+        full_identities = row_identities(full_messages)
+        identities = {id(m): identity for m, identity in zip(full_messages, full_identities)}
         source_messages, page_info = history_page(source_messages, session_key, params)
         source_messages = [{**m, "reactId": m.get("id") if page_info else identities.get(id(m)) or m.get("id")}
                            for m in source_messages]
@@ -2805,6 +2807,16 @@ class GatewayServer:
 
         messages = with_reactions(messages, read_reactions(self.sessions, session_key),
                                   read_agent_reactions(self.sessions, session_key))
+        if session_key.startswith("web:"):
+            # Its voice calls, each as one card in its place in time, built from the
+            # call's own ledger (flowly/live_voice/chat_calls.py): what the Flowly
+            # server stores for a chat it keeps, for every chat the agent keeps.
+            from flowly.live_voice.chat_calls import chat_calls, page_bounds, with_calls
+
+            calls = chat_calls(self.sessions, session_key)
+            if calls:
+                lower, upper = page_bounds(full_messages, source_messages, full_identities) if page_info else (None, None)
+                messages = with_calls(messages, calls, lower=lower, upper=upper)
         return {
             "sessionKey": session_key,
             "sessionId": session_key,

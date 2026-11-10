@@ -2495,6 +2495,12 @@ class AgentLoop:
             subagents = getattr(self, "subagents", None)
             if subagents is not None:
                 subagents.forget_conversation(session_key)
+            # Its voice calls too: their cards were its, and a call's own ledger
+            # would otherwise keep showing in a chat that is gone.
+            if session_key.startswith("web:"):
+                from flowly.live_voice.chat_calls import forget_chat_calls
+
+                await asyncio.to_thread(forget_chat_calls, self.sessions, session_key)
             return deleted
 
     def _should_save_trajectories(self) -> bool:

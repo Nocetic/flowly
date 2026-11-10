@@ -4791,9 +4791,28 @@ def sessions_list(params: dict | None = None) -> dict:
             continue
         if row is not None:
             out.append(row)
+    out = _with_chat_calls(out, sessions_dir)
     if limit is None:
         return {"sessions": out}
     return {"sessions": out, "next": next_cursor}
+
+
+def _with_chat_calls(rows: list[dict], sessions_dir) -> list[dict]:
+    """The page with what its chats' voice calls say (flowly/live_voice/chat_calls.py)."""
+    if not any(row.get("kind") == "voice" or (str(row.get("key", "")).startswith("web:") and not row.get("lastMessage"))
+               for row in rows):
+        return rows
+    from loguru import logger
+
+    from flowly.live_voice.chat_calls import with_chat_calls
+    from flowly.session.manager import SessionManager
+
+    try:
+        sessions = SessionManager(get_flowly_home() / "workspace")
+        return with_chat_calls(rows, sessions, lambda key: sessions._get_session_path(key).exists())
+    except Exception:  # noqa: BLE001 - the list shows without its calls rather than not at all
+        logger.exception("sessions.list: voice calls not added")
+        return rows
 
 
 def _pending_inputs() -> dict:
