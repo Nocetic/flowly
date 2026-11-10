@@ -9428,6 +9428,13 @@ class AgentLoop:
         # was saved: a message sent while the turn ran (run_steering) is
         # written at its own time and must sort after this one.
         user_extras = {"timestamp": msg.timestamp.isoformat(), **_turn_user_extras(msg.metadata)}
+        # The run this message started, on the person's own row: the id the
+        # sending app drew it under (a chat.send runs under its idempotency
+        # key), so an app's bubble and the stored row are one message, also
+        # on a device that saw it sent from another (2026-11-10).
+        turn_run_id = msg.metadata.get("run_id")
+        if isinstance(turn_run_id, str) and turn_run_id and not hidden_user_turn:
+            user_extras["run_id"] = turn_run_id
         try:
             _pending_user: dict[str, Any] = {
                 "role": "user", "content": notes_prompt if notes_only_turn else display_content, **user_extras}
