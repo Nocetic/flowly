@@ -12,12 +12,8 @@ class HistoryPageError(ValueError):
     code = "INVALID_HISTORY_CURSOR"
 
 
-def history_page(rows: list[dict], session_key: str, params: dict) -> tuple[list[dict], dict]:
-    if "limit" not in params and "before" not in params:
-        return rows, {}  # Legacy wire contract remains unchanged.
-    limit = params.get("limit", 50)
-    if type(limit) is not int or not 1 <= limit <= 200:
-        raise HistoryPageError("History page size must be between 1 and 200.")
+def row_identities(rows: list[dict]) -> list[str]:
+    """Each row's id as a history page names it (its archive id, else one from its content)."""
     identities: list[str] = []
     occurrences: dict[str, int] = {}
     for row in rows:
@@ -25,6 +21,16 @@ def history_page(rows: list[dict], session_key: str, params: dict) -> tuple[list
         occurrence = occurrences.get(fingerprint, 0)
         occurrences[fingerprint] = occurrence + 1
         identities.append(str(row.get(EVENT_ID_KEY) or legacy_event_id(row, occurrence)))
+    return identities
+
+
+def history_page(rows: list[dict], session_key: str, params: dict) -> tuple[list[dict], dict]:
+    if "limit" not in params and "before" not in params:
+        return rows, {}  # Legacy wire contract remains unchanged.
+    limit = params.get("limit", 50)
+    if type(limit) is not int or not 1 <= limit <= 200:
+        raise HistoryPageError("History page size must be between 1 and 200.")
+    identities = row_identities(rows)
     end = len(rows)
     before = params.get("before")
     if before is not None:

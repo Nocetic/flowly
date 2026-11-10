@@ -2967,6 +2967,17 @@ Respond to the user now:"""
 
             get_reaction_hub().add_callback(_carry_reaction)
 
+            # ...and the agent keeps it, on the person's newest message, for the
+            # apps that read its chats from it (flowly/session/reactions.py).
+            async def _keep_reaction(session_key: str, emoji: str) -> None:
+                from flowly.session.reactions import note_agent_reaction
+
+                sessions = gateway_server.sessions
+                if sessions is not None:
+                    await asyncio.to_thread(note_agent_reaction, sessions, session_key, emoji)
+
+            get_reaction_hub().add_callback(_keep_reaction)
+
             async def _close_clarify(
                 clarify_id: str, reason: str, session_key: str
             ) -> None:

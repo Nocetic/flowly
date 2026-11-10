@@ -1733,6 +1733,13 @@ class GatewayServer:
             elif method == "chat.history":
                 await self._ws_rpc_chat_history(ws, rpc_id, params)
 
+            elif method == "chat.react":
+                from flowly.session.reactions import ReactionError
+                try:
+                    await self._ws_rpc_reply(ws, rpc_id, self.chat_react_result(params))
+                except (feature_rpc.FeatureRpcError, ReactionError) as exc:
+                    await self._ws_rpc_error(ws, rpc_id, exc.code, exc.message)
+
             elif method == "chat.command":
                 from flowly.session.commands import command_status
                 try:
@@ -2693,6 +2700,29 @@ class GatewayServer:
             return
         await self._ws_rpc_reply(ws, rpc_id, result)
 
+    def chat_react_result(self, params: dict) -> dict:
+        """The person's reaction on one of the agent's messages, set or taken off (``emoji`` null).
+
+        Kept by the agent (flowly/session/reactions.py) for a chat whose
+        reactions no server keeps: a direct gateway's, and a home's that keeps
+        no chats on the Flowly server (server PROTOCOL A11). The message is
+        named by the id ``chat.history`` gave it. Answers its reactions now and
+        its words (what the agent is told the reaction was on).
+        """
+        from flowly.agent.reactions import is_reaction_emoji
+        from flowly.session.reactions import set_reaction
+
+        key = params.get("sessionKey")
+        message_id = params.get("messageId")
+        emoji = params.get("emoji")
+        if not isinstance(key, str) or not key or not self.sessions:
+            raise feature_rpc.FeatureRpcError("INVALID_PARAMS", "sessionKey is required")
+        if not isinstance(message_id, str) or not 0 < len(message_id) <= 200:
+            raise feature_rpc.FeatureRpcError("INVALID_PARAMS", "messageId is required")
+        if emoji is not None and not is_reaction_emoji(emoji):
+            raise feature_rpc.FeatureRpcError("INVALID_PARAMS", "emoji is one emoji, or null")
+        return set_reaction(self.sessions, key, message_id, "user", emoji)
+
     def chat_history_result(self, params: dict) -> dict:
         """A conversation's history as ``chat.history`` answers it, a page at a time.
 
@@ -2739,6 +2769,13 @@ class GatewayServer:
         # latter is the compacted LLM working context (just [summary]+recent
         # after a /compact), which would drop the early turns from the chat UI.
         source_messages = self.sessions.get_full_messages(session_key)
+        if "limit" not in params and "before" not in params:
+            # The whole conversation at once (an older client): each row named all the same, as a
+            # page names it, so a reaction (chat.react) can say which message it is on.
+            from flowly.session.history_page import row_identities
+
+            source_messages = [{**m, "id": m.get("id") or identity}
+                               for m, identity in zip(source_messages, row_identities(source_messages))]
         source_messages, page_info = history_page(source_messages, session_key, params)
 
         # Reconstruct attachment previews from the media paths saved on the
@@ -2754,6 +2791,11 @@ class GatewayServer:
         # deferred-call wrappers here so a reopened Desktop/iOS conversation
         # renders the same effective tool identity it showed while streaming.
         messages = project_rows([history_row(m, attachments=attachments) for m in source_messages])
+        # The reactions on them, as the agent keeps them (flowly/session/reactions.py).
+        from flowly.session.reactions import read_agent_reactions, read_reactions, with_reactions
+
+        messages = with_reactions(messages, read_reactions(self.sessions, session_key),
+                                  read_agent_reactions(self.sessions, session_key))
         return {
             "sessionKey": session_key,
             "sessionId": session_key,

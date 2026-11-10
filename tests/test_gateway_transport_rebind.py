@@ -207,11 +207,13 @@ async def test_chat_history_exposes_full_display_rows_without_archive_internals(
         "".join(block.get("text", "") for block in row["content"])
         for row in messages
     ] == ["early question", "[context-optimized]", "recent answer"]
-    assert set(messages[0]) == {"role", "content", "timestamp"}
+    # Each row is named as a history page names it (a reaction names it so), nothing internal.
+    assert [row["id"] for row in messages] == ["evt_1", "evt_boundary", "evt_3"]
+    assert set(messages[0]) == {"id", "role", "content", "timestamp"}
     assert set(messages[1]) == {
-        "role", "content", "kind", "boundaryKind", "compactionId",
+        "id", "role", "content", "kind", "boundaryKind", "compactionId",
     }
-    assert set(messages[2]) == {"role", "content", "timestamp"}
+    assert set(messages[2]) == {"id", "role", "content", "timestamp"}
 
 
 @pytest.mark.asyncio

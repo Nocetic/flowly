@@ -1628,12 +1628,37 @@ class SessionManager:
                     return out
             except Exception as e:  # pragma: no cover
                 logger.debug("Display-log read failed for {}: {}", key, e)
-        # Fallback for sessions predating the display log: filter internal
-        # triggers the same way flush_full does.
-        return [
-            m for m in self.get_or_create(key).messages
-            if not m.get("_display_hidden")
-        ]
+        # Fallback for sessions predating the display log: the canonical file's
+        # own rows, internal triggers filtered the same way flush_full does.
+        # Each keeps the id it was saved with, else one from its content: a
+        # row loaded with none gets a new random one each time, so a page's
+        # cursor or a reaction on it would not find it after a restart.
+        path = self._get_session_path(key)
+        try:
+            rows = []
+            occurrences: dict[str, int] = {}
+            with path.open(encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    d = json.loads(line)
+                    if not isinstance(d, dict) or d.get("_type") in (
+                        "metadata", ARCHIVE_TRANSITION_TYPE, ARCHIVE_COMMIT_TYPE,
+                    ):
+                        continue
+                    fingerprint = message_fingerprint(d)
+                    occurrence = occurrences.get(fingerprint, 0)
+                    occurrences[fingerprint] = occurrence + 1
+                    if not d.get(EVENT_ID_KEY):
+                        d[EVENT_ID_KEY] = legacy_event_id(d, occurrence)
+                    if not d.get("_display_hidden"):
+                        rows.append(d)
+            return rows
+        except (OSError, ValueError):
+            return [
+                m for m in self.get_or_create(key).messages
+                if not m.get("_display_hidden")
+            ]
 
     def reserve_voice_work(self, key: str) -> None:
         """Establish a task owner through the authenticated dispatcher only.
@@ -1945,6 +1970,9 @@ class SessionManager:
 
                 ExternalAccessStore(access_path).revoke_session(key)
             self._cache.pop(key, None)
+            from flowly.session.reactions import forget_reactions
+
+            forget_reactions(self, key)
             canonical = self._get_session_path(key)
             display = self._get_full_path(key)
             existed = canonical.exists() or display.exists()

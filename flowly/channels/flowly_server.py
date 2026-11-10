@@ -65,8 +65,9 @@ RESUME_JUMP_SECONDS = 2.0
 #: PROTOCOL B7): Core runs them in that agent, in its one conversation.
 PROFILE_CHAT_METHODS = frozenset({
     "chat.send", "chat.inflight", "chat.abort", "chat.steer", "chat.command",
-    # The server reads the agent's chat from Core only to move it over (B7 "Taşıma").
-    "chat.history",
+    # The server reads the agent's chat from Core only to move it over (B7 "Taşıma"),
+    # and for a home that keeps no chats on the server, with its reactions (A11).
+    "chat.history", "chat.react",
 })
 #: A named agent's secrets (flowly.secrets), called on the agent's own address
 #: the same way: the server sends them with ``params.profile``.
@@ -275,7 +276,33 @@ class FlowlyServerChannel(WebChannel):
         if method == "chat.history":
             await self._main_chat_history(ws, msg)
             return
+        if method == "chat.react":
+            await self._main_chat_react(ws, msg)
+            return
         await super()._dispatch_rpc(ws, msg)
+
+    async def _main_chat_react(self, ws, msg: dict) -> None:
+        """The person's reaction on one of the main agent's messages, kept here (server PROTOCOL A11)."""
+        from flowly.channels.feature_rpc import FeatureRpcError
+        from flowly.session.reactions import ReactionError
+
+        rpc_id = msg.get("id", "")
+        session_id = msg.get("sessionId", "")
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+
+        async def reply(body: dict[str, Any]) -> None:
+            await ws.send(json.dumps({"type": "rpc", "id": rpc_id, "sessionId": session_id, **body}))
+
+        gateway = self._screen_gateway
+        if gateway is None or not hasattr(gateway, "chat_react_result"):
+            await reply({"error": {"code": "UNAVAILABLE", "message": "This agent cannot keep reactions here.", "retryable": True}})
+            return
+        try:
+            result = await asyncio.to_thread(gateway.chat_react_result, params)
+        except (FeatureRpcError, ReactionError) as exc:
+            await reply({"error": {"code": exc.code, "message": exc.message, "retryable": False}})
+            return
+        await reply({"result": result})
 
     async def _main_chat_history(self, ws, msg: dict) -> None:
         """The main agent's conversation as this machine keeps it (chat-storage-choice.md).

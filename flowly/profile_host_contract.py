@@ -168,6 +168,7 @@ PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     "sessions.model.get": 30_000,
     "sessions.model.set": 30_000,
     "chat.history": 30_000,
+    "chat.react": 30_000,
     "chat.command": 30_000,
     "chat.requests": 30_000,
     "chat.respond": 30_000,
@@ -667,6 +668,7 @@ def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]
     session_key_methods = {
         "chat.compact",
         "chat.history",
+        "chat.react",
         "chat.inflight",
         "chat.send",
         "chat.steer",
