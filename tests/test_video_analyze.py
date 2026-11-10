@@ -22,7 +22,9 @@ from flowly.agent.tools.video_analyze import VideoAnalyzeTool
 
 def test_detect_mime_known():
     assert va._detect_mime(Path("clip.mp4")) == "video/mp4"
-    assert va._detect_mime(Path("/abs/CLIP.MOV")) == "video/quicktime"
+    # A phone's recording: named as the video models take it, never video/quicktime.
+    assert va._detect_mime(Path("/abs/CLIP.MOV")) == "video/mov"
+    assert va._detect_mime(Path("clip.avi")) == "video/avi"
     assert va._detect_mime(Path("foo.webm")) == "video/webm"
     assert va._detect_mime(Path("foo.mkv")) == "video/x-matroska"
 

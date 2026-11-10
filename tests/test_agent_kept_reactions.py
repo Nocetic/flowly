@@ -35,7 +35,7 @@ def _chat(home, key="web:c1"):
 
 
 def _ids(gateway, key="web:c1"):
-    return {m["role"]: m["id"] for m in gateway.chat_history_result({"sessionKey": key})["messages"]}
+    return {m["role"]: m["reactId"] for m in gateway.chat_history_result({"sessionKey": key})["messages"]}
 
 
 def test_the_persons_reaction_is_kept_and_comes_back_with_its_message(home):

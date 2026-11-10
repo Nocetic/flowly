@@ -36,11 +36,15 @@ from loguru import logger
 
 from flowly.agent.tools.base import Tool
 
+#: As the video models name them in a data URL (OpenRouter's and Gemini's video
+#: types: video/mp4, mpeg, mov, avi, webm). A .mov sent as ``video/quicktime``
+#: reached the model as no video at all ("there is no video in your message",
+#: 2026-11-10: a phone's recording kept on the Mac and read from disk).
 _VIDEO_MIME_TYPES: dict[str, str] = {
     ".mp4": "video/mp4",
     ".webm": "video/webm",
-    ".mov": "video/quicktime",
-    ".avi": "video/x-msvideo",
+    ".mov": "video/mov",
+    ".avi": "video/avi",
     ".mkv": "video/x-matroska",
     ".mpeg": "video/mpeg",
     ".mpg": "video/mpeg",

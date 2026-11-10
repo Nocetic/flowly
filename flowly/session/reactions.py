@@ -198,7 +198,8 @@ def with_reactions(rows: list[dict[str, Any]], reactions: dict[str, list[dict[st
         return rows
     out = []
     for i, row in enumerate(rows):
-        mine = reactions.get(row["id"], []) if isinstance(row.get("id"), str) else []
+        name = row.get("reactId") or row.get("id")
+        mine = reactions.get(name, []) if isinstance(name, str) else []
         theirs = [{"by": "agent", "emoji": placed[i]}] if i in placed else []
         kept = [r for r in mine if r["by"] != "agent" or not theirs] + theirs
         out.append({**row, "reactions": kept} if kept else row)

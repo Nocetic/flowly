@@ -2769,14 +2769,17 @@ class GatewayServer:
         # latter is the compacted LLM working context (just [summary]+recent
         # after a /compact), which would drop the early turns from the chat UI.
         source_messages = self.sessions.get_full_messages(session_key)
-        if "limit" not in params and "before" not in params:
-            # The whole conversation at once (an older client): each row named all the same, as a
-            # page names it, so a reaction (chat.react) can say which message it is on.
-            from flowly.session.history_page import row_identities
+        from flowly.session.history_page import row_identities
 
-            source_messages = [{**m, "id": m.get("id") or identity}
-                               for m, identity in zip(source_messages, row_identities(source_messages))]
+        # What a reaction (chat.react) names each row by, as a page names it
+        # (``reactId``). Its own field: the whole conversation at once (an
+        # older client's read) keeps its rows' ``id`` as they were, where an
+        # ``id`` is the sender's own word for its message (iOS matches its
+        # bubble to the stored row by it, 2026-11-10).
+        identities = {id(m): identity for m, identity in zip(source_messages, row_identities(source_messages))}
         source_messages, page_info = history_page(source_messages, session_key, params)
+        source_messages = [{**m, "reactId": m.get("id") if page_info else identities.get(id(m)) or m.get("id")}
+                           for m in source_messages]
 
         # Reconstruct attachment previews from the media paths saved on the
         # turn. Images get a small base64 JPEG thumbnail (not the full original

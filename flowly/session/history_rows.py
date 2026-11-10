@@ -72,6 +72,8 @@ def history_row(m: dict[str, Any], *, attachments: AttachmentBuilder | None = No
         msg["aborted"] = True
     if m.get("id"):
         msg["id"] = m["id"]
+    if isinstance(m.get("reactId"), str) and m["reactId"]:
+        msg["reactId"] = m["reactId"]
     if m.get("steering_run_id"):
         msg["steeringRunId"] = m["steering_run_id"]
     if m.get("turn_steer") is True:

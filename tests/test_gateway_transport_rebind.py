@@ -207,13 +207,15 @@ async def test_chat_history_exposes_full_display_rows_without_archive_internals(
         "".join(block.get("text", "") for block in row["content"])
         for row in messages
     ] == ["early question", "[context-optimized]", "recent answer"]
-    # Each row is named as a history page names it (a reaction names it so), nothing internal.
-    assert [row["id"] for row in messages] == ["evt_1", "evt_boundary", "evt_3"]
-    assert set(messages[0]) == {"id", "role", "content", "timestamp"}
+    # Each row says what a reaction names it by, as a page names it; its ``id``
+    # stays as the older read gave it (none here): an app matches its own
+    # message to the stored row by an ``id``, never by one made up for it.
+    assert [row["reactId"] for row in messages] == ["evt_1", "evt_boundary", "evt_3"]
+    assert set(messages[0]) == {"reactId", "role", "content", "timestamp"}
     assert set(messages[1]) == {
-        "id", "role", "content", "kind", "boundaryKind", "compactionId",
+        "reactId", "role", "content", "kind", "boundaryKind", "compactionId",
     }
-    assert set(messages[2]) == {"id", "role", "content", "timestamp"}
+    assert set(messages[2]) == {"reactId", "role", "content", "timestamp"}
 
 
 @pytest.mark.asyncio
