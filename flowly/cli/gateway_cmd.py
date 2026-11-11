@@ -3011,11 +3011,38 @@ Respond to the user now:"""
                     await web.send_secret_event(session_key, event_name, data)
                 await gateway_server.broadcast_secret_event(event_name, data)
 
+            # A chat's cards as the agent keeps them (flowly/session/cards.py):
+            # the request's card is kept beside its chat, so a chat the Flowly
+            # server keeps no copy of shows it too, live and after a reload.
+            from flowly.session.cards import add_card_callback, announce, keep_secret_closed, keep_secret_requested
+
+            async def _carry_card(session_key: str, card: dict) -> None:
+                data = {"sessionKey": session_key, "card": card}
+                web = channels.get_channel("web")
+                if session_key.startswith("web:") and web and hasattr(web, "send_secret_event"):
+                    await web.send_secret_event(session_key, "chat.card", data)
+                await gateway_server.broadcast_event("chat.card", data)
+
+            add_card_callback(_carry_card)
+
+            async def _keep_secret_card(keep, wire: dict) -> None:
+                try:
+                    card = await asyncio.to_thread(keep, agent.sessions, wire)
+                except Exception:  # noqa: BLE001 - the request itself is carried regardless
+                    logger.exception("Secret request card not kept")
+                    return
+                if card is not None:
+                    await announce(wire["sessionKey"], card)
+
             async def _secret_requested(request) -> None:
-                await _carry_secret_event(request.session_key, "secret.requested", request.to_wire())
+                wire = request.to_wire()
+                await _keep_secret_card(keep_secret_requested, wire)
+                await _carry_secret_event(request.session_key, "secret.requested", wire)
 
             async def _secret_closed(request, reason: str) -> None:
-                await _carry_secret_event(request.session_key, "secret.closed", closed_to_wire(request, reason))
+                wire = closed_to_wire(request, reason)
+                await _keep_secret_card(keep_secret_closed, wire)
+                await _carry_secret_event(request.session_key, "secret.closed", wire)
 
             _secret_requests.add_requested_callback(_secret_requested)
             _secret_requests.add_closed_callback(_secret_closed)

@@ -690,6 +690,8 @@ class GatewayServer:
         self._profile_subagent_event_versions: WeakKeyDictionary = WeakKeyDictionary()
         self._event_recipients = EventRecipients()
         self._active_tasks: dict[str, asyncio.Task] = {}
+        # Replies to calls this gateway makes of itself (``tell_reaction_turn``).
+        self._own_replies: dict[str, dict[str, Any] | None] = {}
         # Named profile gateways may be shared by two authenticated managers
         # (Desktop and the primary Gateway).  Only the runtime itself can
         # safely arbitrate a cross-manager stop without guessing which parent
@@ -1733,12 +1735,31 @@ class GatewayServer:
             elif method == "chat.history":
                 await self._ws_rpc_chat_history(ws, rpc_id, params)
 
+            elif method == "chat.card.put":
+                from flowly.session.cards import CardError, announce
+                try:
+                    result = self.chat_card_put_result(params)
+                except (feature_rpc.FeatureRpcError, CardError) as exc:
+                    await self._ws_rpc_error(ws, rpc_id, exc.code, exc.message)
+                else:
+                    if result["card"] is not None:
+                        await announce(params["sessionKey"], result["card"])
+                    await self._ws_rpc_reply(ws, rpc_id, result)
+
             elif method == "chat.react":
                 from flowly.session.reactions import ReactionError
                 try:
-                    await self._ws_rpc_reply(ws, rpc_id, self.chat_react_result(params))
+                    result = self.chat_react_result(params)
                 except (feature_rpc.FeatureRpcError, ReactionError) as exc:
                     await self._ws_rpc_error(ws, rpc_id, exc.code, exc.message)
+                else:
+                    wake = result.pop("wake", None)
+                    if wake:
+                        # Its turn's events find the chat by its run (the profile host binds it).
+                        run_id = await self.tell_reaction_turn(ws, client_id, params["sessionKey"], wake)
+                        if run_id:
+                            result["runId"] = run_id
+                    await self._ws_rpc_reply(ws, rpc_id, result)
 
             elif method == "chat.command":
                 from flowly.session.commands import command_status
@@ -2714,6 +2735,11 @@ class GatewayServer:
         no chats on the Flowly server (server PROTOCOL A11). The message is
         named by the id ``chat.history`` gave it. Answers its reactions now and
         its words (what the agent is told the reaction was on).
+
+        ``tell`` (the server's, for a chat it keeps no copy of): the agent
+        hears of the reaction from here too (flowly/agent/reaction_notes.py);
+        one that starts a turn comes back under ``wake``, for the caller to
+        start (``tell_reaction_turn``).
         """
         from flowly.agent.reactions import is_reaction_emoji
         from flowly.session.reactions import set_reaction
@@ -2727,7 +2753,23 @@ class GatewayServer:
             raise feature_rpc.FeatureRpcError("INVALID_PARAMS", "messageId is required")
         if emoji is not None and not is_reaction_emoji(emoji):
             raise feature_rpc.FeatureRpcError("INVALID_PARAMS", "emoji is one emoji, or null")
-        return set_reaction(self.sessions, key, message_id, "user", emoji)
+        tell = params.get("tell", False)
+        if type(tell) is not bool:
+            raise feature_rpc.FeatureRpcError("INVALID_PARAMS", "tell is a boolean")
+        return set_reaction(self.sessions, key, message_id, "user", emoji, tell=tell)
+
+    def chat_card_put_result(self, params: dict) -> dict:
+        """A card the Flowly server puts in a chat it keeps no copy of: a template's (flowly/session/cards.py).
+
+        Answers ``{ok, card}``, the card as it is now (null when ``ifPresent``
+        and the chat has no such card); the caller tells the chat's apps.
+        """
+        from flowly.session.cards import TEMPLATE_CARD, put_card, validate_put
+
+        if not self.sessions:
+            raise feature_rpc.FeatureRpcError("UNAVAILABLE", "This agent keeps no cards here.")
+        key, card_id, fields, if_present = validate_put(params)
+        return {"ok": True, "card": put_card(self.sessions, key, card_id, TEMPLATE_CARD, fields, if_present=if_present)}
 
     def chat_history_result(self, params: dict) -> dict:
         """A conversation's history as ``chat.history`` answers it, a page at a time.
@@ -2742,6 +2784,14 @@ class GatewayServer:
         session_key = params.get("sessionKey", "")
         if not session_key or not self.sessions:
             return {"sessionKey": session_key, "messages": []}
+
+        from flowly.session.exchanges import pair_history, pair_id_of
+
+        pair = pair_id_of(session_key)
+        if pair is not None:
+            # Two agents' conversation (flowly/session/exchanges.py): read only, never a session.
+            return {"sessionKey": session_key, "sessionId": session_key,
+                    "messages": pair_history(self.sessions, pair), "readOnly": True, "hasMore": False}
 
         from flowly.session.history_page import history_page
         from flowly.session.history_rows import history_row, project_rows
@@ -2807,16 +2857,26 @@ class GatewayServer:
 
         messages = with_reactions(messages, read_reactions(self.sessions, session_key),
                                   read_agent_reactions(self.sessions, session_key))
+        from flowly.live_voice.chat_calls import chat_calls, page_bounds, with_calls
+        from flowly.session.cards import card_rows, read_cards
+
+        def bounds() -> tuple[float | None, float | None]:
+            return page_bounds(full_messages, source_messages, full_identities) if page_info else (None, None)
+
         if session_key.startswith("web:"):
             # Its voice calls, each as one card in its place in time, built from the
             # call's own ledger (flowly/live_voice/chat_calls.py): what the Flowly
             # server stores for a chat it keeps, for every chat the agent keeps.
-            from flowly.live_voice.chat_calls import chat_calls, page_bounds, with_calls
-
             calls = chat_calls(self.sessions, session_key)
             if calls:
-                lower, upper = page_bounds(full_messages, source_messages, full_identities) if page_info else (None, None)
+                lower, upper = bounds()
                 messages = with_calls(messages, calls, lower=lower, upper=upper)
+        # Its cards (secret requests, template drafts, exchanges with other
+        # agents; flowly/session/cards.py), each in its place in time too.
+        cards = read_cards(self.sessions, session_key)
+        if cards:
+            lower, upper = bounds()
+            messages = with_calls(messages, card_rows(cards), lower=lower, upper=upper)
         return {
             "sessionKey": session_key,
             "sessionId": session_key,
@@ -2881,6 +2941,17 @@ class GatewayServer:
         if isinstance(session_key, str) and session_key.startswith("desktop:voice:"):
             await self._ws_rpc_error(ws, rpc_id, "VOICE_TRANSCRIPT_ONLY", "Resume voice to continue this conversation.")
             return
+        # What the agent was still to hear of the person's reactions in this
+        # chat goes with this turn (flowly/agent/reaction_notes.py), from
+        # whichever device the message comes; dropped once the turn is taken.
+        held_ids: list[str] = []
+        if self.sessions:
+            from flowly.agent.reaction_notes import held_for_turn
+            from flowly.agent.turn_notes import TURN_NOTES
+
+            told, held_ids = held_for_turn(self.sessions, session_key, list(notes_metadata.get(TURN_NOTES) or []))
+            if held_ids:
+                notes_metadata = notes_inbound_metadata({"notes": told}, message, bool(attachments))
         # A message for a conversation whose reply is still running joins that
         # reply (the agent reads it at its next step) instead of a turn queued
         # behind it; a resent one gets its first acceptance (web channel too).
@@ -3148,6 +3219,11 @@ class GatewayServer:
                 await self._ws_rpc_error(ws, rpc_id, 'CHAT_INPUT_FAILED', 'The attached files could not be prepared. Please try again.')
                 return
 
+        if held_ids:
+            from flowly.session.reactions import drop_held
+
+            drop_held(self.sessions, session_key, held_ids)
+
         # This socket now owns the session's live stream until a re-entry on a
         # different socket rebinds it (see chat.inflight in _handle_feature_rpc).
         self.bind_session_ws(session_key, ws)
@@ -3289,6 +3365,39 @@ class GatewayServer:
             stream_callback,
             extra_metadata={**goal_metadata, "on_user_message": announce_user},
         )
+        return True
+
+    async def tell_reaction_turn(self, ws: Any, client_id: str, session_key: str, note: str) -> str | None:
+        """A reaction that asks the agent to answer, as a turn of its own (flowly/agent/reaction_notes.py).
+
+        Taken as the server's own reaction turn was, a ``chat.send`` with the
+        note and no words of the person's (turn_notes), on the socket the
+        reaction came over: the same acceptance, streaming and run, with what
+        the chat still held told along. Its acknowledgement is this call's,
+        never sent. Answers its run id; None when it was not taken.
+        """
+        run_key = f"reaction-{uuid.uuid4()}"
+        self._own_replies[run_key] = None
+        try:
+            await self._ws_rpc_chat_send(ws, client_id, run_key, {
+                "sessionKey": session_key, "message": "", "notes": [note], "idempotencyKey": run_key,
+            })
+            body = self._own_replies.get(run_key) or {}
+        finally:
+            self._own_replies.pop(run_key, None)
+        result = body.get("result")
+        if isinstance(result, dict) and isinstance(result.get("runId"), str):
+            return result["runId"]
+        error = body.get("error") if isinstance(body.get("error"), dict) else {}
+        logger.warning("[GatewayWS] reaction turn not taken ({})", error.get("code", "NO_REPLY"))
+        return None
+
+    def _own_reply(self, rpc_id: str, body: dict[str, Any]) -> bool:
+        """A reply to a call this gateway made of itself (``tell_reaction_turn``): kept, never sent."""
+        own = getattr(self, "_own_replies", None)  # absent on a gateway a test built bare
+        if not own or rpc_id not in own:
+            return False
+        own[rpc_id] = body
         return True
 
     async def run_report_turn(self, session_key: str, notice: dict[str, Any]) -> bool:
@@ -4379,6 +4488,8 @@ class GatewayServer:
         asyncio.create_task(_run())
 
     async def _ws_rpc_reply(self, ws: web.WebSocketResponse, rpc_id: str, result: Any) -> None:
+        if self._own_reply(rpc_id, {"result": result}):
+            return
         await self._ws_send(ws, {"type": "rpc", "id": rpc_id, "result": result})
 
     # ------------------------------------------------------------------
@@ -5338,6 +5449,8 @@ class GatewayServer:
         error: dict[str, Any] = {"code": code, "message": message}
         if retryable is not None:
             error["retryable"] = retryable
+        if self._own_reply(rpc_id, {"error": error}):
+            return
         await self._ws_send(
             ws,
             {

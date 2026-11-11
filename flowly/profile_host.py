@@ -9,6 +9,7 @@ clients.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import math
@@ -519,6 +520,30 @@ def _remote_sessions(sessions: list) -> list:
         and session["key"].startswith(REMOTE_SESSION_PREFIXES)
         and not is_internal_profile_session(session["key"])
     ]
+
+
+def _exchange_sessions(profile: str) -> Any:
+    """An agent's chats' store, from the host (flowly/session/exchanges.py)."""
+    from flowly.profile import describe_profile, get_flowly_home
+    from flowly.session.manager import SessionManager
+
+    home = get_flowly_home() if profile == "default" else describe_profile(profile).path
+    return SessionManager(home / "workspace", sessions_dir=home / "sessions")
+
+
+def _exchange_chat(profile: str, source_key: str | None) -> tuple[Any, str] | None:
+    """The chat an agent's row of an exchange goes in, as the server's ``exchangeChat``:
+    a named agent's one chat; for the main agent the chat it wrote from, else its latest."""
+    from flowly.agent_home import HOME_SESSION
+    from flowly.session.exchanges import latest_web_chat, pair_id_of
+
+    sessions = _exchange_sessions(profile)
+    if profile != "default":
+        return sessions, HOME_SESSION
+    if source_key and source_key.startswith("web:") and pair_id_of(source_key) is None:
+        return sessions, source_key
+    latest = latest_web_chat(sessions)
+    return (sessions, latest) if latest else None
 
 
 class ProfileHost:
@@ -3056,8 +3081,42 @@ class ProfileHost:
         The inbox turn itself stays private (its live events never leave the
         host); this is the exchange's record: who asked whom what, and what came
         back. ``started`` once the target took it, ``ended`` with its outcome.
-        Sent under the target, the agent that is now working."""
-        await self._emit(target, "agent.exchange", {**data, "at": int(time.time() * 1000)})
+        Sent under the target, the agent that is now working. Kept here too
+        (flowly/session/exchanges.py), and its rows told to the two agents'
+        chats (``chat.card``): a home that keeps no chats on the Flowly
+        server has them from here alone."""
+        stamped = {**data, "at": math.ceil(time.time() * 1000)}
+        await self._emit(target, "agent.exchange", stamped)
+        self._keep_exchange_soon(stamped)
+
+    def _keep_exchange_soon(self, exchange: dict[str, Any]) -> None:
+        """Kept after the ones before it, never in the exchange's way (its reply is awaited at once)."""
+        before = getattr(self, "_exchange_records", None)
+
+        async def keep() -> None:
+            if before is not None:
+                with contextlib.suppress(BaseException):
+                    await before
+            await self._keep_exchange(exchange)
+
+        self._exchange_records = asyncio.create_task(keep())
+
+    async def _keep_exchange(self, exchange: dict[str, Any]) -> None:
+        from flowly.session.cards import announce
+        from flowly.session.exchanges import record_exchange
+
+        try:
+            put = await asyncio.to_thread(record_exchange, exchange, main=_exchange_sessions("default"),
+                                          chat_of=_exchange_chat)
+        except Exception:  # noqa: BLE001 - the exchange itself goes on; only its record is missing
+            logger.exception("Agent exchange not kept")
+            return
+        for profile, key, card in put:
+            data = {"sessionKey": key, "card": card}
+            if profile == "default":
+                await announce(key, card)
+            else:
+                await self._emit(profile, "chat.card", data)
 
     async def _await_broker_reply(self, target: str, run_id: str) -> str:
         """The target's reply text, or a ProfileHostError (timeout, error, empty)."""

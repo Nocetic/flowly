@@ -21,11 +21,13 @@ import json
 import os
 import re
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable
 
 from loguru import logger
 
+from flowly.agent.reaction_notes import FEATURE as REACTION_NOTES_FEATURE
 from flowly.bus.queue import MessageBus
 from flowly.channels.web import WebChannel
 from flowly.config.schema import FLOWLY_SERVER_URL_PREFIXES, FlowlyServerChannelConfig, WebChannelConfig
@@ -60,6 +62,16 @@ CHAT_HISTORY_FEATURE = "chat-history-v1"
 #: a home that keeps no chats on the server sends it uploaded files that way.
 CHAT_FILES_FEATURE = "chat-files-v1"
 
+#: This Core keeps what the agent is to hear of a person's reaction, and tells
+#: it, when the server asks (``chat.react`` ``tell``, flowly/agent/reaction_notes.py):
+#: a home that keeps no chats on the server then holds no note of it either.
+CHAT_REACTION_NOTES_FEATURE = REACTION_NOTES_FEATURE
+
+#: This Core keeps a chat's cards itself (flowly/session/cards.py): it tells them
+#: (``chat.card``) and takes a template's card from the server (``chat.card.put``),
+#: so a chat the server keeps no copy of shows them all.
+CHAT_CARDS_FEATURE = "chat-cards-v1"
+
 #: While backing off, look at the clocks this often for a resume.
 RESUME_TICK_SECONDS = 0.5
 #: The wall clock ran this much further than the monotonic one within a tick:
@@ -73,6 +85,8 @@ PROFILE_CHAT_METHODS = frozenset({
     # The server reads the agent's chat from Core only to move it over (B7 "Taşıma"),
     # and for a home that keeps no chats on the server, with its reactions (A11).
     "chat.history", "chat.react",
+    # A template's card the server puts in a chat it keeps no copy of (flowly/session/cards.py).
+    "chat.card.put",
 })
 #: A named agent's secrets (flowly.secrets), called on the agent's own address
 #: the same way: the server sends them with ``params.profile``.
@@ -98,6 +112,8 @@ PROFILE_CHAT_EVENTS = frozenset({
     "secret.requested", "secret.closed",
     # A template the agent drafted of itself (flowly.templates); the server keeps it.
     "template.drafted",
+    # A card of the chat as the agent keeps it (flowly/session/cards.py).
+    "chat.card",
     "plan.updated", "plan.approval.requested",
 })
 
@@ -284,6 +300,9 @@ class FlowlyServerChannel(WebChannel):
         if method == "chat.react":
             await self._main_chat_react(ws, msg)
             return
+        if method == "chat.card.put":
+            await self._main_chat_card_put(ws, msg)
+            return
         if method == "sessions.delete":
             await self._main_sessions_delete(ws, msg)
             return
@@ -337,7 +356,63 @@ class FlowlyServerChannel(WebChannel):
         except (FeatureRpcError, ReactionError) as exc:
             await reply({"error": {"code": exc.code, "message": exc.message, "retryable": False}})
             return
+        wake = result.pop("wake", None)
+        if wake:
+            # A reaction that asks the agent to answer (reaction_notes): its own
+            # turn, taken here as the server's delivery of it was, on the
+            # session the server named for this chat's turns.
+            run_id = await self._tell_reaction_turn(session_id, params["sessionKey"], wake)
+            if run_id:
+                result["runId"] = run_id
         await reply({"result": result})
+
+    async def _main_chat_card_put(self, ws, msg: dict) -> None:
+        """A template's card the server puts in one of the main agent's chats (flowly/session/cards.py)."""
+        from flowly.channels.feature_rpc import FeatureRpcError
+        from flowly.session.cards import CardError, announce
+
+        rpc_id = msg.get("id", "")
+        session_id = msg.get("sessionId", "")
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+
+        async def reply(body: dict[str, Any]) -> None:
+            await ws.send(json.dumps({"type": "rpc", "id": rpc_id, "sessionId": session_id, **body}))
+
+        gateway = self._screen_gateway
+        if not _server_own_call(msg):
+            await reply({"error": {"code": "FORBIDDEN", "message": "Only the server puts a chat's cards.", "retryable": False}})
+            return
+        if gateway is None or not hasattr(gateway, "chat_card_put_result"):
+            await reply({"error": {"code": "UNAVAILABLE", "message": "This agent cannot keep cards here.", "retryable": True}})
+            return
+        try:
+            result = await asyncio.to_thread(gateway.chat_card_put_result, params)
+        except (FeatureRpcError, CardError) as exc:
+            await reply({"error": {"code": exc.code, "message": exc.message, "retryable": False}})
+            return
+        if result["card"] is not None:
+            await announce(params["sessionKey"], result["card"])
+        await reply({"result": result})
+
+    async def _tell_reaction_turn(self, session_id: str, session_key: str, note: str) -> str | None:
+        """The reaction's turn: a ``chat.send`` with its note and no words, through this channel's own path."""
+        answers: list[dict] = []
+
+        class _Answer:
+            async def send(self, payload: str) -> None:
+                answers.append(json.loads(payload))
+
+        run_key = f"reaction-{uuid.uuid4()}"
+        await self._dispatch_rpc(_Answer(), {
+            "type": "rpc", "id": run_key, "sessionId": session_id, "method": "chat.send",
+            "params": {"sessionKey": session_key, "message": "", "notes": [note], "idempotencyKey": run_key},
+        })
+        result = next((a.get("result") for a in answers if a.get("id") == run_key), None)
+        if isinstance(result, dict) and isinstance(result.get("runId"), str):
+            return result["runId"]
+        error = next((a.get("error") for a in answers if a.get("id") == run_key and isinstance(a.get("error"), dict)), {})
+        logger.warning("[FlowlyServer] reaction turn not taken ({})", (error or {}).get("code", "NO_REPLY"))
+        return None
 
     async def _main_chat_history(self, ws, msg: dict) -> None:
         """The main agent's conversation as this machine keeps it (chat-storage-choice.md).
@@ -406,7 +481,7 @@ class FlowlyServerChannel(WebChannel):
         except ProfileHostError as exc:
             await reply({"error": {"code": exc.code, "message": exc.message, "retryable": exc.retryable}})
             return
-        if method in ("chat.send", "chat.inflight") and isinstance(session_id, str):
+        if method in ("chat.send", "chat.inflight", "chat.react") and isinstance(session_id, str):
             # Before dispatch: the first event may follow the acknowledgement at once.
             # The server also names the session with a read-only chat.inflight when it
             # learns the agent, so the agent's words before its first message (its
@@ -427,9 +502,10 @@ class FlowlyServerChannel(WebChannel):
         session_key = str(inner.get("sessionKey") or "")
         if method == "chat.history" and isinstance(result, dict):
             result = _with_exact_times(result)
-        if method in {"chat.send", "chat.inflight"} and session_key and isinstance(result, dict):
-            # Events that name only their run still find the conversation.
-            receipt = result if method == "chat.send" else result.get("inflight")
+        if method in {"chat.send", "chat.inflight", "chat.react"} and session_key and isinstance(result, dict):
+            # Events that name only their run still find the conversation (a
+            # reaction's own turn, reaction_notes, names its run as a send does).
+            receipt = result if method in {"chat.send", "chat.react"} else result.get("inflight")
             run_id = str(receipt.get("runId") or "") if isinstance(receipt, dict) else ""
             if run_id:
                 self._profile_run_bindings[(profile, run_id)] = (session_key, time.monotonic())
@@ -560,7 +636,8 @@ class FlowlyServerChannel(WebChannel):
         return url, {"additional_headers": {
             "Authorization": f"Bearer {secret}",
             "X-Flowly-Agent-Host": host,
-            "X-Flowly-Agent-Features": f"{VOICE_AUTHORITY_FEATURE},{CHAT_HISTORY_FEATURE},{CHAT_FILES_FEATURE}",
+            "X-Flowly-Agent-Features": (f"{VOICE_AUTHORITY_FEATURE},{CHAT_HISTORY_FEATURE},{CHAT_FILES_FEATURE},"
+                                         f"{CHAT_REACTION_NOTES_FEATURE},{CHAT_CARDS_FEATURE}"),
         }}, None
 
     def _on_connected(self, ws) -> None:

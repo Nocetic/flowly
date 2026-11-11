@@ -1970,9 +1970,11 @@ class SessionManager:
 
                 ExternalAccessStore(access_path).revoke_session(key)
             self._cache.pop(key, None)
+            from flowly.session.cards import forget_cards
             from flowly.session.reactions import forget_reactions
 
             forget_reactions(self, key)
+            forget_cards(self, key)
             canonical = self._get_session_path(key)
             display = self._get_full_path(key)
             existed = canonical.exists() or display.exists()

@@ -27,6 +27,10 @@ from typing import Any
 MAX_REACTED = 2000
 #: The agent's reactions kept per conversation (each on the person's message before it).
 MAX_AGENT_NOTES = 500
+#: What the agent is still to hear of the person's reactions (``turn_notes.MAX_NOTES``): the newest.
+MAX_HELD = 20
+#: A held note older than this is never told (the server's ``REACTION_HELD_TTL_MS``).
+HELD_TTL_SECONDS = 7 * 24 * 60 * 60
 _SIDES = ("user", "agent")
 _lock = threading.Lock()
 
@@ -72,12 +76,22 @@ def read_agent_reactions(sessions: Any, key: str) -> list[dict[str, Any]]:
             if isinstance(n, dict) and isinstance(n.get("emoji"), str) and isinstance(n.get("at"), (int, float))]
 
 
-def _write(path: Path, reactions: dict[str, list[dict[str, str]]], agent: list[dict[str, Any]]) -> None:
+def read_held(sessions: Any, key: str) -> list[dict[str, Any]]:
+    """What the agent is still to hear of the person's reactions, oldest first: ``[{id, reactionOf, note, at}]``."""
+    held = _read(sessions, key).get("held")
+    return [{"id": h["id"], "reactionOf": h["reactionOf"], "note": h["note"], "at": float(h["at"])}
+            for h in (held if isinstance(held, list) else [])
+            if isinstance(h, dict) and isinstance(h.get("id"), str) and isinstance(h.get("reactionOf"), str)
+            and isinstance(h.get("note"), str) and h["note"].strip() and isinstance(h.get("at"), (int, float))]
+
+
+def _write(path: Path, reactions: dict[str, list[dict[str, str]]], agent: list[dict[str, Any]],
+           held: list[dict[str, Any]]) -> None:
     if len(reactions) > MAX_REACTED:
         reactions = dict(list(reactions.items())[-MAX_REACTED:])
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    temporary.write_text(json.dumps({"version": 1, "reactions": reactions, "agent": agent[-MAX_AGENT_NOTES:]},
-                                    ensure_ascii=False))
+    temporary.write_text(json.dumps({"version": 1, "reactions": reactions, "agent": agent[-MAX_AGENT_NOTES:],
+                                     "held": held[-MAX_HELD:]}, ensure_ascii=False))
     os.replace(temporary, path)
 
 
@@ -116,12 +130,19 @@ def latest_user_message_id(sessions: Any, key: str) -> str | None:
     return None
 
 
-def set_reaction(sessions: Any, key: str, message_id: str, by: str, emoji: str | None) -> dict[str, Any]:
+def set_reaction(sessions: Any, key: str, message_id: str, by: str, emoji: str | None, *,
+                 tell: bool = False) -> dict[str, Any]:
     """Put ``by``'s reaction on the message (or take it off, ``emoji`` None).
 
     The person reacts to the agent's messages, the agent to the person's.
     Returns the message's reactions now, and its words (what the agent is
     told the reaction was on).
+
+    ``tell``: the agent is also to hear of the person's reaction from here
+    (flowly/agent/reaction_notes.py): what it had still to hear of an earlier
+    one on this message is withdrawn, and the new one's note is held for the
+    chat's next message, or answered under ``wake`` when it starts a turn of
+    its own. Never set without ``tell``: the server tells it then.
     """
     if by not in _SIDES:
         raise ReactionError("INVALID_PARAMS", "by is user or agent")
@@ -132,17 +153,54 @@ def set_reaction(sessions: Any, key: str, message_id: str, by: str, emoji: str |
     path = _path(sessions, key)
     if path is None:
         raise ReactionError("UNAVAILABLE", "This agent keeps no reactions here.")
+    wake: str | None = None
     with _lock:
         reactions = read_reactions(sessions, key)
+        before = next((r["emoji"] for r in reactions.get(message_id, []) if r["by"] == by), None)
         kept = [r for r in reactions.get(message_id, []) if r["by"] != by]
         if emoji:
             kept.append({"by": by, "emoji": emoji})
         reactions.pop(message_id, None)
         if kept:
             reactions[message_id] = kept
+        held = read_held(sessions, key)
+        if tell and by == "user" and before != emoji:
+            # As the server does (``tellReaction``): a reaction set again as it was tells nothing.
+            from flowly.agent.reaction_notes import reaction_note, wakes
+
+            held = [h for h in held if h["reactionOf"] != message_id]
+            if emoji:
+                note = reaction_note(emoji, _text(message))
+                if wakes(emoji):
+                    wake = note
+                else:
+                    held.append({"id": uuid.uuid4().hex, "reactionOf": message_id, "note": note, "at": time.time()})
         path.parent.mkdir(parents=True, exist_ok=True)
-        _write(path, reactions, read_agent_reactions(sessions, key))
-    return {"ok": True, "messageId": message_id, "reactions": kept, "text": _text(message)[:200]}
+        _write(path, reactions, read_agent_reactions(sessions, key), held)
+    result = {"ok": True, "messageId": message_id, "reactions": kept, "text": _text(message)[:200]}
+    return {**result, "wake": wake} if wake else result
+
+
+def held_notes(sessions: Any, key: str, *, now: float | None = None) -> list[dict[str, Any]]:
+    """The notes the chat's next message tells the agent, oldest first (an expired one never is)."""
+    if _path(sessions, key) is None:
+        return []
+    cutoff = (time.time() if now is None else now) - HELD_TTL_SECONDS
+    return [h for h in read_held(sessions, key) if h["at"] >= cutoff]
+
+
+def drop_held(sessions: Any, key: str, ids: list[str], *, now: float | None = None) -> None:
+    """These notes were told (and an expired one goes with them)."""
+    path = _path(sessions, key)
+    if path is None or not path.exists():
+        return
+    cutoff = (time.time() if now is None else now) - HELD_TTL_SECONDS
+    told = set(ids)
+    with _lock:
+        held = read_held(sessions, key)
+        left = [h for h in held if h["id"] not in told and h["at"] >= cutoff]
+        if len(left) != len(held):
+            _write(path, read_reactions(sessions, key), read_agent_reactions(sessions, key), left)
 
 
 def note_agent_reaction(sessions: Any, key: str, emoji: str, at: float | None = None) -> None:
@@ -160,7 +218,7 @@ def note_agent_reaction(sessions: Any, key: str, emoji: str, at: float | None = 
         agent = read_agent_reactions(sessions, key)
         agent.append({"emoji": emoji, "at": time.time() if at is None else at})
         path.parent.mkdir(parents=True, exist_ok=True)
-        _write(path, read_reactions(sessions, key), agent)
+        _write(path, read_reactions(sessions, key), agent, read_held(sessions, key))
 
 
 def forget_reactions(sessions: Any, key: str) -> None:

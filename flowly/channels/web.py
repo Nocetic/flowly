@@ -275,6 +275,13 @@ def _poster_b64(asset: Any) -> str | None:
     return base64.b64encode(compressed[0]).decode("ascii")
 
 
+def _reaction_sessions() -> Any:
+    """Where this agent keeps its chats' reactions (flowly/session/reactions.py), as the gateway does."""
+    from flowly.session.manager import SessionManager
+
+    return SessionManager(get_flowly_home() / "workspace")
+
+
 def _save_attachments(attachments: list[dict], media_dir: Path) -> list[str]:
     """Resolve attachments to a media reference list.
 
@@ -2406,6 +2413,19 @@ class WebChannel(BaseChannel):
                     "error": {"code": "VOICE_TRANSCRIPT_ONLY", "message": "Resume voice to continue this conversation."},
                 }))
                 return
+            # What the agent was still to hear of the person's reactions in
+            # this chat goes with this turn (flowly/agent/reaction_notes.py),
+            # whichever device the message comes from; dropped once taken.
+            from flowly.agent.reaction_notes import held_for_turn
+
+            reaction_sessions = _reaction_sessions()
+            told, held_ids = held_for_turn(reaction_sessions, session_key,
+                                           list(notes_metadata.get(turn_notes.TURN_NOTES) or []))
+            if held_ids:
+                notes_metadata = turn_notes.inbound_metadata(
+                    {"notes": told}, message_text if isinstance(message_text, str) else "",
+                    bool(params.get("attachments")))
+                notes_only = turn_notes.is_notes_only(notes_metadata)
             # A message for a conversation whose reply is still running joins
             # that reply (the agent reads it at its next step) instead of a
             # turn queued behind it; a resent one gets its first acceptance.
@@ -2542,6 +2562,11 @@ class WebChannel(BaseChannel):
                     'error': {'code': 'CHAT_INPUT_FAILED', 'message': 'The attached files could not be prepared. Please try again.'},
                 }))
                 return
+
+            if held_ids:
+                from flowly.session.reactions import drop_held
+
+                drop_held(reaction_sessions, session_key, held_ids)
 
             # Track the in-flight stream so a client that leaves and re-enters
             # this chat mid-run can fetch the partial via the chat.inflight RPC
