@@ -3231,6 +3231,8 @@ class GatewayServer:
         # This socket now owns the session's live stream until a re-entry on a
         # different socket rebinds it (see chat.inflight in _handle_feature_rpc).
         self.bind_session_ws(session_key, ws)
+        if turn_origin == "user" and not source_profile:
+            await self._tell_other_views(session_key, ws, run_id, params.get("message"))
 
         # Build streaming callback that pushes delta events to the session's
         # CURRENT socket (follows the latest viewer on re-entry).
@@ -4237,6 +4239,37 @@ class GatewayServer:
         payload = self._scoped_event(data, session_key=session_key)
         targets = self._session_targets(session_key, fallback_ws)
         await asyncio.gather(*(self._ws_send(target, payload) for target in targets))
+
+    async def _tell_other_views(self, session_key: str, sender: Any, run_id: str, text: Any) -> None:
+        """A person's message, to every other open view of an app's chat at once.
+
+        Each view hears the reply as it streams; the person's words were the
+        sender's alone, so another view showed the reply under no question
+        until it read the history again. Told as the run's ``user`` state (the
+        shape an agent-authored prompt has), before any of the reply. The
+        sender shows it already. The profile host keeps the log of what it
+        carried itself: a message it did not carry is not its to keep.
+        """
+        from flowly.live_voice.chat_binding import is_chat_key
+
+        if not isinstance(text, str) or not text.strip() or not is_chat_key(session_key):
+            return
+        host = getattr(self, "_profile_host_socket", None)
+        others = [socket for socket in self._session_targets(session_key)
+                  if socket is not sender and socket is not host and not getattr(socket, "closed", False)]
+        if not others:
+            return
+        payload = self._scoped_event({
+            "type": "event",
+            "event": "chat",
+            "data": {
+                "state": "user",
+                "runId": run_id,
+                "sessionKey": session_key,
+                "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+            },
+        }, session_key=session_key)
+        await asyncio.gather(*(self._ws_send(socket, payload) for socket in others))
 
     def _session_targets(self, session_key: str, fallback_ws=None) -> list:
         from flowly.agent_home import is_agent_home
