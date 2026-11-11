@@ -82,6 +82,18 @@ def test_only_the_main_agents_web_chats_take_a_call(key, profile):
     assert refused.value.code == 'INVALID_PARAMS'
 
 
+@pytest.mark.parametrize('key', [CHAT, 'ios:5F2C0A1E-7B3D-4C2A-9E1F-0A1B2C3D4E5F', 'android:c-1', 'desktop:chat-1'])
+def test_an_apps_own_chat_on_a_gateway_takes_a_call(key):
+    """An app on a gateway it reaches directly names its chats itself (iOS ``ios:<uuid>``)."""
+    assert chat_key(key, profile='default') == key
+
+
+@pytest.mark.parametrize('key', ['telegram:123', 'ios:a:b', 'desktop:voice:x', 'desktop:profile-room:r', 'cron:job'])
+def test_a_channel_chat_or_a_nested_key_takes_no_call(key):
+    with pytest.raises(VoiceError):
+        chat_key(key, profile='default')
+
+
 def test_bound_calls_are_not_listed_as_voice_chats(voice):
     open_call(voice)
     voice.open({'conversationId': 'call-2', 'connectionId': 'c', 'language': 'en'}, profile='default', bot_id='agent-1')

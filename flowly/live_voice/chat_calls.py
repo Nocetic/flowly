@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from flowly.live_voice.authority import request_owner_scope
-from flowly.live_voice.chat_binding import call_record
+from flowly.live_voice.chat_binding import call_record, is_chat_key
 from flowly.live_voice.sessions import session_key as voice_session_key
 
 ROW_KIND = "voice_call"
@@ -231,7 +231,7 @@ def with_chat_calls(rows: list[dict], sessions: Any, chat_file_exists: Any, *, f
         return rows
     chats = set(bound.values())
     for row in rows:
-        if str(row.get("key", "")).startswith("web:") and not row.get("lastMessage") and row["key"] in chats:
+        if is_chat_key(row.get("key")) and not row.get("lastMessage") and row["key"] in chats:
             line = preview(sessions, row["key"], listed=listed)
             if line:
                 row["lastMessage"], row["lastMessageRole"] = line["text"], line["role"]
@@ -239,13 +239,13 @@ def with_chat_calls(rows: list[dict], sessions: Any, chat_file_exists: Any, *, f
     running: list[dict] = []
     if first_page:
         for chat in sorted(chats):
-            if not chat.startswith("web:") or chat in keys or chat_file_exists(chat):
+            if not is_chat_key(chat) or chat in keys or chat_file_exists(chat):
                 continue
             if any(call["voiceCall"]["phase"] == "live" for call in chat_calls(sessions, chat, listed=listed)):
                 keys.add(chat)
                 running.append({
                     "key": chat, "fileName": None, "sizeBytes": 0, "modifiedAt": None,
-                    "channel": "web", "chatId": chat.split(":", 1)[1], "title": None,
+                    "channel": chat.split(":", 1)[0], "chatId": chat.split(":", 1)[1], "title": None,
                     "displayName": chat.split(":", 1)[1], "updatedAt": None,
                     "lastAssistantRunId": None, "lastAssistantAt": None,
                     "lastMessage": fallback_text(0, live=True), "lastMessageRole": "assistant",

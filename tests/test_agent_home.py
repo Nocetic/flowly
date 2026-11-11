@@ -217,7 +217,7 @@ def test_backup_restore_preserves_setup_and_transcript(agent, monkeypatch, tmp_p
 
 
 @pytest.mark.asyncio
-async def test_persistent_home_stream_fans_out_without_changing_other_sessions(agent):
+async def test_persistent_home_stream_fans_out_like_every_other_session(agent):
     from unittest.mock import AsyncMock
 
     from flowly.gateway.server import GatewayServer
@@ -237,8 +237,10 @@ async def test_persistent_home_stream_fans_out_without_changing_other_sessions(a
     server._ws_send.reset_mock()
     server.bind_session_ws("desktop:profile-room:private", desktop)
     server.bind_session_ws("desktop:profile-room:private", mobile)
-    await server._session_send("desktop:profile-room:private", desktop, {"text": "single owner"})
-    server._ws_send.assert_awaited_once_with(mobile, {"text": "single owner"})
+    await server._session_send("desktop:profile-room:private", desktop, {"text": "every view"})
+    # Each open view of a chat hears it, the latest first (``_ws_send`` checks
+    # each recipient's authority).
+    assert [call.args[0] for call in server._ws_send.await_args_list] == [mobile, desktop]
     mobile.closed = True
     assert server._session_targets(HOME_SESSION) == [desktop]
 

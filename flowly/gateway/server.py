@@ -711,6 +711,10 @@ class GatewayServer:
         # at the calling socket, so the live stream follows the latest viewer
         # (transport-rebind, mirroring the reference gateway).
         self._session_ws: dict[str, web.WebSocketResponse] = {}
+        # Every open socket that read or wrote a session (oldest first), so a
+        # chat's live events reach each view of it: the chat on two devices, or
+        # the chat and a voice call bound to it on one.
+        self._session_sockets: dict[str, dict[Any, None]] = {}
         self._agent_home_ws: set[web.WebSocketResponse] = set()
         # subagent:<threadId> → {socket: lease expiry (monotonic)}: who
         # watches a subagent's running turns (subagents.watch).
@@ -1556,8 +1560,7 @@ class GatewayServer:
             # Drop any session→ws bindings that pointed at this closed socket so
             # we don't hold a dead ref (a live re-entry re-binds via chat.inflight
             # anyway; _ws_send already no-ops on a closed socket).
-            for _sk in [k for k, v in self._session_ws.items() if v is ws]:
-                self._session_ws.pop(_sk, None)
+            self._forget_session_socket(ws)
             self._forget_subagent_stream_socket(ws)
             getattr(self, "_agent_home_ws", set()).discard(ws)
             if is_current_connection and client_id in self._extension_clients:
@@ -2857,13 +2860,14 @@ class GatewayServer:
 
         messages = with_reactions(messages, read_reactions(self.sessions, session_key),
                                   read_agent_reactions(self.sessions, session_key))
+        from flowly.live_voice.chat_binding import is_chat_key
         from flowly.live_voice.chat_calls import chat_calls, page_bounds, with_calls
         from flowly.session.cards import card_rows, read_cards
 
         def bounds() -> tuple[float | None, float | None]:
             return page_bounds(full_messages, source_messages, full_identities) if page_info else (None, None)
 
-        if session_key.startswith("web:"):
+        if is_chat_key(session_key):
             # Its voice calls, each as one card in its place in time, built from the
             # call's own ledger (flowly/live_voice/chat_calls.py): what the Flowly
             # server stores for a chat it keeps, for every chat the agent keeps.
@@ -4222,13 +4226,14 @@ class GatewayServer:
         fallback_ws: web.WebSocketResponse,
         data: dict,
     ) -> None:
-        """Send to current observers (one socket except the persistent agent home).
+        """Send to every open socket bound to the session (``_session_targets``).
 
-        Routes via ``_session_ws`` (the latest socket that ran chat.send or
-        called chat.inflight for this session) so a client that re-entered
-        mid-stream on a fresh socket keeps receiving forward events. Falls back
-        to the originating socket when nothing is registered. ``_ws_send`` no-ops
-        on a closed socket, so a stale registration just drops silently."""
+        A client that re-entered mid-stream on a fresh socket (chat.inflight)
+        keeps receiving forward events, and so does every other view of the
+        chat still open: the same chat on another device, or a voice call bound
+        to it beside the chat view. Falls back to the originating socket when
+        nothing is bound. ``_ws_send`` checks each recipient's authority and
+        no-ops on a closed socket."""
         payload = self._scoped_event(data, session_key=session_key)
         targets = self._session_targets(session_key, fallback_ws)
         await asyncio.gather(*(self._ws_send(target, payload) for target in targets))
@@ -4240,8 +4245,40 @@ class GatewayServer:
             targets.difference_update(ws for ws in list(targets) if ws.closed)
             if targets:
                 return list(targets)
-        target = self._session_ws.get(session_key) or fallback_ws
-        return [target] if target is not None else []
+        latest = self._session_ws.get(session_key)
+        others: list = []
+        bound = self._session_socket_map().get(session_key)
+        if bound:
+            for socket in [socket for socket in bound if getattr(socket, "closed", False)]:
+                bound.pop(socket, None)
+            if not bound:
+                self._session_socket_map().pop(session_key, None)
+            others = [socket for socket in reversed(list(bound)) if socket is not latest]
+        if latest is not None and (not getattr(latest, "closed", False) or not others):
+            return [latest, *others]
+        if others:
+            return others
+        return [fallback_ws] if fallback_ws is not None else []
+
+    def _session_socket_map(self) -> dict[str, dict[Any, None]]:
+        sockets = self.__dict__.get("_session_sockets")
+        if sockets is None:
+            sockets = self.__dict__["_session_sockets"] = {}
+        return sockets
+
+    def _forget_session_socket(self, ws: Any) -> None:
+        """Drop every session binding of a socket that closed or stopped listening."""
+        for key in [key for key, socket in self._session_ws.items() if socket is ws]:
+            self._session_ws.pop(key, None)
+        sockets = self._session_socket_map()
+        for key in [key for key, bound in sockets.items() if ws in bound]:
+            bound = sockets[key]
+            bound.pop(ws, None)
+            if not bound:
+                sockets.pop(key, None)
+            elif key not in self._session_ws:
+                # The newest view still open becomes the session's latest.
+                self._session_ws[key] = next(reversed(bound))
 
     # ------------------------------------------------------------------
     # A subagent's running turn, live (flowly.agent.subagent_stream)
@@ -4303,15 +4340,17 @@ class GatewayServer:
                 elif socket not in targets:
                     targets.append(socket)
         # A chat.inflight re-entry on the conversation binds its socket too.
-        bound = self.__dict__.get("_session_ws", {}).get(session_key)
-        if bound is not None and not getattr(bound, "closed", False) and bound not in targets:
-            targets.append(bound)
+        if session_key in self.__dict__.get("_session_ws", {}) or session_key in self._session_socket_map():
+            for bound in self._session_targets(session_key):
+                if not getattr(bound, "closed", False) and bound not in targets:
+                    targets.append(bound)
         return targets
 
     def subagent_stream_watched(self, session_key: str) -> bool:
         """Whether any socket would receive this subagent conversation's events (cheap)."""
         return bool(self._stream_watchers().get(session_key)) or (
             session_key in self.__dict__.get("_session_ws", {})
+            or session_key in self._session_socket_map()
         )
 
     def prepare_subagent_stream(self, event: str, session_key: str, data: dict):
@@ -4335,9 +4374,12 @@ class GatewayServer:
         return deliver
 
     def bind_session_ws(self, session_key: str, ws: web.WebSocketResponse) -> None:
-        """Point a session's live stream at ``ws`` (transport-rebind)."""
+        """Add ``ws`` to a session's live stream, as its latest view (transport-rebind)."""
         if session_key:
             self._session_ws[session_key] = ws
+            bound = self._session_socket_map().setdefault(session_key, {})
+            bound.pop(ws, None)
+            bound[ws] = None
             from flowly.agent_home import is_agent_home
             if is_agent_home(session_key):
                 if not hasattr(self, "_agent_home_ws"):
@@ -6027,9 +6069,7 @@ class GatewayServer:
         self._ws_clients.pop(self._profile_host_client_id, None)
         socket = self._profile_host_socket
         if socket is not None:
-            for session_key, candidate in list(self._session_ws.items()):
-                if candidate is socket:
-                    self._session_ws.pop(session_key, None)
+            self._forget_session_socket(socket)
 
     # ------------------------------------------------------------------
     # HTTP: artifacts

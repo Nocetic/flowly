@@ -2,7 +2,7 @@
 
 The call's own session (``desktop:voice:<conversationId>``) stays its ledger:
 connections, transcript revisions, tools. A bound call adds three things to
-its chat (``web:<id>``, the main agent's):
+its chat (one of the main agent's app chats, ``is_chat_key``):
 
 - a record, ``chat {state:"voice_call"}``, on every open and end. It is a
   shared conversation event (never private, never with a ``runId``), so the
@@ -33,7 +33,19 @@ from flowly.session.manager import Session, SessionManager
 
 #: ``system.capabilities.voice.chatBindingVersion``.
 CHAT_BINDING_VERSION = 1
-CHAT_KEY = re.compile(r"^web:[A-Za-z0-9_-]{1,128}$")
+#: An app's chat with the main agent: ``web:<id>`` (every chat a Flowly server
+#: lists), or the ``ios:`` / ``android:`` / ``desktop:`` chat an app opened on
+#: a gateway it reaches directly. One segment only: ``desktop:voice:<id>`` (a
+#: call's own ledger) and other nested keys never match.
+CHAT_KEY = re.compile(r"^(?:web|ios|android|desktop):[A-Za-z0-9_-]{1,128}$")
+#: App-owned keys of that shape that are not a chat with the main agent.
+_NOT_A_CHAT = ("desktop:profile-",)
+
+
+def is_chat_key(value: Any) -> bool:
+    """Whether a call may belong to this session: one of the main agent's app chats."""
+    return (isinstance(value, str) and CHAT_KEY.fullmatch(value) is not None
+            and not value.startswith(_NOT_A_CHAT))
 CONTEXT_KIND = "voice_call_context"
 MAX_TURNS = 400
 MAX_TURN_CHARS = 2000
@@ -45,9 +57,9 @@ MAX_CONTEXT_CHARS = 24_000
 
 
 def chat_key(value: Any, *, profile: str) -> str:
-    """The chat a call may bind to: one of the main agent's ``web:`` chats (v1)."""
-    if not isinstance(value, str) or not CHAT_KEY.fullmatch(value):
-        raise VoiceError("INVALID_PARAMS", "chatSessionKey must be one of the main agent's chats (web:<id>).")
+    """The chat a call may bind to: one of the main agent's app chats (``is_chat_key``)."""
+    if not is_chat_key(value):
+        raise VoiceError("INVALID_PARAMS", "chatSessionKey must be one of the main agent's chats (web:<id>, or an app's own chat on a gateway).")
     if profile != "default":
         raise VoiceError("INVALID_PARAMS", "A call joins a chat only with the main agent.")
     return value
@@ -205,7 +217,7 @@ class VoiceChatBindings:
             session = self.sessions.read(voice_session_key(row["voiceConversationId"]))
             voice = (session.metadata.get("voice") or {}) if session else {}
             chat = voice.get("chatSessionKey")
-            if isinstance(chat, str) and CHAT_KEY.fullmatch(chat) and not voice.get("deletedAt"):
+            if is_chat_key(chat) and not voice.get("deletedAt"):
                 self.bind(row["voiceConversationId"], chat)
 
     def chat_send_origin(self, params: dict, session: str) -> dict:

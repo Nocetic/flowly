@@ -1,10 +1,12 @@
-"""Gateway transport-rebind: a session's live stream follows the latest socket.
+"""Gateway transport-rebind: a session's live stream reaches every open view.
 
 A run streams to the socket that started it. If the client leaves and re-enters
 mid-stream it comes back on a NEW socket and calls chat.inflight; without
 rebinding, forward events (deltas / iteration_step / final) keep going to the
 dead socket and the re-entered view freezes at the snapshot. ``bind_session_ws``
-+ ``_session_send`` route every live event to the session's CURRENT socket.
++ ``_session_send`` route every live event to each socket bound to the session
+that is still open, the latest first: the chat on another device, or a voice
+call bound to the chat beside the chat view, sees the turn too.
 """
 
 from __future__ import annotations
@@ -44,11 +46,55 @@ async def test_forward_events_follow_reentered_socket() -> None:
     assert ws_a.sent == [{"d": 1}]
     assert ws_b.sent == []
 
-    # Client left and re-entered on ws_b (chat.inflight rebinds).
+    # Client left and re-entered on ws_b (chat.inflight rebinds); ws_a closed.
+    ws_a.closed = True
     srv.bind_session_ws("web:c1", ws_b)
     await srv._session_send("web:c1", ws_a, {"d": 2})  # fallback ws_a, current ws_b
     assert ws_a.sent == [{"d": 1}]
     assert ws_b.sent == [{"d": 2}]
+    assert srv._session_targets("web:c1") == [ws_b]
+
+
+@pytest.mark.asyncio
+async def test_every_open_view_of_a_chat_hears_its_turn() -> None:
+    """The chat view and a voice call bound to the chat are two sockets of one
+    app (or two devices): both see the reply, never only the one that bound last."""
+    srv = _bare_server()
+    chat_view, voice_call = _FakeWS(), _FakeWS()
+    srv.bind_session_ws("web:c1", chat_view)   # chat.history / chat.inflight
+    srv.bind_session_ws("web:c1", voice_call)  # the call writes the user's words: chat.send
+    await srv._session_send("web:c1", voice_call, {"state": "final"})
+    assert chat_view.sent == [{"state": "final"}]
+    assert voice_call.sent == [{"state": "final"}]
+    # The latest view is first: an autonomous turn answers there.
+    assert srv._session_targets("web:c1") == [voice_call, chat_view]
+
+
+@pytest.mark.asyncio
+async def test_a_view_that_closes_leaves_the_others_bound() -> None:
+    srv = _bare_server()
+    chat_view, voice_call = _FakeWS(), _FakeWS()
+    srv.bind_session_ws("web:c1", chat_view)
+    srv.bind_session_ws("web:c1", voice_call)
+    voice_call.closed = True
+    srv._forget_session_socket(voice_call)
+    assert srv._session_ws["web:c1"] is chat_view
+    await srv._session_send("web:c1", None, {"d": 5})
+    assert chat_view.sent == [{"d": 5}]
+    srv._forget_session_socket(chat_view)
+    assert srv._session_ws == {} and srv._session_sockets == {}
+
+
+@pytest.mark.asyncio
+async def test_a_view_bound_again_becomes_the_latest_once() -> None:
+    srv = _bare_server()
+    one, two = _FakeWS(), _FakeWS()
+    srv.bind_session_ws("web:c1", one)
+    srv.bind_session_ws("web:c1", two)
+    srv.bind_session_ws("web:c1", one)
+    assert srv._session_targets("web:c1") == [one, two]
+    await srv._session_send("web:c1", None, {"d": 6})
+    assert one.sent == [{"d": 6}] and two.sent == [{"d": 6}]
 
 
 @pytest.mark.asyncio

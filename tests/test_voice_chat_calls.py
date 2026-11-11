@@ -170,3 +170,19 @@ def test_an_apps_call_is_its_chats_whoever_asks(home, manager):
         assert listed["web:app-chat"]["lastMessage"].startswith("🎙 Voice chat · ")
         assert forget_chat_calls(manager, "web:app-chat") == 1
     assert manager.read("desktop:voice:call-9") is None
+
+
+@pytest.mark.parametrize("app_chat", ["ios:5F2C0A1E-7B3D-4C2A-9E1F-0A1B2C3D4E5F", "android:c-1", "desktop:chat-1"])
+def test_an_apps_own_chat_on_a_gateway_has_its_calls_like_a_web_chat(home, manager, app_chat):
+    """An app reaching a gateway directly names its chats itself (iOS ``ios:<uuid>``):
+    a call in one is its chat's as a ``web:`` chat's is, in history and in the list."""
+    chat(manager, key=app_chat, texts=("first", "first answer"))
+    time.sleep(0.05)
+    call(manager, chat=app_chat)
+    rows = GatewayServer(sessions=manager).chat_history_result({"sessionKey": app_chat})["messages"]
+    assert kinds(rows) == ["user", "assistant", "voice_call"]
+    running = f"{app_chat.split(':', 1)[0]}:new-chat"
+    call(manager, "call-2", chat=running, end=False)
+    listed = {row["key"]: row for row in sessions_list({"limit": 50})["sessions"]}
+    assert listed[running]["lastMessage"] == "🎙 Voice chat"
+    assert listed[running]["channel"] == app_chat.split(":", 1)[0]
