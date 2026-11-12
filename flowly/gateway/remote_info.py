@@ -75,7 +75,8 @@ def enable_remote_access() -> dict:
     non-loopback bind must never run open).
 
     Returns the connection info the user types into the desktop plus what
-    changed: {host, port, token, public_ip, host_changed, token_changed}.
+    changed: {host, port, token, pin, lan_ip, public_ip, host_changed,
+    token_changed} (``pin`` is "" when the gateway does not encrypt).
     A restart of the gateway/service is required when anything changed —
     a live process can't rebind.
     """
@@ -101,15 +102,77 @@ def enable_remote_access() -> dict:
     if host_changed or token_changed:
         save_config(cfg)
 
+    from flowly.gateway.tls import pairing_pin
+
     return {
         "host": host,
         "port": int(cfg.gateway.port or 18790),
         "token": token,
+        "pin": pairing_pin(cfg.gateway.tls, host),
         "lan_ip": detect_lan_ip(),
         "public_ip": detect_public_ip(),
         "host_changed": host_changed,
         "token_changed": token_changed,
     }
+
+
+def connect_block(info: dict) -> tuple[list[str], bool]:
+    """What an app pairs with, as Rich markup lines, and whether they end in a
+    scannable code.
+
+    ``info``: {host, port, token, pin, lan_ip, public_ip} (as
+    ``enable_remote_access`` returns it). The token is in the lines, the
+    link and the code: show them on a local terminal only.
+    """
+    from rich.markup import escape
+
+    from flowly.gateway.remote_qr import connect_uri, remote_qr_markup
+    from flowly.gateway.tls import short_fingerprint
+
+    host = (info.get("host") or "").strip()
+    port = int(info["port"])
+    token = info["token"]
+    pin = info.get("pin") or ""
+    lan = info.get("lan_ip") or ""
+    public = info.get("public_ip") or ""
+    bind_all = host in ("", "0.0.0.0", "::")
+
+    lines: list[str] = []
+    if bind_all:
+        # LAN first: a phone on the same Wi-Fi is the common case at home. On a
+        # server the two are the same address.
+        if lan:
+            lines.append(f"  Address : [b]{lan}[/b]  [dim](same network)[/dim]")
+        if public and public != lan:
+            lines.append(
+                f"  Address : [b]{public}[/b]  [dim](over the internet; at home this needs a router port-forward)[/dim]"
+            )
+        if not lan and not public:
+            lines.append("  Address : [b]<this machine's IP>[/b]")
+    else:
+        lines.append(f"  Address : [b]{escape(host)}[/b]")
+    lines += [f"  Port    : [b]{port}[/b]", f"  Token   : [b]{escape(token)}[/b]"]
+    if pin:
+        lines.append(
+            f"  Key     : [b]{short_fingerprint(pin)}[/b]  [dim](connections are encrypted with this gateway's "
+            "own key; the link and the code carry it, and the app shows the same)[/dim]"
+        )
+    else:
+        lines.append(
+            "  Encryption: [b]off[/b]  [dim](plain ws://: only on a network you trust, or behind an HTTPS proxy)[/dim]"
+        )
+
+    primary = (lan or public) if bind_all else host
+    qr = remote_qr_markup(primary, port, token, pin=pin) if primary else None
+    if primary:
+        lines += [
+            "",
+            "  [b]Desktop[/b]: paste this link into a gateway's Address field (Settings → Gateways):",
+            f"  {escape(connect_uri(primary, port, token, pin=pin))}",
+        ]
+    if qr:
+        lines += ["", f"  [b]Phone[/b]: scan with the Flowly app [dim]({primary}:{port})[/dim]", "", qr]
+    return lines, qr is not None
 
 
 def disable_remote_access() -> dict:

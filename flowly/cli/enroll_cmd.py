@@ -3,7 +3,7 @@
 Consolidates everything a self-hosted remote connection needs (and that was
 painful to do by hand): enable remote access, surface the RIGHT ip (the LAN ip
 for the common same-Wi-Fi case, not the public ip), offer to open the firewall
-on Windows, and spell out the exact values + TLS setting to type into the app.
+on Windows, and spell out the exact values (and the gateway's key) to give the app.
 """
 
 from __future__ import annotations
@@ -40,39 +40,17 @@ def enroll() -> None:
     case — and offers to open the firewall on Windows. Restart the gateway
     afterward so it rebinds.
     """
-    from flowly.gateway.remote_info import enable_remote_access
-    from flowly.gateway.remote_qr import remote_qr_markup
+    from flowly.gateway.remote_info import connect_block, enable_remote_access
 
     r = enable_remote_access()
-    lan = r.get("lan_ip") or ""
-    pub = r.get("public_ip") or ""
     port = r["port"]
-    token = r["token"]
     changed = r["host_changed"] or r["token_changed"]
 
-    console.print("\n  [b]✦ Connect your phone[/b] — in the Flowly app, add a server with:\n")
-    if lan:
-        console.print(f"    Same Wi-Fi (most common)  Host : [b]{lan}[/b]")
-    if pub:
-        console.print(f"    Over the internet*        Host : [b]{pub}[/b]")
-    if not lan and not pub:
-        console.print("    Host : [b]<this machine's IP>[/b]")
-    console.print(f"    Port : [b]{port}[/b]")
-    console.print(f"    Token: [b]{token}[/b]")
-    console.print("    TLS  : [b]off[/b]  [dim](the gateway serves plain ws:// — leave 'Use TLS' off)[/dim]")
-    if pub:
-        console.print("    [dim]*needs a router port-forward; for away-from-home prefer a VPN (Tailscale).[/dim]")
+    console.print("\n  [b]✦ Connect your phone[/b] — in the Flowly app, add a gateway with:\n")
+    lines, _ = connect_block(r)
+    for line in lines:
+        console.print(line)
     console.print()
-
-    # Same values as a scannable code — point the app's camera at it to skip
-    # typing host/token. LAN IP first (the same-Wi-Fi common case).
-    primary = lan or pub
-    qr = remote_qr_markup(primary, port, token) if primary else None
-    if qr:
-        where = "same Wi-Fi" if lan else "this host"
-        console.print(f"  [b]Or scan with the Flowly app[/b] [dim]({where} · {primary}:{port})[/dim]\n")
-        console.print(qr)
-        console.print()
 
     # Firewall — the usual blocker. On Windows we can add the rule directly.
     if platform.system() == "Windows":
@@ -103,5 +81,5 @@ def enroll() -> None:
             "[cyan]flowly service restart[/cyan] [dim](or restart `flowly gateway`).[/dim]"
         )
     console.print(
-        "\n  [dim]Keep the token secret. The phone must be on the same Wi-Fi for the LAN IP.[/dim]"
+        "\n  [dim]Keep the token secret. A new one: [cyan]flowly service rotate-token[/cyan].[/dim]"
     )

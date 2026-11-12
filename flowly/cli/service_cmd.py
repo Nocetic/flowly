@@ -787,6 +787,105 @@ def _detect_public_ip() -> str:
     return ""
 
 
+def _print_connect_info(host: str, port: int, token: str, tls_mode: str) -> None:
+    """The values (and the gateway's key) an app pairs with: a local terminal only."""
+    from flowly.gateway.remote_info import connect_block, detect_lan_ip
+    from flowly.gateway.tls import pairing_pin
+
+    bind_all = host in ("0.0.0.0", "::")
+    console.print("\n[bold yellow]Remote access[/bold yellow] — pair an app with this gateway:")
+    lines, _ = connect_block({
+        "host": host, "port": port, "token": token,
+        "pin": pairing_pin(tls_mode, host),
+        "lan_ip": detect_lan_ip() if bind_all else "",
+        "public_ip": _detect_public_ip() if bind_all else "",
+    })
+    for line in lines:
+        console.print(line)
+    console.print(
+        f"\n[dim]Keep the token secret (a new one: `flowly service rotate-token`). "
+        f"Allow inbound TCP {port} in the firewall.[/dim]\n"
+    )
+
+
+_VBS_RUN = re.compile(r'(sh\.Run\s+")((?:""|[^"])*)("\s*,)', re.IGNORECASE)
+# A Windows command line's `--token <value>` (list2cmdline quotes a value with spaces or quotes).
+_WINDOWS_TOKEN_ARG = re.compile(r'\s--token(?:=|\s+)(?:"(?:\\.|[^"])*"|\S+)')
+
+
+def _without_token_argv(argv: list[str]) -> list[str]:
+    out: list[str] = []
+    skip = False
+    for arg in argv:
+        if skip:
+            skip = False
+            continue
+        if arg == "--token":
+            skip = True
+            continue
+        if arg.startswith("--token="):
+            continue
+        out.append(arg)
+    return out
+
+
+def _drop_baked_token(label: str) -> bool:
+    """Take a ``--token`` an older ``service install`` put on the service's
+    command line off it (the gateway then reads config.json). True when the
+    definition changed: the service must be loaded again for it to count."""
+    mac_plist, linux_unit, win_xml = _service_paths(label)
+    system = platform.system().lower()
+    if system == "darwin" and mac_plist and mac_plist.exists():
+        payload = plistlib.loads(mac_plist.read_bytes())
+        argv = [str(item) for item in payload.get("ProgramArguments", [])]
+        kept = _without_token_argv(argv)
+        if kept == argv:
+            return False
+        payload["ProgramArguments"] = kept
+        mac_plist.write_bytes(plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=False))
+        return True
+    if system == "linux" and linux_unit and linux_unit.exists():
+        lines = linux_unit.read_text(encoding="utf-8").splitlines(keepends=True)
+        changed = False
+        for index, line in enumerate(lines):
+            if not line.startswith("ExecStart="):
+                continue
+            argv = shlex.split(line.split("=", 1)[1])
+            kept = _without_token_argv(argv)
+            if kept != argv:
+                ending = "\n" if line.endswith("\n") else ""
+                lines[index] = f"ExecStart={shlex.join(kept)}{ending}"
+                changed = True
+        if changed:
+            linux_unit.write_text("".join(lines), encoding="utf-8")
+        return changed
+    if system == "windows" and win_xml:
+        vbs = win_xml.parent / f"{label}.vbs"
+        if not vbs.exists():
+            return False
+        # As written: the launcher's CRLF line ends stay as they are.
+        with open(vbs, encoding="utf-8", newline="") as handle:
+            text = handle.read()
+
+        def _strip(match: re.Match) -> str:
+            command = match.group(2).replace('""', '"')
+            command = _WINDOWS_TOKEN_ARG.sub("", command)
+            return match.group(1) + command.replace('"', '""') + match.group(3)
+
+        updated = _VBS_RUN.sub(_strip, text)
+        if updated == text:
+            return False
+        with open(vbs, "w", encoding="utf-8", newline="") as handle:
+            handle.write(updated)
+        return True
+    return False
+
+
+def _service_installed(label: str) -> bool:
+    mac_plist, linux_unit, win_xml = _service_paths(label)
+    return any(path is not None and path.exists() for path in (mac_plist, linux_unit, win_xml))
+
+
 def _ensure_linger_linux() -> None:
     """Enable systemd-user *linger* so the gateway keeps running after you log
     out — and starts on boot.
@@ -844,7 +943,7 @@ def service_install(
     cwd: str = typer.Option("", "--cwd", help="Pin the gateway's runtime working directory (absolute, existing). Writes FLOWLY_CWD; omit to use config/workspace."),
     host: str = typer.Option("", "--host", help="Bind address baked into the service. Use 0.0.0.0 (or the VPS IP) to accept remote desktop clients; omit for local-only (127.0.0.1)."),
     remote: bool = typer.Option(False, "--remote", help="Accept connections from your phone / other devices — plain-language alias for --host 0.0.0.0 (a token is ensured automatically)."),
-    token: str = typer.Option("", "--token", help="Remote-access token baked into the service (persisted). Omit to let the gateway auto-generate + print one on first remote bind."),
+    token: str = typer.Option("", "--token", help="Remote-access token to use (saved in config.json, never on the service's command line). Omit to keep the saved one, or get a new one for a first remote bind."),
 ):
     """Install background service for flowly gateway."""
     from flowly.profile import get_flowly_home
@@ -875,11 +974,11 @@ def service_install(
     system = platform.system().lower()
 
     # Build the `flowly gateway …` argv suffix ONCE so every platform's service
-    # definition is identical. --host/--token are baked into the unit's
-    # ExecStart so the *running service* binds the right address + token — the
-    # `flowly gateway` command is separate from `service install`, so the flags
-    # must live on the unit, not just an interactive invocation. Persist them
-    # too, so a manual restart matches.
+    # definition is identical. --host is baked into the unit's ExecStart so the
+    # *running service* binds the right address, and persisted too, so a manual
+    # restart matches. The token is NOT: a service's command line is readable
+    # by anyone on the machine (ps, the plist in LaunchAgents), so it lives in
+    # config.json (owner-only) alone and the gateway reads it from there.
     # Without --port the service follows config.gateway.port on every start,
     # so the port this agent settled on (another user of this computer may
     # hold the default) is one value that every reader agrees on.
@@ -917,14 +1016,17 @@ def service_install(
 
     if host.strip():
         gateway_args += ["--host", effective_host]
-    if auth_token:
-        gateway_args += ["--token", auth_token]
     if verbose:
         gateway_args.append("--verbose")
     if persona:
         gateway_args += ["--persona", persona]
 
-    if _cfg is not None and (host.strip() or auth_token):
+    if host.strip() or auth_token:
+        if _cfg is None:
+            # The token reaches the gateway through config.json only: without
+            # it a remote service would start with a token nobody was shown.
+            console.print("[red]Could not read config.json, so the gateway's address and token cannot be saved.[/red]")
+            raise typer.Exit(1)
         try:
             if host.strip():
                 _cfg.gateway.host = effective_host
@@ -932,34 +1034,13 @@ def service_install(
                 _cfg.gateway.token = auth_token
             save_config(_cfg)
         except Exception as e:
-            console.print(f"[yellow]Could not persist gateway host/token: {e}[/yellow]")
+            console.print(f"[red]Could not save the gateway's address and token: {e}[/red]")
+            raise typer.Exit(1)
 
-    # Hand the user the exact values to enter in the desktop. Printed BEFORE the
+    # Hand the user the exact values to pair an app with. Printed BEFORE the
     # platform install so it's never lost behind a long install trace.
     if remote_exposed and auth_token:
-        _bind_all = effective_host in ("0.0.0.0", "::")
-        console.print("\n[bold yellow]Remote access[/bold yellow] — enter in the app (Settings → Connections):")
-        if _bind_all:
-            # LAN IP first: same-Wi-Fi is the common case, and the public IP only
-            # works from outside the network with a router port-forward.
-            from flowly.gateway.remote_info import detect_lan_ip
-            lan = detect_lan_ip()
-            pub = _detect_public_ip()
-            if lan:
-                console.print(f"  Same Wi-Fi (most common) → Host : [bold]{lan}[/bold]")
-            if pub:
-                console.print(f"  Over the internet (needs port-forward) → Host : [bold]{pub}[/bold]")
-            if not lan and not pub:
-                console.print("  Host : [bold]<this machine's IP>[/bold]")
-        else:
-            console.print(f"  Host : [bold]{effective_host}[/bold]")
-        console.print(f"  Port  : [bold]{port}[/bold]")
-        console.print(f"  Token : [bold]{auth_token}[/bold]")
-        console.print("  TLS   : [bold]off[/bold]  [dim](plain ws:// — leave 'Use TLS' off in the app)[/dim]")
-        console.print(
-            f"[dim]Keep the token secret. Phone on the same Wi-Fi → use the first IP. Allow "
-            f"inbound TCP {port} in the firewall (tip: `flowly enroll` sets this up for you).[/dim]\n"
-        )
+        _print_connect_info(effective_host, port, auth_token, _cfg.gateway.tls)
 
     if system == "darwin" and mac_plist:
         launchd_started_at = time.monotonic()
@@ -1496,6 +1577,78 @@ def service_restart(
         raise typer.Exit(2)
     console.print(f"[red]{result.detail}[/red]")
     raise typer.Exit(1)
+
+
+@service_app.command("rotate-token")
+def service_rotate_token(
+    label: str = typer.Option(DEFAULT_SERVICE_LABEL, "--label", help="Service label"),
+    new_key: bool = typer.Option(False, "--new-key", help="Also give the gateway a new encryption key (every app pairs again)."),
+):
+    """Give the gateway a new remote-access token: the old one stops working.
+
+    An installed service is stopped, given the token and started again; a
+    gateway you run yourself takes it when you restart it. Every app then
+    pairs again, with the link or the code this prints.
+    """
+    from flowly.config.loader import load_config, save_config
+    from flowly.gateway.auth import generate_gateway_token, is_loopback_host
+    from flowly.gateway.tls import encrypts, rotate as rotate_key
+
+    installed = _service_installed(label)
+    port = _configured_gateway_port()
+    mac_plist, linux_unit, win_xml = _service_paths(label)
+    if mac_plist is not None and mac_plist.exists():
+        port = _extract_port_from_plist(mac_plist)
+    elif linux_unit is not None and linux_unit.exists():
+        port = _extract_port_from_unit(linux_unit)
+    elif win_xml is not None and win_xml.exists():
+        port = _extract_port_from_win_xml(win_xml)
+
+    # Stopped first: a running gateway that saves its config would write the
+    # old token back over the new one. Started again only if it was running.
+    was_running = installed and bool(_port_listener_pids(port))
+    if was_running:
+        service_stop(label=label)
+
+    token = generate_gateway_token()
+    config = load_config()
+    config.gateway.token = token
+    save_config(config)
+    host = (config.gateway.host or "127.0.0.1").strip() or "127.0.0.1"
+    remote_exposed = not is_loopback_host(host)
+    if new_key:
+        if encrypts(config.gateway.tls, remote_exposed):
+            rotate_key([host])
+        else:
+            console.print("[dim]This gateway does not encrypt (it listens on this machine only, or gateway.tls is off): no key to replace.[/dim]")
+
+    if installed:
+        # An older install put the token on the service's command line, where
+        # it would win over config.json: take it off.
+        if _drop_baked_token(label) and platform.system().lower() == "linux":
+            _run_cmd(["systemctl", "--user", "daemon-reload"])
+        if not was_running:
+            console.print("[green]✓[/green] New token saved: the service uses it when it starts.")
+        else:
+            service_start(label=label)
+        if was_running and (load_config().gateway.token or "").strip() != token:
+            console.print(
+                "[red]The gateway started with another token: its service still carries an old one. "
+                "Reinstall it (`flowly service install` with the options you installed it with), then run this again.[/red]"
+            )
+            raise typer.Exit(1)
+        if was_running:
+            console.print("[green]✓[/green] New token in use: the old one no longer connects.")
+    else:
+        console.print(
+            "[green]✓[/green] New token saved. No service is installed: restart `flowly gateway` to use it "
+            "(until then the old one still connects)."
+        )
+
+    if remote_exposed:
+        _print_connect_info(host, port, token, config.gateway.tls)
+    else:
+        console.print("[dim]This gateway listens on this machine only.[/dim]")
 
 
 @service_app.command("status")

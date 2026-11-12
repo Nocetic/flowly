@@ -741,7 +741,9 @@ def gateway(
     # Its own key for other machines (flowly/gateway/tls.py): "auto" encrypts
     # when it listens beyond this machine. Its own callers keep plain HTTP.
     tls_mode = config.gateway.tls
-    tls_on = not local_runtime and (tls_mode == "on" or (tls_mode == "auto" and remote_exposed))
+    from flowly.gateway.tls import encrypts
+
+    tls_on = not local_runtime and encrypts(tls_mode, remote_exposed)
     tls_identity = None
     if tls_on:
         from flowly.gateway.tls import ensure_identity, rotate as rotate_tls_identity
@@ -772,7 +774,7 @@ def gateway(
             console.print(f"  Key     : [bold]{tls_identity.fingerprint}[/bold]   [dim](the app shows the same when you pair)[/dim]")
             console.print(
                 "[dim]Connections from your devices are encrypted with this gateway's own key. "
-                "The token is secret (rotate with `flowly gateway --rotate-token`; a new key: --rotate-cert).[/dim]"
+                "The token is secret (a new one: `flowly service rotate-token`; a new key too: add --new-key).[/dim]"
             )
             if allow_plain_remote:
                 console.print(
@@ -783,7 +785,7 @@ def gateway(
                 console.print("[dim]Unencrypted connections from other devices are refused.[/dim]\n")
         else:
             console.print(
-                "[dim]The token is secret (rotate with `flowly gateway --rotate-token`). "
+                "[dim]The token is secret (a new one: `flowly service rotate-token`). "
                 "Expose only over TLS (reverse proxy) or a private network (Tailscale/VPN).[/dim]\n"
             )
 

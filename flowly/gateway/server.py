@@ -36,8 +36,10 @@ from flowly.channels import feature_rpc
 from flowly.coaching import rpc as coaching_rpc
 from flowly.gateway.listener import SniffingSite
 from flowly.gateway.auth import (
+    AuthFailureLimiter,
     MediaTicketStore,
     WsTicketStore,
+    auth_peer_key,
     extract_request_token,
     host_origin_allowed,
     is_loopback_host,
@@ -655,6 +657,8 @@ class GatewayServer:
         if enable_profile_host and not is_loopback_host(host) and not self._require_auth:
             raise ValueError("Remote profile hosting requires gateway authentication.")
         self._ticket_store = WsTicketStore()
+        # Failed credential checks from other machines (flowly/gateway/auth.py).
+        self._auth_failures = AuthFailureLimiter()
         # Screen display admission always needs the configured token, even on a
         # loopback gateway whose other routes exempt local clients. Sockets that
         # presented it (or run under enforced auth) are tracked here.
@@ -849,7 +853,7 @@ class GatewayServer:
 
     def _create_app(self) -> web.Application:
         """Create the aiohttp application."""
-        middlewares = [_cors_middleware]
+        middlewares = [_cors_middleware, self._make_auth_failure_middleware()]
         if self._require_auth:
             middlewares.append(self._make_auth_middleware())
         middlewares.append(_request_owner_middleware)
@@ -954,6 +958,36 @@ class GatewayServer:
         "/control/messages/send", "/control/approvals", "/control/approvals/resolve",
         "/mcp",
     })
+
+    def _make_auth_failure_middleware(self):
+        """Refuse an address that keeps failing credential checks (any route's:
+        the token, a ticket, an MCP key), before its request is looked at."""
+
+        @web.middleware
+        async def _auth_failure_middleware(request: web.Request, handler):
+            peer = auth_peer_key(request.remote)
+            wait = self._auth_failures.retry_after(peer)
+            if wait > 0:
+                return web.json_response(
+                    {"error": "too_many_attempts", "detail": "Too many failed sign-ins from this address. Try again shortly."},
+                    status=429,
+                    headers={"Retry-After": str(max(1, int(wait + 0.999))), "Cache-Control": "no-store"},
+                )
+            try:
+                response = await handler(request)
+            except web.HTTPException as exc:
+                if exc.status == 401:
+                    self._note_auth_failure(peer)
+                raise
+            if response.status == 401:
+                self._note_auth_failure(peer)
+            return response
+
+        return _auth_failure_middleware
+
+    def _note_auth_failure(self, peer: str | None) -> None:
+        if self._auth_failures.record_failure(peer):
+            logger.warning("[Gateway] {} keeps failing to sign in: refused for up to a minute", peer)
 
     def _make_auth_middleware(self):
         @web.middleware

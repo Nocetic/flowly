@@ -83,15 +83,18 @@ flowly bootstrap
 flowly setup channels          # add Telegram/Discord/Slack/…
 flowly service install --start
 
-# 3b. Expose the gateway to network clients (e.g. the desktop app):
-flowly service install --start --host 0.0.0.0 --port 18790 --token "$(openssl rand -hex 24)"
+# 3b. Expose the gateway to your devices (the desktop and phone apps):
+flowly service install --start --remote
+flowly enroll    # address, token and key, a link for the desktop, a code for the phone
 ```
 
 > [!WARNING]
 > If you bind to a non-loopback address, secure it:
 >
-> - Always set a `--token`; clients must present it to connect.
-> - Prefer an **SSH tunnel** or a TLS reverse proxy over exposing `0.0.0.0` directly to the internet. Restrict the port with a firewall / security group.
+> - The gateway encrypts connections from other machines with its own key (`gateway.tls`, `auto` by default; no domain or certificate authority needed). The apps pair with that key from the link or the code, check it on every connection, and refuse a gateway that shows another one: nothing in between can read the chat or the token, or pose as the gateway. Compare the key the app shows with the `Key` line `flowly enroll` prints.
+> - Apps that predate this connect unencrypted while `gateway.allowPlainRemote` is `true` (the default for now). Once yours are updated, set it to `false` in `config.json` and restart: unencrypted connections from other machines are then refused.
+> - Every client presents the token. A generated one (about 256 bits) cannot be guessed, and an address that keeps failing to sign in is refused for up to a minute. The token is kept in `config.json` only, never on the service's command line. Replace it with `flowly service rotate-token` (add `--new-key` for a new key as well); every app then pairs again.
+> - Restrict the port with a firewall / security group to the addresses you connect from, or keep it off the internet entirely: an SSH tunnel, or a private network such as Tailscale or WireGuard.
 > - The agent has shell and filesystem access on the host — **treat gateway access as host access.** See the repo's [`SECURITY.md`](https://github.com/Nocetic/flowly/blob/main/SECURITY.md).
 
 ### MCP management from a remote app
@@ -102,8 +105,8 @@ relay or Firestore registration. The client connects through SSH to the remote
 loopback gateway port, then authenticates with the gateway token. The Flowly
 runtime does not receive or store your SSH password.
 
-This is a separate management path: it does not encrypt the ordinary chat or
-media connection, publish an external-agent MCP URL, or configure TLS for you.
+This is a separate management path: it does not publish an external-agent MCP
+URL or give the gateway a certificate other services trust.
 App support must also be present; updating only the runtime is not enough.
 Follow [Remote MCP setup](remote-mcp.md) before connecting external services.
 

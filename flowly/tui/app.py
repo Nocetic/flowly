@@ -2940,11 +2940,11 @@ class FlowlyTUI(App[None]):
         import asyncio as _asyncio
 
         from flowly.gateway.remote_info import (
+            connect_block,
             disable_remote_access,
             enable_remote_access,
             remote_access_status,
         )
-        from flowly.gateway.remote_qr import remote_qr_markup
 
         transcript = self.query_one(TranscriptPane)
         arg = (rest or "").strip().lower()
@@ -2974,50 +2974,22 @@ class FlowlyTUI(App[None]):
 
         # ``/remote`` / ``on`` / ``status``(enabled) → ensure + print the block.
         r = await _asyncio.to_thread(enable_remote_access)
-        lan = r.get("lan_ip") or ""
-        pub = r.get("public_ip") or ""
         changed = r["host_changed"] or r["token_changed"]
+        block, has_code = connect_block(r)
         lines = [
-            "[b]Remote access[/b] — enter in the app: [b]Settings → Connections[/b]",
+            "[b]Remote access[/b] — pair an app with this gateway:",
             "",
-        ]
-        # LAN IP first: same-Wi-Fi is the common case, and the public IP only
-        # works from outside the network with a router port-forward.
-        if lan:
-            lines.append(f"  Same Wi-Fi (most common) → Host/IP : [b]{lan}[/b]")
-        if pub:
-            lines.append(f"  Over the internet (needs router port-forward) → Host/IP : [b]{pub}[/b]")
-        if not lan and not pub:
-            lines.append("  Host/IP : [b]<this machine's IP>[/b]")
-        lines += [
-            f"  Port    : [b]{r['port']}[/b]",
-            f"  Token   : [b]{r['token']}[/b]",
-            "  TLS     : [b]off[/b]  [dim](the gateway serves plain ws:// — leave 'Use TLS' off)[/dim]",
+            *block,
             "",
-            "  [dim]Phone on the same Wi-Fi → use the first IP. Make sure the OS",
-            "  firewall allows inbound on this port.[/dim]",
+            "  [dim]Make sure the firewall allows inbound on this port.[/dim]",
         ]
         if changed:
             lines.append(
                 "  [yellow]Apply:[/yellow] [cyan]flowly service restart[/cyan] "
                 "[dim]— or restart the gateway (bind/token changed)[/dim]"
             )
-        # Append the scannable code into the SAME block, below the typed values
-        # — same four fields, just point the app's camera at it. LAN IP first
-        # (the same-Wi-Fi common case); the token rides inside, so this stays
-        # TUI-local like the values above.
-        primary = lan or pub
-        qr = remote_qr_markup(primary, r["port"], r["token"]) if primary else None
-        if qr:
-            where = "same Wi-Fi" if lan else "this host"
-            lines += [
-                "",
-                f"  [b]Or scan with the Flowly app[/b] [dim]({where} · {primary}:{r['port']})[/dim]",
-                "",
-                qr,
-            ]
         # Don't collapse when a QR is present — the code must render in full.
-        transcript.add_system("\n".join(lines), collapse_long=qr is None)
+        transcript.add_system("\n".join(lines), collapse_long=not has_code)
 
     async def _configure_provider_inline(
         self,

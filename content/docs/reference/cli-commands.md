@@ -15,7 +15,7 @@ The `flowly` command is the entry point for everything — running the agent, st
 |---|---|
 | `flowly` | Smart entry: opens the terminal chat when a provider/account is configured; on a fresh machine it launches the first-run onboarding instead. |
 | `flowly setup` | First-run onboarding + configuration — sign in with a Flowly account or enter your own API key, plus channels and tools. |
-| `flowly enroll` | Connect a phone / remote device: enable remote access and print the LAN IP, port, token, TLS note, and firewall steps. |
+| `flowly enroll` | Connect a phone / remote device: enable remote access and print the address, port, token and key, a link and a code to pair with, and firewall steps. |
 | `flowly agent -m "..."` | Send a one-shot message to the agent. |
 | `flowly gateway` | Start the gateway daemon (channels run through it). |
 | `flowly login` / `logout` | Sign in / out of a Flowly account (OAuth, optional — BYOK works without it). |
@@ -82,17 +82,18 @@ commands instead, so automation can never stop a service silently.
 | `--remote` | Accept connections from your phone / other devices (plain-language alias for `--host 0.0.0.0`; a token is ensured automatically). |
 | `--host` | Bind address. `0.0.0.0` accepts remote clients; default `127.0.0.1` (local only). |
 | `--token` | Set an explicit remote-access token (otherwise one is auto-generated on the first non-loopback bind). |
-| `--rotate-token` | Generate a fresh remote-access token before starting (invalidates the old one). |
+| `--rotate-token` | Generate a fresh remote-access token before starting (invalidates the old one). For a gateway that runs as a service, use `flowly service rotate-token`. |
 
 An updated gateway registers the owner-only `/api/mcp/manage` route automatically;
 there is no separate `flowly mcp` command to start it. It requires a configured
-gateway token even on loopback. `--remote` exposes a bind address; it does **not**
-enable TLS or start an SSH server. See [Remote MCP setup](../using-flowly/remote-mcp.md)
+gateway token even on loopback. `--remote` exposes a bind address, encrypted with
+the gateway's own key for the Flowly apps; it does **not** give the gateway a
+certificate other services trust, or start an SSH server. See [Remote MCP setup](../using-flowly/remote-mcp.md)
 and the [management API](mcp-management-api.md).
 
 ## flowly enroll
 
-Connect a phone or another device to this gateway in one step: enables remote access (binds `0.0.0.0` + ensures a token), prints the **LAN IP** to use on the same Wi-Fi (plus the public IP for internet access), the port, token, and TLS note, and offers to open the firewall on Windows. Restart the gateway afterward so it rebinds.
+Connect a phone or another device to this gateway in one step: enables remote access (binds `0.0.0.0` + ensures a token), prints the **LAN IP** to use on the same Wi-Fi (plus the public IP for internet access), the port, the token and the gateway's key, a link to paste into the desktop app's gateway address and a code to scan with the phone, and offers to open the firewall on Windows. Restart the gateway afterward so it rebinds.
 
 ## flowly setup
 
@@ -118,6 +119,7 @@ Manage the background gateway service (launchd / systemd / Task Scheduler).
 | `start` | Start the installed service (won't launch a duplicate if a gateway already holds the port). |
 | `stop` | Stop the service. |
 | `restart` | Restart the gateway. |
+| `rotate-token` | Replace the remote-access token (the old one stops working): stops the service, saves the new token, starts it again, and prints the new link and code. `--new-key` replaces the encryption key too. |
 | `status` | Show service state, local health, and a port/process diagnostic (warns if a gateway is running outside the service). |
 | `logs` | Show service logs (real-time by default). |
 | `uninstall` | Remove the service definition. |

@@ -161,6 +161,25 @@ def ensure_identity(hosts: list[str] | None = None, directory: Path | None = Non
     return TlsIdentity(cert_path=cert_path, key_path=key_path, pin=spki_pin(cert_pem))
 
 
+def encrypts(mode: str, remote_exposed: bool) -> bool:
+    """Whether a gateway with ``gateway.tls`` set to ``mode`` encrypts: always
+    with "on", never with "off", and with "auto" when it listens beyond loopback."""
+    return mode == "on" or (mode == "auto" and remote_exposed)
+
+
+def pairing_pin(mode: str, host: str, directory: Path | None = None) -> str:
+    """The pin the apps pair with for a gateway bound to ``host``, or "" when it
+    does not encrypt (or its key cannot be made: the gateway says so when it starts)."""
+    from flowly.gateway.auth import is_loopback_host
+
+    if not encrypts(mode, remote_exposed=not is_loopback_host(host)):
+        return ""
+    try:
+        return ensure_identity([host], directory).pin
+    except Exception:  # noqa: BLE001 — pairing info never fails over the key
+        return ""
+
+
 def rotate(hosts: list[str] | None = None, directory: Path | None = None) -> TlsIdentity:
     """A new key: every app pairs again (the old pin no longer connects)."""
     directory = directory or tls_dir()

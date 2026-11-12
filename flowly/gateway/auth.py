@@ -259,3 +259,95 @@ class MediaTicketStore:
     @property
     def ttl_seconds(self) -> int:
         return self._ttl
+
+
+# ---------------------------------------------------------------------------
+# Failed sign-ins from other machines
+# ---------------------------------------------------------------------------
+
+# A peer that fails this many credential checks within the window is refused
+# (429) until its oldest failure in the window ages out: at most ~20 guesses a
+# minute per address. A generated token (~256 bits) is out of reach anyway; the
+# cap is for a token a person chose (``--token``), and against a peer flooding
+# the gateway with credential checks. Generous enough that an app retrying
+# with a stale token after a rotation is not locked out for more than a minute.
+AUTH_FAILURE_LIMIT = 20
+AUTH_FAILURE_WINDOW_SECONDS = 60.0
+# Addresses tracked at once; the oldest goes first beyond this.
+AUTH_FAILURE_MAX_PEERS = 4096
+
+
+def auth_peer_key(remote: str | None) -> str | None:
+    """The address failures are counted under, or None when not counted.
+
+    Loopback is never counted (this machine's own callers; a same-host proxy
+    makes every client loopback, so it must not lock them all out). An IPv6
+    peer counts by its /64, which one machine usually holds whole.
+    """
+    import ipaddress
+
+    if not remote:
+        return None
+    try:
+        ip = ipaddress.ip_address(str(remote).split("%", 1)[0])
+    except ValueError:
+        return None
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if ip.is_loopback:
+        return None
+    if isinstance(ip, ipaddress.IPv6Address):
+        return str(ipaddress.IPv6Network((ip, 64), strict=False))
+    return str(ip)
+
+
+class AuthFailureLimiter:
+    """Per-address sliding window of failed credential checks."""
+
+    def __init__(
+        self,
+        limit: int = AUTH_FAILURE_LIMIT,
+        window_seconds: float = AUTH_FAILURE_WINDOW_SECONDS,
+        max_peers: int = AUTH_FAILURE_MAX_PEERS,
+        clock=time.monotonic,
+    ) -> None:
+        self._limit = max(1, limit)
+        self._window = window_seconds
+        self._max_peers = max(1, max_peers)
+        self._clock = clock
+        # peer -> failure times, oldest first, at most ``limit`` of them.
+        self._failures: dict[str, list[float]] = {}
+
+    def _recent(self, peer: str) -> list[float]:
+        times = self._failures.get(peer)
+        if not times:
+            return []
+        cutoff = self._clock() - self._window
+        while times and times[0] <= cutoff:
+            times.pop(0)
+        if not times:
+            self._failures.pop(peer, None)
+        return times
+
+    def retry_after(self, peer: str | None) -> float:
+        """Seconds until ``peer`` may try again; 0 when it may now."""
+        if peer is None:
+            return 0.0
+        times = self._recent(peer)
+        if len(times) < self._limit:
+            return 0.0
+        return max(0.0, times[0] + self._window - self._clock())
+
+    def record_failure(self, peer: str | None) -> bool:
+        """Count one failure. True when this one closes the window on ``peer``."""
+        if peer is None:
+            return False
+        times = self._recent(peer)
+        if not times:
+            self._failures.pop(peer, None)
+            while len(self._failures) >= self._max_peers:
+                self._failures.pop(next(iter(self._failures)))
+            times = self._failures.setdefault(peer, [])
+        times.append(self._clock())
+        del times[:-self._limit]
+        return len(times) == self._limit

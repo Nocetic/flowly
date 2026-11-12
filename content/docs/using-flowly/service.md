@@ -32,7 +32,9 @@ To make the background service reachable from your phone or another device, inst
 flowly service install --start --remote
 ```
 
-`--remote` is a plain-language alias for `--host 0.0.0.0` and ensures an access token automatically (use `--host <ip>` / `--token <t>` for explicit control). After installing, run `flowly enroll` to print the LAN IP, port, token, TLS note, and firewall steps for connecting a device. See [`flowly enroll`](../reference/cli-commands.md#flowly-enroll).
+`--remote` is a plain-language alias for `--host 0.0.0.0` and ensures an access token automatically (use `--host <ip>` / `--token <t>` for explicit control). The token is saved in `config.json` only, never on the service's command line, where anyone on the machine could read it. After installing, run `flowly enroll` to print the address, port, token and the gateway's key, a link to paste into the desktop app and a code to scan with the phone, and the firewall steps. See [`flowly enroll`](../reference/cli-commands.md#flowly-enroll).
+
+To replace the token (the old one stops working at once), run `flowly service rotate-token`: it stops the service, saves a new token, starts it again and prints the new link and code. `--new-key` gives the gateway a new encryption key too; every app then pairs again.
 
 ## Platform backends
 
