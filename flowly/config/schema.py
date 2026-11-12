@@ -555,6 +555,13 @@ class GatewayConfig(BaseModel):
     # same-host proxy (a cloud machine's edge relay), where every remote client
     # arrives from 127.0.0.1 and loopback says nothing about who is calling.
     require_auth: bool = False
+    # Encrypt connections from other machines with the gateway's own key
+    # (flowly/gateway/tls.py; the apps pin it). "auto": when it listens beyond
+    # this machine. This machine's own callers keep plain HTTP on the port.
+    tls: Literal["auto", "on", "off"] = "auto"
+    # With TLS, still take unencrypted connections from other machines: apps
+    # that predate pinning. Off refuses them before a byte of HTTP is read.
+    allow_plain_remote: bool = True
 
     @field_validator("port")
     @classmethod

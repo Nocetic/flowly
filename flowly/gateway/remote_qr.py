@@ -32,20 +32,25 @@ _GLYPH = {
 }
 
 
-def connect_uri(host: str, port: int, token: str, *, tls: bool = False) -> str:
+def connect_uri(host: str, port: int, token: str, *, tls: bool = False, pin: str = "") -> str:
     """Build the ``flowly://remote`` URI the app parses into its add-server form.
 
     Carries the same fields the user would type by hand; the app fills host /
-    port / token / TLS from the query string.
+    port / token / TLS from the query string. ``tls`` is a certificate a
+    certificate authority vouches for (a reverse proxy with a domain). ``pin``
+    is the gateway's own key (flowly/gateway/tls.py): an app that knows it
+    connects encrypted to that key alone, whatever ``tls`` says; one that
+    predates pinning ignores it and connects as ``tls`` says.
     """
-    query = urlencode(
-        {
-            "host": host,
-            "port": int(port),
-            "token": token,
-            "tls": "1" if tls else "0",
-        }
-    )
+    fields: dict[str, object] = {
+        "host": host,
+        "port": int(port),
+        "token": token,
+        "tls": "1" if tls else "0",
+    }
+    if pin:
+        fields["pin"] = pin
+    query = urlencode(fields)
     return f"flowly://remote?{query}"
 
 
@@ -82,10 +87,11 @@ def remote_qr_markup(
     token: str,
     *,
     tls: bool = False,
+    pin: str = "",
     border: int = 4,
 ) -> str | None:
     """Connection values → scannable QR markup, or ``None`` when there's nothing
     safe to encode (missing host/token) or QR support is unavailable."""
     if not host or not token:
         return None
-    return qr_markup(connect_uri(host, port, token, tls=tls), border=border)
+    return qr_markup(connect_uri(host, port, token, tls=tls, pin=pin), border=border)

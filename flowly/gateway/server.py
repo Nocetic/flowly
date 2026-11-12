@@ -1,6 +1,7 @@
 """HTTP + WebSocket API server for gateway integrations."""
 
 import asyncio
+import socket
 import base64
 import inspect
 import ipaddress
@@ -33,6 +34,7 @@ from flowly.artifacts.summary import artifact_summary
 from flowly.browser_annotations import append_browser_annotation_context
 from flowly.channels import feature_rpc
 from flowly.coaching import rpc as coaching_rpc
+from flowly.gateway.listener import SniffingSite
 from flowly.gateway.auth import (
     MediaTicketStore,
     WsTicketStore,
@@ -625,9 +627,18 @@ class GatewayServer:
         # Lets the owning agent cancel background title/compaction writers
         # before the session files are removed.
         on_session_delete: SessionDeleteCallback | None = None,
+        # The gateway's own key and certificate (flowly/gateway/tls.py): set,
+        # connections from other machines are encrypted (SniffingSite), plain
+        # HTTP stays for this machine's own callers. None: plain HTTP only.
+        tls_identity: Any | None = None,
+        # With TLS: still take unencrypted connections from other machines
+        # (apps that predate pinning) until the owner turns it off.
+        allow_plain_remote: bool = True,
     ):
         self.host = host
         self.port = port
+        self._tls_identity = tls_identity
+        self._allow_plain_remote = allow_plain_remote
         # Remote-client authentication. A token ONLY gates remote access: when
         # the gateway is bound to loopback every client is local and trusted, so
         # auth is never enforced there. Without this guard a token persisted
@@ -1017,6 +1028,9 @@ class GatewayServer:
                 # The public handshake the desktop probes to decide whether to
                 # prompt for a token before connecting (the /api/status handshake).
                 "auth_required": self._require_auth,
+                # Encrypted for other machines with the gateway's own key; the
+                # pin itself is only told over an authenticated call (gateway.tls).
+                "tls": self._serves_tls(),
                 "capabilities": [
                     "tool_events",  # tool.start / tool.complete WS events
                     "queue_while_busy",  # client-side, but flag for future server queueing
@@ -1778,6 +1792,11 @@ class GatewayServer:
 
             elif method == "chat.send":
                 await self._ws_rpc_chat_send(ws, client_id, rpc_id, params)
+
+            elif method == "gateway.tls":
+                # Over a connection already authenticated by the token: an app
+                # paired before pinning learns the key to pin from now on.
+                await self._ws_rpc_reply(ws, rpc_id, self._tls_info())
 
             elif method == "chat.abort":
                 await self._ws_rpc_chat_abort(ws, rpc_id, params)
@@ -6178,7 +6197,7 @@ class GatewayServer:
         # unnecessary; disabling it removes the benign-but-noisy tracebacks.
         self._runner = web.AppRunner(self._app, tcp_keepalive=False)
         await self._runner.setup()
-        self._site = web.TCPSite(self._runner, self.host, self.port)
+        self._site = self._make_site()
         try:
             await self._site.start()
         except OSError as e:
@@ -6218,7 +6237,7 @@ class GatewayServer:
                 write_api_file(self.host, self.port, self._control_token)
             except Exception as exc:  # pragma: no cover
                 logger.debug("MCP control advertise failed: {}", exc)
-        notable("gateway.started", address=f"http://{self.host}:{self.port}")
+        notable("gateway.started", address=f"{'https+http' if self._serves_tls() else 'http'}://{self.host}:{self.port}")
         # On a root host this profile's screen admits only this gateway's
         # cgroup to its browser (agent_scope); publish it before any agent run.
         from flowly.desktop_runtime.agent_scope import record_agent_cgroup
@@ -6228,6 +6247,40 @@ class GatewayServer:
             self._profile_host.start_keeping_agents()
         if self.on_chat_message:
             logger.info(f"Desktop WebSocket available at ws://{self.host}:{self.port}/ws")
+
+    def _tls_info(self) -> dict[str, Any]:
+        """`gateway.tls`: whether other machines reach it encrypted, and the key's pin."""
+        if not self._serves_tls():
+            return {"tls": False}
+        identity = self._tls_identity
+        return {"tls": True, "pin": identity.pin, "fingerprint": identity.fingerprint,
+                "plainRemote": self._allow_plain_remote}
+
+    def _serves_tls(self) -> bool:
+        return isinstance(self._site, SniffingSite)
+
+    def _make_site(self) -> web.BaseSite:
+        """TLS and plain HTTP on the one port when it has its own key, else plain HTTP."""
+        identity = self._tls_identity
+        if identity is not None:
+            loop = asyncio.get_running_loop()
+            try:
+                # The first-byte peek needs a selector loop (not Windows' proactor).
+                probe = socket.socket()
+                try:
+                    loop.add_reader(probe.fileno(), lambda: None)
+                    loop.remove_reader(probe.fileno())
+                finally:
+                    probe.close()
+            except (NotImplementedError, AttributeError):
+                logger.warning("[Gateway] This system's event loop cannot tell TLS from HTTP: connections stay unencrypted.")
+            else:
+                return SniffingSite(
+                    self._runner, self.host, self.port,
+                    ssl_context=identity.server_context(),
+                    allow_plain_remote=self._allow_plain_remote,
+                )
+        return web.TCPSite(self._runner, self.host, self.port)
 
     async def stop(self) -> None:
         """Stop the server and clean up."""

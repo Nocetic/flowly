@@ -505,6 +505,7 @@ def gateway(
     remote: bool = typer.Option(False, "--remote", help="Accept connections from your phone / other devices — plain-language alias for --host 0.0.0.0 (a token is ensured automatically)."),
     token: str = typer.Option("", "--token", help="Set an explicit remote-access token (persisted). Otherwise one is auto-generated on first non-loopback bind."),
     rotate_token: bool = typer.Option(False, "--rotate-token", help="Generate a fresh remote-access token before starting (invalidates the old one), print it, and persist it."),
+    rotate_cert: bool = typer.Option(False, "--rotate-cert", help="Make the gateway a new encryption key before starting. Every app must pair again (scan the new code)."),
     local_runtime: bool = typer.Option(
         False,
         "--local-runtime",
@@ -737,6 +738,21 @@ def gateway(
         except Exception as e:  # pragma: no cover — never block startup
             logger.warning(f"[Gateway] Could not persist gateway config: {e}")
 
+    # Its own key for other machines (flowly/gateway/tls.py): "auto" encrypts
+    # when it listens beyond this machine. Its own callers keep plain HTTP.
+    tls_mode = config.gateway.tls
+    tls_on = not local_runtime and (tls_mode == "on" or (tls_mode == "auto" and remote_exposed))
+    tls_identity = None
+    if tls_on:
+        from flowly.gateway.tls import ensure_identity, rotate as rotate_tls_identity
+
+        try:
+            tls_identity = (rotate_tls_identity if rotate_cert else ensure_identity)([effective_host])
+        except Exception as e:  # never block startup: unencrypted, and said
+            logger.warning(f"[Gateway] Could not make the gateway's encryption key: {e}")
+            console.print(f"[bold red]Encryption is off:[/bold red] the gateway could not make its key ({e}).")
+    allow_plain_remote = config.gateway.allow_plain_remote
+
     if remote_exposed and auth_token:
         _bind_all = effective_host in ("0.0.0.0", "::")
         console.print(
@@ -752,10 +768,24 @@ def gateway(
             console.print(f"  Host/IP : [bold]{effective_host}[/bold]")
         console.print(f"  Port    : [bold]{port}[/bold]")
         console.print(f"  Token   : [bold]{auth_token}[/bold]")
-        console.print(
-            "[dim]The token is secret (rotate with `flowly gateway --rotate-token`). "
-            "Expose only over TLS (reverse proxy) or a private network (Tailscale/VPN).[/dim]\n"
-        )
+        if tls_identity is not None:
+            console.print(f"  Key     : [bold]{tls_identity.fingerprint}[/bold]   [dim](the app shows the same when you pair)[/dim]")
+            console.print(
+                "[dim]Connections from your devices are encrypted with this gateway's own key. "
+                "The token is secret (rotate with `flowly gateway --rotate-token`; a new key: --rotate-cert).[/dim]"
+            )
+            if allow_plain_remote:
+                console.print(
+                    "[dim]Apps too old to encrypt still connect unencrypted. Once yours are updated, refuse them: "
+                    "set gateway.allowPlainRemote to false in config.json.[/dim]\n"
+                )
+            else:
+                console.print("[dim]Unencrypted connections from other devices are refused.[/dim]\n")
+        else:
+            console.print(
+                "[dim]The token is secret (rotate with `flowly gateway --rotate-token`). "
+                "Expose only over TLS (reverse proxy) or a private network (Tailscale/VPN).[/dim]\n"
+            )
 
         # Same values as a scannable code. Use the LAN IP when bound to all
         # interfaces (instant, no network call — never slow gateway startup);
@@ -764,7 +794,7 @@ def gateway(
         from flowly.gateway.remote_qr import remote_qr_markup
 
         qr_host = detect_lan_ip() if _bind_all else effective_host
-        qr = remote_qr_markup(qr_host, port, auth_token) if qr_host else None
+        qr = remote_qr_markup(qr_host, port, auth_token, pin=tls_identity.pin if tls_identity else "") if qr_host else None
         if qr:
             console.print(f"  [bold]Scan with the Flowly app[/bold] [dim]({qr_host}:{port})[/dim]\n")
             console.print(qr)
@@ -2110,6 +2140,8 @@ Respond to the user now:"""
         host=effective_host,
         port=port,
         auth_token=auth_token,
+        tls_identity=tls_identity,
+        allow_plain_remote=allow_plain_remote,
         require_loopback_auth=loopback_auth_required(config, local_runtime),
         advertise_control=not local_runtime,
         enable_profile_host=not local_runtime and current_profile_name() == "default",
@@ -2698,7 +2730,7 @@ Respond to the user now:"""
                 loop.add_signal_handler(sig, signal_handler)
             # A settings change stops the gateway the way a signal does, then
             # starts it again in place (see flowly.self_restart).
-            self_restart.install(shutdown_event.set, drop_flags=("--rotate-token",))
+            self_restart.install(shutdown_event.set, drop_flags=("--rotate-token", "--rotate-cert"))
 
         _watch_task: asyncio.Task | None = None
         _source_task: asyncio.Task | None = None
