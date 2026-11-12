@@ -211,3 +211,76 @@ def test_an_allowed_model_carries_no_lock_and_odd_rows_are_skipped() -> None:
     assert catalog._flowly_catalog_row("nope") is None
     weird = catalog._flowly_catalog_row({"id": "x/y", "allowed": False, "required_plan": "galaxy"})
     assert weird is not None and "locked" in weird.tags and not any(tag.startswith("plan:") for tag in weird.tags)
+
+
+def _plan(monkeypatch, plan: str, default: str, listed: list[str]) -> None:
+    monkeypatch.setattr(catalog, "_CACHE", {"flowly": [Model(id=m, name=m) for m in listed]})
+    monkeypatch.setattr(catalog, "_FLOWLY_POLICY", FlowlyModelPolicy(plan=plan, default_model=default))
+
+
+def _model(path: Path) -> str:
+    return json.loads(path.read_text(encoding="utf-8"))["agents"]["defaults"]["model"]
+
+
+def test_a_free_account_moves_off_the_paid_default_it_cannot_call(tmp_path: Path, monkeypatch) -> None:
+    """2026-11-12, a new macOS user on Free: the agent started on Haiku 5.5,
+    which Free does not list, and its first message came back 403."""
+    monkeypatch.setenv("FLOWLY_HOME", str(tmp_path))
+    path = _write_config(tmp_path, "anthropic/claude-haiku-5.5")
+    _plan(monkeypatch, "free", "anthropic/claude-haiku-4.5",
+          ["anthropic/claude-haiku-4.5", "deepseek/deepseek-v4-flash", "tencent/hy3"])
+
+    assert asyncio.run(catalog.reconcile_flowly_model(force_refresh=False)) == "anthropic/claude-haiku-4.5"
+    assert _model(path) == "anthropic/claude-haiku-4.5"
+
+
+def test_a_paid_account_moves_off_free_default_to_its_own(tmp_path: Path, monkeypatch) -> None:
+    """Starter and up run Haiku 5.5: an agent upgraded from Free leaves 4.5,
+    which a paid plan keeps callable but never lists."""
+    monkeypatch.setenv("FLOWLY_HOME", str(tmp_path))
+    path = _write_config(tmp_path, "anthropic/claude-haiku-4.5")
+    _plan(monkeypatch, "starter", "anthropic/claude-haiku-5.5",
+          ["anthropic/claude-haiku-5.5", "deepseek/deepseek-v4-flash"])
+
+    assert asyncio.run(catalog.reconcile_flowly_model(force_refresh=False)) == "anthropic/claude-haiku-5.5"
+    assert _model(path) == "anthropic/claude-haiku-5.5"
+
+
+def test_a_default_the_plan_lists_stays(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("FLOWLY_HOME", str(tmp_path))
+    path = _write_config(tmp_path, "anthropic/claude-haiku-5.5")
+    _plan(monkeypatch, "pro", "anthropic/claude-haiku-5.5",
+          ["anthropic/claude-haiku-5.5", "anthropic/claude-sonnet-5.5"])
+
+    assert asyncio.run(catalog.reconcile_flowly_model(force_refresh=False)) is None
+    assert _model(path) == "anthropic/claude-haiku-5.5"
+
+
+def test_no_catalog_no_change(tmp_path: Path, monkeypatch) -> None:
+    """Offline or signed out: the policy is unknown, so nothing moves."""
+    monkeypatch.setenv("FLOWLY_HOME", str(tmp_path))
+    path = _write_config(tmp_path, "anthropic/claude-haiku-5.5")
+    monkeypatch.setattr(catalog, "_CACHE", {"flowly": [Model(id="anthropic/claude-haiku-4.5", name="x")]})
+    monkeypatch.setattr(catalog, "_FLOWLY_POLICY", None)
+
+    assert asyncio.run(catalog.reconcile_flowly_model(force_refresh=False)) is None
+    assert _model(path) == "anthropic/claude-haiku-5.5"
+
+
+def test_the_gateway_switches_the_running_provider_only_when_the_model_moved(tmp_path: Path, monkeypatch) -> None:
+    from flowly.cli.gateway_cmd import _reconcile_flowly_default
+
+    monkeypatch.setenv("FLOWLY_HOME", str(tmp_path))
+    path = _write_config(tmp_path, "anthropic/claude-haiku-5.5")
+    _plan(monkeypatch, "free", "anthropic/claude-haiku-4.5", ["anthropic/claude-haiku-4.5"])
+    reloads: list[int] = []
+
+    async def reload() -> dict:
+        reloads.append(1)
+        return {"ok": True}
+
+    assert asyncio.run(_reconcile_flowly_default(reload)) == "anthropic/claude-haiku-4.5"
+    assert reloads == [1]
+    assert asyncio.run(_reconcile_flowly_default(reload)) is None
+    assert reloads == [1]
+    assert _model(path) == "anthropic/claude-haiku-4.5"

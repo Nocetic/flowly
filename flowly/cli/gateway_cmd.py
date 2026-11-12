@@ -260,6 +260,32 @@ async def _warm_model_catalog(provider_key: str) -> None:
     await warm_cache(provider_key)
 
 
+async def _reconcile_flowly_default(reload_provider) -> str | None:
+    """Move a Flowly default the account's plan lacks to the plan's default.
+
+    A new agent starts on Claude Haiku 5.5, which Free does not list, and an
+    agent whose plan changed keeps the previous plan's default: its first
+    message would be refused, or it would run a model its picker hides.
+    Signing in reconciles once; this covers every start after, on the catalog
+    just warmed. Only Flowly's own defaults move (``reconcile_flowly_model``),
+    and the running provider is rebuilt when one did. Never raises.
+    """
+    try:
+        from flowly.integrations.model_catalog import reconcile_flowly_model
+
+        changed = await reconcile_flowly_model(force_refresh=False)
+    except Exception as exc:  # noqa: BLE001 — a boot nicety, never a failure
+        logger.warning(f"[provider] default model not reconciled: {exc}")
+        return None
+    if changed:
+        logger.info(f"[provider] the plan's default model is {changed}; switching to it")
+        try:
+            await reload_provider()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[provider] reload after reconciling the model failed: {exc}")
+    return changed
+
+
 def _start_media_library_sync() -> None:
     """Reconcile the media library on a daemon thread. Never raises.
 
@@ -2857,9 +2883,12 @@ Respond to the user now:"""
             # Fire-and-forget: it must not delay the gateway becoming
             # reachable, and a failure is survivable because the guess is
             # still there. `warm_cache` swallows its own errors.
-            _catalog_task = asyncio.create_task(
-                _warm_model_catalog(active.key),
-            )
+            async def _warm_and_reconcile() -> None:
+                await _warm_model_catalog(active.key)
+                if active.key == "flowly":
+                    await _reconcile_flowly_default(on_provider_reload)
+
+            _catalog_task = asyncio.create_task(_warm_and_reconcile())
 
             # Flowlet reactive watches — a lightweight 60s heartbeat that fires
             # schedule/stale/condition reminders LLM-free (client taps trigger an

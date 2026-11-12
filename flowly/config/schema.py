@@ -345,8 +345,9 @@ class AgentDefaults(BaseModel):
     workspace. ``~`` is expanded. Overridden per-call by an explicit
     ``working_dir``, per-session by the gateway, and by the ``FLOWLY_CWD``
     env var. See flowly/runtime_cwd.py for the full resolution order."""
-    # Every new agent's model: in every Flowly plan's list (Free included) and
-    # Flowly's default for paid plans (flowly-app PAID_DEFAULT_MODEL).
+    # Every new agent's model: Flowly's default for paid plans (flowly-app
+    # PAID_DEFAULT_MODEL). Free does not list it: signing in, and each gateway
+    # start, move it to the plan's own default (model_catalog.reconcile_flowly_model).
     model: str = "anthropic/claude-haiku-5.5"
     # How hard the model thinks on this agent's turns (flowly/providers/effort.py).
     # Empty → the model's own default. Background calls that switch thinking

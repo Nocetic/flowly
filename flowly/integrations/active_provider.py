@@ -548,7 +548,7 @@ def _build_for(config: Config, name: str) -> ActiveProvider | None:
 # (e.g. Anthropic BYOK can't serve "moonshotai/kimi-k2.5"). Picking a safe
 # default + notifying beats failing the user's first message.
 DEFAULT_MODELS: dict[str, str] = {
-    "flowly": "anthropic/claude-haiku-5.5",   # proxy default, listed in every plan
+    "flowly": "anthropic/claude-haiku-5.5",   # paid plans' default; reconcile_flowly_model moves Free to its own
     "openrouter": "anthropic/claude-haiku-4.5",
     "anthropic": "claude-haiku-4-5",
     "openai": "gpt-4o-mini",

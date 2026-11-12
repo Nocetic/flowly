@@ -754,14 +754,24 @@ def _catalog_contains(models: list[Model], model_id: str) -> bool:
     return any("locked" not in model.tags and model.id in candidates for model in models)
 
 
-# The ONLY values reconcile may rewrite without the user asking. These are old
-# *schema defaults* a config can still carry from before the account catalog
-# existed — not choices anyone made. Everything else is a user's explicit
-# selection, and validating it against the catalog is not safe grounds to
-# replace it: the TUI runs this against a possibly-stale cached catalog at
-# boot, so a freshly released model that's absent from yesterday's cache would
-# otherwise be silently reverted to the backend default on every restart.
-_LEGACY_SCHEMA_DEFAULTS = frozenset({"moonshotai/kimi-k2.5"})
+# The ONLY values reconcile may rewrite without the user asking: the models
+# Flowly itself starts an agent on, never choices anyone made.
+# - Kimi K2.5: an old schema default a config can still carry.
+# - Claude Haiku 5.5: today's schema default, on every paid plan but not Free
+#   (flowly-app ``FREE_MODELS``), so a Free account's first message was refused.
+# - Claude Haiku 4.5: Free's default (``SPONSORED_FREE_DEFAULT_MODEL``), which a
+#   paid plan only keeps callable, unlisted; an upgraded agent moves to 5.5.
+# Each is replaced only when the account's catalog lacks it and has the plan's
+# default. Everything else is a user's explicit selection, and validating it
+# against the catalog is not safe grounds to replace it: this runs against a
+# possibly-stale cached catalog at boot, so a freshly released model that's
+# absent from yesterday's cache would otherwise be silently reverted to the
+# backend default on every restart.
+_LEGACY_SCHEMA_DEFAULTS = frozenset({
+    "moonshotai/kimi-k2.5",
+    "anthropic/claude-haiku-5.5",
+    "anthropic/claude-haiku-4.5",
+})
 
 
 def _is_legacy_schema_default(model_id: str) -> bool:
@@ -773,10 +783,10 @@ def _is_legacy_schema_default(model_id: str) -> bool:
 
 
 async def reconcile_flowly_model(*, force_refresh: bool = True) -> str | None:
-    """Migrate a stale legacy default to the account catalog's default model.
+    """Move a Flowly default the account's plan lacks to the plan's default model.
 
-    Scope is deliberately narrow: only an old schema default (or an empty
-    model) is ever replaced, and only when the authenticated catalog confirms
+    Scope is deliberately narrow: only a model Flowly itself starts agents on
+    (``_LEGACY_SCHEMA_DEFAULTS``) or an empty model is ever replaced, and only when the authenticated catalog confirms
     it's unavailable while the backend default is. A model the user actually
     chose is NEVER rewritten here — if their plan can't serve it, the request
     itself will say so, which is honest; a background rewrite that keeps
