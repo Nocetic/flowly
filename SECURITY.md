@@ -182,8 +182,16 @@ authorisation model.
 
 **Surfaces in Flowly:**
 
-- **Gateway WebSocket** (`flowly/gateway/server.py`). Local
-  IPC for the Desktop UI; loopback-only bind.
+- **Gateway WebSocket and HTTP** (`flowly/gateway/server.py`). Local
+  IPC for the Desktop UI on a loopback bind (the default). Bound beyond
+  loopback (`--remote`, `--host`) it is a network surface: every caller
+  presents the gateway token (about 256 bits, compared in constant
+  time; an address with 20 failures in a minute is refused for up to a
+  minute). Connections from other machines are TLS on the gateway's own
+  P-256 key (`gateway.tls`, `auto`), which the Flowly apps pin; plain
+  connections from other machines are accepted only while
+  `gateway.allowPlainRemote` is true. The token lives in `config.json`
+  only, never on a service's command line.
 - **Web channel via relay** (`useflowlyapp.com`). Pushes events to
   paired iOS devices and browser clients via APNs / SSE; resolves
   inbound RPC over the same channel. Pairing is mediated by the
@@ -309,9 +317,14 @@ Plugins reading agent memory are §2.5; nothing in §4.1 changes that.
 
 - Run the agent as a non-root user. The desktop bundle does this
   by default; the CLI inherits the operator's shell user.
-- Do not expose the gateway (`flowly gateway`, default port 18790)
-  to the public internet without VPN, Tailscale, or firewall
-  protection. The default bind is `127.0.0.1`.
+- The default bind is `127.0.0.1`. A gateway bound beyond it encrypts
+  connections from other machines with its own key, which the Flowly
+  apps pin; set `gateway.allowPlainRemote` to `false` once every app is
+  updated. Still restrict the port (firewall, security group) to the
+  addresses you connect from, or keep it on a VPN or Tailscale. A
+  gateway on Windows cannot encrypt yet: keep it off untrusted networks.
+- Replace the token with `flowly service rotate-token` when a device
+  holding it is lost; `--new-key` replaces the encryption key too.
 - The gateway's WebSocket and the relay (`useflowlyapp.com`) carry
   authorisation tokens; treat both as sensitive transport. The
   relay is currently the only externally-reachable surface in the
