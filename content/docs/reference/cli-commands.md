@@ -83,6 +83,7 @@ commands instead, so automation can never stop a service silently.
 | `--host` | Bind address. `0.0.0.0` accepts remote clients; default `127.0.0.1` (local only). |
 | `--token` | Set an explicit remote-access token (otherwise one is auto-generated on the first non-loopback bind). |
 | `--rotate-token` | Generate a fresh remote-access token before starting (invalidates the old one). For a gateway that runs as a service, use `flowly service rotate-token`. |
+| `--rotate-cert` | Make the gateway a new encryption key before starting. Every app pairs again from the new code. |
 
 An updated gateway registers the owner-only `/api/mcp/manage` route automatically;
 there is no separate `flowly mcp` command to start it. It requires a configured

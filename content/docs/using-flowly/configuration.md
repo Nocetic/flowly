@@ -201,6 +201,14 @@ Setting a provider explicitly (`/provider`, `flowly setup`, or `active` in this 
 | `host` | `"127.0.0.1"` |
 | `port` | `18790` (1–65535) |
 | `token` | `""` — static gateway administration token; the CLI ensures one on a non-loopback bind |
+| `requireAuth` | `false` — ask for the token even from this machine (a gateway behind a same-host proxy, where every client arrives from `127.0.0.1`) |
+| `tls` | `"auto"` — encrypt connections from other machines with the gateway's own key: `auto` when it listens beyond this machine, `on` always, `off` never. Callers on this machine keep plain HTTP on the same port |
+| `allowPlainRemote` | `true` — with encryption on, still accept unencrypted connections from other machines (apps too old to pin the key). `false` refuses them |
+
+The gateway's key lives in `~/.flowly/gateway/tls/` (`key.pem`, `cert.pem`,
+owner-only). It is made on first use, kept across restarts and certificate
+renewals, and replaced only by `flowly service rotate-token --new-key` or
+`flowly gateway --rotate-cert`. See [Self-hosting](self-hosting.md#connecting-your-devices).
 
 The dedicated `POST /api/mcp/manage` route always requires a valid, non-empty
 gateway token, including through an SSH loopback forward. An empty token may

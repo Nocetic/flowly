@@ -97,6 +97,48 @@ flowly enroll    # address, token and key, a link for the desktop, a code for th
 > - Restrict the port with a firewall / security group to the addresses you connect from, or keep it off the internet entirely: an SSH tunnel, or a private network such as Tailscale or WireGuard.
 > - The agent has shell and filesystem access on the host — **treat gateway access as host access.** See the repo's [`SECURITY.md`](https://github.com/Nocetic/flowly/blob/main/SECURITY.md).
 
+### Connecting your devices
+
+`flowly enroll` (or `/remote` in the TUI, or `flowly service install --remote`)
+prints everything an app needs:
+
+- **Address**: the LAN address for a device on the same network, and the
+  public address when it differs (at home that one needs a port forward on
+  your router).
+- **Port** and **Token**.
+- **Key**: the first 16 hex digits of the gateway's key, such as
+  `98C6 BFF6 4CE7 4227`. The desktop app shows the same digits under
+  Settings → Gateways once it is paired.
+- A `flowly://remote?…` **link**: paste it into a gateway's Address field in
+  the desktop app (Settings → Gateways) and the form fills itself.
+- A **code** to scan with the iOS or Android app.
+
+The link and the code carry the key, so an app paired from them is encrypted
+to it from its first connection. Typing the address and token by hand gives
+no key: the app then asks the gateway for it over its first, unencrypted
+connection and pins whatever answers. On a network you do not trust, pair
+from the link or the code instead.
+
+An app paired before the gateway had a key does the same once it is updated:
+it learns the key on its next connection and is encrypted from then on.
+
+**When the key changes.** The key is made once and kept, across restarts,
+renewed certificates and a new address. It changes only when you ask
+(`flowly service rotate-token --new-key`, `flowly gateway --rotate-cert`) or
+when `~/.flowly/gateway/tls/` is deleted. The apps then refuse the gateway and
+say its key changed; pair them again from the new code. If you did not change
+the key, something else is answering at that address: do not pair again.
+
+**Replacing the token.** `flowly service rotate-token` stops the service if it
+is running, saves a new token, starts it again and prints the new link and
+code. The old
+token stops working at once, and every app pairs again. It also removes a
+token an older `flowly service install` put on the service's command line.
+
+**Windows.** A gateway on Windows cannot yet encrypt: it serves other machines
+unencrypted and logs a warning when it starts. Reach it over a private network
+(Tailscale, WireGuard) or an SSH tunnel.
+
 ### MCP management from a remote app
 
 An updated gateway provides `POST /api/mcp/manage` for verified SSH-capable

@@ -145,6 +145,33 @@ Confirm the channel is `enabled` in config and that access control
 (`allowFrom` / pairing) permits the sender. See the channel's own page under
 [Channels](/docs/channels/overview).
 
+## Apps on other devices
+
+**The app says the gateway's key changed.**
+The gateway answered with a key other than the one the app paired with, so
+the app sent it nothing. If you made a new key (`flowly service rotate-token
+--new-key`, `flowly gateway --rotate-cert`, or deleted `~/.flowly/gateway/tls/`),
+pair the app again from the new link or code (`flowly enroll`). If you did
+not, another machine is answering at that address: check the address before
+pairing again.
+
+**The app cannot connect after `allowPlainRemote` was set to `false`.**
+That app connects unencrypted: it is too old to pin the key, or it was added
+with a host and token typed by hand and never learned the key. Update the app,
+then pair it from the link or code. Until all your apps are updated, leave
+`allowPlainRemote` at `true`.
+
+**`429` / "Too many failed sign-ins from this address".**
+An address that fails the token check 20 times in a minute is refused for up
+to a minute, even with the right token. It usually means an app still has an
+old token after `flowly service rotate-token`: pair it again, then wait a
+minute. Connections from the gateway's own machine are never refused.
+
+**The gateway prints "Encryption is off".**
+It could not make or read its key in `~/.flowly/gateway/tls/` (permissions, a
+full disk) and runs unencrypted. Fix the cause and restart. On Windows the
+gateway always runs unencrypted for now.
+
 ## Remote MCP setup
 
 If remote chat works but connecting an MCP service asks for WSS, the existing
