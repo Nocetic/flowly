@@ -735,6 +735,34 @@ def _provider_configured() -> bool:
     return provider_readiness().ready
 
 
+#: Every service's gateway runs with it (``flowly gateway --wait-for-provider``).
+WAIT_FOR_PROVIDER_FLAG = "--wait-for-provider"
+
+
+def _note_waiting_for_provider() -> None:
+    console.print(
+        "[yellow]No model provider yet:[/yellow] the agent starts and waits for one.\n"
+        "  [cyan]flowly login[/]   [dim]— sign in to Flowly[/]\n"
+        "  [cyan]flowly setup[/]   [dim]— or connect your own provider[/]"
+    )
+
+
+def _service_waits_for_provider(label: str) -> bool:
+    """Whether the installed service's gateway starts with no provider (installed by
+    a Core that passes ``--wait-for-provider``); one installed before would crash-loop."""
+    mac_plist, linux_unit, win_xml = _service_paths(label)
+    candidates = [mac_plist, linux_unit, win_xml]
+    if win_xml is not None:
+        candidates.append(win_xml.with_suffix(".vbs"))
+    for path in candidates:
+        try:
+            if path is not None and path.exists() and WAIT_FOR_PROVIDER_FLAG in path.read_text(encoding="utf-8", errors="ignore"):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _warn_no_provider(action: str) -> None:
     from flowly.integrations.active_provider import provider_readiness
 
@@ -961,13 +989,11 @@ def service_install(
     start_requested = bool(start)
     skipped_start_no_provider = False
 
-    # Preflight: don't hand launchd/systemd a gateway that will crash-loop
-    # on a missing provider. Install the unit either way (so it's ready),
-    # but skip the auto-start when there's nothing for it to run.
+    # A service runs `flowly gateway --wait-for-provider`: with no provider yet
+    # it starts anyway and takes one when its owner signs in, so it never
+    # crash-loops and Flowly Desktop can install it before the sign-in.
     if start and not _provider_configured():
-        _warn_no_provider("starting the service")
-        start = False
-        skipped_start_no_provider = True
+        _note_waiting_for_provider()
 
     mac_plist, linux_unit, win_xml = _service_paths(label)
     exec_argv = _resolve_flowly_exec_argv()
@@ -983,6 +1009,7 @@ def service_install(
     # so the port this agent settled on (another user of this computer may
     # hold the default) is one value that every reader agrees on.
     gateway_args = ["gateway", "--port", str(port)] if port else ["gateway"]
+    gateway_args.append(WAIT_FOR_PROVIDER_FLAG)
     if not port:
         from flowly.cli.gateway_cmd import _leave_another_users_port
 
@@ -1340,8 +1367,10 @@ def service_start(
 ):
     """Start installed background service."""
     if not _provider_configured():
-        _warn_no_provider("starting the service")
-        raise typer.Exit(1)
+        if not _service_waits_for_provider(label):
+            _warn_no_provider("starting the service")
+            raise typer.Exit(1)
+        _note_waiting_for_provider()
     mac_plist, linux_unit, win_xml = _service_paths(label)
     system = platform.system().lower()
 

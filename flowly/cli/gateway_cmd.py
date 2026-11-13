@@ -538,6 +538,12 @@ def gateway(
         hidden=True,
         help="Run a Desktop-managed, loopback-only profile backend.",
     ),
+    wait_for_provider: bool = typer.Option(
+        False,
+        "--wait-for-provider",
+        help="Start even with no model provider yet, and take one when you sign in "
+             "(services run this way, so they never crash-loop).",
+    ),
 ):
     """Start the flowly gateway."""
     # Windows: make stdout/stderr encode the Unicode glyphs we print (✓, →, the
@@ -875,6 +881,14 @@ def gateway(
     # modal and the gateway agree on what's running.
     from flowly.integrations.active_provider import resolve_active_provider
     active = resolve_active_provider(config)
+    # `is True`: called as a plain function, the default is Typer's OptionInfo.
+    if active is None and wait_for_provider is True:
+        # Installed before its owner signed in (Flowly Desktop's first launch,
+        # a service set up before `flowly login`): it runs, answers "no model
+        # yet", and signing in hot-reloads the real provider (on_provider_reload).
+        from flowly.integrations.active_provider import ActiveProvider
+
+        active = ActiveProvider(key="none", api_key="", api_base=None, source="none yet: waiting for sign-in")
     if active is None:
         console.print("[red]Error: No LLM provider available.[/red]")
         console.print(
@@ -900,12 +914,17 @@ def gateway(
         if provider_cfg is not None:
             fallback_keys = getattr(provider_cfg, "fallback_keys", []) or []
 
-    provider = build_provider(
-        active,
-        default_model=config.agents.defaults.model,
-        fallback_keys=fallback_keys,
-        config=config,
-    )
+    if active.key == "none":
+        from flowly.providers.no_provider import NoProvider
+
+        provider = NoProvider(config.agents.defaults.model)
+    else:
+        provider = build_provider(
+            active,
+            default_model=config.agents.defaults.model,
+            fallback_keys=fallback_keys,
+            config=config,
+        )
 
     # Create cron service first (agent needs it)
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
@@ -2867,7 +2886,9 @@ Respond to the user now:"""
             _objective_events.set_broadcaster(_announce_objectives)
             await agenda.start()
             if not local_runtime:
-                await heartbeat.start(run_on_start=True)
+                # No provider yet: the first beat waits for its interval, by when
+                # a sign-in has given the agent one.
+                await heartbeat.start(run_on_start=active.key != "none")
 
             # Warm the active provider's model catalogue.
             #
@@ -2884,6 +2905,8 @@ Respond to the user now:"""
             # reachable, and a failure is survivable because the guess is
             # still there. `warm_cache` swallows its own errors.
             async def _warm_and_reconcile() -> None:
+                if active.key == "none":
+                    return
                 await _warm_model_catalog(active.key)
                 if active.key == "flowly":
                     await _reconcile_flowly_default(on_provider_reload)

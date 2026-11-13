@@ -195,6 +195,9 @@ def classify_response(response: "LLMResponse") -> ErrorCategory:
     }
 
     # Machine-readable provider codes are the highest-confidence signal.
+    # No provider yet (flowly.providers.no_provider): retrying cannot help.
+    if "no_provider" in machine_signals:
+        return ErrorCategory.AUTH
     if machine_signals & {
         "context_length_exceeded",
         "model_context_window_exceeded",
@@ -287,6 +290,14 @@ def present_provider_error(response: "LLMResponse") -> ProviderErrorPresentation
             message=(
                 "Compact the conversation or reduce large attachments, then try again."
             ),
+            retryable=False,
+            category=category,
+        )
+    if category == ErrorCategory.AUTH and info is not None and info.code == "no_provider":
+        return ProviderErrorPresentation(
+            code="NO_PROVIDER",
+            title="Your agent has no model yet",
+            message="Sign in to Flowly or connect a model provider, then try again.",
             retryable=False,
             category=category,
         )

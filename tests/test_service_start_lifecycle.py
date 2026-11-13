@@ -140,7 +140,7 @@ def test_fresh_macos_install_bootstraps_gui_domain_and_verifies_health(
     assert plist_path.exists()
     plist = plistlib.loads(plist_path.read_bytes())
     assert plist["Label"] == LABEL
-    assert plist["ProgramArguments"][-3:] == ["gateway", "--port", str(PORT)]
+    assert plist["ProgramArguments"][-4:] == ["gateway", "--port", str(PORT), "--wait-for-provider"]
     assert not any(command[:2] == ["launchctl", "bootout"] for command, _check in commands)
     assert (
         ["launchctl", "bootstrap", "gui/501", str(plist_path)],
@@ -691,9 +691,12 @@ def test_occupied_non_gateway_port_is_not_reported_as_started(
     assert "occupied by PID 4321" in output.getvalue()
 
 
-def test_requested_start_without_provider_installs_but_returns_failure(
+def test_requested_start_without_provider_starts_a_gateway_that_waits_for_one(
     install_env, monkeypatch, output
 ):
+    """Flowly Desktop installs the agent before its owner signs in (2026-11-13):
+    the service starts, and its gateway waits for a provider instead of
+    crash-looping (``flowly gateway --wait-for-provider``)."""
     unit_path = install_env / f"{LABEL}.service"
     monkeypatch.setattr(service_cmd.platform, "system", lambda: "Linux")
     monkeypatch.setattr(
@@ -703,14 +706,16 @@ def test_requested_start_without_provider_installs_but_returns_failure(
     )
     monkeypatch.setattr(service_cmd, "_provider_configured", lambda: False)
     monkeypatch.setattr(service_cmd, "_ensure_linger_linux", lambda: None)
-    monkeypatch.setattr(service_cmd, "_run_cmd", lambda args, check=True: _result())
+    commands = []
+    monkeypatch.setattr(service_cmd, "_run_cmd", lambda args, check=True: commands.append(args) or _result())
+    monkeypatch.setattr(service_cmd, "_require_service_health", lambda port, **kwargs: None)
 
-    with pytest.raises(typer.Exit) as exc:
-        _install()
+    _install()
 
-    assert exc.value.exit_code == 1
     assert unit_path.exists()
-    assert "not starting the service" in output.getvalue()
+    assert "--wait-for-provider" in unit_path.read_text()
+    assert any(args[:3] == ["systemctl", "--user", "restart"] or "start" in args for args in commands)
+    assert "waits for one" in output.getvalue()
 
 
 def test_default_startup_wait_fits_desktop_cli_timeout():
