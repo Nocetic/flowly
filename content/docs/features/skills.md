@@ -1,7 +1,7 @@
 ---
 title: Skills
 eyebrow: Features
-description: A skill is a directory containing a SKILL.md "recipe" with YAML frontmatter and a markdown body that teaches the agent how to perform a task or use a tool. Flowly ships 135 builtin skills, and you can install more, drop them into your workspace, or have the agent author its own.
+description: A skill is a directory containing a SKILL.md "recipe" with YAML frontmatter and a markdown body that teaches the agent how to perform a task or use a tool. Flowly installs 39 core skills and ships 106 more in its skill library, one command away; you can also install skills from the hub, drop them into your workspace, or have the agent author its own.
 ---
 
 ## SKILL.md format
@@ -29,6 +29,31 @@ The `metadata` field is a JSON string carrying a `flowly` object. Recognized `fl
 | `install` | Install hint. |
 | `related_skills` | Related skill names. |
 | `tags` | Free-form tags. |
+
+## Core skills and the library
+
+Every agent starts with a short core set (`flowly/skills/`): your Mac's apps
+(Notes, Reminders, Messages, Find My), your accounts (Google Workspace, GitHub,
+Notion, Linear, Teams), everyday work (weather, maps, summaries, YouTube,
+documents, spreadsheets, decks, charts, writing) and Flowly's own (flowlets,
+the browser, computer use, MCP, memory import, plans, skill and plugin
+authoring). A short list is one the agent can choose from.
+
+The library (`flowly/skills_library/`) ships with Flowly but is not installed:
+financial models, engineering and science, academic research, software
+development, creative tools, business documents, and skills that need a
+service key or a tool of their own. One installs in one step, with no network:
+
+```bash
+flowly skills library            # what is in it
+flowly skills library finance    # only what matches
+flowly skills install dcf-model  # add one
+```
+
+The agent can do the same (`skill_manage` actions `library` and `install`),
+and its skill list tells it the library is there. An agent installed before
+the split keeps any library skill it changed; an unchanged one leaves with the
+next update and installs again the same way.
 
 ## Discovery and priority
 
@@ -59,7 +84,7 @@ The agent does not see full skill bodies up front. Skills are disclosed in three
 | Tool | Capability |
 | --- | --- |
 | `skill_view` | Read-only. Loads and discloses a skill body (tier 2) or a linked file (tier 3). Also resolves plugin-namespaced skills as `plugin:name`. |
-| `skill_manage` | Create / patch / edit / delete / list / write_file / remove_file / archive / restore for agent-authored skills under `~/.flowly/skills/<name>/`. |
+| `skill_manage` | Create / patch / edit / delete / list / write_file / remove_file / archive / restore for agent-authored skills under `~/.flowly/skills/<name>/`; `library` lists Flowly's skill library and `install` adds one. |
 
 `skill_manage` validates the skill name against `^[a-z0-9][a-z0-9_-]{0,63}$`, requires a `description` in frontmatter, scans content for prompt injection, and uses atomic writes. Supporting files are capped at 1 MB and restricted to the four supporting subdirs.
 
@@ -70,7 +95,8 @@ A thin alias over the hub:
 | Command | Description |
 | --- | --- |
 | `flowly skills list [--all]` | List installed skills. |
-| `flowly skills install <source> [--force]` | Install a skill from the hub. |
+| `flowly skills library [query]` | List Flowly's skill library (shipped, not installed). |
+| `flowly skills install <source> [--force]` | Install a skill: a library skill by name, or one from the hub. |
 | `flowly skills remove <skill>` | Remove an installed skill. |
 | `flowly skills search <query>` | Search the hub registry. |
 

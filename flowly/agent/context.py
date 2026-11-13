@@ -1628,6 +1628,7 @@ class ContextBuilder:
 Scan skills below. If one matches your task, load it with `skill_view(name)` and follow its instructions.
 Skip the read when a first-class tool already documents the workflow (flowlet, cron, plan): its description, templates and guide are the contract. A skill is for knowledge a tool doesn't give you.
 Skills with available="false" need dependencies — try installing with apt/brew.
+Not here? Flowly's skill library has specialist ones (skill_manage action="library", then "install").
 
 {skills_summary}""")
 
@@ -2389,7 +2390,9 @@ When in doubt, ASK FIRST. A wrong action can't be undone.""")
                     "with `skill_view(name)` and follow it. Skills marked "
                     "available=\"false\" need setup. Skip the read when a first-class "
                     "tool already documents the workflow (flowlet, cron, plan): its "
-                    "description, templates and guide are the contract.\n\n"
+                    "description, templates and guide are the contract. Not here? "
+                    "Flowly's skill library has specialist ones (skill_manage "
+                    "action=\"library\", then \"install\").\n\n"
                     f"{skills_summary}"
                 )
 

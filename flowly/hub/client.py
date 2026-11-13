@@ -343,6 +343,12 @@ class HubClient:
             return "local", {"path": source}
 
         else:
+            # A skill of Flowly's own library ships with Core: no network.
+            from flowly.skills.library import library_skill
+
+            shipped = library_skill(source)
+            if shipped is not None:
+                return "library", {"path": str(shipped)}
             # Registry skill
             # Handle version: skill-name@1.2.3
             version = None

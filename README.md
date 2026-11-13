@@ -68,7 +68,7 @@ flowly service install --start    # launchd (macOS) / systemd (Linux) / Task Sch
   <td>Every fact you share becomes part of a governed <b>memory of your world</b> with a calibrated trust score — 👍/👎 to retune it, and a background consolidation pass merges duplicates and retires stale notes. Structured facts also land in a <b>knowledge graph</b>. Opt in and Flowly mines your recurring procedures to <b>write and refine its own skills</b>, every change snapshotted and reversible.</td>
 </tr>
 <tr>
-  <td><b>135 built-in skills</b></td>
+  <td><b>39 core skills + a library of 106</b></td>
   <td>Plus skill <b>bundles</b> (one keystroke enables a whole stack) and drop-in Markdown skills. Compatible with the open <a href="https://agentskills.io">agentskills.io</a> standard.</td>
 </tr>
 <tr>
@@ -240,7 +240,7 @@ in **[CONTRIBUTING.md](CONTRIBUTING.md#development-setup)**.
 
 ## Status
 
-Flowly was open-source in v1.x, closed during the v2 rewrite, and is back open under **Apache 2.0**. The agent, 40+ tools, 135 skills, and every channel adapter in this repo are the same code that ships inside the Flowly Desktop app — there is no separate "lite" build.
+Flowly was open-source in v1.x, closed during the v2 rewrite, and is back open under **Apache 2.0**. The agent, 40+ tools, 145 skills, and every channel adapter in this repo are the same code that ships inside the Flowly Desktop app — there is no separate "lite" build.
 
 Active development. Issues and PRs welcome.
 

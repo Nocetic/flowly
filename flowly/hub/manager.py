@@ -233,7 +233,7 @@ class SkillManager:
             )
         if source_type == "url":
             return self._install_from_url(params["url"], staging, force)
-        if source_type == "local":
+        if source_type in ("local", "library"):
             return self._install_from_local(params["path"], staging, force)
         logger.error(f"Unknown source type: {source_type}")
         return None

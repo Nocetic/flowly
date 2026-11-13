@@ -118,7 +118,11 @@ class SkillManageTool(Tool):
         return (
             "Manage skills (create, patch, edit, delete, list). "
             "Use this only when the user explicitly asks to create, update, "
-            "delete, or inspect skills."
+            "delete, or inspect skills. Flowly's skill library holds specialist "
+            "skills that are not installed (financial models, engineering and "
+            "science, academic research, software development, creative tools, "
+            "business documents): 'library' lists them, 'install' adds one by name "
+            "when the owner asks or the task needs one."
         )
 
     @property
@@ -128,14 +132,15 @@ class SkillManageTool(Tool):
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["create", "patch", "edit", "delete", "list", "write_file", "remove_file", "archive", "restore"],
+                    "enum": ["create", "patch", "edit", "delete", "list", "write_file", "remove_file", "archive", "restore", "library", "install"],
                     "description": "The action to perform.",
                 },
                 "name": {
                     "type": "string",
                     "description": (
                         "Skill name (lowercase, hyphens/underscores, max 64 chars). "
-                        "Required for all actions except 'list'."
+                        "Required for all actions except 'list' and 'library' "
+                        "(for 'library' it narrows the list to names and descriptions containing it)."
                     ),
                 },
                 "content": {
@@ -200,7 +205,42 @@ class SkillManageTool(Tool):
             return self._archive(kwargs.get("name", ""))
         if action == "restore":
             return self._restore(kwargs.get("name", ""))
-        return f"Error: Unknown action '{action}'. Use: create, patch, edit, delete, list, write_file, remove_file, archive, restore."
+        if action == "library":
+            return self._library(kwargs.get("name", ""))
+        if action == "install":
+            return self._install(kwargs.get("name", ""))
+        return f"Error: Unknown action '{action}'. Use: create, patch, edit, delete, list, write_file, remove_file, archive, restore, library, install."
+
+    def _library(self, query: str) -> str:
+        """Flowly's skill library: shipped with Core, not installed."""
+        from flowly.skills.library import describe, library_skills
+
+        needle = query.strip().lower()
+        rows = []
+        for name, path in library_skills().items():
+            desc = describe(path)
+            if needle and needle not in name.lower() and needle not in desc.lower():
+                continue
+            rows.append(f"- {name}: {desc[:140]}" if desc else f"- {name}")
+        if not rows:
+            return f"No library skill matches '{query}'." if needle else "The skill library is empty."
+        return "Flowly's skill library (install one with action='install'):\n" + "\n".join(rows)
+
+    def _install(self, name: str) -> str:
+        """Add one library skill to this agent's skills."""
+        from flowly.hub.manager import SkillManager
+        from flowly.skills.library import library_skill
+
+        if library_skill(name) is None:
+            return f"Error: '{name}' is not in Flowly's skill library. Use action='library' to see what is."
+        try:
+            with SkillManager(managed_dir=_skills_dir(), workspace_dir=self._workspace) as manager:
+                skill = manager.install(name)
+        except Exception as exc:  # noqa: BLE001
+            return f"Error: could not install '{name}': {exc}"
+        if skill is None:
+            return f"Error: could not install '{name}'."
+        return f"Installed '{name}'. Load it with skill_view('{name}')."
 
     # ── Actions ────────────────────────────────────────────────────
 

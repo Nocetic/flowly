@@ -156,6 +156,9 @@ class SkillBlocked(Exception):
 
 def trust_for(source_type: str) -> str:
     """The trust a parsed source carries (``HubClient.parse_skill_source``)."""
+    if source_type == "library":
+        # Flowly's own library ships with Core, as the built-in skills do.
+        return TRUST_BUILTIN
     return TRUST_REGISTRY if source_type == "registry" else TRUST_COMMUNITY
 
 

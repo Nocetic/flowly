@@ -314,9 +314,15 @@ async def test_second_manager_cooperatively_stops_desktop_owned_profile_runtime(
         stopped = await remote_manager.stop("writer")
         assert stopped["status"]["state"] == "stopped"
         assert profiles.read_runtime_lease(root / "writer") is None
+        # The owner either still holds the closed socket (OFFLINE/STOPPED) or
+        # has already seen it close (NOT_RUNNING): which one is a race with the
+        # runtime's exit (a faster exit, 2026-11-13, made the owner see it
+        # first and a plain read restart the agent). Either way a background
+        # read never reaches or wakes the stopped runtime.
         with pytest.raises(ProfileHostError) as owner_closed:
-            await desktop_owner.rpc("writer", "sessions.list", {})
-        assert owner_closed.value.code in {"PROFILE_OFFLINE", "PROFILE_STOPPED"}
+            await desktop_owner.rpc("writer", "sessions.list", {}, if_running=True)
+        assert owner_closed.value.code in {"PROFILE_OFFLINE", "PROFILE_STOPPED", "PROFILE_NOT_RUNNING"}
+        assert profiles.read_runtime_lease(root / "writer") is None
     finally:
         await remote_manager.shutdown()
         await desktop_owner.shutdown()

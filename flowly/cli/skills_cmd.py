@@ -52,6 +52,26 @@ def skills_list(
     console.print(table)
 
 
+@skills_app.command("library")
+def skills_library(
+    query: str = typer.Argument("", help="Only skills whose name or description contains this"),
+):
+    """List Flowly's skill library: specialist skills that ship with Flowly, not installed."""
+    from flowly.skills.library import describe, library_skills
+
+    needle = query.strip().lower()
+    table = Table(title="Flowly's skill library")
+    table.add_column("Skill", style="cyan")
+    table.add_column("What it does")
+    for name, path in library_skills().items():
+        desc = describe(path)
+        if needle and needle not in name.lower() and needle not in desc.lower():
+            continue
+        table.add_row(name, desc[:100])
+    console.print(table)
+    console.print("[dim]Add one: flowly skills install <skill>[/dim]")
+
+
 @skills_app.command("install")
 def skills_install(
     source: str = typer.Argument(..., help="Skill source"),

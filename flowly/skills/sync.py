@@ -182,10 +182,24 @@ def sync_skills(quiet: bool = True) -> dict[str, list[str] | int]:
                 if not quiet:
                     logger.info(f"[SkillSync] Preserved user-modified: {name}")
 
-    # Clean removed bundled skills from manifest
+    # Clean removed bundled skills from manifest. A skill that moved to the
+    # library (flowly.skills.library) leaves the agent too, unless its owner
+    # changed it: then it is theirs, and stays as a skill of their own.
+    from flowly.skills.library import library_skills
+
+    library = library_skills()
+    result["retired"] = []
     for name in manifest:
         if name not in bundled_names and name not in new_manifest:
             result["cleaned"].append(name)  # type: ignore
+            dest = user_dir / name
+            origin_hash = manifest[name]
+            if name in library and origin_hash and dest.is_dir() and _dir_hash(dest) == origin_hash:
+                try:
+                    shutil.rmtree(str(dest))
+                    result["retired"].append(name)  # type: ignore
+                except OSError as exc:
+                    logger.warning(f"[SkillSync] Could not retire {name}: {exc}")
 
     _write_manifest(new_manifest)
 
@@ -212,6 +226,11 @@ def _manifest_is_fresh() -> bool:
     manifest = _manifest_path()
     if not manifest.exists():
         return False
+    # A skill the bundle no longer has (moved to the library): sync retires it,
+    # even where no file of the bundle is newer (a git checkout).
+    bundled = {name for name, _ in _discover_bundled()}
+    if any(name not in bundled for name in _read_manifest()):
+        return False
     manifest_mtime = manifest.stat().st_mtime
     for f in _get_bundled_dir().rglob("*"):
         if f.is_file() and f.stat().st_mtime > manifest_mtime:
@@ -235,8 +254,11 @@ def ensure_synced(quiet: bool = True) -> dict[str, list[str] | int] | None:
         result = sync_skills(quiet=quiet)
         _SYNCED_THIS_PROCESS = True
         copied, updated = result.get("copied", []), result.get("updated", [])
+        retired = result.get("retired", [])
         if copied or updated:
             logger.info(f"[SkillSync] {len(copied)} new, {len(updated)} updated skills")
+        if retired:
+            logger.info(f"[SkillSync] {len(retired)} skills moved to the library: {', '.join(retired)}")
         return result
     except Exception as e:
         logger.warning(f"[SkillSync] Failed (non-critical): {e}")
