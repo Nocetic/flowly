@@ -1448,6 +1448,8 @@ def service_start(
             # covers users who only ever run `service start` on an already
             # installed unit (no re-install).
             _ensure_linger_linux()
+            # Stopped with --until-start it was disabled: on again, at login too.
+            _run_cmd(["systemctl", "--user", "enable", label], check=False)
             _run_cmd(["systemctl", "--user", "start", label])
             _require_service_health(_port, manager="systemd")
             console.print(f"[green]✓[/green] Started service {label}")
@@ -1488,8 +1490,21 @@ def service_start(
 @service_app.command("stop")
 def service_stop(
     label: str = typer.Option(DEFAULT_SERVICE_LABEL, "--label", help="Service label"),
+    until_start: bool = typer.Option(
+        False, "--until-start",
+        help="Keep it off, at login too, until `flowly service start` (Flowly Desktop "
+             "does this when its agent should run only while the app does).",
+    ),
 ):
-    """Stop background service."""
+    """Stop background service.
+
+    Plain ``stop`` leaves the service installed and enabled, so the service
+    manager starts it again at the next login (macOS ``RunAtLoad``, a systemd
+    user unit). ``--until-start`` also disables it there; ``service start``
+    enables it again. A Windows task already stays off: its supervisor exits
+    at logon while the stop flag is there, and ``start`` clears it.
+    """
+    until_start = until_start is True  # called as a plain function, the default is Typer's OptionInfo
     mac_plist, linux_unit, win_xml = _service_paths(label)
     system = platform.system().lower()
 
@@ -1506,8 +1521,13 @@ def service_stop(
         if system == "darwin" and mac_plist:
             _run_cmd(["launchctl", "stop", label], check=False)
             _run_cmd(["launchctl", "unload", str(mac_plist)], check=False)
+            if until_start:
+                # Not loaded at the next login either; `service start` enables it.
+                _run_cmd(["launchctl", "disable", _launchd_target(label, _launchd_domain(label))], check=False)
         elif system == "linux":
             _run_cmd(["systemctl", "--user", "stop", label], check=False)
+            if until_start:
+                _run_cmd(["systemctl", "--user", "disable", label], check=False)
         elif system == "windows":
             # Signal the supervisor loop to exit (covers the Startup-folder
             # fallback that schtasks /end can't reach), then end the task.
@@ -1525,7 +1545,7 @@ def service_stop(
         _kill_gateway_on_port(port)
         if system == "darwin":
             _clear_launchd_fallback_marker(label)
-        console.print(f"[green]✓[/green] Stopped service {label}")
+        console.print(f"[green]✓[/green] Stopped service {label}" + (" (off until `flowly service start`)" if until_start else ""))
     except typer.Exit:
         raise
     except Exception as e:

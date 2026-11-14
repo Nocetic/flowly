@@ -732,3 +732,60 @@ def test_default_startup_wait_fits_desktop_cli_timeout():
         service_cmd.SERVICE_START_TOTAL_BUDGET
         + service_cmd.SERVICE_HEALTH_REQUEST_TIMEOUT
     ) < 30.0
+
+
+# ── Off until started (Flowly Desktop's "run in the background" off, 2026-11-14) ──
+
+
+def _record_stop(monkeypatch, tmp_path, system: str):
+    plist = tmp_path / f"{LABEL}.plist"
+    plist.write_text("<plist/>")
+    unit = tmp_path / f"{LABEL}.service"
+    unit.write_text("[Service]")
+    monkeypatch.setattr(service_cmd.platform, "system", lambda: system)
+    monkeypatch.setattr(service_cmd, "_service_paths",
+                        lambda _label: (plist, None, None) if system == "Darwin" else (None, unit, None))
+    monkeypatch.setattr(service_cmd, "_extract_port_from_plist", lambda _p: PORT)
+    monkeypatch.setattr(service_cmd, "_extract_port_from_unit", lambda _p: PORT)
+    monkeypatch.setattr(service_cmd, "_kill_gateway_on_port", lambda _port: None)
+    monkeypatch.setattr(service_cmd, "_clear_launchd_fallback_marker", lambda _label: None)
+    monkeypatch.setattr(service_cmd.os, "getuid", lambda: 501)
+    commands: list[list[str]] = []
+
+    def fake_run(args, check=True):
+        commands.append(list(args))
+        if args[:2] == ["launchctl", "print"]:
+            return _result(1)
+        if args == ["launchctl", "managername"]:
+            return _result(stdout="Aqua\n")
+        return _result()
+
+    monkeypatch.setattr(service_cmd, "_run_cmd", fake_run)
+    return commands
+
+
+def test_a_mac_service_stopped_until_start_stays_off_at_login(tmp_path, monkeypatch, output) -> None:
+    """Plain stop only unloads it: launchd loads the plist again at the next login (RunAtLoad)."""
+    commands = _record_stop(monkeypatch, tmp_path, "Darwin")
+    service_cmd.service_stop(label=LABEL)
+    assert not any(c[:2] == ["launchctl", "disable"] for c in commands)
+
+    commands.clear()
+    service_cmd.service_stop(label=LABEL, until_start=True)
+    assert ["launchctl", "disable", f"gui/501/{LABEL}"] in commands
+    assert "off until" in output.getvalue()
+
+
+def test_a_linux_service_stopped_until_start_is_disabled_and_start_enables_it(tmp_path, monkeypatch) -> None:
+    commands = _record_stop(monkeypatch, tmp_path, "Linux")
+    service_cmd.service_stop(label=LABEL, until_start=True)
+    assert ["systemctl", "--user", "disable", LABEL] in commands
+
+    unit = tmp_path / f"{LABEL}.service"
+    _prepare_start(monkeypatch, system="Linux", paths=(None, unit, None))
+    monkeypatch.setattr(service_cmd, "_extract_port_from_unit", lambda _p: PORT)
+    monkeypatch.setattr(service_cmd, "_require_service_health", lambda port, **kwargs: None)
+    started: list[list[str]] = []
+    monkeypatch.setattr(service_cmd, "_run_cmd", lambda args, check=True: started.append(list(args)) or _result())
+    service_cmd.service_start(label=LABEL)
+    assert started.index(["systemctl", "--user", "enable", LABEL]) < started.index(["systemctl", "--user", "start", LABEL])
