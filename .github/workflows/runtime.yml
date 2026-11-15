@@ -87,7 +87,7 @@ jobs:
           built="$(uv run --no-project --python 3.12 python -c "import json; print(json.load(open('dist/runtime/flowly-runtime/flowly-runtime.json'))['target'])")"
           test "$built" = "${{ matrix.target }}" || { echo "built $built, expected ${{ matrix.target }}"; exit 1; }
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: flowly-runtime-${{ matrix.target }}
           path: |
