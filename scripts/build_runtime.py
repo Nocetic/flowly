@@ -18,6 +18,14 @@ target builds on its own runner. Layout of the folder:
 
 The source comes from `git archive <ref>`, never from the working tree, so
 uncommitted edits can't ship.
+
+What a runtime never runs is left out (Tcl/Tk, IDLE, lib2to3, pip, C headers,
+type stubs, test suites), and the rest is byte-compiled ahead with
+unchecked-hash .pyc files, which Python loads without looking at the source's
+time (2026-11-15: a zip keeps file times to 2 seconds in local time, so every
+timestamp .pyc in the Windows runtime was stale and Core compiled its whole
+tree again at every start). Everything but Core ships as .pyc alone; Core
+keeps its .py beside them. A Windows install writes half the files it did.
 """
 from __future__ import annotations
 
@@ -130,12 +138,132 @@ def install_python(version: str, work: Path, destination: Path) -> Path:
     return exe
 
 
-def compile_stdlib(python: Path) -> None:
-    """Byte-compile the standard library: the runtime runs with -B, so nothing compiles later."""
-    stdlib = output([python, "-I", "-c", "import sysconfig; print(sysconfig.get_paths()['stdlib'])"])
-    # The test suites hold files that are invalid on purpose.
-    run([python, "-I", "-m", "compileall", "-q", "-j", "0",
-         "-x", r"[/\\](test|tests|lib2to3[/\\]tests|idle_test)[/\\]", stdlib])
+# Never run by a runtime, so never shipped (paths under the Python's prefix):
+# Tcl/Tk and what needs it, headers and import libraries for building C code,
+# man pages.
+PREFIX_LEFT_OUT = ("include", "libs", "share", "tcl", "lib/tcl*", "lib/tk*", "lib/itcl*", "lib/thread*",
+                   "lib/libtcl*", "lib/libtk*", "lib/pkgconfig")
+# Extension modules of the above and CPython's own test modules (DLLs\ on Windows, lib-dynload/ elsewhere).
+EXTENSIONS_LEFT_OUT = ("_tkinter*", "tcl*.dll", "tk*.dll", "_test*", "_ctypes_test*", "xxlimited*", "_xxtestfuzz*",
+                       "_xxsubinterpreters*", "_xxinterpchannels*")
+# Standard library modules no agent imports. ensurepip stays: `python -m ensurepip` brings pip back.
+STDLIB_LEFT_OUT = ("idlelib", "tkinter", "turtledemo", "lib2to3", "test", "turtle.py")
+# Installed packages: pip (Core installs with uv) and the files only a build or a type checker reads.
+PACKAGES_LEFT_OUT = ("pip", "pip-*.dist-info")
+PACKAGE_FILES_LEFT_OUT = frozenset({".pyi", ".h", ".hpp", ".c", ".cpp", ".pxd", ".pyx", ".pxi", ".f", ".f90", ".lib", ".chm"})
+# Test suites inside packages (numpy.testing is a module, not a suite, and stays).
+PACKAGE_TEST_DIRS = frozenset({"tests", "test"})
+# Core: its own package keeps its sources (tracebacks, skills' scripts); everything else ships as .pyc only.
+CORE_PACKAGE = "flowly"
+
+
+def python_paths(python: Path) -> tuple[Path, Path]:
+    """The interpreter's standard library and site-packages folders."""
+    stdlib, purelib = output([python, "-I", "-c",
+                              "import sysconfig; p = sysconfig.get_paths(); print(p['stdlib']); print(p['purelib'])"]).splitlines()
+    return Path(stdlib), Path(purelib)
+
+
+def _remove(path: Path) -> int:
+    """Removes a file or a folder; returns how many files went."""
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+        return 1
+    if path.is_dir():
+        count = sum(1 for p in path.rglob("*") if not p.is_dir())
+        shutil.rmtree(path)
+        return count
+    return 0
+
+
+def prune(prefix: Path, stdlib: Path, site_packages: Path) -> int:
+    """Removes what a runtime never runs (the *_LEFT_OUT lists). Returns how many files went."""
+    removed = 0
+    for pattern in PREFIX_LEFT_OUT:
+        for path in prefix.glob(pattern):
+            removed += _remove(path)
+    for folder in (prefix / "DLLs", stdlib / "lib-dynload"):
+        for pattern in EXTENSIONS_LEFT_OUT:
+            for path in folder.glob(pattern):
+                removed += _remove(path)
+    for name in STDLIB_LEFT_OUT:
+        removed += _remove(stdlib / name)
+    for pattern in PACKAGES_LEFT_OUT:
+        for path in site_packages.glob(pattern):
+            removed += _remove(path)
+    for top in sorted(site_packages.iterdir()):
+        if top.name == CORE_PACKAGE or not top.is_dir():
+            continue
+        for path in sorted(top.rglob("*"), reverse=True):
+            if path.is_dir() and path.name in PACKAGE_TEST_DIRS:
+                removed += _remove(path)
+            elif path.is_file() and path.suffix.lower() in PACKAGE_FILES_LEFT_OUT:
+                removed += _remove(path)
+    return removed
+
+
+def compile_runtime(python: Path, stdlib: Path, site_packages: Path) -> int:
+    """
+    Byte-compiles everything ahead, as unchecked-hash .pyc (loaded without a look at the source's time), and
+    leaves the standard library and every package but Core as .pyc only. The runtime runs with -B, so nothing
+    compiles later. Returns how many sources went.
+    """
+    for cache in [*stdlib.rglob("__pycache__")]:
+        shutil.rmtree(cache, ignore_errors=True)
+    # -B: the compiler's own imports (and its worker processes') write no timestamp .pyc of their own.
+    compile_all = [python, "-I", "-B", "-m", "compileall", "-q", "-j", "0", "--invalidation-mode", "unchecked-hash"]
+    core = site_packages / CORE_PACKAGE
+    # Core: .pyc in __pycache__ beside its sources.
+    run([*compile_all, core])
+    # The rest: legacy .pyc in place of each source (-b). A file that does not compile (a template, a file meant
+    # for another Python) keeps its source.
+    sep = r"[/\\]"
+    subprocess.run([str(a) for a in [*compile_all, "-b", "-x", f"{sep}site-packages{sep}{CORE_PACKAGE}{sep}", stdlib]],
+                   check=False)
+    dropped = 0
+    for source in stdlib.rglob("*.py"):
+        if source.is_relative_to(core) or not source.with_suffix(".pyc").is_file():
+            continue
+        source.unlink()
+        dropped += 1
+    return dropped
+
+
+IMPORT_PROBE = r"""
+import importlib, json, pkgutil, sys, sysconfig, warnings
+warnings.simplefilter("ignore")
+ok = []
+def attempt(name):
+    try:
+        importlib.import_module(name)
+        ok.append(name)
+    except BaseException:
+        pass
+site = sysconfig.get_paths()["purelib"]
+for module in pkgutil.iter_modules([site]):
+    attempt(module.name)
+import flowly
+for module in pkgutil.walk_packages(flowly.__path__, "flowly.", onerror=lambda name: None):
+    attempt(module.name)
+print(json.dumps(sorted(set(ok))))
+"""
+
+
+def importable(python: Path, env: dict[str, str] | None = None) -> set[str]:
+    """Every top-level package in site-packages and every Core module that imports, in a fresh interpreter."""
+    with tempfile.TemporaryDirectory(prefix="flowly-runtime-probe-") as neutral:
+        text = output([python, "-s", "-P", "-B", "-c", IMPORT_PROBE], cwd=neutral, env=env)
+    return set(json.loads(text.splitlines()[-1]))
+
+
+def pyc_modes(root: Path) -> dict[str, int]:
+    """How many .pyc files carry each invalidation mode: timestamp, checked-hash, unchecked-hash."""
+    modes = {"timestamp": 0, "checked-hash": 0, "unchecked-hash": 0}
+    for pyc in root.rglob("*.pyc"):
+        with pyc.open("rb") as f:
+            flags = int.from_bytes(f.read(8)[4:8], "little")
+        modes["timestamp" if not flags & 1 else "checked-hash" if flags & 2 else "unchecked-hash"] += 1
+    return modes
 
 
 def runtime_extras(source: Path) -> list[str]:
@@ -156,8 +284,8 @@ def install_core(source: Path, python: Path, work: Path) -> None:
     wheels = work / "wheel"
     run(["uv", "build", "--wheel", "--out-dir", wheels, source])
     [wheel] = wheels.glob("flowly_ai-*.whl")
-    common = ["uv", "pip", "install", "--python", python, "--no-cache", "--compile-bytecode",
-              "--link-mode", "copy"]
+    # Not compiled here: compile_runtime does it once the runtime is complete.
+    common = ["uv", "pip", "install", "--python", python, "--no-cache", "--link-mode", "copy"]
     run([*common, "--requirement", requirements])
     run([*common, "--no-deps", wheel])
 
@@ -173,8 +301,11 @@ def write_launchers(runtime: Path) -> None:
         launcher.chmod(0o755)
 
 
-def smoke_test(runtime: Path, version: str) -> None:
-    """The runtime starts from its own folder and reports the version it was built from."""
+def smoke_test(runtime: Path, version: str, imported: set[str] | None = None) -> None:
+    """
+    The runtime starts from its own folder and reports the version it was built from, its .pyc files are all
+    unchecked-hash, and everything that imported before the build left files out still imports.
+    """
     launcher = runtime / "bin" / ("flowly.cmd" if sys.platform == "win32" else "flowly")
     env = {k: v for k, v in os.environ.items() if not k.startswith(("PYTHON", "VIRTUAL_ENV", "UV_"))}
     python = runtime / "python" / ("python.exe" if sys.platform == "win32" else "bin/python3")
@@ -191,6 +322,13 @@ def smoke_test(runtime: Path, version: str) -> None:
                          env=env, cwd=neutral)
     if not Path(located).resolve().is_relative_to(runtime.resolve()):
         raise SystemExit(f"build_runtime: Core imported from {located}, outside the runtime")
+    modes = pyc_modes(runtime)
+    if modes["timestamp"] or modes["checked-hash"] or not modes["unchecked-hash"]:
+        raise SystemExit(f"build_runtime: the runtime's .pyc files are {modes}, expected unchecked-hash only")
+    if imported is not None:
+        missing = sorted(imported - importable(python, env))
+        if missing:
+            raise SystemExit(f"build_runtime: left-out files broke these imports: {missing[:20]}")
     # Inside a signed app a written file breaks the signature's seal.
     written = sorted(_files(runtime) - before)
     if written:
@@ -238,15 +376,23 @@ def main() -> None:
         version = tomllib.loads((source / "pyproject.toml").read_text())["project"]["version"]
         runtime.mkdir()
         python = install_python(args.python, work, runtime / "python")
-        compile_stdlib(python)
         install_core(source, python, work)
+        stdlib, site_packages = python_paths(python)
+        clean_env = {k: v for k, v in os.environ.items() if not k.startswith(("PYTHON", "VIRTUAL_ENV", "UV_"))}
+        imported = importable(python, clean_env) - {name.split("-")[0] for name in PACKAGES_LEFT_OUT}
+        files = sum(1 for p in runtime.rglob("*") if not p.is_dir())
+        removed = prune(runtime / "python", stdlib, site_packages)
+        sources = compile_runtime(python, stdlib, site_packages)
+        print(f"runtime: {files} files installed, {removed} left out, {sources} sources as .pyc only", flush=True)
 
     write_launchers(runtime)
     python_version = output([python, "-c", "import platform; print(platform.python_version())"])
     manifest = {"name": "flowly-runtime", "version": version, "commit": commit,
                 "target": target, "python": python_version}
     (runtime / MANIFEST).write_text(json.dumps(manifest, indent=2) + "\n")
-    smoke_test(runtime, version)
+    smoke_test(runtime, version, imported)
+    files = sum(1 for p in runtime.rglob("*") if not p.is_dir())
+    print(f"runtime: {files} files")
     print(f"runtime: {runtime} ({version}, {commit[:8]}, {target}, Python {python_version})")
 
     if not args.no_archive:
