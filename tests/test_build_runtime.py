@@ -111,7 +111,7 @@ def _fake_python(root: Path) -> tuple[Path, Path, Path]:
         "Lib/site-packages/numpy/_core/tests/test_a.py": "", "Lib/site-packages/numpy/core.pyi": "",
         "Lib/site-packages/numpy/_core/include/x.h": "", "Lib/site-packages/numpy/README.md": "",
         "Lib/site-packages/flowly/__init__.py": "VALUE = 1\n", "Lib/site-packages/flowly/tests/__init__.py": "",
-        "Lib/site-packages/flowly/stubs.pyi": "",
+        "Lib/site-packages/flowly/stubs.pyi": "", "Lib/threading.py": "", "Lib/tomllib/__init__.py": "",
     }
     for name, text in files.items():
         (prefix / name).parent.mkdir(parents=True, exist_ok=True)
@@ -129,12 +129,67 @@ def test_what_a_runtime_never_runs_is_left_out(tmp_path):
             "Lib/idlelib", "Lib/tkinter", "Lib/lib2to3", "Lib/turtle.py", "Lib/site-packages/pip",
             "Lib/site-packages/pip-25.0.dist-info", "Lib/site-packages/numpy/_core/tests",
             "Lib/site-packages/numpy/core.pyi", "Lib/site-packages/numpy/_core/include/x.h"]
-    kept = ["DLLs/_ssl.pyd", "Lib/json/__init__.py", "Lib/ensurepip/__init__.py",
+    kept = ["DLLs/_ssl.pyd", "Lib/threading.py", "Lib/tomllib/__init__.py", "Lib/json/__init__.py", "Lib/ensurepip/__init__.py",
             "Lib/site-packages/numpy/testing/__init__.py", "Lib/site-packages/numpy/README.md",
             # Core is shipped as it is built.
             "Lib/site-packages/flowly/tests/__init__.py", "Lib/site-packages/flowly/stubs.pyi"]
     assert [name for name in gone if (prefix / name).exists()] == []
     assert [name for name in kept if not (prefix / name).exists()] == []
+
+
+def test_windows_letter_case_never_takes_a_module_the_runtime_needs(monkeypatch, tmp_path):
+    # Path.glob ignores letter case on Windows: there `lib/thread*` (Tcl's thread package on macOS and Linux)
+    # matched Lib/threading.py, and `lib/tk*` Lib/tkinter. Here every glob behaves as on Windows.
+    import fnmatch
+    builder = _builder()
+    prefix, stdlib, site = _fake_python(tmp_path)
+
+    def windows_glob(self, pattern, **_):
+        found = [self]
+        for part in pattern.split("/"):
+            found = [c for d in found if d.is_dir() for c in d.iterdir() if fnmatch.fnmatch(c.name.lower(), part.lower())]
+        return iter(found)
+
+    monkeypatch.setattr(Path, "glob", windows_glob)
+
+    builder.prune(prefix, stdlib, site)
+
+    assert (prefix / "Lib" / "threading.py").is_file()
+    assert (prefix / "Lib" / "tomllib" / "__init__.py").is_file()
+
+
+def test_a_compile_pass_that_stopped_early_fails_the_build(monkeypatch, tmp_path):
+    # The pass that turns the standard library and packages into .pyc runs unchecked (a file meant for another
+    # Python must not stop it). Had it died, their sources would stay, compiled again at every start: the build
+    # must say so rather than ship it.
+    import subprocess
+    import sys
+    import pytest
+    builder = _builder()
+    prefix, stdlib, site = _fake_python(tmp_path)
+    real_run = subprocess.run
+
+    def run(args, *rest, **kwargs):
+        if "-b" in [str(a) for a in args]:
+            return subprocess.CompletedProcess(args, 1)
+        return real_run(args, *rest, **kwargs)
+
+    monkeypatch.setattr(builder.subprocess, "run", run)
+
+    with pytest.raises(SystemExit, match="compile but got no .pyc"):
+        builder.compile_runtime(Path(sys.executable), stdlib, site)
+
+
+def test_a_source_that_does_not_compile_keeps_its_source(tmp_path):
+    import sys
+    builder = _builder()
+    prefix, stdlib, site = _fake_python(tmp_path)
+    (stdlib / "py2_only.py").write_text("print 'meant for another Python'\n")
+
+    builder.compile_runtime(Path(sys.executable), stdlib, site)
+
+    assert (stdlib / "py2_only.py").is_file()
+    assert not (stdlib / "py2_only.pyc").exists()
 
 
 def test_only_core_keeps_its_sources(tmp_path):

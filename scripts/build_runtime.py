@@ -30,6 +30,7 @@ keeps its .py beside them. A Windows install writes half the files it did.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import os
@@ -176,20 +177,33 @@ def _remove(path: Path) -> int:
     return 0
 
 
+def matching(folder: Path, pattern: str) -> list[Path]:
+    """
+    The paths under `folder` that `pattern` names, letter case and all on every system. Path.glob ignores case
+    on Windows, where `lib/thread*` (Tcl's thread package elsewhere) would take Lib/threading.py.
+    """
+    found = [folder]
+    for part in pattern.split("/"):
+        found = [child for parent in found if parent.is_dir() for child in sorted(parent.iterdir())
+                 if fnmatch.fnmatchcase(child.name, part)]
+    return found
+
+
 def prune(prefix: Path, stdlib: Path, site_packages: Path) -> int:
     """Removes what a runtime never runs (the *_LEFT_OUT lists). Returns how many files went."""
     removed = 0
     for pattern in PREFIX_LEFT_OUT:
-        for path in prefix.glob(pattern):
+        for path in matching(prefix, pattern):
             removed += _remove(path)
     for folder in (prefix / "DLLs", stdlib / "lib-dynload"):
         for pattern in EXTENSIONS_LEFT_OUT:
-            for path in folder.glob(pattern):
+            for path in matching(folder, pattern):
                 removed += _remove(path)
     for name in STDLIB_LEFT_OUT:
-        removed += _remove(stdlib / name)
+        for path in matching(stdlib, name):
+            removed += _remove(path)
     for pattern in PACKAGES_LEFT_OUT:
-        for path in site_packages.glob(pattern):
+        for path in matching(site_packages, pattern):
             removed += _remove(path)
     for top in sorted(site_packages.iterdir()):
         if top.name == CORE_PACKAGE or not top.is_dir():
@@ -221,12 +235,35 @@ def compile_runtime(python: Path, stdlib: Path, site_packages: Path) -> int:
     subprocess.run([str(a) for a in [*compile_all, "-b", "-x", f"{sep}site-packages{sep}{CORE_PACKAGE}{sep}", stdlib]],
                    check=False)
     dropped = 0
+    left: list[str] = []
     for source in stdlib.rglob("*.py"):
-        if source.is_relative_to(core) or not source.with_suffix(".pyc").is_file():
+        if source.is_relative_to(core):
+            continue
+        if not source.with_suffix(".pyc").is_file():
+            left.append(str(source))
             continue
         source.unlink()
         dropped += 1
+    # A source left without its .pyc must be one that does not compile. If any other is left, the pass above
+    # stopped early, and the runtime would compile it again at every start (what this build exists to end).
+    compiles = subprocess.run([str(python), "-I", "-B", "-c", COMPILES_PROBE], input="\n".join(left).encode(),
+                              capture_output=True, check=True).stdout.decode().splitlines()
+    if compiles:
+        raise SystemExit(f"{len(compiles)} source(s) compile but got no .pyc, e.g. {compiles[:5]}")
     return dropped
+
+
+# The files (one a line on stdin) that compile: their source has no .pyc only if compileall never reached them.
+COMPILES_PROBE = r"""
+import sys
+for name in sys.stdin.buffer.read().decode().splitlines():
+    try:
+        with open(name, "rb") as f:
+            compile(f.read(), name, "exec", dont_inherit=True)
+    except Exception:
+        continue
+    sys.stdout.buffer.write(name.encode() + b"\n")
+"""
 
 
 IMPORT_PROBE = r"""
