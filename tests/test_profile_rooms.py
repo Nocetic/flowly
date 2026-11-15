@@ -2926,3 +2926,36 @@ async def test_room_tool_identity_is_per_member_and_execution_not_provider_id(tm
     service._update_activity(room["id"], "default", event)
     assert service._tool_calls(room["id"], "default")[0]["activityId"] not in {first, other}
     await service.shutdown()
+
+
+def test_the_group_database_is_created_where_fsync_needs_a_writable_handle(tmp_path: Path, monkeypatch) -> None:
+    """Windows flushes only a handle opened for writing; a read-only one fails
+    with EBADF. The first start there could never create the group database,
+    and every group call answered ROOM_STORE_INVALID (2026-11-15)."""
+    import errno
+    import os
+
+    writable: set[int] = set()
+    real_open = os.open
+    real_fsync = os.fsync
+
+    def tracking_open(path, flags, *args, **kwargs):
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if flags & (os.O_WRONLY | os.O_RDWR):
+            writable.add(descriptor)
+        else:
+            writable.discard(descriptor)
+        return descriptor
+
+    def windows_fsync(descriptor):
+        if descriptor not in writable:
+            raise OSError(errno.EBADF, "Bad file descriptor")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(room_store_module.os, "open", tracking_open)
+    monkeypatch.setattr(room_store_module.os, "fsync", windows_fsync)
+    store = SQLiteRoomStore(tmp_path / "rooms" / "rooms.sqlite3")
+
+    assert store.initialize_verified({}) is True
+    assert store.exists()
+    assert store.load().revision == 0

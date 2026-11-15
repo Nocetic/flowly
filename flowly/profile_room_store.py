@@ -921,7 +921,11 @@ class SQLiteRoomStore:
 
     @staticmethod
     def _fsync_file(path: Path) -> None:
-        descriptor = os.open(path, os.O_RDONLY)
+        # Opened for writing: Windows flushes only a handle that may write
+        # (os.fsync on a read-only one fails with EBADF), so a read-only open
+        # failed every first start there and left groups unusable
+        # (ROOM_STORE_INVALID, 2026-11-15). POSIX accepts either.
+        descriptor = os.open(path, os.O_RDWR | getattr(os, "O_BINARY", 0))
         try:
             os.fsync(descriptor)
         finally:
