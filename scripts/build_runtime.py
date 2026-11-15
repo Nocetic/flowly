@@ -156,6 +156,9 @@ PACKAGE_FILES_LEFT_OUT = frozenset({".pyi", ".h", ".hpp", ".c", ".cpp", ".pxd", 
 PACKAGE_TEST_DIRS = frozenset({"tests", "test"})
 # Core: its own package keeps its sources (tracebacks, skills' scripts); everything else ships as .pyc only.
 CORE_PACKAGE = "flowly"
+# Packages that find their own modules by listing *.py (site-packages paths): they keep their sources too, with
+# their .pyc in __pycache__ as Core's. The build's import check finds the next one.
+KEEPS_SOURCES = ("onnxruntime/tools/ort_format_model/ort_flatbuffers_py/fbs",)
 
 
 def python_paths(python: Path) -> tuple[Path, Path]:
@@ -227,17 +230,19 @@ def compile_runtime(python: Path, stdlib: Path, site_packages: Path) -> int:
     # -B: the compiler's own imports (and its worker processes') write no timestamp .pyc of their own.
     compile_all = [python, "-I", "-B", "-m", "compileall", "-q", "-j", "0", "--invalidation-mode", "unchecked-hash"]
     core = site_packages / CORE_PACKAGE
-    # Core: .pyc in __pycache__ beside its sources.
-    run([*compile_all, core])
+    kept = [core, *(site_packages / name for name in KEEPS_SOURCES)]
+    # Core and the packages that list their own sources: .pyc in __pycache__ beside them.
+    run([*compile_all, *(folder for folder in kept if folder.is_dir())])
     # The rest: legacy .pyc in place of each source (-b). A file that does not compile (a template, a file meant
     # for another Python) keeps its source.
     sep = r"[/\\]"
-    subprocess.run([str(a) for a in [*compile_all, "-b", "-x", f"{sep}site-packages{sep}{CORE_PACKAGE}{sep}", stdlib]],
+    excluded = "|".join(re.escape(name).replace("/", sep) for name in (CORE_PACKAGE, *KEEPS_SOURCES))
+    subprocess.run([str(a) for a in [*compile_all, "-b", "-x", f"{sep}site-packages{sep}({excluded}){sep}", stdlib]],
                    check=False)
     dropped = 0
     left: list[str] = []
     for source in stdlib.rglob("*.py"):
-        if source.is_relative_to(core):
+        if any(source.is_relative_to(folder) for folder in kept):
             continue
         if not source.with_suffix(".pyc").is_file():
             left.append(str(source))
@@ -267,29 +272,61 @@ for name in sys.stdin.buffer.read().decode().splitlines():
 
 
 IMPORT_PROBE = r"""
-import importlib, json, pkgutil, sys, sysconfig, warnings
+import fnmatch, importlib, json, pkgutil, sys, sysconfig, warnings
 warnings.simplefilter("ignore")
+left_out, skipped = json.loads(sys.argv[1])
+
+class LeftOut:
+    # What the build leaves out is missing in both runs: the check compares only what leaving files out and
+    # shipping .pyc did, not modules gone on purpose (tkinter, and PIL.ImageTk with it).
+    def find_spec(self, name, path=None, target=None):
+        if any(fnmatch.fnmatchcase(name.partition(".")[0], pattern) for pattern in left_out):
+            raise ModuleNotFoundError(f"left out: {name}", name=name)
+        return None
+
+sys.meta_path.insert(0, LeftOut())
 ok = []
+
 def attempt(name):
     try:
-        importlib.import_module(name)
-        ok.append(name)
+        module = importlib.import_module(name)
     except BaseException:
-        pass
+        return None
+    ok.append(name)
+    return module
+
+def walk(name, path):
+    for found in pkgutil.iter_modules(path, name + "."):
+        if found.name.rpartition(".")[2] in skipped:
+            continue
+        module = attempt(found.name)
+        if module is not None and found.ispkg:
+            walk(found.name, list(getattr(module, "__path__", [])))
+
 site = sysconfig.get_paths()["purelib"]
-for module in pkgutil.iter_modules([site]):
-    attempt(module.name)
-import flowly
-for module in pkgutil.walk_packages(flowly.__path__, "flowly.", onerror=lambda name: None):
-    attempt(module.name)
+for top in pkgutil.iter_modules([site]):
+    module = attempt(top.name)
+    if module is not None and top.ispkg:
+        walk(top.name, list(getattr(module, "__path__", [])))
 print(json.dumps(sorted(set(ok))))
 """
+# Never imported by the check: test suites (left out) and __main__ (runs a program).
+PROBE_SKIPS = sorted({*PACKAGE_TEST_DIRS, "__main__"})
+
+
+def probe_left_out() -> list[str]:
+    """Top-level module names the build leaves out, as patterns."""
+    names = [name.removesuffix(".py") for name in STDLIB_LEFT_OUT]
+    names += [pattern for pattern in EXTENSIONS_LEFT_OUT if not pattern.endswith(".dll")]
+    names += [pattern for pattern in PACKAGES_LEFT_OUT if not pattern.endswith(".dist-info")]
+    return names
 
 
 def importable(python: Path, env: dict[str, str] | None = None) -> set[str]:
-    """Every top-level package in site-packages and every Core module that imports, in a fresh interpreter."""
+    """Every module in site-packages (Core's included, test suites not) that imports, in a fresh interpreter."""
     with tempfile.TemporaryDirectory(prefix="flowly-runtime-probe-") as neutral:
-        text = output([python, "-s", "-P", "-B", "-c", IMPORT_PROBE], cwd=neutral, env=env)
+        text = output([python, "-s", "-P", "-B", "-c", IMPORT_PROBE, json.dumps([probe_left_out(), PROBE_SKIPS])],
+                      cwd=neutral, env=env)
     return set(json.loads(text.splitlines()[-1]))
 
 
@@ -416,7 +453,7 @@ def main() -> None:
         install_core(source, python, work)
         stdlib, site_packages = python_paths(python)
         clean_env = {k: v for k, v in os.environ.items() if not k.startswith(("PYTHON", "VIRTUAL_ENV", "UV_"))}
-        imported = importable(python, clean_env) - {name.split("-")[0] for name in PACKAGES_LEFT_OUT}
+        imported = importable(python, clean_env)
         files = sum(1 for p in runtime.rglob("*") if not p.is_dir())
         removed = prune(runtime / "python", stdlib, site_packages)
         sources = compile_runtime(python, stdlib, site_packages)

@@ -96,6 +96,9 @@ def test_the_minor_version_link_uv_leaves_is_not_a_second_python(monkeypatch, tm
 
 # ── What ships: left-out files, and .pyc that never go stale ─────────────────
 
+FBS = "onnxruntime/tools/ort_format_model/ort_flatbuffers_py/fbs"
+
+
 def _fake_python(root: Path) -> tuple[Path, Path, Path]:
     """A Windows-shaped Python prefix with a little of everything the builder keeps or drops."""
     prefix = root / "python"
@@ -112,6 +115,9 @@ def _fake_python(root: Path) -> tuple[Path, Path, Path]:
         "Lib/site-packages/numpy/_core/include/x.h": "", "Lib/site-packages/numpy/README.md": "",
         "Lib/site-packages/flowly/__init__.py": "VALUE = 1\n", "Lib/site-packages/flowly/tests/__init__.py": "",
         "Lib/site-packages/flowly/stubs.pyi": "", "Lib/threading.py": "", "Lib/tomllib/__init__.py": "",
+        f"Lib/site-packages/{FBS}/__init__.py": "import glob, os\n"
+        "__all__ = [os.path.basename(f)[:-3] for f in glob.glob(os.path.join(os.path.dirname(__file__), '*.py'))]\n",
+        f"Lib/site-packages/{FBS}/Tensor.py": "VALUE = 1\n",
     }
     for name, text in files.items():
         (prefix / name).parent.mkdir(parents=True, exist_ok=True)
@@ -205,6 +211,21 @@ def test_only_core_keeps_its_sources(tmp_path):
     assert list((site / "flowly" / "__pycache__").glob("__init__.*.pyc"))
     modes = builder.pyc_modes(prefix)
     assert modes["timestamp"] == modes["checked-hash"] == 0 and modes["unchecked-hash"] > 0
+
+
+def test_a_package_that_lists_its_own_sources_keeps_them(tmp_path):
+    # onnxruntime's flatbuffers bindings find their modules by globbing *.py: as .pyc only they find none.
+    import sys
+    builder = _builder()
+    prefix, stdlib, site = _fake_python(tmp_path)
+
+    builder.compile_runtime(Path(sys.executable), stdlib, site)
+
+    fbs = site / FBS
+    assert (fbs / "Tensor.py").is_file() and (fbs / "__init__.py").is_file()
+    assert not (fbs / "Tensor.pyc").exists()
+    assert list((fbs / "__pycache__").glob("Tensor.*.pyc"))
+    assert builder.pyc_modes(fbs)["unchecked-hash"] == 2
 
 
 def test_a_runtime_whose_file_times_moved_loads_its_bytecode_not_its_sources(tmp_path):
