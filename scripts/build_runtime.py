@@ -275,6 +275,7 @@ IMPORT_PROBE = r"""
 import fnmatch, importlib, json, pkgutil, sys, sysconfig, warnings
 warnings.simplefilter("ignore")
 left_out, skipped = json.loads(sys.argv[1])
+result = sys.argv[2]
 
 class LeftOut:
     # What the build leaves out is missing in both runs: the check compares only what leaving files out and
@@ -308,7 +309,9 @@ for top in pkgutil.iter_modules([site]):
     module = attempt(top.name)
     if module is not None and top.ispkg:
         walk(top.name, list(getattr(module, "__path__", [])))
-print(json.dumps(sorted(set(ok))))
+# To a file, not stdout: a module may print, or swap sys.stdout, while it imports or as the interpreter exits.
+with open(result, "w", encoding="utf-8") as out:
+    json.dump(sorted(set(ok)), out)
 """
 # Never imported by the check: test suites (left out) and __main__ (runs a program).
 PROBE_SKIPS = sorted({*PACKAGE_TEST_DIRS, "__main__"})
@@ -325,9 +328,15 @@ def probe_left_out() -> list[str]:
 def importable(python: Path, env: dict[str, str] | None = None) -> set[str]:
     """Every module in site-packages (Core's included, test suites not) that imports, in a fresh interpreter."""
     with tempfile.TemporaryDirectory(prefix="flowly-runtime-probe-") as neutral:
-        text = output([python, "-s", "-P", "-B", "-c", IMPORT_PROBE, json.dumps([probe_left_out(), PROBE_SKIPS])],
-                      cwd=neutral, env=env)
-    return set(json.loads(text.splitlines()[-1]))
+        result = Path(neutral) / "imported.json"
+        done = subprocess.run([str(python), "-s", "-P", "-B", "-c", IMPORT_PROBE,
+                               json.dumps([probe_left_out(), PROBE_SKIPS]), str(result)],
+                              cwd=neutral, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if not result.is_file():
+            # A module ended the interpreter while it imported: say which, from what it printed last.
+            sys.stderr.write((done.stdout + done.stderr)[-4000:])
+            raise SystemExit(f"build_runtime: the import check stopped (exit {done.returncode}) before it finished")
+        return set(json.loads(result.read_text(encoding="utf-8")))
 
 
 def pyc_modes(root: Path) -> dict[str, int]:

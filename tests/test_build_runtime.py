@@ -249,3 +249,25 @@ def test_a_runtime_whose_file_times_moved_loads_its_bytecode_not_its_sources(tmp
                            capture_output=True, text=True, check=True).stdout.strip()
 
     assert value == "1"
+
+
+def test_a_module_that_prints_never_breaks_the_import_check(tmp_path):
+    # rc10's Windows build: a module wrote to stdout after the check's own last line (at import, or as the
+    # interpreter exits), and the check read the wrong line. The result now goes to a file.
+    import os
+    import subprocess
+    import sys
+    builder = _builder()
+    venv = tmp_path / "venv"
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(venv)], check=True)
+    python = venv / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+    purelib = subprocess.run([python, "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+                             capture_output=True, text=True, check=True).stdout.strip()
+    (Path(purelib) / "noisy.py").write_text(
+        "import atexit, io, sys\nprint('hello from noisy')\natexit.register(lambda: print('bye from noisy'))\n")
+    (Path(purelib) / "swapper.py").write_text("import io, sys\nsys.stdout = io.StringIO()\n")
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("PYTHON", "VIRTUAL_ENV", "UV_"))}
+
+    imported = builder.importable(python, env)
+
+    assert {"noisy", "swapper"} <= imported
