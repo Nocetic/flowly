@@ -471,15 +471,9 @@ def _launchd_fallback_process_running(label: str) -> tuple[bool, int | None]:
     pid = _read_launchd_fallback_pid(label)
     if pid is None:
         return False, None
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False, pid
-    except PermissionError:
-        return True, pid
-    except OSError:
-        return False, pid
-    return True, pid
+    from flowly.pid_alive import pid_alive
+
+    return pid_alive(pid), pid
 
 
 def _clear_launchd_fallback_marker(label: str) -> None:

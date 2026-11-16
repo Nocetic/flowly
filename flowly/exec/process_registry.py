@@ -295,9 +295,9 @@ class ProcessRegistry:
         # Detached sessions (recovered post-restart) have no reader, so we
         # probe liveness on demand.
         if session.detached and not session.exited and session.pid:
-            try:
-                os.kill(session.pid, 0)
-            except ProcessLookupError:
+            from flowly.pid_alive import pid_alive
+
+            if not pid_alive(session.pid):
                 session.exited = True
                 session.exit_code = None
                 session._finished_at = time.time()

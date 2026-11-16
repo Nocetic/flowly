@@ -61,16 +61,10 @@ def snapshot_child_pids() -> set[int]:
 
 
 def _alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # Exists but not ours to signal — treat as alive but untouchable.
-        return True
-    except OSError:
-        return False
+    # Exists but not ours to signal counts as alive (flowly/pid_alive.py).
+    from flowly.pid_alive import pid_alive
+
+    return pid_alive(pid)
 
 
 def reap_pids(pids: set[int], server_name: str = "") -> None:

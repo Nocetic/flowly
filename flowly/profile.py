@@ -1592,17 +1592,10 @@ def update_profile_settings(
 
 
 def _pid_is_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
+    # Never os.kill(pid, 0): on Windows that is Ctrl+C to the whole console (flowly/pid_alive.py).
+    from flowly.pid_alive import pid_alive
+
+    return pid_alive(pid)
 
 
 def _process_identity(pid: int) -> str | None:

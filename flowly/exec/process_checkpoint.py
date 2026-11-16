@@ -28,17 +28,9 @@ CHECKPOINT_VERSION = 1
 
 
 def _is_pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
+    from flowly.pid_alive import pid_alive
+
+    return pid_alive(pid)
 
 
 class ProcessCheckpoint:

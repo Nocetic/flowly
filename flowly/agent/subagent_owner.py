@@ -111,31 +111,10 @@ def _own_identity() -> str | None:
 
 
 def _pid_alive(pid: int) -> bool:
-    """Whether ``pid`` is a running process, without signalling it.
+    """Whether ``pid`` is a running process, without signalling it (flowly/pid_alive.py)."""
+    from flowly.pid_alive import pid_alive
 
-    On Windows ``os.kill(pid, 0)`` is not a probe (signal 0 is CTRL_C_EVENT,
-    any other value terminates the process), so the process is opened for a
-    query instead.
-    """
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        import ctypes
-
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
-        if not handle:
-            return kernel32.GetLastError() == 5  # ERROR_ACCESS_DENIED: it exists
-        try:
-            code = ctypes.c_ulong()
-            if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                return code.value == 259  # STILL_ACTIVE
-            return True
-        finally:
-            kernel32.CloseHandle(handle)
-    from flowly.profile import _pid_is_alive
-
-    return _pid_is_alive(pid)
+    return pid_alive(pid)
 
 
 def process_owner(instance: str = PROCESS_INSTANCE) -> dict[str, Any]:

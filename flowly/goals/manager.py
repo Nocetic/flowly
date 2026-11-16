@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
@@ -783,12 +782,9 @@ def _gate_continuation(state: GoalState, gate: GoalGate, skipped: bool) -> str:
 
 
 def _pid_is_alive(pid: int) -> bool:
+    from flowly.pid_alive import pid_alive
+
     try:
-        os.kill(int(pid), 0)
-    except ProcessLookupError:
+        return pid_alive(int(pid))
+    except (TypeError, ValueError):
         return False
-    except PermissionError:
-        return True
-    except (OSError, ValueError):
-        return False
-    return True
