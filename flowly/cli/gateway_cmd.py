@@ -564,7 +564,7 @@ def gateway(
     from flowly.providers.factory import build_provider
     from flowly.agent.loop import AgentLoop
     from flowly.channels.manager import ChannelManager
-    from flowly.cron.service import CronService, is_silent_response
+    from flowly.cron.service import CronService, CronStoreLoadError, is_silent_response
     from flowly.cron.types import CronJob
     from flowly.cron import script_runner, skill_loader
     from flowly.cron.context import cron_context
@@ -2734,9 +2734,16 @@ Respond to the user now:"""
             "[cyan]flowly setup channels[/cyan][/dim]"
         )
 
-    cron_status = cron.status()
-    if cron_status["jobs"] > 0:
-        console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
+    # An unreadable schedule file turns the schedules off, never the agent
+    # (it kept a Windows agent from ever starting, 2026-11-16). Its schedules
+    # stay on disk, untouched, until someone fixes the file.
+    try:
+        cron_status = cron.status()
+    except CronStoreLoadError as e:
+        console.print(f"[yellow]⚠[/yellow] Cron: off, its store is unreadable: {e}")
+    else:
+        if cron_status["jobs"] > 0:
+            console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
 
     console.print(f"[green]✓[/green] Heartbeat: every 30m")
     if legacy_voice_bridge_enabled:
@@ -2861,7 +2868,10 @@ Respond to the user now:"""
                                 return
 
                     _manager_task = asyncio.create_task(_watch_desktop_manager())
-            await cron.start()
+            try:
+                await cron.start()
+            except CronStoreLoadError as e:
+                logger.error(f"[Gateway] Cron is off until its store is readable: {e}")
             # An agent that stays up prunes its media daily, not only at start
             # and after a generation (sharing files alone never pruned).
             from flowly.media.retention import prune_daily

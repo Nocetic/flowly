@@ -76,6 +76,29 @@ class CronStoreLoadError(RuntimeError):
     """The durable cron store exists but cannot be loaded safely."""
 
 
+def _write_durably(path: Path, text: str) -> None:
+    """Replace ``path`` with ``text``: after a crash or a power cut it holds the old text or the new, never nothing.
+
+    The new text reaches the disk (fsync) before the rename. Without that, a
+    machine that loses power right after the rename can come back with the
+    file empty or full of NUL bytes: the rename was journaled, its data was
+    not (a Windows test machine, 2026-11-16, whose agent then never started).
+    """
+    tmp = path.with_suffix(f".tmp.{secrets.token_hex(4)}")
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(tmp), str(path))
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 def is_silent_response(response: str | None) -> bool:
     """Return True if a cron callback response is the [SILENT] sentinel."""
     if not isinstance(response, str):
@@ -305,7 +328,15 @@ class CronService:
 
         if self.store_path.exists():
             try:
-                data = json.loads(self.store_path.read_text(encoding="utf-8"))
+                raw = self.store_path.read_bytes()
+                if not raw.strip(b" \t\r\n\x00"):
+                    # Nothing in it (a write cut short by a crash or a power
+                    # cut): no schedule can be read back from it, so nothing
+                    # is lost by starting empty. Set it aside, never refuse:
+                    # refusing kept the whole agent from starting.
+                    self._set_aside_blank_store(len(raw))
+                    raw = b'{"jobs": []}'
+                data = json.loads(raw.decode("utf-8"))
                 if not isinstance(data, dict) or not isinstance(data.get("jobs", []), list):
                     raise ValueError("cron store must contain a jobs array")
                 jobs = []
@@ -407,6 +438,20 @@ class CronService:
             self._save_store()
         return self._store
 
+    def _set_aside_blank_store(self, size: int) -> None:
+        """Keep a blank store beside the new one, as evidence, under a name nothing reads."""
+        stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        aside = self.store_path.with_name(f"{self.store_path.name}.blank-{stamp}")
+        try:
+            os.replace(str(self.store_path), str(aside))
+            where = f"set aside as {aside.name}"
+        except OSError as e:
+            where = f"could not be set aside ({e}); it is replaced at the next save"
+        logger.warning(
+            f"Cron store {self.store_path} was blank ({size} bytes, no schedules in it); "
+            f"starting with no jobs, {where}"
+        )
+
     def _save_store(self) -> None:
         """Save jobs to disk atomically."""
         if not self._store:
@@ -482,22 +527,18 @@ class CronService:
             ]
         }
 
-        tmp_path = self.store_path.with_suffix(f".tmp.{secrets.token_hex(4)}")
-        try:
-            tmp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-            os.replace(str(tmp_path), str(self.store_path))
-        except Exception:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
+        _write_durably(self.store_path, json.dumps(data, indent=2))
 
     async def start(self) -> None:
         """Start the cron service."""
         self._stopping = False
         self._running = True
-        self._load_store()
+        try:
+            self._load_store()
+        except CronStoreLoadError:
+            # Not running: status() says so, and nothing is armed.
+            self._running = False
+            raise
         self._recompute_next_runs()
         self._save_store()
         self._arm_timer()
@@ -544,16 +585,7 @@ class CronService:
         """Atomically persist the small durable index for one run."""
         run_id = str(record["runId"])
         path = job_dir / f"{run_id}.json"
-        tmp = path.with_suffix(f".tmp.{secrets.token_hex(4)}")
-        try:
-            tmp.write_text(json.dumps(record, indent=2), encoding="utf-8")
-            os.replace(str(tmp), str(path))
-        except Exception:
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
+        _write_durably(path, json.dumps(record, indent=2))
         return path
 
     def _legacy_run_record(self, job_id: str, path: Path) -> dict[str, Any]:
@@ -1217,16 +1249,7 @@ class CronService:
 
         content = "\n".join(parts)
 
-        tmp_path = output_file.with_suffix(f".tmp.{secrets.token_hex(4)}")
-        try:
-            tmp_path.write_text(content, encoding="utf-8")
-            os.replace(str(tmp_path), str(output_file))
-        except Exception:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
+        _write_durably(output_file, content)
 
         from flowly.push.cron_push import cron_notification_snapshot
 
