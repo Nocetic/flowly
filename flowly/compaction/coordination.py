@@ -27,12 +27,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Iterator
 
+from flowly.utils import file_lock
 from flowly.utils.helpers import ensure_dir
-
-try:  # POSIX is the production target; the fallback remains process-safe.
-    import fcntl
-except ImportError:  # pragma: no cover - exercised only on non-POSIX hosts
-    fcntl = None  # type: ignore[assignment]
 
 
 class CompactionLeaseTimeoutError(RuntimeError):
@@ -97,7 +93,7 @@ class CompactionCoordinator:
                 handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(tmp, path)
+            file_lock.replace_file(tmp, path)
             try:
                 directory_fd = os.open(path.parent, os.O_RDONLY)
                 try:
@@ -112,20 +108,15 @@ class CompactionCoordinator:
             except OSError:
                 pass
 
+    # A lease excludes every process on every platform (on Windows it once
+    # excluded none: flowly/utils/file_lock.py).
     @staticmethod
     def _try_lock(handle: Any) -> bool:
-        if fcntl is None:
-            return True
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return False
-        return True
+        return file_lock.try_lock_exclusive(handle)
 
     @staticmethod
     def _unlock(handle: Any) -> None:
-        if fcntl is not None:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        file_lock.unlock(handle)
 
     @asynccontextmanager
     async def lease(
@@ -192,13 +183,11 @@ class CompactionCoordinator:
         lock_path, state_path = self._paths(session_key, breaker=True)
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with open(lock_path, "a+b") as handle:
-            if fcntl is not None:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            file_lock.lock_exclusive(handle)
             try:
                 yield state_path
             finally:
-                if fcntl is not None:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                file_lock.unlock(handle)
 
     @staticmethod
     def _breaker_from_json(value: dict[str, Any]) -> BreakerState:

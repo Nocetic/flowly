@@ -35,7 +35,8 @@ class _FakeMsvcrt:
 
         assert nbytes == 1
         assert os.lseek(fd, 0, os.SEEK_CUR) == 0, "Windows locks from the current position: it must be byte 0"
-        path = self.paths.setdefault(fd, str(fd))
+        info = os.fstat(fd)
+        path = self.paths.get(fd) or f"{info.st_dev}:{info.st_ino}"  # the file, whichever handle
         self.calls.append(("lock" if mode == self.LK_NBLCK else "unlock" if mode == self.LK_UNLCK else "other", fd))
         if mode == self.LK_NBLCK:
             owner = self.held.get(path)
@@ -48,7 +49,11 @@ class _FakeMsvcrt:
 
 @pytest.fixture
 def windows(monkeypatch):
+    """No fcntl anywhere (``import fcntl`` fails, as on Windows), msvcrt's locks instead."""
+    import sys
+
     fake = _FakeMsvcrt()
+    monkeypatch.setitem(sys.modules, "fcntl", None)
     monkeypatch.setattr(file_lock, "fcntl", None)
     monkeypatch.setattr(file_lock, "msvcrt", fake)
     monkeypatch.setattr(file_lock.time, "sleep", lambda _seconds: None)
@@ -68,7 +73,6 @@ def test_a_second_holder_waits_for_the_first_on_windows(tmp_path: Path, windows:
     lock = tmp_path / "x.lock"
     first = lock.open("a+b")
     second = lock.open("a+b")
-    windows.paths[first.fileno()] = windows.paths[second.fileno()] = str(lock)
     try:
         file_lock.lock_exclusive(first)
         refused = 0
@@ -82,7 +86,7 @@ def test_a_second_holder_waits_for_the_first_on_windows(tmp_path: Path, windows:
         monkeypatch.setattr(file_lock.time, "sleep", sleep)
         file_lock.lock_exclusive(second)
         assert refused == 3
-        assert windows.held[str(lock)] == second.fileno()
+        assert list(windows.held.values()) == [second.fileno()]
     finally:
         first.close()
         second.close()
@@ -170,3 +174,75 @@ def test_the_lock_holds_across_processes(tmp_path: Path) -> None:
     finally:
         release.set()
         holder.join(10)
+
+
+# ── every other lock two agents of one computer share (2026-11-16) ─────────
+
+
+def test_one_sign_in_refresh_at_a_time_on_windows(tmp_path: Path, windows: _FakeMsvcrt, monkeypatch) -> None:
+    """The main agent and a named agent must never spend the same refresh token."""
+    from flowly.auth import shared_signin
+
+    monkeypatch.setattr(shared_signin, "signin_home", lambda: tmp_path)
+    with shared_signin.refresh_lock("flowly"):
+        assert windows.held, "the refresh ran unguarded"
+    assert not windows.held
+
+
+def test_one_favourites_writer_at_a_time_on_windows(tmp_path: Path, windows: _FakeMsvcrt, monkeypatch) -> None:
+    from flowly.integrations import model_favorites
+
+    monkeypatch.setattr(model_favorites, "_path", lambda: tmp_path / "state" / "model-favorites.json")
+    with model_favorites._locked():
+        assert windows.held, "two agents could write the favourites at once"
+    assert not windows.held
+
+
+@pytest.mark.asyncio
+async def test_one_compaction_of_a_conversation_at_a_time_on_windows(tmp_path: Path, windows: _FakeMsvcrt, monkeypatch) -> None:
+    from flowly.compaction import coordination
+    from flowly.compaction.coordination import CompactionCoordinator, CompactionLeaseTimeoutError
+
+    monkeypatch.setattr(coordination, "fcntl", None, raising=False)
+    first, second = CompactionCoordinator(tmp_path), CompactionCoordinator(tmp_path)
+    async with first.lease("desktop:profile-home") as lease:
+        assert lease.fence == 1
+        with pytest.raises(CompactionLeaseTimeoutError):
+            async with second.lease("desktop:profile-home", timeout=0):
+                pass
+    async with second.lease("desktop:profile-home", timeout=0) as later:
+        assert later.fence == 2
+    with first._breaker_lock("desktop:profile-home"):
+        assert windows.held
+    assert not windows.held
+
+
+#: Modules that lock with fcntl alone because they never run on Windows: the
+#: Linux screen installer (gated on sys.platform == "linux"), and the MCP
+#: manifest cache and diagnostics, which refuse before locking where there is
+#: no dir_fd/O_NOFOLLOW (Windows). Anything else needs a Windows lock.
+POSIX_ONLY_LOCKS = {
+    "flowly/desktop_runtime/installation_gate.py",
+    "flowly/desktop_runtime/installer.py",
+    "flowly/desktop_runtime/install_payload.py",
+    "flowly/desktop_runtime/python_install_worker.py",
+    "flowly/desktop_runtime/python_installer.py",
+    "flowly/desktop_runtime/runtime_account_payload.py",
+    "flowly/mcp/diagnostics.py",
+    "flowly/mcp/manifest.py",
+}
+
+
+def test_no_lock_in_core_is_posix_only_unless_it_never_runs_on_windows() -> None:
+    root = Path(file_lock.__file__).resolve().parents[2]
+    fcntl_only = {
+        str(path.relative_to(root))
+        for path in (root / "flowly").rglob("*.py")
+        if "import fcntl" in (text := path.read_text(encoding="utf-8"))
+        and "msvcrt" not in text
+        and path.name != "file_lock.py"
+    }
+    assert fcntl_only == POSIX_ONLY_LOCKS, (
+        "Lock with flowly.utils.file_lock (or add a msvcrt path): "
+        f"{sorted(fcntl_only - POSIX_ONLY_LOCKS)}; no longer fcntl-only: {sorted(POSIX_ONLY_LOCKS - fcntl_only)}"
+    )

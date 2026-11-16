@@ -20,7 +20,6 @@ cannot undo itself.
 from __future__ import annotations
 
 import json
-import os
 import secrets
 import time
 from contextlib import contextmanager
@@ -48,19 +47,17 @@ def _path() -> Path:
 
 @contextmanager
 def _locked() -> Iterator[None]:
+    from flowly.utils.file_lock import lock_exclusive, unlock
+
     path = _path().with_suffix(".lock")
     path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        import fcntl
-    except ImportError:  # no advisory locks (Windows): one writer is the norm
-        yield
-        return
+    # Every agent of the computer writes here, Windows included.
     with open(path, "a+") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        lock_exclusive(handle)
         try:
             yield
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            unlock(handle)
 
 
 def _valid(entry: Any) -> dict[str, Any] | None:
@@ -100,7 +97,10 @@ def _write(entries: list[dict[str, Any]]) -> None:
     tmp = path.with_suffix(f".tmp.{secrets.token_hex(4)}")
     try:
         tmp.write_text(json.dumps({"version": 1, "favorites": entries}, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, path)
+        # Another agent reading the list holds it open for a moment on Windows.
+        from flowly.utils.file_lock import replace_file
+
+        replace_file(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
 

@@ -61,6 +61,24 @@ def lock_exclusive(handle: IO[Any]) -> None:
             delay = min(delay * 2, _POLL_MAX_SECONDS)
 
 
+def try_lock_exclusive(handle: IO[Any]) -> bool:
+    """Take the file alone if no other handle holds it; never wait."""
+    if fcntl is not None:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
+    if msvcrt is None:  # pragma: no cover
+        return True
+    handle.seek(0)
+    try:
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        return False
+    return True
+
+
 def unlock(handle: IO[Any]) -> None:
     """Let the file go (closing the handle does too)."""
     if fcntl is not None:

@@ -51,18 +51,16 @@ def signin_scope_suffix() -> str:
 def refresh_lock(name: str) -> Iterator[None]:
     """Hold the computer-wide lock for refreshing sign-in ``name``.
 
-    Blocking: the holder is a refresh of a few seconds at most. Where the
-    platform has no advisory locks (Windows) the body runs unguarded, as before."""
+    Blocking: the holder is a refresh of a few seconds at most. Windows is
+    locked too (it once ran unguarded there, so the main agent and a named
+    agent could spend the same refresh token: flowly/utils/file_lock.py)."""
+    from flowly.utils.file_lock import lock_exclusive, unlock
+
     path = signin_home() / "credentials" / f"{name}.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        import fcntl
-    except ImportError:
-        yield
-        return
     with open(path, "a+") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        lock_exclusive(handle)
         try:
             yield
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            unlock(handle)
