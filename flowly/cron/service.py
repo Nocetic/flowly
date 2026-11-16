@@ -15,6 +15,7 @@ from typing import Any, Callable, Coroutine, Literal
 
 from loguru import logger
 
+from flowly.utils.file_lock import replace_file
 from flowly.utils.wall_clock import sleep_until_wall
 from flowly.gateway_logs.notable import notable
 
@@ -90,7 +91,7 @@ def _write_durably(path: Path, text: str) -> None:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(str(tmp), str(path))
+        replace_file(str(tmp), str(path))
     except Exception:
         try:
             tmp.unlink(missing_ok=True)

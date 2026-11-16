@@ -53,12 +53,8 @@ from flowly.session.ownership import (
     require_session_file,
     session_visible,
 )
+from flowly.utils.file_lock import lock_exclusive, replace_file, unlock
 from flowly.utils.helpers import ensure_dir, safe_filename
-
-try:  # Session persistence is local-file based on macOS/Linux in production.
-    import fcntl
-except ImportError:  # pragma: no cover - non-POSIX fallback remains atomic
-    fcntl = None  # type: ignore[assignment]
 
 #: Re-exported so callers that write the row can reach it from here; the
 #: definition lives with the other compaction constants.
@@ -96,15 +92,15 @@ def session_file_lock(canonical_path: Path) -> Iterator[None]:
         return
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open('a+b') as handle:
-        if fcntl is not None:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        # Every process, on every platform (on Windows it once locked nothing:
+        # flowly/utils/file_lock.py).
+        lock_exclusive(handle)
         held.add(identity)
         try:
             yield
         finally:
             held.remove(identity)
-            if fcntl is not None:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            unlock(handle)
 
 
 @dataclass(frozen=True)
@@ -1902,8 +1898,10 @@ class SessionManager:
                 f.flush()
                 os.fsync(f.fileno())
 
-            # Atomic rename (POSIX guarantees this is atomic on same filesystem)
-            os.replace(str(tmp_path), str(path))
+            # Atomic rename (POSIX guarantees this is atomic on same filesystem).
+            # On Windows a program outside Flowly holding the file open for a
+            # moment (an antivirus scan) is waited for, not a failed turn.
+            replace_file(str(tmp_path), str(path))
             try:
                 directory_fd = os.open(path.parent, os.O_RDONLY)
                 try:
