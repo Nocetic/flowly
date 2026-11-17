@@ -178,7 +178,14 @@ class Recap:
 
 async def recap_turn(provider: Any, model: str | None, record: dict[str, Any], excerpts: list[str],
                      reply: str, *, earlier: dict[str, Any] | None = None, part_of: bool = False) -> Recap:
-    """Summarize and judge one finished turn. Never raises."""
+    """Summarize and judge one finished turn. Never raises.
+
+    Thinking off, as for every short answer asked in the background
+    (flowly/providers/background.py): at the agent's own level a thinking
+    model spent the cap thinking, or the 30 s waiting, and the turn had no
+    summary. A named agent on Grok 4.7 at Medium had none for any task
+    (2026-11-17) while the main agent, on Haiku, had them.
+    """
     try:
         response = await provider.chat(
             messages=build_messages(record, excerpts, reply, earlier=earlier, part_of=part_of),
@@ -187,6 +194,7 @@ async def recap_turn(provider: Any, model: str | None, record: dict[str, Any], e
             temperature=0.2,
             timeout=TIMEOUT_SECONDS,
             purpose="activity_recap",
+            reasoning=False,
         )
     except Exception as exc:  # noqa: BLE001 — a summary is never worth an error
         logger.debug(f"[activity] recap request failed: {exc!r}")

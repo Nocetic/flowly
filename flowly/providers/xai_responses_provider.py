@@ -267,7 +267,8 @@ class XAIResponsesProvider(LLMProvider):
         return redact_secret(text, self.api_key or "")
 
     def _error_response(self, exc: Exception) -> LLMResponse:
-        message = self._redact(str(exc))
+        # A timeout's text is empty: say what it was, or the log reads "call error: " and nothing.
+        message = self._redact(str(exc) or type(exc).__name__)
         logger.error("xAI Responses call error: {}", message)
         return LLMResponse(
             content=f"Error calling LLM: {message}",

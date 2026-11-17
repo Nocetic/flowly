@@ -1045,3 +1045,42 @@ def test_the_step_rpc_validates_and_reads(home, clock):
     finally:
         rec.end(task, outcome="completed")
     assert validate_profile_rpc("activity.step", {"id": "rpc", "index": 0})[0] == "activity.step"
+
+
+class _ThinkingModel:
+    """A thinking model at the agent's level (Grok 4.7 at Medium, 2026-11-17): it spends the
+    whole cap thinking and says nothing, unless the call turns thinking off."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any):
+        self.calls.append(kwargs)
+        if kwargs.get("reasoning") is not False:
+            return SimpleNamespace(content="", finish_reason="length",
+                                   usage={"prompt_tokens": 4734, "completion_tokens": kwargs["max_tokens"]})
+        return SimpleNamespace(content='{"work": true, "title": "Review the X accounts", "outcome": "Done", '
+                                       '"summary": "I reviewed them.", "steps": []}',
+                               finish_reason="stop", usage={"prompt_tokens": 4734, "completion_tokens": 60})
+
+
+@pytest.mark.asyncio
+async def test_a_thinking_model_still_summarizes_the_turn():
+    # A named agent on a thinking model had no summary for any task; the main agent on Haiku had them.
+    provider = _ThinkingModel()
+
+    result = await recap.recap_turn(provider, "grok-4.7", {"request": "review our X accounts", "steps": []}, [], "done")
+
+    assert result.words is not None and result.words["title"] == "Review the X accounts"
+    assert provider.calls[0]["reasoning"] is False
+
+
+def test_an_xai_timeout_says_what_it_was(caplog):
+    import httpx
+
+    from flowly.providers.xai_responses_provider import XAIResponsesProvider
+
+    response = XAIResponsesProvider("key")._error_response(httpx.ReadTimeout(""))
+
+    # It read "xAI Responses call error: " and nothing more.
+    assert response.content == "Error calling LLM: ReadTimeout"
