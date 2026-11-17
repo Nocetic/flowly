@@ -35,16 +35,16 @@ def _decode_access(value: object, sessions_dir: Path) -> EventAccess:
     if (not isinstance(value, dict) or set(value) != {'scopes', 'owner', 'blocked', 'canonical'}
             or type(value['blocked']) is not bool or type(value['canonical']) is not bool
             or not isinstance(value['scopes'], list) or len(value['scopes']) > 8):
-        raise VoiceAuthorityError()
+        raise VoiceAuthorityError(reason='access shape')
     scopes = []
     try:
         for item in value['scopes']:
             if not isinstance(item, dict) or set(item) != {'sessionKey', 'owner'}:
-                raise VoiceAuthorityError()
+                raise VoiceAuthorityError(reason='access shape')
             scopes.append(SessionControlScope.bind(item['sessionKey'], item['owner'], sessions_dir=sessions_dir))
         extra = SessionControlScope.bind(None, value['owner']).owner
     except SessionAccessError:
-        raise VoiceAuthorityError() from None
+        raise VoiceAuthorityError(reason='conversation scope') from None
     owner = RequestOwner(extra.get('uid')) if extra is not None else None
     return EventAccess(scopes=tuple(scopes), owner=owner, blocked=value['blocked'], canonical=value['canonical'])
 
@@ -82,14 +82,14 @@ class ProfileEventVerifier:
         authority = frame.get(_FIELD)
         if (frame.get('type') != 'event' or not isinstance(frame.get('event'), str)
                 or not isinstance(authority, dict) or set(authority) != {'eventId', 'access', 'proof'}):
-            raise VoiceAuthorityError()
+            raise VoiceAuthorityError(reason='unsigned' if authority is None else 'event shape')
         public = {name: value for name, value in frame.items() if name != _FIELD}
         owner = self._proof.verify(authority['eventId'], _METHOD, {'frame': public, 'access': authority['access']}, authority['proof'])
         if owner is not None:
-            raise VoiceAuthorityError()
+            raise VoiceAuthorityError(reason='event carries an owner')
         access = _decode_access(authority['access'], sessions_dir)
         payload = public.get('data')
         session_key = (payload.get('sessionKey') or payload.get('session_key')) if isinstance(payload, dict) else None
         if session_key and any(scope.key is not None and scope.key != session_key for scope in access.scopes):
-            raise VoiceAuthorityError()
+            raise VoiceAuthorityError(reason='another conversation')
         return ScopedEvent(public, access)

@@ -231,3 +231,50 @@ def test_ids_are_let_go_in_the_order_they_expire():
 def test_a_long_turns_events_fit_in_what_is_remembered():
     # A turn streaming 100 events a second for the whole window is not refused.
     assert EVENT_MAX_AGE_SECONDS * 100 <= 131_072 * 2
+
+
+# ── an event refused anyway ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_refused_event_says_why_and_reads_again_what_the_agent_waits_on(setup, monkeypatch):  # noqa: F811
+    frame, sessions = source(setup)
+    host = ProfileHost.__new__(ProfileHost)
+    runtime = _Runtime("marketing-manager", None, SimpleNamespace(), _DroppedLink(), INSTANCE,
+                       capabilities=frozenset({"voice-owner-events-v1"}), voice_parent_key=PARENT_KEY)
+    # Later than any stall the window allows for.
+    runtime.event_authority = ProfileEventVerifier(
+        INSTANCE, key=PARENT_KEY, now=lambda: time.time() + EVENT_MAX_AGE_SECONDS + 60)
+    # Read where the event is checked, from the agent's own home.
+    monkeypatch.setattr("flowly.profile.describe_profile", lambda name: SimpleNamespace(path=sessions.sessions_dir.parent))
+    resynced, handled, logged = [], AsyncMock(), []
+    monkeypatch.setattr(host, "_schedule_attention_refresh", lambda found: resynced.append(found))
+    monkeypatch.setattr(host, "_handle_event", handled)
+    sink = host_module.logger.add(lambda message: logged.append(str(message)), level="WARNING")
+    try:
+        await host._handle_runtime_event(runtime, frame)
+    finally:
+        host_module.logger.remove(sink)
+
+    handled.assert_not_awaited()
+    # It may have been an approval request: what the agent waits on is read again from it.
+    assert resynced == [runtime]
+    assert any("stale" in line and "chat" in line for line in logged), logged
+
+
+def test_each_refusal_names_its_reason(setup):  # noqa: F811
+    frame, sessions = source(setup)
+    verifier = ProfileEventVerifier(INSTANCE, key=PARENT_KEY)
+    verifier.verify(frame, sessions_dir=sessions.sessions_dir)
+    with pytest.raises(VoiceAuthorityError) as replayed:
+        verifier.verify(frame, sessions_dir=sessions.sessions_dir)
+    forged = json.loads(json.dumps(frame))
+    forged["data"]["message"] = "changed"
+    with pytest.raises(VoiceAuthorityError) as signature:
+        ProfileEventVerifier(INSTANCE, key=PARENT_KEY).verify(forged, sessions_dir=sessions.sessions_dir)
+    with pytest.raises(VoiceAuthorityError) as unsigned:
+        ProfileEventVerifier(INSTANCE, key=PARENT_KEY).verify({"type": "event", "event": "chat"}, sessions_dir=sessions.sessions_dir)
+
+    assert (replayed.value.reason, signature.value.reason, unsigned.value.reason) == ("replayed", "signature", "unsigned")
+    # Never shown to a client: the message stays the same.
+    assert str(replayed.value) == "Profile request authority could not be verified."

@@ -2519,8 +2519,14 @@ class ProfileHost:
             owner = access.producer()
             if not access.permits(owner):
                 return
-        except (VoiceAuthorityError, SessionAccessError, OSError, ValueError):
-            logger.warning('Profile event authority could not be verified for {}', runtime.profile)
+        except (VoiceAuthorityError, SessionAccessError, OSError, ValueError) as exc:
+            reason = getattr(exc, 'reason', '') or type(exc).__name__
+            logger.warning('Profile event authority could not be verified for {}: {} ({})',
+                           runtime.profile, reason, frame.get('event') or '?')
+            # What it said is gone, and it may have been the request for an
+            # approval or an answer (2026-11-17: the agent then waited on one
+            # nobody saw). What the bot waits on is read again from the bot.
+            self._schedule_attention_refresh(runtime)
             return
         with request_owner_scope(owner), event_access_scope(access):
             await self._handle_event(runtime, str(event.get('event') or ''), event.get('data'))

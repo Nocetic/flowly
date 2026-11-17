@@ -15,8 +15,10 @@ from typing import Callable, Iterator
 
 
 class VoiceAuthorityError(RuntimeError):
-    def __init__(self, *, unavailable: bool = False):
+    def __init__(self, *, unavailable: bool = False, reason: str = ''):
         self.code = 'VOICE_AUTH_UNAVAILABLE' if unavailable else 'VOICE_AUTH_REQUIRED'
+        #: Why, for the log only (stale, replayed, signature, …); never sent to a client.
+        self.reason = reason
         super().__init__('Profile request authority is unavailable.' if unavailable
                          else 'Profile request authority could not be verified.')
 
@@ -126,24 +128,29 @@ class ProfileHopVerifier:
 
     def verify(self, request_id: str, method: str, params: dict, proof: object) -> RequestOwner | None:
         if not isinstance(proof, dict) or set(proof) != {'version', 'instanceId', 'issuedAt', 'owner', 'mac'}:
-            raise VoiceAuthorityError()
+            raise VoiceAuthorityError(reason='proof shape')
         issued = proof['issuedAt']
         now = self._now()
-        if (type(proof['version']) is not int or proof['version'] != 1 or proof['instanceId'] != self.instance_id
-                or type(issued) is not int or issued < now - self._max_age or issued > now + 5
+        if (type(proof['version']) is not int or proof['version'] != 1 or type(issued) is not int
                 or not valid_parent_key(proof['mac'])):
-            raise VoiceAuthorityError()
+            raise VoiceAuthorityError(reason='proof shape')
+        if proof['instanceId'] != self.instance_id:
+            raise VoiceAuthorityError(reason='another instance')
+        if issued < now - self._max_age:
+            raise VoiceAuthorityError(reason=f'stale ({int(now - issued)} s old)')
+        if issued > now + 5:
+            raise VoiceAuthorityError(reason=f'from the future ({int(issued - now)} s)')
         unsigned = {key: value for key, value in proof.items() if key != 'mac'}
         expected = _mac(self.key, request_id, method, params, unsigned)
         if not hmac.compare_digest(expected, proof['mac']):
-            raise VoiceAuthorityError()
+            raise VoiceAuthorityError(reason='signature')
         owner = _read_owner(proof['owner'])
         monotonic = self._monotonic()
         while self._seen and next(iter(self._seen.values())) <= monotonic:
             self._seen.popitem(last=False)
         if request_id in self._seen:
-            raise VoiceAuthorityError()
+            raise VoiceAuthorityError(reason='replayed')
         if len(self._seen) >= self._max_requests:
-            raise VoiceAuthorityError(unavailable=True)
+            raise VoiceAuthorityError(unavailable=True, reason='too many at once')
         self._seen[request_id] = monotonic + self._remember
         return owner
