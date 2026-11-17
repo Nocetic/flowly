@@ -403,6 +403,15 @@ def smoke_test(runtime: Path, version: str, imported: set[str] | None = None) ->
                           "import flowly, flowly.cli.commands, flowly.gateway.server, "
                           "fitz, PIL, cryptography, pydantic_core; print(flowly.__file__)"],
                          env=env, cwd=neutral)
+        if sys.platform == "win32":
+            # Credentials on Windows live in DPAPI files (flowly/account/dpapi_store.py), whose
+            # ctypes calls only a real Windows can check: a secret past Credential Manager's limit
+            # round-trips, sealed, in a folder outside the runtime.
+            sealed = Path(neutral) / "credentials"
+            print(output([python, "-s", "-P", "-B", "-c",
+                          "import sys; from pathlib import Path; from flowly.account.dpapi_store import self_test; "
+                          "self_test(Path(sys.argv[1]))", sealed],
+                         env=env, cwd=neutral), flush=True)
     if not Path(located).resolve().is_relative_to(runtime.resolve()):
         raise SystemExit(f"build_runtime: Core imported from {located}, outside the runtime")
     modes = pyc_modes(runtime)

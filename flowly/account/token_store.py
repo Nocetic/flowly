@@ -8,8 +8,9 @@ backups (Time Machine, rsync, BorgBackup), sync tools (Dropbox, iCloud),
 and file-system enumeration. Enterprise environments require credentials
 in OS-managed keychains.
 
-This module wraps ``keyring`` (cross-platform: macOS Keychain, Linux
-Secret Service via D-Bus, Windows Credential Manager) and transparently
+This module wraps ``keyring`` (macOS Keychain, Linux Secret Service via
+D-Bus) and, on Windows, DPAPI-sealed files (``flowly.account.dpapi_store``:
+Credential Manager is too small for an account), and transparently
 migrates any legacy JSON file on first read.
 
 If keyring is unavailable (headless Linux without dbus/gnome-keyring, CI
@@ -86,6 +87,30 @@ _KEYRING_DISABLED: bool | None = None  # None = not yet decided
 
 # Cached result of the macOS pre-flight below (None = not yet probed).
 _MACOS_KEYCHAIN_MISSING: bool | None = None
+
+# Windows' DPAPI store (None = not yet opened, False = DPAPI did not work here).
+_WINDOWS_STORE: Any = None
+
+
+def _on_windows() -> bool:
+    return os.name == "nt"
+
+
+def _windows_store():
+    """The DPAPI file store on Windows (``flowly.account.dpapi_store``), else None.
+
+    Credential Manager holds 1280 characters per secret and a Flowly account is
+    longer: every Windows sign-in latched the keychain off and saved its tokens
+    to a plain file (2026-11-16). DPAPI is what Credential Manager encrypts
+    with, without the limit.
+    """
+    global _WINDOWS_STORE
+    if not _on_windows():
+        return None
+    if _WINDOWS_STORE is None:
+        from flowly.account.dpapi_store import open_store
+        _WINDOWS_STORE = open_store() or False
+    return _WINDOWS_STORE or None
 
 
 def _default_keychain_path(value: Any) -> Path | None:
@@ -243,13 +268,24 @@ def _try_keyring():
         # broken, and an unsandboxed run (or the desktop) should still use the
         # keychain normally.
         return None
+    windows = _windows_store()
     if _KEYRING_DISABLED is None:
-        # First call this process — seed the in-process latch from disk
-        # so the very first save/load doesn't hit the OS dialog if a prior
-        # launch already learned it's broken.
-        _KEYRING_DISABLED = _is_keyring_marked_broken()
+        if windows is not None:
+            # A marker on Windows records Credential Manager refusing a secret
+            # past its size (error 1783), which this store has no limit for.
+            # Windows shows no panel, so trying again costs nothing: a store
+            # that fails latches off for this process and writes it anew.
+            _forget_marker()
+            _KEYRING_DISABLED = False
+        else:
+            # First call this process — seed the in-process latch from disk
+            # so the very first save/load doesn't hit the OS dialog if a prior
+            # launch already learned it's broken.
+            _KEYRING_DISABLED = _is_keyring_marked_broken()
     if _KEYRING_DISABLED:
         return None
+    if windows is not None:
+        return windows
     if _MACOS_KEYCHAIN_MISSING is None:
         _MACOS_KEYCHAIN_MISSING = _macos_keychain_missing()
     if _MACOS_KEYCHAIN_MISSING:
@@ -338,21 +374,28 @@ def _disable_keyring(
     _write_marker(f"{reason}\n# {raw}" if raw else reason)
 
 
+def _forget_marker() -> bool:
+    """Delete the persistent marker; True iff there was one."""
+    try:
+        marker_path = _keyring_marker_path()
+        existed = marker_path.exists()
+        marker_path.unlink(missing_ok=True)
+        return existed
+    except OSError as exc:
+        log.warning("keyring marker unlink failed: %s", exc)
+        return False
+
+
 def reset_keyring_disable() -> bool:
     """Remove the persistent keyring-broken marker so the next launch
     attempts the keychain again. Returns True iff a marker existed.
 
     Backs ``flowly keychain retry``."""
-    global _KEYRING_DISABLED, _MACOS_KEYCHAIN_MISSING
-    existed = False
-    try:
-        marker_path = _keyring_marker_path()
-        existed = marker_path.exists()
-        marker_path.unlink(missing_ok=True)
-    except OSError as exc:
-        log.warning("keyring marker unlink failed: %s", exc)
+    global _KEYRING_DISABLED, _MACOS_KEYCHAIN_MISSING, _WINDOWS_STORE
+    existed = _forget_marker()
     _KEYRING_DISABLED = None  # re-probe on next _try_keyring()
     _MACOS_KEYCHAIN_MISSING = None  # …including the macOS pre-flight
+    _WINDOWS_STORE = None  # …and Windows' DPAPI probe
     return existed
 
 
@@ -362,8 +405,11 @@ def storage_status() -> StorageStatus:
     if keyring is not None:
         backend = keyring.get_keyring()
         module = type(backend).__module__ or ""
+        from flowly.account.dpapi_store import DISPLAY_NAME, DpapiKeyring
         # Friendly per-platform name from module path.
-        if "macOS" in module:
+        if isinstance(backend, DpapiKeyring):
+            nice = DISPLAY_NAME
+        elif "macOS" in module:
             nice = "macOS Keychain"
         elif "Windows" in module:
             nice = "Windows Credential Manager"
@@ -402,8 +448,8 @@ def _no_keyring_hint() -> str:
     """
     if sys.platform == "darwin":
         return "this Mac has no keychain Flowly can write to"
-    if os.name == "nt":
-        return "Windows Credential Manager wasn't available"
+    if _on_windows():
+        return "Windows data protection wasn't available"
     return "install gnome-keyring or libsecret for OS keychain storage"
 
 
@@ -452,7 +498,11 @@ def load_credentials() -> dict[str, Any] | None:
         migrated = _migrate_legacy_file_to_keyring(keyring)
         if migrated is not None:
             return migrated
-        return None
+        # …or this home's own fallback file, written while the keychain was
+        # off: on Windows that is every sign-in before the DPAPI store, and
+        # anywhere it is a sign-in from before `flowly keychain retry`.
+        # Reading only the keychain here signed those homes out.
+        return _migrate_fallback_file_to_keyring(keyring)
 
     # No keyring — read file directly.
     return _read_file()
@@ -465,6 +515,13 @@ def clear_credentials() -> None:
             keyring.delete_password(_service_name(), ACCOUNT_KEY)
         except Exception:
             pass
+    # This home's fallback file too: signing out once left it in place at
+    # every home but the default, still signed in, and a keychain that came
+    # back would now move it in again.
+    try:
+        _fallback_path().unlink(missing_ok=True)
+    except OSError:
+        pass
     _purge_legacy_file()
 
 
@@ -500,6 +557,25 @@ def _purge_legacy_file() -> None:
         LEGACY_PATH.unlink()
     except OSError:
         pass
+
+
+def _migrate_fallback_file_to_keyring(keyring) -> dict[str, Any] | None:
+    """Move this home's fallback ``account.json`` into the keychain, then delete it."""
+    path = _fallback_path()
+    data = _read_file()
+    if data is None:
+        return None
+    try:
+        keyring.set_password(_service_name(), ACCOUNT_KEY, json.dumps(data, separators=(",", ":")))
+    except Exception as exc:
+        disable_keyring_for("migration set_password", exc)
+        return data
+    try:
+        path.unlink()
+    except OSError as exc:
+        log.warning("couldn't delete %s after moving it to the keychain: %s", path, exc)
+    log.info("moved %s → keychain", path)
+    return data
 
 
 def _migrate_legacy_file_to_keyring(keyring) -> dict[str, Any] | None:

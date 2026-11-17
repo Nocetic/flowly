@@ -1,6 +1,6 @@
 """``flowly keychain`` — inspect and re-enable OS keychain credential storage.
 
-Flowly prefers the OS keychain (macOS Keychain, Windows Credential Manager,
+Flowly prefers the OS keychain (macOS Keychain, DPAPI-sealed files on Windows,
 Linux Secret Service) for sign-in tokens and subscription credentials, and
 falls back to an owner-only file when the keychain refuses. That fallback is
 sticky on purpose — a Mac with no default keychain otherwise re-opens a
