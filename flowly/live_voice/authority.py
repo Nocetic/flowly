@@ -7,6 +7,7 @@ import json
 import re
 import secrets
 import time
+from collections import OrderedDict
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -105,15 +106,23 @@ def sign_profile_hop(key: str, instance_id: str, request_id: str, method: str,
 class ProfileHopVerifier:
     def __init__(self, instance_id: str, *, key: str | None = None,
                  now: Callable[[], float] = time.time,
-                 monotonic: Callable[[], float] = time.monotonic, max_requests: int = 4096):
+                 monotonic: Callable[[], float] = time.monotonic, max_requests: int = 4096,
+                 max_age: int = 30):
         if not _identity(instance_id) or (key is not None and not valid_parent_key(key)):
             raise VoiceAuthorityError()
         self.instance_id = instance_id
         self.key = key if key is not None else secrets.token_hex(32)
         self._now = now
         self._monotonic = monotonic
-        self._seen: dict[str, float] = {}
+        # Ids in the order they were seen: each lives the same time, so they
+        # also expire in that order and are let go from the front, never by a
+        # sweep over all of them on every proof (an event stream verifies many).
+        self._seen: OrderedDict[str, float] = OrderedDict()
         self._max_requests = max_requests
+        #: How old a proof may be. Each id is remembered for longer than that, so
+        #: nothing old enough to pass can be passed twice.
+        self._max_age = max_age
+        self._remember = max_age + 15
 
     def verify(self, request_id: str, method: str, params: dict, proof: object) -> RequestOwner | None:
         if not isinstance(proof, dict) or set(proof) != {'version', 'instanceId', 'issuedAt', 'owner', 'mac'}:
@@ -121,7 +130,7 @@ class ProfileHopVerifier:
         issued = proof['issuedAt']
         now = self._now()
         if (type(proof['version']) is not int or proof['version'] != 1 or proof['instanceId'] != self.instance_id
-                or type(issued) is not int or issued < now - 30 or issued > now + 5
+                or type(issued) is not int or issued < now - self._max_age or issued > now + 5
                 or not valid_parent_key(proof['mac'])):
             raise VoiceAuthorityError()
         unsigned = {key: value for key, value in proof.items() if key != 'mac'}
@@ -130,10 +139,11 @@ class ProfileHopVerifier:
             raise VoiceAuthorityError()
         owner = _read_owner(proof['owner'])
         monotonic = self._monotonic()
-        self._seen = {key: deadline for key, deadline in self._seen.items() if deadline > monotonic}
+        while self._seen and next(iter(self._seen.values())) <= monotonic:
+            self._seen.popitem(last=False)
         if request_id in self._seen:
             raise VoiceAuthorityError()
         if len(self._seen) >= self._max_requests:
             raise VoiceAuthorityError(unavailable=True)
-        self._seen[request_id] = monotonic + 45
+        self._seen[request_id] = monotonic + self._remember
         return owner

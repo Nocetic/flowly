@@ -17,6 +17,17 @@ from flowly.session.control_access import SessionControlScope
 from flowly.session.ownership import SessionAccessError, owner_metadata
 
 _FIELD = 'voiceEventAuthority'
+
+#: How late an agent's event may reach the host and still count. A request
+#: hop answers within seconds, so its proofs live 30 s; an event can wait far
+#: longer in the socket while the host is starved of CPU (a throttled cloud
+#: machine, 2026-11-17). Events signed 30 s earlier were dropped, the request
+#: for an approval among them: it never reached the owner and the agent
+#: waited on it until it was stopped.
+EVENT_MAX_AGE_SECONDS = 600
+#: Event ids remembered at once (each for the age above and a little more):
+#: a long turn streams many; past this the host refuses events, never forgets one early.
+EVENT_REPLAY_LIMIT = 131_072
 _METHOD = 'runtime.voice.event'
 
 
@@ -64,8 +75,8 @@ class ProfileEventVerifier:
         def effective_now():
             return max(now(), wall_start + monotonic() - monotonic_start)
 
-        self._proof = ProfileHopVerifier(instance_id, key=key, max_requests=16384,
-                                        now=effective_now, monotonic=monotonic)
+        self._proof = ProfileHopVerifier(instance_id, key=key, max_requests=EVENT_REPLAY_LIMIT,
+                                        now=effective_now, monotonic=monotonic, max_age=EVENT_MAX_AGE_SECONDS)
 
     def verify(self, frame: dict, *, sessions_dir: Path) -> ScopedEvent:
         authority = frame.get(_FIELD)

@@ -18,7 +18,7 @@ from flowly.live_voice.authority import (
     request_owner_scope,
     sign_profile_hop,
 )
-from flowly.live_voice.event_transport import ProfileEventVerifier, sign_profile_event
+from flowly.live_voice.event_transport import EVENT_MAX_AGE_SECONDS, ProfileEventVerifier, sign_profile_event
 from flowly.live_voice.events import EventAccess, current_event_access
 from flowly.profile_host import ProfileHost, _Runtime
 from flowly.profile_host_contract import ProfileHostError
@@ -82,7 +82,7 @@ def test_replay_does_not_deliver_a_second_terminal(setup):
 
 def test_expired_event_proof_cannot_be_replayed_on_a_fresh_verifier(setup):
     frame, sessions = source(setup)
-    verifier = ProfileEventVerifier(INSTANCE, key=PARENT_KEY, now=lambda: time.time() + 60)
+    verifier = ProfileEventVerifier(INSTANCE, key=PARENT_KEY, now=lambda: time.time() + EVENT_MAX_AGE_SECONDS + 1)
     with pytest.raises(VoiceAuthorityError):
         verifier.verify(frame, sessions_dir=sessions.sessions_dir)
 
@@ -92,7 +92,8 @@ def test_clock_rollback_does_not_make_an_event_valid_after_replay_cache_expiry(s
     wall, monotonic = [time.time()], [100.0]
     verifier = ProfileEventVerifier(INSTANCE, key=PARENT_KEY, now=lambda: wall[0], monotonic=lambda: monotonic[0])
     verifier.verify(frame, sessions_dir=sessions.sessions_dir)
-    monotonic[0] += 60
+    # Past the time its id is remembered: the clock that stood still must not make it new again.
+    monotonic[0] += EVENT_MAX_AGE_SECONDS + 16
     with pytest.raises(VoiceAuthorityError):
         verifier.verify(frame, sessions_dir=sessions.sessions_dir)
 

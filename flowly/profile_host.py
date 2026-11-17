@@ -481,6 +481,18 @@ def _clean_attention(result: Any) -> dict[str, dict[str, Any]]:
     return clean
 
 
+def _lease_listening(lease: dict[str, Any]) -> bool:
+    """The lease names where the bot listens. A bot coming back writes its
+    new instance first and its port and token a moment later: attaching in
+    between was refused as "an older Flowly Desktop runtime" and the host
+    stopped the bot it was waiting for."""
+    try:
+        port = int(lease.get("port") or 0)
+    except (TypeError, ValueError):
+        return False
+    return 1 <= port <= 65_535 and len(str(lease.get("authToken") or "")) >= 32
+
+
 @dataclass(slots=True)
 class _Runtime:
     profile: str
@@ -2432,10 +2444,24 @@ class ProfileHost:
                 and not self._closed
                 and runtime.ws.close_code == RESTART_CLOSE_CODE
             )
+            # Only the link dropped: the bot runs on, its turn with it. A host
+            # starved of CPU (a throttled cloud machine, 2026-11-17) missed the
+            # bot's ping, the bot closed the socket, and this stopped the bot
+            # mid-turn: the turn was lost and the app showed it running.
+            reconnecting = (
+                owns_runtime
+                and not self._closed
+                and not restarting
+                and runtime.process is not None
+                and runtime.process.returncode is None
+            )
             if owns_runtime:
                 self._runtimes.pop(runtime.profile, None)
             if owns_runtime and not self._closed:
-                await self._emit(runtime.profile, "connection", {"state": "starting" if restarting else "error"})
+                await self._emit(
+                    runtime.profile, "connection",
+                    {"state": "starting" if restarting or reconnecting else "error"},
+                )
             for future in runtime.pending.values():
                 if not future.done():
                     future.set_exception(ProfileHostError(
@@ -2443,6 +2469,8 @@ class ProfileHost:
                     ))
             if restarting:
                 self._follow_restart(runtime)
+            elif reconnecting:
+                self._follow_restart(runtime, same_instance=True)
             elif owns_runtime:
                 await self._close_runtime(runtime)
 
@@ -3271,14 +3299,17 @@ class ProfileHost:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    def _follow_restart(self, old: _Runtime) -> None:
-        """Wait for a bot restarting itself in place, then take it back.
+    def _follow_restart(self, old: _Runtime, *, same_instance: bool = False) -> None:
+        """Wait for a bot restarting itself in place, then take it back; or,
+        with ``same_instance``, connect again to a bot whose link alone dropped.
 
         It counts as starting meanwhile, so a request for it waits for it
         instead of spawning a second process next to the one coming back.
         """
         name = old.profile
-        task = asyncio.create_task(self._reattach_restarted(old), name=f"profile-restart:{name}")
+        task = asyncio.create_task(
+            self._reattach_restarted(old, same_instance=same_instance), name=f"profile-restart:{name}"
+        )
         self._starting[name] = task
         self._background_tasks.add(task)
 
@@ -3291,7 +3322,7 @@ class ProfileHost:
 
         task.add_done_callback(done)
 
-    async def _reattach_restarted(self, old: _Runtime) -> _Runtime:
+    async def _reattach_restarted(self, old: _Runtime, *, same_instance: bool = False) -> _Runtime:
         name = old.profile
         process = old.process
         await self._close_runtime(old, keep_process=True)
@@ -3309,17 +3340,25 @@ class ProfileHost:
                 lease = await asyncio.to_thread(read_runtime_lease, profile_dir)
                 if (
                     lease
-                    and str(lease.get("instanceId") or "") != old.instance_id
+                    # A restart comes back as a new instance; a dropped link is still the same one.
+                    and (str(lease.get("instanceId") or "") == old.instance_id) == same_instance
                     and (process is None or lease.get("pid") == process.pid)
+                    and _lease_listening(lease)
                 ):
-                    break
+                    attaching = True
+                    try:
+                        runtime = await self._attach_runtime(name, lease, recheck=read_runtime_lease)
+                        break
+                    except ProfileHostError as exc:
+                        # Still too busy to answer (the stall that dropped the link): try again while there is time.
+                        if not (same_instance and exc.retryable and time.monotonic() < deadline):
+                            raise
+                        attaching = False
                 if time.monotonic() >= deadline:
                     raise ProfileHostError(
                         "PROFILE_START_FAILED", "The bot did not come back after restarting.", retryable=True
                     )
                 await asyncio.sleep(_RESTART_POLL_SECONDS)
-            attaching = True
-            runtime = await self._attach_runtime(name, lease, recheck=read_runtime_lease)
         except BaseException as exc:
             if old.owned and process is not None:
                 await self._terminate_process(process)
