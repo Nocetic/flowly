@@ -10,6 +10,7 @@ request body or a token must not reach an activity list.
 from __future__ import annotations
 
 import re
+import shlex
 from pathlib import PurePath
 from typing import Any
 from urllib.parse import urlparse
@@ -87,10 +88,33 @@ def _site(url: str) -> str:
     return _line(host[4:] if host.startswith("www.") else host)
 
 
+_SETTING = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# Programs that run the next one: the step is named by what they run.
+_WRAPPERS = frozenset({"env", "sudo", "nohup", "time", "nice", "command", "exec"})
+# Their options that take a value of their own (`sudo -u me`, `nice -n 5`).
+_WRAPPER_VALUE_OPTIONS = frozenset({"-u", "-g", "-n", "-C", "-S", "-p", "-h", "-U"})
+
+
 def _program(command: str) -> str:
     # The program only: arguments carry paths, hosts and, too often, secrets.
-    first = command.strip().split(None, 1)[0] if command.strip() else ""
-    return _line(PurePath(first).name)
+    # Settings before it (`TZ=Europe/Istanbul date`) and the wrappers that run
+    # it are skipped: the first word alone named a routine's step "Istanbul".
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        words = command.split()
+    i = 0
+    while i < len(words):
+        word = words[i]
+        if _SETTING.match(word):
+            i += 1
+        elif PurePath(word).name in _WRAPPERS:
+            i += 1
+            while i < len(words) and words[i].startswith("-"):
+                i += 2 if words[i] in _WRAPPER_VALUE_OPTIONS else 1
+        else:
+            return _line(PurePath(word).name)
+    return ""
 
 
 def is_work(step: dict[str, Any]) -> bool:

@@ -79,6 +79,21 @@ def test_a_step_keeps_a_short_target_and_never_the_arguments():
     assert describe_step("something_new", {"x": 1}) == {"tool": "something_new", "kind": "other", "target": ""}
 
 
+@pytest.mark.parametrize("command, program", [
+    # An environment setting before the program is not the program: this one
+    # read "Ran Istanbul" in the apps (a morning routine, 2026-11-22).
+    ('TZ=Europe/Istanbul date "+%Y-%m-%d %H:%M"', "date"),
+    ("LANG=C FOO='a b' /usr/bin/sort data.txt", "sort"),
+    ("env -i PATH=/bin ls -la", "ls"),
+    ("sudo -u me systemctl restart x", "systemctl"),
+    ("nohup python3 serve.py", "python3"),
+    ("date", "date"),
+    ("TZ=UTC", ""),
+])
+def test_a_command_is_named_by_its_program_not_its_settings(command, program):
+    assert describe_step("exec", {"command": command})["target"] == program
+
+
 def test_recalling_asking_and_planning_are_conversation_everything_else_is_work():
     for tool in ("memory_search", "memory_append", "knowledge_graph", "session_search", "clarify",
                  "plan", "skill_view", "skills_list"):
