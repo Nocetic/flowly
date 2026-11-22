@@ -128,6 +128,29 @@ class HubClient:
             logger.warning(f"Failed to get skill {slug}: {e}")
             return None
 
+    @staticmethod
+    def _site(host: str | None) -> str:
+        host = (host or "").lower()
+        return host[4:] if host.startswith("www.") else host
+
+    def _get_on_own_site(self, url: str, hops: int = 3) -> httpx.Response:
+        """GET ``url``, following redirects only within the same site.
+
+        The registry hands out ``www.`` addresses that answer 308 to the bare
+        domain, and no redirect was followed: every install failed
+        (2026-11-22). A redirect to any other site is still refused, so a
+        download never leaves the place it was offered from.
+        """
+        resp = self._client.get(url)
+        for _ in range(hops):
+            if not resp.is_redirect:
+                return resp
+            target = resp.url.join(resp.headers.get("location", ""))
+            if target.scheme != "https" or self._site(target.host) != self._site(resp.url.host):
+                return resp
+            resp = self._client.get(target)
+        return resp
+
     def download_skill(self, skill: SkillInfo, target_dir: Path) -> Path | None:
         """
         Download a skill to the target directory.
@@ -149,7 +172,7 @@ class HubClient:
 
         try:
             # Download skill content
-            resp = self._client.get(skill.download_url)
+            resp = self._get_on_own_site(skill.download_url)
             resp.raise_for_status()
 
             # Verify hash if provided
