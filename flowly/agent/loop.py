@@ -2291,7 +2291,14 @@ class AgentLoop:
             trigger = self._activity_trigger(msg, synthetic_goal_id)
             if trigger is None:
                 return None
+            from flowly.activity.recorder import ROUTINE_METADATA_KEY
+
             request = msg.content or ""
+            # A routine's turn wraps the owner's words in the runner's
+            # instructions; the task keeps only what the owner wrote.
+            routine = msg.metadata.get(ROUTINE_METADATA_KEY) if trigger.get("kind") == "routine" else None
+            if isinstance(routine, dict) and isinstance(routine.get("request"), str) and routine["request"].strip():
+                request = routine["request"]
             if synthetic_goal_id and getattr(self, "goal_manager", None) is not None:
                 state = self.goal_manager.get(msg.session_key)
                 request = getattr(state, "goal", "") or request

@@ -571,6 +571,28 @@ def test_a_routine_is_titled_by_its_name_until_summarized(home, clock):
     assert (item["title"], item["kind"], item["trigger"]["name"]) == ("Morning brief", "routine", "Morning brief")
 
 
+def test_a_routine_keeps_the_owners_words_not_the_runners_wrapper(home, clock, monkeypatch):
+    # The cron runner wraps a routine's message in "[Scheduled Task: …]" and
+    # its delivery rules; the apps showed that wrapper as the task's request
+    # (a morning routine, 2026-11-23).
+    import flowly.activity as activity
+    from flowly.activity.recorder import ROUTINE_METADATA_KEY
+    from flowly.agent.loop import AgentLoop
+    from flowly.bus.events import InboundMessage
+
+    rec = ActivityRecorder()
+    monkeypatch.setattr(activity, "get_activity_recorder", lambda: rec)
+    loop = AgentLoop.__new__(AgentLoop)
+    wrapped = "[Scheduled Task: Morning brief]\nRead my inbox.\n\n# Delivery contract\nYour final response ..."
+    msg = InboundMessage(channel="cron", sender_id="cron", chat_id="job-7", content=wrapped,
+                         metadata={ROUTINE_METADATA_KEY: {"name": "Morning brief", "request": "Read my inbox."}})
+    assert loop._activity_begin(msg, "r", "").request == "Read my inbox."
+    # A runner that names no request still records what the turn was given.
+    bare = InboundMessage(channel="cron", sender_id="cron", chat_id="job-8", content=wrapped,
+                          metadata={ROUTINE_METADATA_KEY: {"name": "Morning brief"}})
+    assert loop._activity_begin(bare, "s", "").request.startswith("[Scheduled Task: Morning brief]")
+
+
 def test_who_started_a_task():
     from flowly.activity.recorder import ROUTINE_METADATA_KEY
     from flowly.agent.loop import _AGENT_INTRODUCTION, AgentLoop

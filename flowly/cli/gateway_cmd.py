@@ -1349,8 +1349,9 @@ def gateway(
                         stream_callback=_record_delta,
                         on_iteration=_record_iteration,
                         run_id=run_id,
-                        # The activity journal names the task after its routine.
-                        extra_metadata={ROUTINE_METADATA_KEY: {"name": job.name}},
+                        # The activity journal names the task after its routine
+                        # and keeps the owner's words, not this wrapper.
+                        extra_metadata={ROUTINE_METADATA_KEY: {"name": job.name, "request": job.payload.message}},
                     )
                 except Exception as e:
                     err = f"Agent execution failed: {e}"
@@ -1455,6 +1456,7 @@ def gateway(
                 stream_callback=_record_delta,
                 on_iteration=_record_iteration,
                 run_id=run_id,
+                extra_metadata={ROUTINE_METADATA_KEY: {"name": job.name, "request": job.payload.message}},
             )
         except Exception as e:
             err = f"Agent execution failed: {e}"
