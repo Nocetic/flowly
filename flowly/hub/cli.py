@@ -384,13 +384,14 @@ Example:
 @app.command()
 def publish():
     """
-    Publish a skill to the Flowly Skills Marketplace.
+    How a skill reaches the Flowly Skills Marketplace.
 
-    Skills are published through the web UI at https://useflowlyapp.com/skills/publish
+    The Marketplace is curated: Flowly publishes its skills, and the website
+    takes none (2026-11-24). A skill of your own needs no Marketplace.
     """
-    console.print("Publish skills at: [cyan]https://useflowlyapp.com/skills/publish[/cyan]")
-    console.print("\n[dim]Sign in with your Flowly account, upload your SKILL.md,")
-    console.print("and the marketplace handles security scanning and publishing.[/dim]")
+    console.print("The Flowly Marketplace is curated: Flowly publishes its skills.")
+    console.print("\n[dim]Your own skill needs no Marketplace: put its folder (with a SKILL.md)")
+    console.print("in your agent's skills folder, or ask your agent to write it with skill-creator.[/dim]")
 
 
 # ============================================================================
