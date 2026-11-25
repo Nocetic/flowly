@@ -619,7 +619,7 @@ wheels = [
 
 [[package]]
 name = "flowly-ai"
-version = "3.4.0rc18"
+version = "4.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
