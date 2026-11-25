@@ -26,6 +26,20 @@ from flowly.profile_host import ProfileHost
 
 
 @pytest.fixture(autouse=True)
+def _agents_share_the_hosts_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start named agents outside the CLI sandbox, as this test process is.
+
+    A real gateway and the agents it starts make the same sandbox choice: a
+    wrapped gateway passes FLOWLY_SANDBOX_WRAPPED on, so they share one PID
+    namespace. This process is never wrapped, but on a Linux host with bwrap
+    an agent it started wrapped itself in a PID namespace of its own and wrote
+    that namespace's PID into its lease, which never matched the PID started
+    here (PROFILE_RUNTIME_CHANGED on CI only).
+    """
+    monkeypatch.setenv("FLOWLY_SANDBOX", "0")
+
+
+@pytest.fixture(autouse=True)
 def _clean_self_restart(monkeypatch: pytest.MonkeyPatch):
     from flowly.integrations import service_control
 

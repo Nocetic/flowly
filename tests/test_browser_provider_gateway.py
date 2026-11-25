@@ -22,6 +22,20 @@ class FakeWebSocket:
         self.messages.append(data)
 
 
+async def _until_sent(socket: FakeWebSocket, turns: int = 20) -> None:
+    """Let a tool request reach its socket.
+
+    ``_ws_send`` sends through ``asyncio.wait_for``, which before Python 3.12
+    wraps the send in a task of its own: the message goes a loop turn later
+    there, so a single ``sleep(0)`` found nothing sent on 3.11 and the request
+    left pending kept the test process from ever exiting.
+    """
+    for _ in range(turns):
+        if any(message.get("type") == "tool_request" for message in socket.messages):
+            return
+        await asyncio.sleep(0)
+
+
 def _server_with_clients(*client_ids: str) -> tuple[GatewayServer, dict[str, FakeWebSocket]]:
     server = GatewayServer(host="127.0.0.1", port=0)
     clients = {client_id: FakeWebSocket() for client_id in client_ids}
@@ -93,7 +107,7 @@ async def test_tool_result_must_come_from_target_provider() -> None:
             "request-1", "read_page", {}, provider_id="embedded"
         )
     )
-    await asyncio.sleep(0)
+    await _until_sent(clients["desktop-browser"])
 
     assert clients["desktop-browser"].messages[-1]["providerId"] == "embedded"
     server._handle_extension_tool_result(
@@ -445,7 +459,7 @@ async def test_direct_chat_binding_routes_only_to_owned_registration() -> None:
             browser_binding=binding,
         )
     )
-    await asyncio.sleep(0)
+    await _until_sent(clients["desktop-controller"])
 
     request = next(
         message

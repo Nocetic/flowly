@@ -98,9 +98,21 @@ def store(tmp_path, monkeypatch, identities):
     monkeypatch.setattr(account, "_trusted_root", lambda path: None)
     fstat = os.fstat
 
+    class OwnedByRoot:
+        """The file's real stat, owned by root. ``os.fstat`` is the whole
+        process's: whatever else reads it while this runs gets a whole answer
+        (on Linux CI something read ``st_size`` from a partial one)."""
+
+        def __init__(self, real):
+            self._real = real
+
+        st_uid = 0
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
     def info(fd):
-        real = fstat(fd)
-        return SimpleNamespace(st_uid=0, st_mode=real.st_mode, st_nlink=real.st_nlink)
+        return OwnedByRoot(fstat(fd))
 
     monkeypatch.setattr(os, "fstat", info)
     path = tmp_path / "account.json"
