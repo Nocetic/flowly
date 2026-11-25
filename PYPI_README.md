@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/Nocetic/flowly/main/assets/banner.png" alt="Flowly — the personal AI agent you own, everywhere you are" width="100%">
   <p>
     <a href="https://pypi.org/project/flowly-ai/"><img src="https://img.shields.io/pypi/v/flowly-ai?style=for-the-badge&label=pypi&color=7C5CFC" alt="PyPI"></a>
-    <img src="https://img.shields.io/badge/python-%E2%89%A53.11-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python">
+    <img src="https://img.shields.io/badge/python-%E2%89%A53.12-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python">
     <img src="https://img.shields.io/badge/macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-14181F?style=for-the-badge" alt="Platform">
     <a href="https://github.com/Nocetic/flowly/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-3B82F6?style=for-the-badge" alt="License"></a>
   </p>

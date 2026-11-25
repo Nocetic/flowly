@@ -1,7 +1,7 @@
 <div align="center">
   <img src="assets/banner.png" alt="Flowly — the personal AI agent you own, everywhere you are" width="100%">
   <p>
-    <img src="https://img.shields.io/badge/python-≥3.11-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python">
+    <img src="https://img.shields.io/badge/python-≥3.12-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python">
     <img src="https://img.shields.io/badge/macOS%20·%20Linux%20·%20Windows-14181F?style=for-the-badge" alt="Platform">
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-3B82F6?style=for-the-badge" alt="License"></a>
   </p>

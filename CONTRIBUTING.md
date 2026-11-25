@@ -37,7 +37,7 @@ config. No second account, no state to keep in sync.
 ### Prerequisites
 
 [uv](https://docs.astral.sh/uv/) (it manages Python for you) and Git. Python
-**3.11+** is required (`pyproject.toml`); 3.12 is what CI uses. Install uv:
+**3.12+** is required (`pyproject.toml`); 3.12 is what CI uses. Install uv:
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh          # macOS / Linux
@@ -169,7 +169,7 @@ uv run --extra dev ruff check flowly/      # lint (add --fix to fix)
 
 Tests set their own `FLOWLY_HOME` and never touch your real state.
 
-CI runs `ruff check` and `pytest` on every PR (Ubuntu, Python 3.11 + 3.12). Run
+CI runs `ruff check` and `pytest` on every PR (Ubuntu, Python 3.12). Run
 both locally first. Tests use `pytest-asyncio` in `auto` mode — write
 `async def test_...` directly, no decorator needed. Keep new tests hermetic (no
 network, no real keys): use `monkeypatch` and `tmp_path`, and set `FLOWLY_HOME`
