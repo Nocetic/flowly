@@ -492,15 +492,29 @@ def _messages_contain_image_input(messages: list[dict[str, Any]]) -> bool:
 # Fullwidth vertical bar (U+FF5C) — used in deepseek/DSML markers like
 # ``<｜｜DSML｜｜tool_calls>`` and ``<｜tool▁calls▁begin｜>``.
 _PIPE = "[｜|]"
+_DSML = rf"{_PIPE}+\s*DSML\s*{_PIPE}+\s*"
+# The wrapper is ``tool_calls`` (V4) or ``function_calls`` (V3.2), and comes
+# out mangled at long context (``<｜DSML｜ calls>``), so its name is not
+# trusted; the invoke blocks inside are what carry the call.
+_DSML_WRAPPER = r"(?:tool_|function_|\s)?calls"
 _DSML_BLOCK_RE = re.compile(
-    rf"<\s*{_PIPE}+\s*DSML\s*{_PIPE}+\s*tool_calls\s*>.*?</\s*{_PIPE}+\s*DSML\s*{_PIPE}+\s*tool_calls\s*>",
+    rf"<\s*{_DSML}{_DSML_WRAPPER}\s*>.*?</\s*{_DSML}{_DSML_WRAPPER}\s*>",
     re.DOTALL,
 )
+_DSML_INVOKE_RE = re.compile(rf"<\s*{_DSML}invoke\b[^>]*>.*?</\s*{_DSML}invoke\s*>", re.DOTALL)
+# A call the model never closed runs to the end of the text.
+_DSML_OPEN_CALL_RE = re.compile(rf"<\s*{_DSML}(?:{_DSML_WRAPPER}|invoke\b|parameter\b)[^>]*>.*", re.DOTALL)
 _DSML_TAG_RE = re.compile(rf"</?\s*{_PIPE}+\s*DSML\s*{_PIPE}+[^>]*>", re.DOTALL)
 _DEEPSEEK_MARK_RE = re.compile(rf"<\s*{_PIPE}\s*tool[▁_ ]*calls?[▁_ ]*(?:begin|end)\s*{_PIPE}\s*>")
 _XML_TOOLCALLS_RE = re.compile(r"<\s*(tool_calls|function_calls)\s*>.*?</\s*\1\s*>", re.DOTALL | re.IGNORECASE)
 _XML_INVOKE_RE = re.compile(r"<\s*invoke\b[^>]*>.*?</\s*invoke\s*>", re.DOTALL | re.IGNORECASE)
 _CODE_FENCE_RE = re.compile(r"(```.*?```|~~~.*?~~~)", re.DOTALL)
+
+# The reply of a turn that ran out of steps when the model could not write one.
+STEP_LIMIT_REPLY = (
+    "I reached this turn's limit of {limit} steps before finishing. "
+    'Say "continue" and I\'ll pick up where I left off.'
+)
 
 
 # A plugin's pre_llm_call hook must not hold the owner's reply. Past this the
@@ -606,6 +620,8 @@ def _strip_leaked_tool_markup(text: str | None) -> str:
             cleaned.append(seg)
             continue
         seg = _DSML_BLOCK_RE.sub("", seg)
+        seg = _DSML_INVOKE_RE.sub("", seg)
+        seg = _DSML_OPEN_CALL_RE.sub("", seg)
         seg = _XML_TOOLCALLS_RE.sub("", seg)
         seg = _XML_INVOKE_RE.sub("", seg)
         seg = _DEEPSEEK_MARK_RE.sub("", seg)
@@ -5433,13 +5449,32 @@ class AgentLoop:
         messages: list[dict],
         tool_results: list[dict],
         session_key: str = "",
+        *,
+        tools: list[dict] | None = None,
+        model: str | None = None,
+        step_limit: int | None = None,
     ) -> str | None:
         """Ask the model to summarize what happened in natural language.
 
         When the loop exits with a hardcoded fallback, this gives the model
         a chance to explain what happened to the user naturally.
+
+        ``tools`` are the turn's own tool definitions, sent with
+        ``tool_choice="none"``: the request keeps the turn's cached prefix,
+        and a model that still calls a tool answers with a structured call
+        this reply ignores rather than markup it invents for the tools it no
+        longer sees. ``step_limit`` is set when the turn ran out of steps
+        with the work unfinished. A reply carrying tool-call markup is a call
+        the model wanted to make, not a summary, so it is not used.
         """
-        if tool_results:
+        if step_limit:
+            summary_prompt = (
+                f"This turn reached its limit of {step_limit} steps before the work "
+                "was finished, and tools are off for this reply. Tell the user that "
+                "the step limit was reached, what has been done so far, what is "
+                "left, and that they can say to continue."
+            )
+        elif tool_results:
             summary_prompt = (
                 "The tool calls above have completed. "
                 "Summarize what happened to the user in a natural, concise way. "
@@ -5457,12 +5492,15 @@ class AgentLoop:
         try:
             response, _fitted_messages = await self._call_provider_with_context_recovery(
                 messages=messages_copy,
-                tools=[],
-                model=self.model,
+                tools=list(tools or []),
+                model=model or self.model,
                 temperature=0.7,
                 tool_choice="none",
                 session_key=session_key,
             )
+            if _contains_leaked_tool_markup(response.content):
+                logger.warning("Summary turn answered with a tool call written as text; not using it")
+                return None
             if (
                 response.finish_reason != "error"
                 and response.content
@@ -6676,6 +6714,10 @@ class AgentLoop:
             # Ephemeral guidance for this screen run; never part of the durable journal.
             messages.append({"role": "user", "content": screen_handoff_guidance(session_key)})
 
+        # The tool definitions of the last model call, and whether the loop
+        # ran out of steps (the ``while`` ended without a ``break``).
+        last_tool_defs: list[dict[str, Any]] = []
+        ran_out_of_steps = False
         while iteration < max_turn_iterations or steering.has_pending(outbound_run_id):
             try:
                 await await_screen_checkpoint()
@@ -6890,6 +6932,7 @@ class AgentLoop:
                 str(td.get("function", {}).get("name", ""))
                 for td in tool_defs
             }
+            last_tool_defs = tool_defs
             # Always use "auto" on the first iteration so the model can output
             # a preamble sentence ("Hemen bakıyorum.") before the tool call.
             # This is critical for voice mode — the user needs audio feedback
@@ -8248,11 +8291,14 @@ class AgentLoop:
                 exact_message=True,
             )
             break
+        else:
+            ran_out_of_steps = True
 
         steering.close(outbound_run_id)
         run_was_aborted = bool(
             outbound_run_id and self.is_run_aborted(outbound_run_id)
         )
+        step_limit = max_turn_iterations if ran_out_of_steps and not run_was_aborted else None
 
         if enforce_action_tools and not successful_tools_were_used and not run_was_aborted:
             if not final_content or not final_content.startswith("Tool"):
@@ -8306,9 +8352,14 @@ class AgentLoop:
                 messages,
                 accumulated_tool_results,
                 session_key=session_key,
+                tools=last_tool_defs,
+                model=selected_model,
+                step_limit=step_limit,
             )
             if summary:
                 final_content = summary
+            elif step_limit:
+                final_content = STEP_LIMIT_REPLY.format(limit=step_limit)
 
         await progress.settle("stopped" if run_was_aborted else "failed")
         return final_content, accumulated_tool_results, executed_tool_names, total_usage, messages
