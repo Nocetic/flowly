@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from flowly.agent.loop import STEP_LIMIT_REPLY, AgentLoop
+from flowly.agent.loop import STEP_LIMIT_REPLIES, AgentLoop
 from flowly.agent.tools.base import Tool
 from flowly.bus.queue import MessageBus
 from flowly.config.schema import Config
@@ -64,7 +64,7 @@ class _NeverDoneProvider(LLMProvider):
         )
 
 
-async def _run_out_of_steps(tmp_path, monkeypatch, final: str):
+async def _run_out_of_steps(tmp_path, monkeypatch, final: str, history=None, turn="Read every part and summarize it."):
     monkeypatch.setenv("FLOWLY_HOME", str(tmp_path / "home"))
     provider = _NeverDoneProvider(final)
     loop = AgentLoop(
@@ -81,9 +81,10 @@ async def _run_out_of_steps(tmp_path, monkeypatch, final: str):
         final_content, *_ = await loop._run_llm_tool_loop(
             messages=[
                 {"role": "system", "content": "test"},
-                {"role": "user", "content": "Read every part and summarize it."},
+                *(history or []),
+                {"role": "user", "content": turn},
             ],
-            turn_content="Read every part and summarize it.",
+            turn_content=turn,
             session_key="web:step-limit",
             tool_platform="web",
         )
@@ -111,6 +112,23 @@ async def test_reply_call_keeps_the_tools_and_says_the_limit_was_reached(tmp_pat
 async def test_tool_markup_in_the_reply_becomes_the_step_limit_reply(tmp_path, monkeypatch):
     final, _provider, probe = await _run_out_of_steps(tmp_path, monkeypatch, STEP_LIMIT_LEAK)
 
-    assert final == STEP_LIMIT_REPLY.format(limit=2)
+    assert final == STEP_LIMIT_REPLIES["en"].format(limit=2)
     assert "DSML" not in final
     assert probe.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_step_limit_reply_speaks_the_persons_language(tmp_path, monkeypatch):
+    # "devam et" is too short to tell; the message before it is Turkish.
+    final, _provider, _probe = await _run_out_of_steps(
+        tmp_path,
+        monkeypatch,
+        STEP_LIMIT_LEAK,
+        history=[
+            {"role": "user", "content": "Neler var baksana, bana sayfa sayfa basitçe özetler misin?"},
+            {"role": "assistant", "content": "Okuyorum."},
+        ],
+        turn="devam et",
+    )
+
+    assert final == STEP_LIMIT_REPLIES["tr"].format(limit=2)

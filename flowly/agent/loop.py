@@ -510,11 +510,40 @@ _XML_TOOLCALLS_RE = re.compile(r"<\s*(tool_calls|function_calls)\s*>.*?</\s*\1\s
 _XML_INVOKE_RE = re.compile(r"<\s*invoke\b[^>]*>.*?</\s*invoke\s*>", re.DOTALL | re.IGNORECASE)
 _CODE_FENCE_RE = re.compile(r"(```.*?```|~~~.*?~~~)", re.DOTALL)
 
-# The reply of a turn that ran out of steps when the model could not write one.
-STEP_LIMIT_REPLY = (
-    "I reached this turn's limit of {limit} steps before finishing. "
-    'Say "continue" and I\'ll pick up where I left off.'
-)
+# The reply of a turn that ran out of steps when the model could not write
+# one, in the language the person writes in (live_voice.language's three).
+STEP_LIMIT_REPLIES = {
+    "en": (
+        "I reached this turn's limit of {limit} steps before finishing. "
+        'Say "continue" and I\'ll pick up where I left off.'
+    ),
+    "tr": (
+        "İşi bitirmeden bu turun {limit} adımlık sınırına ulaştım. "
+        '"Devam et" yazarsan kaldığım yerden sürdürürüm.'
+    ),
+    "es": (
+        "Llegué al límite de {limit} pasos de este turno antes de terminar. "
+        'Escribe "continúa" y sigo donde lo dejé.'
+    ),
+}
+
+
+def _step_limit_reply(limit: int, turn_content: str, messages: list[dict[str, Any]]) -> str:
+    """STEP_LIMIT_REPLIES in the language of the turn's message, else of the
+    person's latest message that clearly has one ("devam et" says nothing)."""
+    from flowly.live_voice.language import detect_language
+
+    texts = [turn_content]
+    texts += [
+        _without_plugin_context(message.get("content"))
+        for message in reversed(messages)
+        if message.get("role") == "user" and not message.get(_EPHEMERAL_NUDGE)
+    ]
+    for text in texts:
+        language = detect_language(text) if isinstance(text, str) else None
+        if language in STEP_LIMIT_REPLIES:
+            return STEP_LIMIT_REPLIES[language].format(limit=limit)
+    return STEP_LIMIT_REPLIES["en"].format(limit=limit)
 
 
 # A plugin's pre_llm_call hook must not hold the owner's reply. Past this the
@@ -8359,7 +8388,7 @@ class AgentLoop:
             if summary:
                 final_content = summary
             elif step_limit:
-                final_content = STEP_LIMIT_REPLY.format(limit=step_limit)
+                final_content = _step_limit_reply(step_limit, turn_content, messages)
 
         await progress.settle("stopped" if run_was_aborted else "failed")
         return final_content, accumulated_tool_results, executed_tool_names, total_usage, messages
